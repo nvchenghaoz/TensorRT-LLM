@@ -17,6 +17,7 @@
 import copy
 import dataclasses
 import math
+import os
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
@@ -60,7 +61,9 @@ from ..modules.fused_ops.rmsnorm_residual_add import (
     rmsnorm_residual_add_scale,
 )
 from ..modules.gated_mlp import GatedMLP
+from ..modules.gemma4.fused_norm_quant import gemma4_fused_norm_add_fp4
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
+from ..modules.gemma4.packed_head import configure_packed_head
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
@@ -785,6 +788,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         # gate_up NVFP4 quantize (both decided lazily like the tail).
         self._fused_norm_add: Optional[bool] = None
         self._fused_norm_quant: Optional[bool] = None
+        self._combine_norm_quant = os.environ.get("TRTLLM_GEMMA4_FUSED_NORM_QUANT", "1") == "1"
         # The next layer's input_layernorm (wired by Gemma4TextModel); when
         # set, the fused tail can emit that norm as a second output so the
         # next layer skips its standalone input-norm pass.
@@ -946,23 +950,46 @@ class Gemma4DecoderLayer(DecoderLayer):
             attention_mask_data=attention_mask_data,
             **kwargs,
         )
-        # Fused post_attention RMSNorm + residual add (one kernel instead of
-        # a norm round-trip plus a separate add). The unfused sequence remains
-        # for configurations the kernel does not support.
-        if (
+        can_fuse_norm = (
             isinstance(hidden_states, torch.Tensor)
             and hidden_states.dim() == 2
             and hidden_states.dtype == torch.bfloat16
-            and residual.shape == hidden_states.shape
             and not is_torch_compiling()
+        )
+        can_quantize_mlp_input = (
+            can_fuse_norm
+            and not lora_params
+            and hidden_states.shape[-1] % 32 == 0
+            and self._fused_norm_quant_enabled()
+        )
+        fused_mlp_input = None
+        if (
+            can_fuse_norm
+            and residual.shape == hidden_states.shape
             and self._fused_norm_add_enabled()
         ):
-            hidden_states = rmsnorm_residual_add(
-                hidden_states,
-                residual,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-            )
+            if (
+                can_quantize_mlp_input
+                and self._combine_norm_quant
+                and 64 <= hidden_states.shape[-1] <= 16384
+            ):
+                hidden_states, fp4, sf = gemma4_fused_norm_add_fp4(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm.weight,
+                    self.pre_feedforward_layernorm.weight,
+                    self.mlp.gate_up_proj.input_scale,
+                    self.post_attention_layernorm.variance_epsilon,
+                    self.pre_feedforward_layernorm.variance_epsilon,
+                )
+                fused_mlp_input = Fp4QuantizedTensor(fp4, sf)
+            else:
+                hidden_states = rmsnorm_residual_add(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
         else:
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = residual + hidden_states
@@ -975,15 +1002,9 @@ class Gemma4DecoderLayer(DecoderLayer):
         # input_scale / alpha the unfused quantize would use; the fused
         # kernel skips the intermediate bf16 round, so the GEMM inputs are
         # near- rather than byte-identical).
-        if (
-            not lora_params
-            and isinstance(hidden_states, torch.Tensor)
-            and hidden_states.dim() == 2
-            and hidden_states.dtype == torch.bfloat16
-            and hidden_states.shape[-1] % 32 == 0
-            and not is_torch_compiling()
-            and self._fused_norm_quant_enabled()
-        ):
+        if fused_mlp_input is not None:
+            hidden_states = self.mlp(fused_mlp_input, lora_params=lora_params)
+        elif can_quantize_mlp_input:
             fp4, sf = rmsnorm_fp4_quant(
                 hidden_states,
                 self.pre_feedforward_layernorm.weight,
@@ -1295,6 +1316,12 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             )
 
         super().__init__(Gemma4TextModel(model_config), model_config)
+        self._packed_head_enabled = os.environ.get("TRTLLM_GEMMA4_PACKED_HEAD", "0") == "1"
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        if self._packed_head_enabled:
+            configure_packed_head(self.lm_head)
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:

@@ -845,9 +845,8 @@ class CudaCoreNVFP4Runner(TunableRunner):
     """
     CUDA Core-based NVFP4 GEMM runner.
 
-    This runner is available on:
-    - SM >= 100 (Blackwell)
-    - M <= 8 (small batch size limitation from kernel template)
+    Available on SM >= 100 (Blackwell). The kernel tiles the token dimension
+    and reads activation scales directly in the producer's swizzled layout.
     """
 
     # Shared tuning config (no tactics needed, single implementation)
@@ -855,8 +854,6 @@ class CudaCoreNVFP4Runner(TunableRunner):
 
     # Minimum supported architecture: SM100 (Blackwell)
     MIN_SM_VERSION = 100
-    # Maximum M dimension (from cudaCoreGemmTemplateMaxM in C++ kernel)
-    MAX_M_DIMENSION = 8
 
     def __init__(self,
                  output_buffer_kind: int,
@@ -869,25 +866,11 @@ class CudaCoreNVFP4Runner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
-        """Return [0] if architecture and shape requirements are met, otherwise []."""
-        # Check architecture support at runtime
-        if torch.cuda.is_available():
-            capability = torch.cuda.get_device_capability(
-                torch.device('cuda:0'))
-            sm_version = capability[0] * 10 + capability[1]
-            if sm_version < self.MIN_SM_VERSION:
-                return []
-        else:
+        """Offer the tiled kernel on supported GPUs; batch size is unrestricted."""
+        if not torch.cuda.is_available():
             return []
-
-        # Check M dimension limitation (kernel template constraint)
-        act_fp4, weight, act_sf, weight_scale, alpha = inputs
-        m = act_fp4.shape[0]
-        if m > self.MAX_M_DIMENSION:
-            return []
-
-        # Single tactic (no config variations)
-        return [0]
+        major, minor = torch.cuda.get_device_capability(inputs[0].device)
+        return [0] if major * 10 + minor >= self.MIN_SM_VERSION else []
 
     def forward(
         self,
@@ -897,22 +880,17 @@ class CudaCoreNVFP4Runner(TunableRunner):
     ) -> torch.Tensor:
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
-        # Unswizzle the activation scale factors
-        # act_sf is swizzled, need to reverse it for cuda_core_nvfp4_gemm
-        m = act_fp4.shape[0]
-        act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            act_sf.view((m + 128 - 1) // 128 * 128, -1))
-
         result = torch.ops.trtllm.cuda_core_nvfp4_gemm(
             act_fp4,
             weight,
-            scale_a=act_sf_unswizzled,
+            scale_a=act_sf,
             scale_b=weight_scale,
             alpha=alpha,
             bias=bias,
             out_dtype=self.output_dtype,
             output_buffer_kind=self.output_buffer_kind,
             group=self.group,
+            scale_a_swizzled=True,
         )
         return result
 
@@ -1202,35 +1180,20 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     f"{sm_version}. Please add other backends to "
                     "allowed_backends.")
 
-        # Add CUDA Core tactics if available
+        # Let the runner own hardware eligibility; the tuner compares all batch sizes.
         if self._is_backend_allowed("cuda_core"):
-            is_cuda_core_supported = False
-            m = act_fp4.shape[0]
-            sm_version = None
-
-            if torch.cuda.is_available():
-                capability = torch.cuda.get_device_capability(
-                    torch.device('cuda:0'))
-                sm_version = capability[0] * 10 + capability[1]
-                # Check both SM version and M dimension constraints
-                is_cuda_core_supported = (
-                    sm_version >= CudaCoreNVFP4Runner.MIN_SM_VERSION
-                    and m <= CudaCoreNVFP4Runner.MAX_M_DIMENSION)
-
-            if is_cuda_core_supported:
-                cuda_core_runner = CudaCoreNVFP4Runner(self.output_buffer_kind,
-                                                       self.output_dtype,
-                                                       group=self.group)
-                cuda_core_tactics = cuda_core_runner.get_valid_tactics(
-                    inputs, profile)
+            cuda_core_runner = CudaCoreNVFP4Runner(self.output_buffer_kind,
+                                                   self.output_dtype,
+                                                   group=self.group)
+            cuda_core_tactics = cuda_core_runner.get_valid_tactics(
+                inputs, profile)
+            if cuda_core_tactics:
                 tactics.extend([("cuda_core", tactic)
                                 for tactic in cuda_core_tactics])
             elif self._is_only_backend("cuda_core"):
-                # Explicitly forced but conditions not met - raise error
-                error_msg = f"CUDA Core backend requires SM >= {CudaCoreNVFP4Runner.MIN_SM_VERSION} and M <= {CudaCoreNVFP4Runner.MAX_M_DIMENSION}. "
-                error_msg += f"Current: SM={sm_version if sm_version else 'N/A'}, M={m}. "
-                error_msg += "Please add other backends to allowed_backends."
-                raise ValueError(error_msg)
+                raise ValueError(
+                    f"CUDA Core backend requires SM >= {CudaCoreNVFP4Runner.MIN_SM_VERSION}. "
+                    "Please add other backends to allowed_backends.")
 
         # Add CUTLASS tactics if available
         if self._is_backend_allowed("cutlass"):
@@ -1380,7 +1343,7 @@ def nvfp4_gemm(
     - CUTLASS: Predefined CUTLASS configurations with auto-tuning
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
     - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
-    - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
+    - CUDA Core: CUDA Core implementation (requires SM >= 100)
     - Marlin: Ada/Hopper W4A16 NVFP4 implementation (requires SM 89-99)
 
     The AutoTuner profiles all available backends during the first run and caches

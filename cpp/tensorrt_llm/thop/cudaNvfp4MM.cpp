@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (out) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
+#include <cstdint>
 #include <torch/extension.h>
 
 using torch::Tensor;
@@ -36,7 +37,7 @@ namespace
 using tensorrt_llm::common::check;
 
 void cuda_core_nvfp4_gemm_caller(Tensor& out, Tensor const& a, Tensor const& b, Tensor const& scale_a,
-    Tensor const& scale_b, Tensor const& alpha, std::optional<at::Tensor> const& bias, bool fast_acc = false)
+    Tensor const& scale_b, Tensor const& alpha, std::optional<at::Tensor> const& bias, bool scale_a_swizzled)
 {
     int32_t m = a.sizes()[0];
     int32_t n = b.sizes()[0];
@@ -82,7 +83,7 @@ void cuda_core_nvfp4_gemm_caller(Tensor& out, Tensor const& a, Tensor const& b, 
 
     tensorrt_llm::kernels::cuda_core_gemm_nvfp4::Params params(a_ptr, b_ptr, out_ptr, m, n, k,
         reinterpret_cast<__nv_fp8_e4m3 const*>(a_scale), reinterpret_cast<__nv_fp8_e4m3 const*>(b_scale), aType,
-        outType, reinterpret_cast<float const*>(alpha_ptr), bias_ptr);
+        outType, reinterpret_cast<float const*>(alpha_ptr), bias_ptr, scale_a_swizzled);
     bool dispatched = tensorrt_llm::kernels::cuda_core_gemm_nvfp4::cudaCoreGemmDispatcher(params, stream);
     TORCH_CHECK(dispatched, "Failed to dispatch cudaCoreGemmLauncher");
 }
@@ -90,7 +91,7 @@ void cuda_core_nvfp4_gemm_caller(Tensor& out, Tensor const& a, Tensor const& b, 
 } // namespace
 
 Tensor& cuda_core_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    Tensor const& alpha, std::optional<at::Tensor> const& bias, Tensor& out)
+    Tensor const& alpha, std::optional<at::Tensor> const& bias, Tensor& out, bool scale_a_swizzled)
 {
     CHECK_TH_CUDA(mat_a);
     CHECK_TH_CUDA(mat_b);
@@ -107,23 +108,45 @@ Tensor& cuda_core_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, Tenso
     TORCH_CHECK(mat_a.sizes()[1] == mat_b.sizes()[1]);
     TORCH_CHECK(mat_b.sizes()[0] == out.sizes()[1]);
 
-    TORCH_CHECK(scale_a.dtype() == SF_DTYPE);
-    TORCH_CHECK(scale_b.dtype() == SF_DTYPE);
-
-    cuda_core_nvfp4_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, alpha, bias, true);
+    CHECK_INPUT(scale_a, SF_DTYPE);
+    CHECK_INPUT(scale_b, SF_DTYPE);
+    TORCH_CHECK(mat_b.device() == mat_a.device() && alpha.device() == mat_a.device()
+            && scale_a.device() == mat_a.device() && scale_b.device() == mat_a.device(),
+        "GEMM tensors must reside on the activation device");
+    TORCH_CHECK(mat_a.size(1) % 16 == 0, "FP4 vector loads require K divisible by 32");
+    // Raw vector loads require aligned payload and scale pointers, including offset views.
+    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(mat_a.data_ptr()) % 16 == 0
+            && reinterpret_cast<std::uintptr_t>(mat_b.data_ptr()) % 16 == 0,
+        "FP4 payloads must be 16-byte aligned");
+    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(scale_a.data_ptr()) % 2 == 0
+            && reinterpret_cast<std::uintptr_t>(scale_b.data_ptr()) % 2 == 0,
+        "Scale buffers must be 2-byte aligned");
+    auto const scale_cols = mat_a.size(1) / 8;
+    auto const padded_scale_cols = (scale_cols + 3) / 4 * 4;
+    auto const activation_scale_size
+        = scale_a_swizzled ? ((mat_a.size(0) + 127) / 128 * 128) * padded_scale_cols : mat_a.size(0) * scale_cols;
+    TORCH_CHECK(scale_a.numel() >= activation_scale_size, "Activation scale buffer is too small for its layout");
+    TORCH_CHECK(scale_b.numel() >= ((mat_b.size(0) + 127) / 128 * 128) * padded_scale_cols,
+        "Weight scale buffer is too small for its 128x4 layout");
+    if (out.numel() == 0)
+    {
+        return out;
+    }
+    cuda_core_nvfp4_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, alpha, bias, scale_a_swizzled);
     return out;
 }
 
 // mat_a: [M, K / 2], FLOAT4_E2M1X2
 // mat_b: [N, K / 2], FLOAT4_E2M1X2
 // out: [M, N], fp16/bf16/fp32
-// scale_a: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
-// scale_b: ceil(N / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
+// scale_a: row-major [M, K/16], or padded 128x4 layout when scale_a_swizzled is true
+// scale_b: padded 128x4 layout
 // bias: fp16/bf16/fp32
 // out_dtype: fp16/bf16/fp32
 Tensor cuda_core_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
     Tensor const& alpha, std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype,
-    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt,
+    bool scale_a_swizzled = false)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
@@ -133,7 +156,7 @@ Tensor cuda_core_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, Tensor con
     auto [out, _] = torch_ext::allocate_output(
         output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
-    return cuda_core_nvfp4_gemm_out(mat_a, mat_b, scale_a, scale_b, alpha, bias, out);
+    return cuda_core_nvfp4_gemm_out(mat_a, mat_b, scale_a, scale_b, alpha, bias, out, scale_a_swizzled);
 }
 
 } // namespace torch_ext
@@ -144,7 +167,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "cuda_core_nvfp4_gemm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor alpha, Tensor? bias,"
-        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None)"
+        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None, bool scale_a_swizzled=False)"
         " -> (Tensor out)");
 }
 

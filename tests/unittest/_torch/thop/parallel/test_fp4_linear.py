@@ -710,9 +710,11 @@ def test_fp4_linear_cublaslt(dtype, mnk):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mnk", [(1, 4096, 7168), (4, 7168, 16384),
-                                 (8, 2112, 7168)])
+                                 (8, 2112, 7168), (16, 2048, 4096),
+                                 (32, 2048, 4096), (64, 2048, 4096),
+                                 (128, 2048, 4096), (256, 2048, 4096)])
 def test_fp4_linear_cuda_core(dtype, mnk):
-    """Test CUDA Core NVFP4 GEMM implementation on SM >= 100 (M <= 8)"""
+    """Test tiled CUDA Core NVFP4 GEMM against CUTLASS across batch sizes."""
 
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
@@ -895,9 +897,6 @@ def _make_nvfp4_inputs_for_bias_test(m, n, k, dtype=torch.bfloat16):
 def test_fp4_gemm_bias_per_backend(backend, mnk):
     """Per-backend numerical parity: nvfp4_gemm(bias=B) ≈ nvfp4_gemm(bias=None) + B."""
     m, n, k = mnk
-    if backend == "cuda_core" and m > 8:
-        pytest.skip("cuda_core backend only supports M <= 8")
-
     act_fp4, w_fp4, act_sf, w_sf, alpha = _make_nvfp4_inputs_for_bias_test(
         m, n, k)
     bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") * 0.5

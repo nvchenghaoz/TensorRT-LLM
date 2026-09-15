@@ -4390,3 +4390,116 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGemma4CombinedNormQuant(unittest.TestCase):
+    """Exercise decoder dispatch and an actual NVFP4 Linear consumer."""
+
+    @staticmethod
+    def _layer() -> Gemma4DecoderLayer:
+        from tensorrt_llm._torch.modules.linear import Linear
+        from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+        class Attention(torch.nn.Module):
+            def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+                return hidden_states * 0.75
+
+        class MLP(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.gate_up_proj = Linear(
+                    256,
+                    256,
+                    bias=False,
+                    dtype=torch.bfloat16,
+                    quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+                    nvfp4_allowed_backends=["cutlass"],
+                ).cuda()
+                linear = self.gate_up_proj
+                weight = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+                scale = torch.tensor([256.0], device="cuda")
+                fp4, sf = torch.ops.trtllm.fp4_quantize(weight, scale, 16, False)
+                linear.weight.copy_(fp4)
+                linear.weight_scale.copy_(sf)
+                linear.input_scale.fill_(128.0)
+                linear.inv_input_scale.fill_(1 / 128.0)
+                linear.weight_scale_2.fill_(1 / 256.0)
+                linear.alpha.fill_(1 / (128 * 256))
+                self.last_input = None
+
+            def forward(
+                self, x: torch.Tensor | Fp4QuantizedTensor, lora_params: object = None
+            ) -> torch.Tensor:
+                self.last_input = x
+                return self.gate_up_proj(x)
+
+        layer = Gemma4DecoderLayer(_make_model_config(GEMMA4_SMALL_CONFIG), layer_idx=0).cuda()
+        layer.self_attn = Attention()
+        layer.mlp = MLP()
+        for norm in (
+            layer.input_layernorm,
+            layer.post_attention_layernorm,
+            layer.pre_feedforward_layernorm,
+            layer.post_feedforward_layernorm,
+        ):
+            norm.weight.normal_(1.0, 0.2)
+        return layer
+
+    @torch.inference_mode()
+    def test_batched_graph_matches_separate_kernels(self) -> None:
+        from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+        torch.manual_seed(892)
+        layer = self._layer()
+        for m in (1, 2, 4, 8, 16, 32, 64, 128, 256, 129, 257, 1024):
+            with self.subTest(m=m):
+                x = torch.randn(m, 256, device="cuda", dtype=torch.bfloat16)
+                positions = torch.arange(m, device="cuda")
+                layer._combine_norm_quant = False
+                expected = layer(positions, x, None)
+                layer._combine_norm_quant = True
+                actual = layer(positions, x, None)
+                self.assertIsInstance(layer.mlp.last_input, Fp4QuantizedTensor)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = layer(positions, x, None)
+                for _ in range(3):
+                    x.normal_()
+                    graph.replay()
+                    layer._combine_norm_quant = False
+                    expected = layer(positions, x, None)
+                    layer._combine_norm_quant = True
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    @torch.inference_mode()
+    def test_existing_fallbacks(self) -> None:
+        from tensorrt_llm._torch.models import modeling_gemma4
+
+        for case in ("disabled", "lora", "compile", "dynamic", "pre_scale", "norm"):
+            with self.subTest(case=case):
+                layer = self._layer()
+                layer._combine_norm_quant = case != "disabled"
+                linear = layer.mlp.gate_up_proj
+                kwargs = {}
+                if case == "lora":
+                    kwargs["lora_params"] = SimpleNamespace()
+                elif case == "dynamic":
+                    linear.force_dynamic_quantization = True
+                elif case == "pre_scale":
+                    linear.pre_quant_scale = torch.ones(256, device="cuda", dtype=torch.bfloat16)
+                elif case == "norm":
+                    layer._fused_norm_add = False
+                x = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+                with (
+                    unittest.mock.patch.object(
+                        modeling_gemma4, "is_torch_compiling", return_value=case == "compile"
+                    ),
+                    unittest.mock.patch.object(
+                        modeling_gemma4, "gemma4_fused_norm_add_fp4"
+                    ) as fused,
+                ):
+                    output = layer(torch.arange(4, device="cuda"), x, None, **kwargs)
+                    fused.assert_not_called()
+                    self.assertEqual(output.shape, x.shape)
+                    self.assertTrue(torch.isfinite(output).all())

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,11 +56,14 @@ struct Params
     float const* alpha_ptr;
     // Optional per-N bias broadcast: shape [n], same dtype as output. May be nullptr.
     void const* bias;
+    // Read the producer's 128x4 scale layout without an unswizzle pass.
+    bool scale_a_swizzled;
 
     // used by torch flow
     Params(void const* _act, void const* _weight, void* _output, SizeType32 _m, SizeType32 _n, SizeType32 _k,
         __nv_fp8_e4m3 const* _scale_a, __nv_fp8_e4m3 const* _scale_b, cudaDataType_t _inputType,
-        cudaDataType_t _outputType, float const* _alpha_ptr, void const* _bias = nullptr)
+        cudaDataType_t _outputType, float const* _alpha_ptr, void const* _bias = nullptr,
+        bool _scale_a_swizzled = false)
         : act(_act)
         , weight(_weight)
         , output(_output)
@@ -73,6 +76,7 @@ struct Params
         , scale_b(_scale_b)
         , alpha_ptr(_alpha_ptr)
         , bias(_bias)
+        , scale_a_swizzled(_scale_a_swizzled)
     {
     }
 };

@@ -1300,6 +1300,11 @@ def _register_fake():
         n = weight.shape[0]
         return input.new_empty((m, n), dtype=input.dtype)
 
+    @torch.library.register_fake("trtllm::lossless_bf16_gemm")
+    def _(input: torch.Tensor, weight: torch.Tensor, metadata: torch.Tensor,
+          exceptions: torch.Tensor, out_features: int):
+        return input.new_empty((input.shape[0], out_features))
+
     @torch.library.register_fake("trtllm::cuda_core_nvfp4_gemm")
     def _(mat_a: torch.Tensor,
           mat_b: torch.Tensor,
@@ -1309,7 +1314,8 @@ def _register_fake():
           bias: Optional[torch.Tensor],
           out_dtype: Optional[torch.dtype],
           output_buffer_kind: int = 0,
-          group: Optional[List[int]] = None):
+          group: Optional[List[int]] = None,
+          scale_a_swizzled: bool = False):
         # mat_a: [M, K/2], mat_b: [N, K/2]
         # Output should be [M, N] with dtype=out_dtype
         m = mat_a.shape[0]

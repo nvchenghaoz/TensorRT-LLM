@@ -52,6 +52,7 @@ add_library(
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
+  losslessBf16GemmOp.cpp
   marlinNvfp4MM.cpp
   marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
