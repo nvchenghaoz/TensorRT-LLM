@@ -17,6 +17,7 @@
 import copy
 import dataclasses
 import math
+import os
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
@@ -61,6 +62,7 @@ from ..modules.fused_ops.rmsnorm_residual_add import (
 )
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
+from ..modules.gemma4.packed_bf16 import configure_packed_bf16
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
@@ -1295,6 +1297,29 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             )
 
         super().__init__(Gemma4TextModel(model_config), model_config)
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        # Derived buffers preserve checkpoint BF16 bits, at the cost of extra
+        # device memory. Keep this opt-in while evaluating KV-cache tradeoffs.
+        packed = os.environ.get("TRTLLM_GEMMA4_PACKED_BF16", "0")
+        if packed not in ("0", "attention", "head", "all"):
+            raise ValueError("TRTLLM_GEMMA4_PACKED_BF16 must be 0, attention, head, or all")
+        if packed in ("attention", "all"):
+            for layer in self.model.layers:
+                configure_packed_bf16(layer.self_attn.qkv_proj, reassociated=True)
+                configure_packed_bf16(layer.self_attn.o_proj, reassociated=True)
+        if packed in ("head", "all"):
+            configure_packed_bf16(self.lm_head, reassociated=False)
+        if packed != "0":
+            cache_bytes = sum(
+                buffer.numel() * buffer.element_size()
+                for name, buffer in self.named_buffers()
+                if "_packed_bf16_" in name
+            )
+            logger.info(
+                f"Gemma4 packed BF16 {packed}: {cache_bytes / 2**30:.2f} GiB derived buffers"
+            )
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
