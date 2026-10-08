@@ -1412,3 +1412,97 @@ def test_no_generations_clears_the_recorded_page_tuple():
 
     assert meta.replanned == []
     assert cache[params].fa2_plan_num_blocks is None
+
+
+@unittest.skipIf(not flashinfer_backend._has_sm120_prims(),
+                 "needs SM120 and FlashInfer's cute-dsl-prims backend")
+def test_fp8_kv_context_prefill_runs_prims():
+    """FP8-KV context prefill over a cached prefix runs on cute-dsl-prims (FP8 math) for long and short chunks;
+    the decode rows stay on FA2."""
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    torch.manual_seed(0)
+    num_heads, num_kv_heads, head_dim, tokens_per_block = 16, 2, 128, 64
+    num_blocks = 64
+    kv_cache_manager = KVCacheManager(
+        KvCacheConfig(max_tokens=num_blocks * tokens_per_block),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=num_blocks * tokens_per_block,
+        max_batch_size=3,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.FP8,
+    )
+    kv_cache_manager.add_dummy_requests([0, 1, 2], [1200, 764, 501])
+    buf = kv_cache_manager.get_buffers(0)
+    buf.copy_(torch.randn(buf.shape, device="cuda").to(buf.dtype))
+    layer = FlashInferAttention(
+        layer_idx=0,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        num_kv_heads=num_kv_heads,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8))
+
+    def run(request_ids, past_seen_tokens, seq_lens, num_contexts):
+        metadata = TestingFlashInferAttentionMetadata(
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int),
+            num_contexts=num_contexts,
+            kv_cache_params=KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
+            max_num_requests=len(request_ids),
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+        )
+        metadata.prepare()
+        num_tokens = sum(seq_lens)
+        q = torch.randn(num_tokens,
+                        num_heads * head_dim,
+                        dtype=torch.bfloat16,
+                        device="cuda")
+        k = torch.randn(num_tokens,
+                        num_kv_heads * head_dim,
+                        dtype=torch.bfloat16,
+                        device="cuda")
+        v = torch.randn_like(k)
+        out = layer.forward(q, k, v, metadata)
+
+        # Reference from the cache contents after the forward (the new tokens are appended in FP8).
+        cache = kv_cache_manager.get_buffers(0, kv_layout=metadata.kv_layout)
+        cache = cache.transpose(2, 3)  # HND -> [blocks, 2, tokens, heads, dim]
+        block_ids = kv_cache_manager.get_batch_cache_indices(request_ids)
+        errors, start = [], 0
+        for r, (past, new) in enumerate(zip(past_seen_tokens, seq_lens)):
+            kv = torch.cat(cache[block_ids[r]].unbind(0), dim=1)
+            kv_len = past + new
+            group = num_heads // num_kv_heads
+            k_r = kv[0, :kv_len].float().repeat_interleave(group, dim=1)
+            v_r = kv[1, :kv_len].float().repeat_interleave(group, dim=1)
+            q_r = q[start:start + new].view(new, num_heads, head_dim).float()
+            scores = torch.einsum("qhd,khd->hqk", q_r, k_r) / head_dim**0.5
+            causal = (torch.arange(kv_len, device="cuda")[None, :]
+                      > torch.arange(past, kv_len, device="cuda")[:, None])
+            scores.masked_fill_(causal[None], float("-inf"))
+            ref = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v_r)
+            got = out[start:start + new].view(new, num_heads, head_dim).float()
+            errors.append(float((got - ref).norm() / ref.norm()))
+            start += new
+        wrappers = list(metadata._plan_params_to_wrappers.values())
+        assert len(wrappers) == 1
+        return wrappers[0], errors
+
+    # Context chunks of 200 and 64 new tokens plus a decode row: prefill on prims, decode on FA2.
+    wrappers, errors = run([0, 1, 2], [1000, 700, 500], [200, 64, 1], 2)
+    assert wrappers.prefill_wrapper._backend == "cute-dsl-prims"
+    assert wrappers.decode_wrapper._backend == "fa2"
+    # FP8 math (Q and P rounded to e4m3) for context rows; 16-bit math for the decode row.
+    assert errors[0] < 6e-2 and errors[1] < 6e-2 and errors[2] < 2e-2, errors
+
+    # A lone 16-token chunk over the cached prefix runs on prims as well.
+    wrappers, errors = run([0], [1000], [16], 1)
+    assert wrappers.prefill_wrapper._backend == "cute-dsl-prims"
+    assert errors[0] < 6e-2, errors
