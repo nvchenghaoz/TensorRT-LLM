@@ -38,11 +38,7 @@ from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
 from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
-from .fuse_elementwise_ops import (
-    extract_transpose_prefill_slice,
-    fused_gdn_post_conv,
-    pack_gdn_decode_qkv,
-)
+from .fuse_elementwise_ops import fused_gdn_post_conv, pack_gdn_decode_qkv
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import Mamba2Metadata
@@ -756,14 +752,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             query_start_loc_p = query_start_loc[: num_prefill + 1]
             has_initial_states_p = has_initial_states[:num_prefill]
 
-            mixed_qkv_p_t = extract_transpose_prefill_slice(
-                mixed_qkv_p,
-                mixed_qkv_p.shape[0],
-                0,
-                mixed_qkv_p.shape[1],
-            )
             mixed_qkv_p_t = causal_conv1d_fn(
-                mixed_qkv_p_t,
+                mixed_qkv_p.t(),
                 self.conv1d.weight,
                 self.conv1d.bias,
                 activation=self.activation,
@@ -844,14 +834,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     self.head_v_dim,
                 )
         else:
-            mixed_qkv_t = extract_transpose_prefill_slice(
-                mixed_qkv,
-                mixed_qkv.shape[0],
-                0,
-                mixed_qkv.shape[1],
-            )
             mixed_qkv_t = causal_conv1d_fn(
-                mixed_qkv_t,
+                mixed_qkv.t(),
                 self.conv1d.weight,
                 self.conv1d.bias,
                 activation=self.activation,
