@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.modules.fla.gdn_decode_t1 import (
+    can_use_gdn_t1_decode, fused_sigmoid_gating_delta_rule_update_t1)
 from tensorrt_llm._torch.modules.fla.utils import custom_device_ctx
 from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 from tensorrt_llm.logger import logger
@@ -492,6 +494,26 @@ def fused_sigmoid_gating_delta_rule_update(
             scale=scale,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
+            output=output,
+        )
+
+    # Pure decode (exactly one token per sequence): T == 1 specialized Triton
+    # kernel with no time loop and a grid sized to fill the GPU.
+    if can_use_gdn_t1_decode(initial_state_source, cu_seqlens, B, T, N, K, V):
+        return fused_sigmoid_gating_delta_rule_update_t1(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             output=output,
         )
 
