@@ -833,9 +833,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             else:
                 query, key, value, g, beta = fused_gdn_post_conv(
                     mixed_qkv_p_t,
-                    mixed_qkv_d,
-                    a,
-                    b,
+                    None,
+                    a[:num_prefill_tokens],
+                    b[:num_prefill_tokens],
                     self.A_log,
                     self.dt_bias,
                     self.num_k_heads_per_tp,
@@ -997,6 +997,59 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if attn_out_prefill is None:
                 return attn_out_decode
             return torch.cat((attn_out_prefill, attn_out_decode), dim=1)
+
+        if num_decode_tokens > 0:
+            # Decode rows take the recurrent decode kernel, which updates their
+            # pool state in place; only prefill rows run the chunked kernel.
+            if output is None:
+                output = mixed_qkv.new_empty(
+                    (
+                        1,
+                        num_prefill_tokens + num_decode_tokens,
+                        self.num_v_heads_per_tp,
+                        self.head_v_dim,
+                    )
+                )
+            key_dim = self.key_dim_per_tp
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                q=mixed_qkv_d[..., :key_dim].view(
+                    1, num_decode_tokens, self.num_k_heads_per_tp, self.head_k_dim
+                ),
+                k=mixed_qkv_d[..., key_dim : 2 * key_dim].view(
+                    1, num_decode_tokens, self.num_k_heads_per_tp, self.head_k_dim
+                ),
+                v=mixed_qkv_d[..., 2 * key_dim :].view(
+                    1, num_decode_tokens, self.num_v_heads_per_tp, self.head_v_dim
+                ),
+                a=a[num_prefill_tokens:],
+                b=b[num_prefill_tokens:],
+                initial_state_source=ssm_states,
+                initial_state_indices=state_indices_d,
+                cu_seqlens=query_start_loc_long[num_prefill:] - num_prefill_tokens,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                output=output[:, num_prefill_tokens:],
+            )
+            chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                initial_state=ssm_states,
+                initial_state_indices=state_indices_p,
+                inplace_indexed_state_update=True,
+                output_final_state=False,
+                cu_seqlens=query_start_loc_long[: num_prefill + 1],
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+                output=output[:, :num_prefill_tokens],
+                state_workspace=kwargs.get("state_workspace"),
+            )
+            return output
 
         core_attn_out, _ = chunk_gated_delta_rule(
             q=query,
