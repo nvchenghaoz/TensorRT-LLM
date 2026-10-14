@@ -3811,9 +3811,11 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                 "(B12xMoEWrapper, cute_dsl.utils.convert_sf_to_mma_layout). "
                 f"Original import error: {e}") from e
 
-        # ``_SHARED_MOE_OUTPUT_BUF`` lives next to the backend so all MoE
-        # layers across the model share one wrapper-owned output buffer.
-        from .fused_moe_cute_dsl_b12x import _SHARED_MOE_OUTPUT_BUF
+        # ``_SHARED_MOE_OUTPUT_BUF`` / ``_SHARED_B12X_WORKSPACES`` live next to
+        # the backend so all MoE layers across the model share one
+        # wrapper-owned output buffer and one set of scratch workspaces.
+        from .fused_moe_cute_dsl_b12x import (_SHARED_B12X_WORKSPACES,
+                                              _SHARED_MOE_OUTPUT_BUF)
 
         quant_config = getattr(module, "quant_config", None)
         is_w4a16_nvfp4 = (quant_config is not None
@@ -3913,7 +3915,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # CUDA-graph workspace must match the stored tensors.
         b12x_intermediate_size = w2_in_dim
 
-        module.b12x_wrapper = B12xMoEWrapper(
+        wrapper_kwargs = dict(
             num_experts=module.num_experts,
             top_k=module.routing_method.experts_per_token,
             hidden_size=module.hidden_size,
@@ -3923,6 +3925,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             activation=self._ACTIVATION_MAP[module.activation_type],
             quant_mode="w4a16" if is_w4a16_nvfp4 else "nvfp4",
         )
+        module.b12x_wrapper = B12xMoEWrapper(**wrapper_kwargs)
 
         # Replace the wrapper's per-instance output buffer with a shared one.
         # Layers run sequentially on a single stream, so a single buffer of the
@@ -3939,6 +3942,22 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             else:
                 # Free the freshly allocated buffer; reuse the existing one.
                 module.b12x_wrapper._moe_output = shared
+
+        # Share the wrapper's scratch workspaces the same way: layers built
+        # with the same wrapper arguments run one at a time, so one set serves
+        # them all. This saves one set per extra layer, ~270 MiB for 256
+        # experts, hidden 2048, intermediate 512, ``max_num_tokens=4096``.
+        workspace_key = (tuple(sorted(wrapper_kwargs.items())),
+                         str(module.b12x_wrapper.device))
+        shared_workspaces = _SHARED_B12X_WORKSPACES.get(workspace_key)
+        if shared_workspaces is None:
+            _SHARED_B12X_WORKSPACES[workspace_key] = (
+                module.b12x_wrapper._static_workspace,
+                module.b12x_wrapper._dynamic_workspace,
+            )
+        else:
+            (module.b12x_wrapper._static_workspace,
+             module.b12x_wrapper._dynamic_workspace) = shared_workspaces
 
         logger.info_once(
             f"NVFP4CuteDslB12xFusedMoEMethod active: hidden={module.hidden_size}, "

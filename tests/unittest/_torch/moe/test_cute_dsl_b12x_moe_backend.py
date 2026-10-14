@@ -22,16 +22,21 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl_b12x
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xFusedMoE,
+    _B12xRouteRunner,
     _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
+    MoECommPlan,
     MoEDeployment,
     MoEEnvironment,
     MoEProblem,
     MoERejectReason,
+    MoERunContext,
     canonical_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
@@ -39,7 +44,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4CuteDslB12xFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
 )
-from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm._torch.utils import ActivationType, Fp4QuantizedTensor
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -167,45 +172,183 @@ def test_can_implement_rejects_attention_dp_without_expert_parallelism():
 
 
 # --------------------------------------------------------------------------
-# Hybrid CUTLASS-prefill / b12x-decode dispatch predicate tests
-#
-# ``_route_to_cutlass`` is a pure shape predicate on its input ``x``; we test
-# it via a stub that holds the class constant, sidestepping the full
-# CutlassFusedMoE constructor (which needs a routing method, real model
-# config, etc.).
+# NVFP4 route selection: b12x vs CUTLASS, chosen per token bucket by the
+# AutoTuner through ``_B12xRouteRunner``. The runner is driven on a stub
+# module so the route plumbing is checked without the full CutlassFusedMoE
+# constructor (routing method, model config, weights).
 # --------------------------------------------------------------------------
 
 
-class _RoutePredicateStub:
-    """Minimal carrier for the unbound dispatch predicate."""
+class _RouteStub:
+    """Module stand-in that records which route ran."""
 
-    _PREFILL_VIA_CUTLASS_THRESHOLD = CuteDslB12xFusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
+    _UNTUNED_CUTLASS_MIN_TOKENS = CuteDslB12xFusedMoE._UNTUNED_CUTLASS_MIN_TOKENS
+    num_experts = 16
+    hidden_size = 64
+    intermediate_size_per_partition = 32
+    dtype = torch.bfloat16
+    activation_type = ActivationType.Swiglu
+    routing_method = types.SimpleNamespace(top_k=4)
 
-    _route_to_cutlass = CuteDslB12xFusedMoE._route_to_cutlass
+    def __init__(self):
+        self.calls = []
+
+    def _run_b12x(self, ctx):
+        self.calls.append(("b12x", ctx.x.shape[0]))
+        return "b12x"
+
+    def _run_cutlass(self, ctx, workspace):
+        self.calls.append(("cutlass", ctx.x.shape[0]))
+        return "cutlass"
 
 
-def test_dispatch_routes_prefill_shape_via_cutlass():
-    stub = _RoutePredicateStub()
-    x = torch.empty(_RoutePredicateStub._PREFILL_VIA_CUTLASS_THRESHOLD, 1024)
-    assert stub._route_to_cutlass(x) is True
+def _route_inputs(num_tokens: int, dtype: torch.dtype = torch.bfloat16):
+    return [
+        torch.zeros(num_tokens, _RouteStub.hidden_size, dtype=dtype),
+        torch.zeros(num_tokens, _RouteStub.routing_method.top_k, dtype=torch.int32),
+        torch.zeros(num_tokens, _RouteStub.routing_method.top_k, dtype=torch.float32),
+    ]
 
 
-def test_dispatch_just_below_threshold_takes_b12x():
-    stub = _RoutePredicateStub()
-    x = torch.empty(_RoutePredicateStub._PREFILL_VIA_CUTLASS_THRESHOLD - 1, 1024)
-    assert stub._route_to_cutlass(x) is False
+def _route_runner(stub: _RouteStub, num_tokens: int) -> _B12xRouteRunner:
+    x, experts, scales = _route_inputs(num_tokens)
+    ctx = MoERunContext(token_selected_experts=experts, token_final_scales=scales, x=x, x_sf=None)
+    return _B12xRouteRunner(stub, ctx, workspace=None)
 
 
-def test_dispatch_decode_shape_takes_b12x():
-    stub = _RoutePredicateStub()
-    x = torch.empty(1, 1024)
-    assert stub._route_to_cutlass(x) is False
+@pytest.mark.parametrize(
+    "num_tokens, route",
+    [
+        (1, "b12x"),
+        (CuteDslB12xFusedMoE._UNTUNED_CUTLASS_MIN_TOKENS - 1, "b12x"),
+        (CuteDslB12xFusedMoE._UNTUNED_CUTLASS_MIN_TOKENS, "cutlass"),
+    ],
+)
+def test_route_without_tuning_result_uses_size_rule(num_tokens, route):
+    stub = _RouteStub()
+    runner = _route_runner(stub, num_tokens)
+    assert runner(_route_inputs(num_tokens), tactic=-1) == route
+
+
+@pytest.mark.parametrize(
+    "tactic, route",
+    [(_B12xRouteRunner.B12X, "b12x"), (_B12xRouteRunner.CUTLASS, "cutlass")],
+)
+@pytest.mark.parametrize("num_tokens", [1, 4096])
+def test_route_tactic_overrides_size_rule(tactic, route, num_tokens):
+    stub = _RouteStub()
+    runner = _route_runner(stub, num_tokens)
+    assert runner(_route_inputs(num_tokens), tactic=tactic) == route
+    assert stub.calls == [(route, num_tokens)]
+
+
+def test_route_runner_offers_both_routes():
+    runner = _route_runner(_RouteStub(), 8)
+    assert runner.get_valid_tactics(_route_inputs(8), profile=None) == [
+        _B12xRouteRunner.B12X,
+        _B12xRouteRunner.CUTLASS,
+    ]
+
+
+def test_route_fp16_activations_only_run_cutlass():
+    """b12x's NVFP4 kernels are bf16-only, tuned or not."""
+    stub = _RouteStub()
+    runner = _route_runner(stub, 1)
+    fp16_inputs = _route_inputs(1, torch.float16)
+    assert runner.get_valid_tactics(fp16_inputs, profile=None) == [_B12xRouteRunner.CUTLASS]
+    assert runner(fp16_inputs, tactic=-1) == "cutlass"
+    runner(fp16_inputs, tactic=-1, do_preparation=True)
+    assert stub.calls == [("cutlass", 1), ("cutlass", 1)]
+
+
+def test_route_preparation_runs_both_routes_on_the_profiled_shape():
+    stub = _RouteStub()
+    runner = _route_runner(stub, 1)
+    runner(_route_inputs(32), tactic=-1, do_preparation=True)
+    assert stub.calls == [("b12x", 32), ("cutlass", 32)]
+
+
+def test_route_tuning_config_keys_on_power_of_two_token_buckets():
+    config = _route_runner(_RouteStub(), 8).get_tuning_config()
+    (spec,) = config.dynamic_tensor_specs
+    assert (spec.input_idx, spec.dim_idx) == (0, 0)
+    assert sorted(spec.gen_tuning_buckets(4096)) == [2**i for i in range(13)]
+    assert spec.map_to_tuning_buckets(96) == 64
+    shapes = [torch.Size([96, 64]), torch.Size([1, 4]), torch.Size([1, 4])]
+    assert [c.infer_shape(shapes) for c in config.constraint_specs] == [96, 96]
+
+
+def test_route_profile_inputs_look_like_routing():
+    x, experts, scales = (
+        _route_runner(_RouteStub(), 8).get_tuning_config().inputs_pre_hook(_route_inputs(128))
+    )
+    top_k = _RouteStub.routing_method.top_k
+    assert x.abs().sum() > 0
+    assert experts.dtype == torch.int32 and experts.shape == (128, top_k)
+    assert int(experts.min()) >= 0 and int(experts.max()) < _RouteStub.num_experts
+    assert all(len(set(row.tolist())) == top_k for row in experts)
+    assert scales.dtype == torch.float32
+    torch.testing.assert_close(scales.sum(dim=-1), torch.ones(128))
+
+
+def test_nvfp4_quantize_input_leaves_activations_unquantized():
+    moe = object.__new__(CuteDslB12xFusedMoE)
+    moe.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    x = torch.empty(4096, 1024)
+
+    with patch.object(
+        CutlassFusedMoE,
+        "quantize_input",
+        side_effect=AssertionError("the CUTLASS route quantizes in run_moe"),
+    ):
+        out, out_sf = CuteDslB12xFusedMoE.quantize_input(moe, x)
+
+    assert out is x
+    assert out_sf is None
+
+
+def test_quantize_input_rejects_prequantized_input():
+    moe = object.__new__(CuteDslB12xFusedMoE)
+    moe.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    fp4 = Fp4QuantizedTensor(torch.empty(1, 512, dtype=torch.uint8), torch.empty(1, 64))
+    with pytest.raises(ValueError, match="Fp4QuantizedTensor"):
+        CuteDslB12xFusedMoE.quantize_input(moe, fp4)
+
+
+@pytest.mark.parametrize(
+    "quant_algo, num_tokens", [(QuantAlgo.W4A16_NVFP4, 4096), (QuantAlgo.NVFP4, 0)]
+)
+def test_run_moe_skips_route_tuning(quant_algo, num_tokens):
+    """W4A16 has no CUTLASS route, and empty chunks have nothing to profile."""
+    moe = object.__new__(CuteDslB12xFusedMoE)
+    moe.quant_config = QuantConfig(quant_algo=quant_algo)
+    x, experts, scales = _route_inputs(num_tokens)
+    ctx = MoERunContext(
+        token_selected_experts=experts,
+        token_final_scales=scales,
+        x=x,
+        x_sf=None,
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=True,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+    )
+    with (
+        patch.object(CuteDslB12xFusedMoE, "_run_b12x", return_value="b12x") as run_b12x,
+        patch.object(
+            AutoTuner, "choose_one", side_effect=AssertionError("route must not be tuned")
+        ),
+    ):
+        assert CuteDslB12xFusedMoE.run_moe(moe, ctx) == "b12x"
+    run_b12x.assert_called_once_with(ctx)
 
 
 def test_w4a16_nvfp4_prefill_quantize_input_stays_on_b12x():
     moe = object.__new__(CuteDslB12xFusedMoE)
     moe.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
-    x = torch.empty(CuteDslB12xFusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD, 1024)
+    x = torch.empty(CuteDslB12xFusedMoE._UNTUNED_CUTLASS_MIN_TOKENS, 1024)
 
     with patch.object(
         CutlassFusedMoE,
@@ -218,20 +361,24 @@ def test_w4a16_nvfp4_prefill_quantize_input_stays_on_b12x():
     assert out_sf is None
 
 
-def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
-    class _RoutingMethod:
-        experts_per_token = 4
+class _FakeB12xWrapper:
+    """Records construction arguments; stands in for flashinfer.B12xMoEWrapper."""
 
-    class _FakeB12xWrapper:
-        calls = []
+    calls = []
 
-        def __init__(self, **kwargs):
-            self._moe_output = None
-            self.calls.append(kwargs)
+    def __init__(self, **kwargs):
+        self._moe_output = None
+        self._static_workspace = object()
+        self._dynamic_workspace = object()
+        self.device = "cuda:0"
+        self.calls.append(kwargs)
 
+
+def _install_fake_flashinfer(monkeypatch):
     def _convert_sf_to_mma_layout(scales, *, m, k, num_groups):
         return scales
 
+    _FakeB12xWrapper.calls = []
     flashinfer = types.ModuleType("flashinfer")
     flashinfer.B12xMoEWrapper = _FakeB12xWrapper
     cute_dsl = types.ModuleType("flashinfer.cute_dsl")
@@ -240,19 +387,32 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", flashinfer)
     monkeypatch.setitem(sys.modules, "flashinfer.cute_dsl", cute_dsl)
     monkeypatch.setitem(sys.modules, "flashinfer.cute_dsl.utils", utils)
+    # Start every test from an empty cross-layer pool.
+    monkeypatch.setattr(fused_moe_cute_dsl_b12x, "_SHARED_B12X_WORKSPACES", {})
 
-    num_experts = 2
-    hidden_size = 128
-    logical_intermediate_size = 1856
-    padded_intermediate_size = 1920
+
+def _nvfp4_b12x_module(
+    *,
+    quant_algo: QuantAlgo = QuantAlgo.W4A16_NVFP4,
+    num_experts: int = 2,
+    hidden_size: int = 128,
+    logical_intermediate_size: int = 1856,
+    padded_intermediate_size: int = 1920,
+    max_num_tokens: int = 8,
+) -> torch.nn.Module:
+    """An NVFP4 (W4A4) or W4A16_NVFP4 MoE module with the attributes the b12x weight prep reads."""
+
+    class _RoutingMethod:
+        experts_per_token = 4
+
     module = torch.nn.Module()
     module.num_experts = num_experts
     module.hidden_size = hidden_size
     module.intermediate_size_per_partition = logical_intermediate_size
-    module.moe_max_num_tokens = 8
+    module.moe_max_num_tokens = max_num_tokens
     module.routing_method = _RoutingMethod()
     module.activation_type = ActivationType.Swiglu
-    module.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    module.quant_config = QuantConfig(quant_algo=quant_algo)
     module.w3_w1_weight = torch.empty(
         num_experts,
         2 * padded_intermediate_size,
@@ -265,27 +425,38 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
         padded_intermediate_size // 16,
         dtype=torch.int64,
     )
-    w3_w1_weight_scale = torch.ones(
+    module.w3_w1_weight_scale = torch.ones(
         num_experts,
         2 * padded_intermediate_size,
         hidden_size // 16,
         dtype=torch.float8_e4m3fn,
     )
-    w2_weight_scale = torch.ones(
+    module.w2_weight_scale = torch.ones(
         num_experts,
         hidden_size,
         padded_intermediate_size // 16,
         dtype=torch.float8_e4m3fn,
     )
-    module.w3_w1_weight_scale = w3_w1_weight_scale.clone()
-    module.w2_weight_scale = w2_weight_scale.clone()
     module.fc31_alpha = torch.tensor([0.25, 0.5], dtype=torch.float32)
     module.fc2_alpha = torch.tensor([0.125, 0.25], dtype=torch.float32)
     module.fc31_input_scale = torch.tensor(2.0, dtype=torch.float32)
     module.fc2_input_scale = torch.tensor(4.0, dtype=torch.float32)
+    return module
 
+
+def _transform(module: torch.nn.Module) -> None:
     with patch.object(NVFP4CutlassFusedMoEMethod, "transform_weights", return_value=None):
         NVFP4CuteDslB12xFusedMoEMethod().transform_weights(module)
+
+
+def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
+    _install_fake_flashinfer(monkeypatch)
+    padded_intermediate_size = 1920
+    module = _nvfp4_b12x_module(padded_intermediate_size=padded_intermediate_size)
+    w3_w1_weight_scale = module.w3_w1_weight_scale.clone()
+    w2_weight_scale = module.w2_weight_scale.clone()
+
+    _transform(module)
 
     assert _FakeB12xWrapper.calls
     wrapper_kwargs = _FakeB12xWrapper.calls[0]
@@ -310,11 +481,21 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
     )
 
 
-def test_dispatch_rejects_non_tensor():
-    """Non-tensor inputs (e.g. Fp4QuantizedTensor) stay on the b12x path
-    so the existing ValueError surfaces in quantize_input."""
-    stub = _RoutePredicateStub()
-    assert stub._route_to_cutlass(object()) is False
+def test_b12x_layers_share_scratch_workspaces(monkeypatch):
+    """MoE layers with the same wrapper configuration share one set of scratch."""
+    _install_fake_flashinfer(monkeypatch)
+    layers = [_nvfp4_b12x_module() for _ in range(3)]
+    other = _nvfp4_b12x_module(max_num_tokens=16)
+    for module in layers + [other]:
+        _transform(module)
+
+    first = layers[0].b12x_wrapper
+    for module in layers[1:]:
+        assert module.b12x_wrapper._static_workspace is first._static_workspace
+        assert module.b12x_wrapper._dynamic_workspace is first._dynamic_workspace
+    # A different max_num_tokens sizes the scratch differently, so it keeps its own.
+    assert other.b12x_wrapper._static_workspace is not first._static_workspace
+    assert other.b12x_wrapper._dynamic_workspace is not first._dynamic_workspace
 
 
 # ---------------------------------------------------------------------------

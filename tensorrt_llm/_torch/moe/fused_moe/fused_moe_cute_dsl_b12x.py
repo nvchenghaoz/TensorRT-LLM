@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from dataclasses import replace
 from typing import Optional, Tuple, Union
 
@@ -23,7 +24,20 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from ...utils import ActivationType, Fp4QuantizedTensor
+from ...autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
+from ...utils import (
+    ActivationType,
+    Fp4QuantizedTensor,
+    get_last_power_of_2_num_tokens_buckets,
+    last_positive_power_of_2,
+)
 from .activation import MoEActivationSupport
 from .fused_moe_cutlass import CutlassFusedMoE
 from .impl_contract import (
@@ -48,6 +62,13 @@ from .interface import _reject
 # run sequentially on the same CUDA stream, and the wrapper consumes its
 # previous output before the next layer is dispatched.
 _SHARED_MOE_OUTPUT_BUF: dict = {}
+
+# Shared wrapper scratch: the (static, dynamic) workspaces ``B12xMoEWrapper``
+# preallocates for CUDA graphs, keyed by the wrapper's construction arguments
+# and device. They hold only per-call state (routed-row bookkeeping, packed
+# activations, barriers), and MoE layers run one at a time on one stream, so a
+# single set serves every layer with the same configuration.
+_SHARED_B12X_WORKSPACES: dict[tuple, tuple] = {}
 
 # ActivationType -> b12x activation string. b12x currently exposes "relu2"
 # (Nemotron-style x * relu(x)) and "silu" (SwiGLU-style x * silu(gate)).
@@ -148,14 +169,146 @@ def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
     return True
 
 
+def _routed_profile_inputs(
+    num_experts: int, top_k: int, inputs: list[torch.Tensor]
+) -> list[torch.Tensor]:
+    """Replace the tuner's synthesized inputs with realistic routing.
+
+    The AutoTuner fills profiling inputs with zeros; b12x's cost depends on how
+    many distinct experts the routing touches, so profile with ``top_k``
+    distinct experts per token, normalized weights and non-zero activations.
+    """
+    x, token_selected_experts, token_final_scales = inputs
+    scores, experts = torch.topk(
+        torch.rand(x.shape[0], num_experts, device=x.device), top_k, dim=-1
+    )
+    return [
+        torch.randn_like(x),
+        experts.to(token_selected_experts.dtype),
+        (scores / scores.sum(dim=-1, keepdim=True)).to(token_final_scales.dtype),
+    ]
+
+
+class _B12xRouteRunner(TunableRunner):
+    """One NVFP4 MoE call through either of the backend's two routes.
+
+    ``B12X`` runs FlashInfer's b12x kernels, which quantize the activations
+    themselves; ``CUTLASS`` quantizes them to NVFP4 and runs the CUTLASS
+    grouped GEMM. Which one is faster depends on the MoE shape and the token
+    count, so the AutoTuner times both per power-of-two token bucket. b12x
+    takes and returns bf16 only, so fp16 activations always run CUTLASS.
+    """
+
+    B12X = 0
+    CUTLASS = 1
+
+    tuning_config_cache: dict[tuple, TuningConfig] = {}
+
+    def __init__(
+        self,
+        moe: "CuteDslB12xFusedMoE",
+        ctx: MoERunContext,
+        workspace: Optional[dict],
+    ) -> None:
+        super().__init__()
+        self.moe = moe
+        self.ctx = ctx
+        self.workspace = workspace
+
+    def unique_id(self) -> tuple:
+        moe = self.moe
+        return (
+            moe.num_experts,
+            moe.routing_method.top_k,
+            moe.hidden_size,
+            moe.intermediate_size_per_partition,
+            moe.dtype,
+            moe.activation_type,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: list[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> list[int]:
+        if inputs[0].dtype != torch.bfloat16:
+            return [self.CUTLASS]
+        return [self.B12X, self.CUTLASS]
+
+    def get_tuning_config(self) -> TuningConfig:
+        key = self.unique_id()
+        if key not in type(self).tuning_config_cache:
+
+            def num_tokens(input_shapes: list[torch.Size]) -> int:
+                return input_shapes[0][0]
+
+            type(self).tuning_config_cache[key] = TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        0,
+                        0,
+                        get_last_power_of_2_num_tokens_buckets,
+                        last_positive_power_of_2,
+                    ),
+                ),
+                constraint_specs=(
+                    ConstraintSpec(1, 0, num_tokens),
+                    ConstraintSpec(2, 0, num_tokens),
+                ),
+                inputs_pre_hook=functools.partial(
+                    _routed_profile_inputs,
+                    self.moe.num_experts,
+                    self.moe.routing_method.top_k,
+                ),
+                use_cold_l2_cache=True,
+            )
+        return type(self).tuning_config_cache[key]
+
+    def forward(
+        self,
+        inputs: list[torch.Tensor],
+        *,
+        tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        x, token_selected_experts, token_final_scales = inputs
+        ctx = replace(
+            self.ctx,
+            x=x,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+        )
+        b12x_ok = x.dtype == torch.bfloat16
+        if do_preparation:
+            # b12x compiles its kernels and CUTLASS tunes its own tactics the
+            # first time they see a shape; neither may happen inside the
+            # CUDA graph that times the routes.
+            if b12x_ok:
+                self.moe._run_b12x(ctx)
+            return self.moe._run_cutlass(ctx, self.workspace)
+        if tactic == -1:  # no tuning result for this token count
+            tactic = (
+                self.B12X
+                if b12x_ok and x.shape[0] < self.moe._UNTUNED_CUTLASS_MIN_TOKENS
+                else self.CUTLASS
+            )
+        if tactic == self.CUTLASS:
+            return self.moe._run_cutlass(ctx, self.workspace)
+        return self.moe._run_b12x(ctx)
+
+
 class CuteDslB12xFusedMoE(CutlassFusedMoE):
     """B12x NVFP4 fused-MoE backend for SM120 / SM121.
 
-    Large prefill chunks use CUTLASS; decode uses FlashInfer's b12x kernel.
+    NVFP4 calls run either FlashInfer's b12x kernels or CUTLASS NVFP4, chosen
+    per token count by the AutoTuner (``_B12xRouteRunner``); W4A16_NVFP4 calls
+    always run b12x.
 
     The only subclass of ``CutlassFusedMoE``, and the only backend for which
-    that is a real dependency rather than a shortcut: ``_route_to_cutlass``
-    sends every NVFP4 prefill chunk through ``CutlassFusedMoE.quantize_input`` /
+    that is a real dependency rather than a shortcut: the CUTLASS route
+    (``_run_cutlass``) goes through ``CutlassFusedMoE.quantize_input`` /
     ``CutlassFusedMoE.run_moe``, which read the whole Cutlass execution state
     (chunking stream and events, ``use_fused_finalize``, the tuner flags, the
     LoRA slot helpers, ``_tuner_shapes``, ``_run_moe_w4a16_nvfp4``).
@@ -205,12 +358,9 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
     # SM120 = desktop Blackwell (RTX 5090 / GB202); SM121 = GB10 / DGX Spark.
     _SUPPORTED_SM_VERSIONS = frozenset({120, 121})
 
-    # Prefill chunks (``x.shape[0] >= threshold``) route via CUTLASS NVFP4
-    # GroupGEMM; decode (``x.shape[0] < threshold``) uses b12x. 64 cleanly
-    # separates conc=1 prefill (m=2048 with ``max_num_tokens=2048``) from
-    # decode (m=1) and stays robust against future chunked-prefill splits
-    # that might shrink prefill chunk size.
-    _PREFILL_VIA_CUTLASS_THRESHOLD = 64
+    # NVFP4 route when there is no tuning result (autotuner disabled, or a
+    # token count the warmup did not tune): CUTLASS from this many tokens.
+    _UNTUNED_CUTLASS_MIN_TOKENS = 64
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -316,16 +466,6 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
             return NVFP4CuteDslB12xFusedMoEMethod()
         return super()._get_quant_method()
 
-    def _route_to_cutlass(self, x) -> bool:
-        """Return ``True`` iff this call should fall back to the inherited
-        CUTLASS path (NVFP4 prefill chunk). ``Fp4QuantizedTensor`` inputs
-        always stay on the b12x path (which rejects them) so the existing
-        error message is preserved."""
-        quant_config = getattr(self, "quant_config", None)
-        if quant_config is not None and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
-            return False
-        return isinstance(x, torch.Tensor) and x.shape[0] >= self._PREFILL_VIA_CUTLASS_THRESHOLD
-
     # ``post_load_weights`` is inherited from ``CutlassFusedMoE`` and
     # dispatches to ``self.quant_method.transform_weights(self)`` — for this
     # backend ``self.quant_method`` is ``NVFP4CuteDslB12xFusedMoEMethod``
@@ -333,7 +473,7 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
     # ``convert_sf_to_mma_layout`` reshape, ``B12xMoEWrapper`` instantiation,
     # and the cross-layer shared output buffer dance. The wrapper and the
     # bundled weight dict are attached to this module as ``self.b12x_wrapper``
-    # / ``self._b12x_weights``, which the decode path below consumes.
+    # / ``self._b12x_weights``, which ``_run_b12x`` consumes.
 
     @nvtx_range("[b12x] quantize_input")
     def quantize_input(
@@ -342,23 +482,16 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
         post_quant_comm: bool = True,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Hybrid dispatch entrypoint for activation handling.
+        """Pass the bf16 / fp16 activations through unquantized.
 
-        NVFP4 prefill chunks take the inherited
-        :meth:`CutlassFusedMoE.quantize_input` path so the downstream
-        ``run_moe`` can call CUTLASS NVFP4 GroupGEMM. Decode chunks and
-        W4A16_NVFP4 chunks pass through unchanged because b12x quantizes
-        activations internally (consumes a bf16 / fp16 ``x`` and produces its
-        own scale factors).
+        b12x quantizes them inside its kernels, and the CUTLASS route
+        quantizes them in ``_run_cutlass`` once ``run_moe`` has picked the
+        route for this call.
         """
-        if self._route_to_cutlass(x):
-            return CutlassFusedMoE.quantize_input(
-                self, x, post_quant_comm=post_quant_comm, **kwargs
-            )
         if isinstance(x, Fp4QuantizedTensor):
             raise ValueError(
-                "CuteDslB12xFusedMoE does not accept Fp4QuantizedTensor input "
-                "on the b12x decode path; b12x performs its own input quantization."
+                "CuteDslB12xFusedMoE does not accept Fp4QuantizedTensor input; "
+                "it quantizes activations itself."
             )
         return x, None
 
@@ -369,49 +502,59 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
         *,
         workspace: Optional[dict] = None,
     ) -> torch.Tensor:
+        # Check the plan before the tuner runs: it treats exceptions raised
+        # while profiling as failed tactics.
+        require_comm_plan(self, ctx)
+        # Empty chunks skip the tuner: its profiling inputs need a token.
+        if self.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4 or ctx.x.shape[0] == 0:
+            return self._run_b12x(ctx)
+        runner = _B12xRouteRunner(self, ctx, workspace)
+        inputs = [ctx.x, ctx.token_selected_experts, ctx.token_final_scales]
+        _, tactic = AutoTuner.get().choose_one(
+            "CuteDslB12xFusedMoE::run_moe_nvfp4",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        return runner(inputs, tactic=tactic)
+
+    def _run_cutlass(self, ctx: MoERunContext, workspace: Optional[dict]) -> torch.Tensor:
+        """Quantize the activations to NVFP4 and run the CUTLASS grouped GEMM."""
         plan = require_comm_plan(self, ctx)
-        x = ctx.x
-        if self._route_to_cutlass(x):
-            # ``CutlassFusedMoE.run_moe`` forwards ``output_dtype`` straight
-            # into the C++ ``trtllm::fused_moe`` op, which requires a concrete
-            # high-precision ``ScalarType`` (uint8 / FP4-packed activations are
-            # rejected at the kernel epilogue with "Invalid output type Byte").
-            # ``ConfigurableMoE.forward`` always fills ``output_dtype``, so this
-            # only narrows the type for anything driving ``run_moe`` without it.
-            _HIGH_PRECISION = {torch.float16, torch.bfloat16, torch.float32}
-            cutlass_output_dtype = ctx.output_dtype
-            if cutlass_output_dtype is None:
-                cutlass_output_dtype = (
-                    x.dtype
-                    if isinstance(x, torch.Tensor) and x.dtype in _HIGH_PRECISION
-                    else torch.bfloat16
-                )
-            return CutlassFusedMoE.run_moe(
-                self,
-                replace(ctx, output_dtype=cutlass_output_dtype),
-                workspace=workspace,
-            )
-        token_selected_experts = ctx.token_selected_experts
-        token_final_scales = ctx.token_final_scales
-        x_sf = ctx.x_sf
-        moe_output = plan.moe_output
+        x, x_sf = CutlassFusedMoE.quantize_input(
+            self, ctx.x, post_quant_comm=not plan.input_sf_swizzled
+        )
+        # ``CutlassFusedMoE.run_moe`` forwards ``output_dtype`` straight into
+        # the C++ ``trtllm::fused_moe`` op, which requires a concrete
+        # high-precision ``ScalarType``. ``ConfigurableMoE.forward`` always
+        # fills it; default to the activation dtype for direct callers.
+        output_dtype = ctx.output_dtype if ctx.output_dtype is not None else ctx.x.dtype
+        return CutlassFusedMoE.run_moe(
+            self,
+            replace(ctx, x=x, x_sf=x_sf, output_dtype=output_dtype),
+            workspace=workspace,
+        )
+
+    def _run_b12x(self, ctx: MoERunContext) -> torch.Tensor:
+        """Run FlashInfer's b12x kernels on the unquantized activations."""
+        plan = require_comm_plan(self, ctx)
         if self.b12x_wrapper is None or self._b12x_weights is None:
             raise RuntimeError(
                 "CuteDslB12xFusedMoE.run_moe called before process_weights_after_loading completed."
             )
-        if x_sf is not None:
+        if ctx.x_sf is not None:
             raise ValueError(
-                "CuteDslB12xFusedMoE expects unquantized input (x_sf=None) "
-                "on the b12x decode path; got a precomputed scale factor."
+                "CuteDslB12xFusedMoE expects unquantized input (x_sf=None); "
+                "got a precomputed scale factor."
             )
 
         # Annotate the kwargs spread + wrapper entry separately so we can
         # attribute the per-layer Python dispatch cost vs. the kernel cost.
         with nvtx_range("[b12x] wrapper.run"):
             out = self.b12x_wrapper.run(
-                x=x,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
+                x=ctx.x,
+                token_selected_experts=ctx.token_selected_experts,
+                token_final_scales=ctx.token_final_scales,
                 **self._b12x_weights,
             )
 
@@ -420,8 +563,8 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
         # alltoall workspace tensor), copy into it; ``can_implement`` rejects
         # the topologies that could pick alltoall, so this is a defensive
         # path for future workspace-driven uses.
-        if moe_output is not None:
+        if plan.moe_output is not None:
             with nvtx_range("[b12x] out_copy"):
-                moe_output.copy_(out)
-            return moe_output
+                plan.moe_output.copy_(out)
+            return plan.moe_output
         return out
