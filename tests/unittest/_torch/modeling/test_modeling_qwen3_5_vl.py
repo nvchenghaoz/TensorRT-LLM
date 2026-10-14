@@ -294,6 +294,25 @@ def test_qwen35_lm_head_requires_native_nvfp4_blocks(sm_version: int, group_size
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [100, 103, 120])
+def test_qwen35_keeps_native_nvfp4_lm_head(sm_version: int) -> None:
+    """Qwen3.8 exports label lm_head NVFP4 (with an input scale); it must stay
+    NVFP4 instead of falling back to the bf16 dequant path."""
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64, vocab_size=248320),
+        mapping=Mapping(),
+        quant_config_dict={"lm_head": QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)},
+    )
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
+    ):
+        keep = _lm_head_nvfp4_enabled(model_config)
+        assert keep
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep)
+    assert model_config.quant_config_dict["lm_head"].quant_algo == QuantAlgo.NVFP4
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("sm_version", [90, 100, 103, 120])
 def test_qwen35_rejects_32_element_experts_before_promotion(sm_version: int) -> None:
     model_config = SimpleNamespace(
