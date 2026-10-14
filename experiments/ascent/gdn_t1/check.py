@@ -17,6 +17,8 @@
 #      iteration; non-indexed slots and read-only inputs checked before reset.
 #   C. CUDA graph capture, then replay with changed inputs and state indices.
 #   D. PAD (-1) state index and non-decode (T != N) fallback dispatch.
+# Bitwise equality with the original kernel is reported in every section
+# (informational; pass/fail uses the tolerances above).
 import json
 
 import torch
@@ -173,6 +175,12 @@ def nonidx_mask(idx):
 
 failures = []
 summary = {}
+bitwise_vs_original = {"compared": 0, "identical": 0}
+
+
+def note_bitwise(same):
+    bitwise_vs_original["compared"] += 1
+    bitwise_vs_original["identical"] += int(same)
 
 
 def fail(msg):
@@ -224,8 +232,10 @@ def section_a(n):
         agg["c_out_mean"] += ec[1] / steps
         agg["o_st_mean"] += so[1] / steps
         agg["c_st_mean"] += sc[1] / steps
-        bit_out += int(beq(out_o, out_c))
-        bit_state += int(beq(pool_o, pool_c))
+        same_out, same_pool = beq(out_o, out_c), beq(pool_o, pool_c)
+        bit_out += int(same_out)
+        bit_state += int(same_pool)
+        note_bitwise(same_out and same_pool)
         if step in (0, 19, 59, 119):
             log(f"A N={n} step {step}: out err orig {eo[0]:.3e}/{eo[1]:.3e} "
                 f"cand {ec[0]:.3e}/{ec[1]:.3e}; state err orig "
@@ -263,7 +273,8 @@ def section_b(n):
         p_o = pool0.clone()
         o_o = torch.zeros_like(lay["out"])
         run(inp, p_o, idx, o_o, original=True)
-        lay.update(ref_o=ref_o, ref_s=ref_s,
+        lay.update(ref_o=ref_o, ref_s=ref_s, orig_out=o_o,
+                   orig_pool=p_o,
                    orig_out_err=err(o_o[0], ref_o),
                    orig_st_err=err(p_o[idx.long()], ref_s))
         lay["snap"] = inp.snapshot()
@@ -294,6 +305,7 @@ def section_b(n):
     worst = {"out_max": 0.0, "st_max": 0.0, "out_ratio": 0.0,
              "st_ratio": 0.0}
     drift = 0
+    bit_orig = 0
     for it in range(WARMUP + ITERS):
         reset()
         g.replay()
@@ -302,6 +314,11 @@ def section_b(n):
         states = [lay["pool"][lay["idx"].long()].clone() for lay in layers]
         if first_states is None:
             first_states = states
+            for lay in layers:
+                same = beq(lay["out"], lay["orig_out"]) and beq(
+                    lay["pool"], lay["orig_pool"])
+                bit_orig += int(same)
+                note_bitwise(same)
         for li, lay in enumerate(layers):
             if not beq(states[li], first_states[li]):
                 drift += 1
@@ -343,7 +360,8 @@ def section_b(n):
     if not all_same:
         fail(f"B N={n}: invocations not bitwise identical")
     res = dict(invocations=len(outs), layers=LAYERS, drift_events=drift,
-               all_bitwise_identical=all_same, **worst)
+               all_bitwise_identical=all_same,
+               layers_bitwise_equal_to_original=bit_orig, **worst)
     log(f"B N={n}: {json.dumps(res)}")
     summary[f"B_N{n}"] = res
     del g
@@ -387,6 +405,8 @@ def section_c():
         same_eager = beq(out, o_e) and beq(pool, p_e)
         if not same_eager:
             fail(f"C trial {trial}: graph replay != eager candidate")
+        same_orig = beq(out, o_o) and beq(pool, p_o)
+        note_bitwise(same_orig)
         ec, eo = err(out[0], ref_o), err(o_o[0], ref_o)
         sc, so = err(pool[idx.long()], ref_s), err(p_o[idx.long()], ref_s)
         for kind, c_e, o_e2 in (("out_max", ec[0], eo[0]),
@@ -400,6 +420,7 @@ def section_c():
         if not beq(pool[nmask], pool0[nmask]):
             fail(f"C trial {trial}: non-indexed slot written")
         res.append(dict(trial=trial, graph_eq_eager=same_eager,
+                        bitwise_eq_original=same_orig,
                         cand_out_err=ec, orig_out_err=eo, cand_st_err=sc,
                         orig_st_err=so))
     log(f"C: {json.dumps(res)}")
@@ -430,6 +451,8 @@ def section_d():
         ec[1] <= RATIO * eo[1]
     if not ok:
         fail(f"D pad index: cand {ec} orig {eo}")
+    same_orig = beq(o_c, o_o) and beq(p_c, p_o)
+    note_bitwise(same_orig)
     # Non-decode varlen batch (T != N) must keep the generic kernel.
     before = _t1_calls[0]
     T = 5
@@ -453,6 +476,7 @@ def section_d():
     if _t1_calls[0] != before:
         fail("D: T != N batch dispatched to the T == 1 kernel")
     summary["D"] = dict(pad_cand_err=ec, pad_orig_err=eo,
+                        pad_bitwise_eq_original=same_orig,
                         varlen_fallback=_t1_calls[0] == before)
     log(f"D: {json.dumps(summary['D'])}")
 
@@ -476,6 +500,7 @@ def main():
                     "fallback",
         "tolerance": "candidate max/mean abs error <= 1.5x original's; "
                      "repeated invocations bitwise identical",
+        "bitwise_vs_original": bitwise_vs_original,
         "num_failures": len(failures),
         "failures": failures[:20],
         "summary": summary,

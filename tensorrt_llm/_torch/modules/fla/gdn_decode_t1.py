@@ -123,15 +123,15 @@ def fused_sigmoid_gating_delta_rule_update_t1_kernel(
 def gdn_t1_decode_config(num_heads_total: int, V: int) -> Tuple[int, int]:
     """(BV, num_warps) for N * HV (sequence, value-head) pairs.
 
-    Tuned on SM120 (RTX PRO 6000, 188 SMs) at HV=32, K=V=128: small tiles keep
-    enough programs in flight at N <= 4; at larger batches the kernel is
-    state-bandwidth bound and BV=16 / 1 warp is marginally best.
+    Tuned on SM120 (RTX PRO 6000, 188 SMs) at HV=32, K=V=128: BV=8 keeps
+    enough programs in flight at N <= 2; above that the kernel is
+    state-bandwidth bound and BV=16 is marginally best. One warp per program
+    keeps every reduction (q/k L2 norm, k- and q-contractions) in the same
+    per-thread grouping and order as the generic single-warp kernel, so the
+    results are bitwise identical to it; 2-4 warps were within ~2%.
     """
-    if num_heads_total <= 128:
-        bv, warps = 8, 2
-    else:
-        bv, warps = 16, 1
-    return min(bv, V), warps
+    bv = 8 if num_heads_total <= 64 else 16
+    return min(bv, V), 1
 
 
 def can_use_gdn_t1_decode(
