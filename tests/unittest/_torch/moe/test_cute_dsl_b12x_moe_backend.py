@@ -481,6 +481,33 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
     )
 
 
+def test_nvfp4_w4a4_post_load_uses_modelopt_scale_contract(monkeypatch):
+    """W4A4: block scales as stored; activation global scales travel apart from the weight alphas."""
+    _install_fake_flashinfer(monkeypatch)
+    module = _nvfp4_b12x_module(quant_algo=QuantAlgo.NVFP4)
+    w3_w1_weight_scale = module.w3_w1_weight_scale.clone()
+    w2_weight_scale = module.w2_weight_scale.clone()
+
+    _transform(module)
+
+    assert _FakeB12xWrapper.calls
+    assert _FakeB12xWrapper.calls[0].get("quant_mode") == "nvfp4", _FakeB12xWrapper.calls[0]
+    weights = module._b12x_weights
+    assert torch.equal(weights["w1_weight_sf"].float(), w3_w1_weight_scale.float())
+    assert torch.equal(weights["w2_weight_sf"].float(), w2_weight_scale.float())
+    expected = {
+        # weight_scale_2 = alpha * input_scale: [0.25, 0.5] * 2 and [0.125, 0.25] * 4.
+        "w1_alpha": [0.5, 1.0],
+        # FC2 weight scale times the FC2 activation global scale 1 / 4.
+        "w2_alpha": [0.125, 0.25],
+        "input_global_scale": [0.5, 0.5],
+        "fc2_input_scale": [0.25, 0.25],
+    }
+    for name, values in expected.items():
+        assert weights[name].dtype == torch.float32, name
+        assert torch.allclose(weights[name], torch.tensor(values, dtype=torch.float32)), name
+
+
 def test_b12x_layers_share_scratch_workspaces(monkeypatch):
     """MoE layers with the same wrapper configuration share one set of scratch."""
     _install_fake_flashinfer(monkeypatch)

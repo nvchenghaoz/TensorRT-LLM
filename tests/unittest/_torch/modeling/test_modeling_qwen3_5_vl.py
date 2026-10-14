@@ -313,6 +313,68 @@ def test_qwen35_rejects_32_element_experts_before_promotion(sm_version: int) -> 
         _normalize_qwen35_quant_config_dict(model_config)
 
 
+_MOE_EXPERT_MODULES = (
+    "experts",
+    "shared_expert.gate_proj",
+    "shared_expert.up_proj",
+    "shared_expert.down_proj",
+)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("sm_version", "expected_algo"),
+    [
+        (90, QuantAlgo.W4A16_NVFP4),
+        (100, QuantAlgo.NVFP4),
+        (103, QuantAlgo.NVFP4),
+        (120, QuantAlgo.NVFP4),
+        (121, QuantAlgo.W4A16_NVFP4),
+    ],
+)
+def test_qwen35_shared_expert_follows_routed_expert_precision(
+    sm_version: int, expected_algo: QuantAlgo
+) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=40),
+        quant_config_dict={
+            f"model.language_model.layers.0.mlp.{module}": QuantConfig(
+                quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16
+            )
+            for module in _MOE_EXPERT_MODULES
+        },
+    )
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
+    ):
+        _normalize_qwen35_quant_config_dict(model_config)
+
+    assert {
+        module: model_config.quant_config_dict[f"model.layers.0.mlp.{module}"].quant_algo
+        for module in _MOE_EXPERT_MODULES
+    } == {module: expected_algo for module in _MOE_EXPERT_MODULES}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [100, 103, 120])
+def test_qwen35_keeps_w4a16_shared_expert_for_32_element_blocks(sm_version: int) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=40),
+        quant_config_dict={
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj": QuantConfig(
+                quant_algo=QuantAlgo.W4A16_NVFP4, group_size=32
+            ),
+        },
+    )
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
+    ):
+        _normalize_qwen35_quant_config_dict(model_config)
+
+    config = model_config.quant_config_dict["model.layers.0.mlp.shared_expert.gate_proj"]
+    assert config.quant_algo == QuantAlgo.W4A16_NVFP4
+
+
 @pytest.mark.parametrize("group_size", [16, 32])
 @pytest.mark.cpu_only
 def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int) -> None:
