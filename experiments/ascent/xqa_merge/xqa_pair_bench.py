@@ -1,10 +1,12 @@
-import ctypes, hashlib, json, math, os, sys, time
+import ctypes, glob, hashlib, json, math, os, subprocess, sys, time
 import numpy as np
 import torch
 from cuda.bindings import driver as cu
 from cuda.bindings import nvrtc
 # Paired kernel_mha benchmark (run inline with python -c in both arms; compiles <cwd>/cpp/kernels/xqa/mha.cu exactly like
 # the NVRTC JIT path). Args: primary configs BxM,... and extra configs BxM,... (M = sub-sequences per sequence).
+# Provenance: prints the arm's git HEAD and the sha256 of every file in cpp/kernels/xqa, so a pair shows that both arms
+# compile identical XQA headers and differ only in mha.cu.
 HDRS = ['cuda_hint.cuh', 'defines.h', 'ldgsts.cuh', 'mha.h', 'mhaUtils.cuh', 'mma.cuh', 'platform.h', 'utils.cuh', 'utils.h', 'mha_stdheaders.cuh', 'mha_components.cuh', 'mla_sm120.cuh', 'gmma.cuh', 'gmma_impl.cuh', 'barriers.cuh', 'tma.h', 'specDec.h']
 CHDRS = ['cuda_bf16.h', 'cuda_bf16.hpp', 'cuda_fp16.h', 'cuda_fp16.hpp', 'cuda_fp8.h', 'cuda_fp8.hpp', 'vector_types.h', 'vector_functions.h', 'device_types.h']
 MACROS = dict(INPUT_FP16='0', DTYPE='__nv_bfloat16', GENERATE_CUBIN='1', NDEBUG='1', HEAD_ELEMS='256', BEAM_WIDTH='1', CACHE_ELEM_ENUM='2', TOKENS_PER_PAGE='32', HEAD_GRP_SIZE='8', M_TILESIZE='8', USE_CUSTOM_BARRIER='1', SLIDING_WINDOW='1', LOW_PREC_OUTPUT='0', USE_INPUT_KV='0', ROPE_STYLE='0', ROPE_ELEMS='64', IS_SPEC_DEC_TREE='0', SKIP_SOFTMAX_ATTN='0', __FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__='1', __FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__='1')
@@ -22,12 +24,27 @@ def log(*a):
     print(*a, flush=True)
 
 
+def git_head():
+    try:
+        return subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception as e:  # provenance only
+        return 'unavailable: %s' % e
+
+
 prim = [tuple(int(x) for x in c.split('x')) for c in sys.argv[1].split(',') if c]
 extra = [tuple(int(x) for x in c.split('x')) for c in (sys.argv[2] if len(sys.argv) > 2 else '').split(',') if c]
+xdir = os.path.join(os.getcwd(), 'cpp/kernels/xqa')
+head = git_head()
+xqa_files = {os.path.relpath(f, xdir): hashlib.sha256(open(f, 'rb').read()).hexdigest()
+             for f in sorted(glob.glob(os.path.join(xdir, '*'))) if os.path.isfile(f)}
+hdr_digest = hashlib.sha256(''.join('%s:%s\n' % kv for kv in sorted(xqa_files.items()) if kv[0] != 'mha.cu').encode()).hexdigest()
+log('git HEAD', head)
+log('cpp/kernels/xqa files except mha.cu: %d, combined sha256 %s' % (len(xqa_files) - 1, hdr_digest))
+for f, h in sorted(xqa_files.items()):
+    log('  %s %s' % (h, f))
 torch.cuda.init()
 torch.zeros(1, device='cuda')
 ck(cu.cuInit(0))
-xdir = os.path.join(os.getcwd(), 'cpp/kernels/xqa')
 src = open(os.path.join(xdir, 'mha.cu')).read()
 src_sha = hashlib.sha256(src.encode()).hexdigest()
 names = [h.encode() for h in HDRS + CHDRS]
@@ -50,7 +67,7 @@ smem = int(sv.value)
 A = cu.CUfunction_attribute
 ck(cu.cuFuncSetAttribute(func, A.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem))
 regs = ck(cu.cuFuncGetAttribute(A.CU_FUNC_ATTRIBUTE_NUM_REGS, func))
-log('compiled mha.cu sha256', src_sha[:16], 'smem', smem, 'regs', regs)
+log('compiled mha.cu sha256', src_sha, 'smem', smem, 'regs', regs, 'device', torch.cuda.get_device_name())
 
 bmax = max(b for b, _ in prim + extra)
 g = torch.Generator(device='cuda')
@@ -131,8 +148,21 @@ def bench(b, m):
     s['nb_sub_seq'] = m
     s['output_sha256'] = hashlib.sha256(out[:b].contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
     s['output_finite'] = bool(torch.isfinite(out[:b].float()).all().item())
+    s['semaphores_zero'] = bool((sem == 0).all().item())
     return s
 
+
+# flush bandwidth (outside every timed region): one timed 384 MiB read sweep, reported as bytes/s
+fe0, fe1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+for _ in range(3):
+    flushbuf.sum()
+fe0.record()
+for _ in range(10):
+    flushbuf.sum()
+fe1.record()
+torch.cuda.synchronize()
+flush_bps = 10 * flushbuf.numel() * 4 / (fe0.elapsed_time(fe1) * 1e-3)
+log('flush read sweep: %d MiB at %.1f GB/s' % (FLUSH_MB, flush_bps / 1e9))
 
 res = {'batch': {}, 'output': {'class': 'exact'}, 'extra': {}}
 for b, m in prim:
@@ -141,8 +171,10 @@ for b, m in prim:
 for b, m in extra:
     res['extra']['%dx%d' % (b, m)] = bench(b, m)
     log('extra B=%d m=%d: %.2f us' % (b, m, res['extra']['%dx%d' % (b, m)]['kernel_ms'] * 1e3))
-res['config'] = dict(mha_cu_sha256=src_sha, smem=smem, regs=regs, seq_len=SEQ, shared_prefix=PREFIX, warmup=WARMUP,
-                     iters=ITERS, rounds=ROUNDS, flush='384 MiB read sweep before every call (outside timing)',
+res['config'] = dict(git_head=head, mha_cu_sha256=src_sha, xqa_other_files_sha256=hdr_digest, smem=smem, regs=regs,
+                     seq_len=SEQ, shared_prefix=PREFIX, warmup=WARMUP, iters=ITERS, rounds=ROUNDS,
+                     flush='%d MiB read sweep (torch.sum) before every call, outside timing; %.1f GB/s' % (FLUSH_MB, flush_bps / 1e9),
+                     flush_bytes_per_s=flush_bps,
                      poison='output NaN-filled before every call', timing='CUDA graph replay + CUDA events; kernel_ms = 10-90% trimmed mean',
                      pdl='off in both arms', kv='FP8 E4M3 paged, 32 tokens/block, 32768-token shared prefix')
 print(json.dumps(res), flush=True)
