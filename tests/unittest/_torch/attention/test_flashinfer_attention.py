@@ -22,6 +22,8 @@ from tensorrt_llm._torch.attention.backends.flashinfer import (
 from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+    CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -1126,6 +1128,151 @@ class TestFlashInferAttention(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    def test_cascade_decode_matches_plain_decode_with_cuda_graph(self) -> None:
+        """Cascade decode over KV pages shared by the batch matches plain decode.
+
+        All requests but the last map their first pages onto request 0's, as
+        block reuse does for a shared prompt prefix; the last one is a
+        CUDA-graph padding row with its own pages, whose output is ignored.
+        The captured graph is then replayed for a batch that shares nothing.
+        """
+        num_heads, num_kv_heads, head_dim = 16, 2, 256
+        dtype = torch.bfloat16
+        tokens_per_block = 16
+        shared_pages = 4
+        past_seen_tokens = [
+            shared_pages * tokens_per_block + extra
+            for extra in (5, 17, 30, 9, 40, 22)
+        ]
+        batch_size = len(past_seen_tokens)
+        request_ids = list(range(batch_size - 1)) + [CUDA_GRAPH_DUMMY_REQUEST_ID]
+        num_blocks = 128
+
+        kv_cache_manager = KVCacheManager(
+            KvCacheConfig(max_tokens=num_blocks * tokens_per_block),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=num_blocks * tokens_per_block,
+            max_batch_size=batch_size,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=tensorrt_llm.bindings.DataType.BF16,
+        )
+        kv_cache_manager.add_dummy_requests(request_ids,
+                                            [t + 1 for t in past_seen_tokens])
+        kv_buffer = kv_cache_manager.get_buffers(0)
+        kv_buffer.copy_(torch.randn_like(kv_buffer))
+
+        class SharedPrefixKVCacheManager:
+            """Delegates to the real manager, sharing request 0's first pages."""
+
+            def __init__(self, inner, enable_block_reuse):
+                self._inner = inner
+                # Cascade decode is only used with block reuse on.
+                self.enable_block_reuse = enable_block_reuse
+                self.share = True
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def get_batch_cache_indices_flat(self,
+                                             request_ids,
+                                             num_blocks,
+                                             layer_idx=None):
+                flat = self._inner.get_batch_cache_indices_flat(
+                    request_ids, num_blocks, layer_idx=layer_idx).clone()
+                if not self.share:
+                    return flat
+                shared = flat[:shared_pages].clone()
+                start = 0
+                for request_id, n in zip(request_ids, num_blocks):
+                    if request_id != request_ids[-1]:
+                        flat[start:start + shared_pages] = shared
+                    start += n
+                return flat
+
+        q = torch.randn(batch_size, num_heads * head_dim, dtype=dtype,
+                        device='cuda')
+        k = torch.randn(batch_size,
+                        num_kv_heads * head_dim,
+                        dtype=dtype,
+                        device='cuda')
+        v = torch.randn_like(k)
+        layer = FlashInferAttention(layer_idx=0,
+                                    head_dim=head_dim,
+                                    num_heads=num_heads,
+                                    num_kv_heads=num_kv_heads)
+        workspace = torch.empty(1024 * 1024 * 128,
+                                dtype=torch.int,
+                                device='cuda')
+
+        def make_metadata(enable_block_reuse, share=True, **kwargs):
+            manager = SharedPrefixKVCacheManager(kv_cache_manager,
+                                                 enable_block_reuse)
+            manager.share = share
+            metadata = TestingFlashInferAttentionMetadata(
+                seq_lens=torch.ones((batch_size, ), dtype=torch.int),
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=past_seen_tokens),
+                max_num_requests=batch_size,
+                max_num_tokens=8192,
+                kv_cache_manager=manager,
+                request_ids=request_ids,
+                **kwargs)
+            metadata.prepare()
+            return metadata
+
+        reference_metadata = make_metadata(enable_block_reuse=False)
+        self.assertIsNone(reference_metadata._cascade_layout)
+        reference = layer.forward(q, k, v, reference_metadata)
+
+        with mock.patch.object(flashinfer_backend, "_CASCADE_MIN_SHARED_PAGES",
+                               2), mock.patch.object(flashinfer_backend,
+                                                     "_CASCADE_MIN_ROWS", 2):
+            eager_metadata = make_metadata(enable_block_reuse=True)
+            self.assertEqual(eager_metadata._cascade_layout.shared_pages,
+                             shared_pages)
+            eager = layer.forward(q, k, v, eager_metadata)
+
+            graph_metadata = make_metadata(enable_block_reuse=True,
+                                           is_cuda_graph=True,
+                                           workspace_buffer=workspace)
+            for _ in range(2):
+                layer.forward(q, k, v, graph_metadata)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = layer.forward(q, k, v, graph_metadata)
+            graph.replay()
+            self.assertTrue(
+                all(wrappers.cascade_active for wrappers in
+                    graph_metadata._plan_params_to_wrappers.values()))
+            real = slice(0, batch_size - 1)
+            torch.testing.assert_close(eager[real],
+                                       reference[real],
+                                       atol=1e-2,
+                                       rtol=0)
+            torch.testing.assert_close(captured[real],
+                                       reference[real],
+                                       atol=1e-2,
+                                       rtol=0)
+
+            # Same graph, a batch without shared pages: level 0 is empty.
+            unshared_reference = layer.forward(
+                q, k, v, make_metadata(enable_block_reuse=False, share=False))
+            graph_metadata.kv_cache_manager.share = False
+            graph_metadata.prepare()
+            self.assertEqual(graph_metadata._cascade_layout.shared_pages, 0)
+            graph.replay()
+            torch.testing.assert_close(captured,
+                                       unshared_reference,
+                                       atol=1e-2,
+                                       rtol=0)
+        kv_cache_manager.shutdown()
+
     def test_ragged_prefill_no_kv_cache_uses_cudnn_plan(self) -> None:
         """Ragged QKV with ``kv_cache_manager=None`` plans via cuDNN (``_plan_ragged_cudnn_no_kv``)."""
         if not torch.cuda.is_available():
@@ -1351,6 +1498,7 @@ class _FakeMetadata:
         self.num_blocks = num_blocks
         self.num_contexts = num_contexts
         self._plan_params_to_wrappers = wrappers_by_params
+        self._cascade_layout = None
         self.replanned = []
 
     def _plan_with_params(self, plan_params):
@@ -1360,6 +1508,7 @@ class _FakeMetadata:
             self.num_blocks[self.num_contexts:])
         wrappers.is_planned = True
 
+    _fa2_decode_plan_key = FlashInferAttentionMetadata._fa2_decode_plan_key
     refresh = FlashInferAttentionMetadata._refresh_fa2_cuda_graph_plans
 
 

@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -3204,6 +3204,124 @@ def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
                 token_final_scales,
                 dtype_activation,
                 router_logits,
+            )
+
+            ref_fused_moe.check_accuracy(output, ref_output)
+
+
+@pytest.mark.parametrize("route", ["b12x", "cutlass"])
+@pytest.mark.parametrize("num_tokens", [1, 128])
+@pytest.mark.parametrize(
+    "model_config",
+    [MoeModelConfig(64, 8, 2048, 512), MoeModelConfig(60, 4, 2048, 1408)],
+    ids=lambda c: f"e{c.num_experts}_k{c.top_k}_h{c.hidden_size}_i{c.intermediate_size}",
+)
+def test_cute_dsl_b12x_nvfp4_routes_match_reference(
+    route: str,
+    num_tokens: int,
+    model_config: MoeModelConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both NVFP4 routes the AutoTuner picks between must be correct at any
+    token count, not only where they usually win."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    sm_version = get_sm_version()
+    if sm_version not in (120, 121):
+        pytest.skip(f"CuteDslB12xFusedMoE requires SM120/SM121, got SM{sm_version}")
+    pytest.importorskip("flashinfer")
+
+    dtype_activation = torch.bfloat16
+    backend_type = MoeBackendType.CUTE_DSL_B12X
+    quant_algo = QuantAlgo.NVFP4
+    num_experts = model_config.num_experts
+    top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
+    intermediate_size = model_config.intermediate_size
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
+
+    # Without a tuning result the route falls back to its token-count rule;
+    # moving the cutoff pins every call to the requested route.
+    AutoTuner.get().clear_cache()
+    monkeypatch.setattr(
+        CuteDslB12xFusedMoE,
+        "_UNTUNED_CUTLASS_MIN_TOKENS",
+        0 if route == "cutlass" else num_tokens + 1,
+    )
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype_activation, device="cuda")
+        router_logits = torch.randn(
+            (num_tokens, num_experts), dtype=dtype_activation, device="cuda"
+        )
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype_activation,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype_activation,
+            quant_config=quant_config,
+            mapping=mapping,
+        )
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            with (
+                patch.object(CuteDslB12xFusedMoE, "_run_b12x", wraps=backend._run_b12x) as run_b12x,
+                patch.object(
+                    CuteDslB12xFusedMoE, "_run_cutlass", wraps=backend._run_cutlass
+                ) as run_cutlass,
+            ):
+                output = run_backend_moe(
+                    backend,
+                    backend_type,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    dtype_activation,
+                    router_logits,
+                )
+            assert (run_b12x.call_count, run_cutlass.call_count) == (
+                (1, 0) if route == "b12x" else (0, 1)
             )
 
             ref_fused_moe.check_accuracy(output, ref_output)

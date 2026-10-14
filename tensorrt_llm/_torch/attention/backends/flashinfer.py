@@ -64,6 +64,14 @@ from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
 _FORCE_RAGGED_FA2 = False
 """Used for testing."""
 
+# Cascade decode attends every decode query once to the KV pages the batch
+# shares (e.g. a reused prompt prefix), separately from each request's own
+# pages, and merges the two partial results. It pays off once enough rows
+# share enough pages; otherwise the batch runs it with the shared level masked
+# out of the merge (CUDA graphs) or uses plain decode (eager).
+_CASCADE_MIN_SHARED_PAGES = 16
+_CASCADE_MIN_ROWS = 8
+
 _MAX_CUDA_THREADS_PER_BLOCK = 1024
 
 
@@ -297,6 +305,32 @@ class FlashInferWrappers:
     # and columns before narrowing future updates.
     decode_block_table_active_rows: int = field(default=0, repr=False)
     decode_block_table_active_width: int = field(default=0, repr=False)
+    # Recorded after a sync-free decode plan. FlashInfer stages the plan in a
+    # pinned host buffer and uploads it with an async H2D copy, so the next
+    # plan must not rewrite that buffer before the copy has run.
+    decode_plan_event: Optional[torch.cuda.Event] = field(default=None,
+                                                          repr=False)
+    # Cascade decode: level 0 attends all decode queries to the batch's shared
+    # pages, level 1 each row to its remaining pages.
+    cascade_wrapper: Optional[
+        flashinfer.MultiLevelCascadeAttentionWrapper] = field(default=None,
+                                                              repr=False)
+    # Whether the last decode plan for these params was a cascade plan.
+    cascade_active: bool = field(default=False, repr=False)
+
+
+@dataclass
+class _CascadeLayout:
+    """Host side of one batch's cascade split, built by prepare().
+
+    shared_pages is 0 when the batch does not qualify; a captured CUDA graph
+    then runs level 0 over no pages, which leaves level 1's result unchanged.
+    """
+    shared_pages: int
+    own_indptr: torch.Tensor  # pinned int32, num_generations + 1 entries
+    num_own_pages: int
+    # Changes whenever the shared or own plans must be rebuilt.
+    key: tuple
 
 
 # Environment variable arming the host-side page-table check, and how many
@@ -398,6 +432,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     "decode backend.")
         self._publish_decode_wrapper_kv_lens(result)
         return result
+
+    def get_cascade_decode_wrapper(self, plan_params: PlanParams):
+        """The cascade wrapper when the last decode plan was a cascade plan, else None."""
+        wrappers = self._plan_params_to_wrappers.get(plan_params)
+        if wrappers is None or not wrappers.cascade_active:
+            return None
+        return wrappers.cascade_wrapper
 
     def get_ragged_prefill_wrapper(
             self, plan_params: PlanParams) -> _RaggedPrefillWrapper:
@@ -848,6 +889,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.paged_kv_indptr = self.paged_kv_indptr_decode[:num_seqs + 1]
         self._paged_kv_last_page_len[:num_seqs].copy_(
             target._paged_kv_last_page_len[:num_seqs], non_blocking=True)
+        self._host_paged_kv_last_page_len = None
         self._cached_token_lens[:num_seqs].copy_(
             target._cached_token_lens[:num_seqs], non_blocking=True)
 
@@ -1053,6 +1095,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         runtime_lens = self._draft_kv_runtime_lens[:num_seqs]
         self._cached_token_lens[:num_seqs].copy_(runtime_lens)
         self._paged_kv_last_page_len[:num_seqs].copy_(runtime_lens)
+        self._host_paged_kv_last_page_len = None
         self._paged_kv_last_page_len[:num_seqs].sub_(1)
         torch.remainder(self._paged_kv_last_page_len[:num_seqs],
                         self.page_size,
@@ -1171,8 +1214,35 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._host_pool_indices: Dict[int, torch.Tensor] = {}
         self._host_paged_kv_indices: Optional[torch.Tensor] = None
         self._host_paged_kv_indptr_decode: Optional[torch.Tensor] = None
+        # Host copy of _paged_kv_last_page_len for the prepare() that built it;
+        # None whenever the device buffer is rewritten from other sources.
+        self._host_paged_kv_last_page_len: Optional[torch.Tensor] = None
         self._uses_full_generation_page_table = False
         self._max_num_blocks_per_seq = 0
+
+        # Decode rows can only share KV pages through block reuse, and the
+        # shared level only pays off for enough rows.
+        self._cascade_enabled = (self.kv_cache_manager is not None
+                                 and getattr(self.kv_cache_manager,
+                                             "enable_block_reuse", False)
+                                 and self.max_num_requests >= _CASCADE_MIN_ROWS)
+        self._cascade_layout: Optional[_CascadeLayout] = None
+        if self._cascade_enabled:
+            # CUDA-graph plan buffers of the cascade wrapper, per level:
+            # qo_indptr, kv indptr and last page length (indices below).
+            rows = self.max_num_requests
+            self._cascade_qo_indptr = [
+                torch.zeros(2, dtype=torch.int, device='cuda'),
+                torch.zeros(rows + 1, dtype=torch.int, device='cuda')
+            ]
+            self._cascade_kv_indptr = [
+                torch.zeros(2, dtype=torch.int, device='cuda'),
+                torch.zeros(rows + 1, dtype=torch.int, device='cuda')
+            ]
+            self._cascade_last_page_len = [
+                torch.zeros(1, dtype=torch.int, device='cuda'),
+                torch.zeros(rows, dtype=torch.int, device='cuda')
+            ]
 
         # VSWA (Variable Sliding Window Attention): models with per-layer
         # max_attention_window create separate V2 pool groups with independent
@@ -1203,6 +1273,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 capture_graph=capture_graph,
             )
             self._max_num_blocks_per_seq = self.kv_cache_manager.max_blocks_per_seq
+            if self._cascade_enabled:
+                self._cascade_own_indices = torch.zeros(max_num_blocks,
+                                                        dtype=torch.int,
+                                                        device='cuda')
+                self._cascade_shared_indices = torch.zeros(
+                    max(1, self._max_num_blocks_per_seq),
+                    dtype=torch.int,
+                    device='cuda')
 
             # Layers may share one page-index list only when they are in the
             # same pool AND have the same page-index scale: VSWA splits pools,
@@ -1585,6 +1663,75 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         wrappers.decode_block_table_active_width = max_n
         return block_tables[:num_gens]
 
+    def _prepare_cascade_decode(self) -> None:
+        """Split each decode row's pages into the run the batch shares and its own tail.
+
+        The shared run is the longest page prefix common to every decode row
+        except CUDA-graph padding rows, whose outputs are discarded. It is used
+        when at least _CASCADE_MIN_ROWS rows share at least
+        _CASCADE_MIN_SHARED_PAGES pages; otherwise shared_pages is 0 and every
+        row keeps all its pages on level 1.
+        """
+        from ...pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        self._cascade_layout = None
+        num_gens = self.num_generations
+        if (num_gens == 0 or self._vswa_layer_to_pool is not None
+                or self._uses_full_generation_page_table
+                or self._is_shared_kv_draft_view
+                or self._is_separate_kv_draft_view
+                or self._host_paged_kv_indices is None):
+            return
+        pages = self._host_paged_kv_indices.numpy()
+        gen_blocks = np.asarray(self.num_blocks[self.num_contexts:],
+                                dtype=np.int64)
+        starts = self.num_context_blocks + np.concatenate(
+            ([0], np.cumsum(gen_blocks)[:-1]))
+        real = np.asarray([
+            rid != CUDA_GRAPH_DUMMY_REQUEST_ID
+            for rid in self.request_ids[self.num_contexts:self.num_contexts +
+                                        num_gens]
+        ])
+        rows = np.flatnonzero(real)
+        shared = 0
+        if len(rows) >= _CASCADE_MIN_ROWS:
+            # Every row keeps at least its last, partially filled, page.
+            shared = int(gen_blocks[rows].min()) - 1
+            block = pages[starts[rows][:, None] + np.arange(shared)]
+            same = (block == block[0]).all(axis=0)
+            if not same.all():
+                shared = int(np.argmin(same))
+            if shared < _CASCADE_MIN_SHARED_PAGES:
+                shared = 0
+        skip = np.where(real, shared, 0)
+        own = gen_blocks - skip
+        own_indptr = np.concatenate(([0], np.cumsum(own)))
+        num_own = int(own_indptr[-1])
+        own_ids = pages[np.repeat(starts + skip, own) + np.arange(num_own) -
+                        np.repeat(own_indptr[:-1], own)]
+
+        def pinned_int32(arr: np.ndarray) -> torch.Tensor:
+            return maybe_pin_memory(
+                torch.from_numpy(arr.astype(np.int32, copy=False)))
+
+        self._cascade_own_indices[:num_own].copy_(pinned_int32(own_ids),
+                                                  non_blocking=True)
+        if shared:
+            shared_ids = pages[starts[rows[0]]:starts[rows[0]] + shared]
+            self._cascade_shared_indices[:shared].copy_(
+                pinned_int32(shared_ids), non_blocking=True)
+        self._cascade_layout = _CascadeLayout(
+            shared_pages=shared,
+            own_indptr=pinned_int32(own_indptr),
+            num_own_pages=num_own,
+            key=(shared, real.tobytes()))
+
+    def _fa2_decode_plan_key(self) -> tuple:
+        """Everything a captured FA2 decode plan depends on for this batch."""
+        key = tuple(self.num_blocks[self.num_contexts:])
+        if self._cascade_layout is not None:
+            key += self._cascade_layout.key
+        return key
+
     def _clean_cached_plans(self, *, defer_plan: bool):
         for plan_params in list(self._plan_params_to_wrappers.keys()):
             # Generally, plan_params with non-trivial attention masking are relevant only the
@@ -1603,6 +1750,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     def _refresh_fa2_cuda_graph_plans(self) -> None:
         """Refresh captured FA2 schedules after page metadata is finalized."""
         num_blocks = tuple(self.num_blocks[self.num_contexts:])
+        plan_key = self._fa2_decode_plan_key()
         for plan_params, wrappers in self._plan_params_to_wrappers.items():
             if (plan_params.attention_mask_data is not None
                     or plan_params.multi_item_params is not None
@@ -1610,7 +1758,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 continue
             if not num_blocks:
                 wrappers.fa2_plan_num_blocks = None
-            elif wrappers.fa2_plan_num_blocks != num_blocks:
+            elif wrappers.fa2_plan_num_blocks != plan_key:
                 # Graph replay does not re-enter forward_impl. Each wrapper
                 # owns its persistent integer plan workspace, while the shared
                 # float workspace is run scratch.
@@ -1784,6 +1932,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                   self.page_size)
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
             paged_kv_last_page_len, non_blocking=True)
+        self._host_paged_kv_last_page_len = paged_kv_last_page_len
 
         # Ragged page table, see https://docs.flashinfer.ai/tutorials/kv_layout.html#page-table-layout
         # For decoding, this MUST be allocated ahead of time (for CUDA graphs).
@@ -1897,6 +2046,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         self._debug_validate_page_table(kv_lens_host, logical_num_blocks,
                                         num_blocks)
+
+        if self._cascade_enabled:
+            self._prepare_cascade_decode()
 
         # CUDA graph + trtllm-gen: update _block_tables and _kv_lens_buffer
         # so the trtllm-gen decode kernel uses current page indices.
@@ -2265,6 +2417,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 )
         decode_wrapper = wrappers.decode_wrapper
 
+        # A CUDA-graph decode re-plan reads only host page metadata, and the
+        # device buffers it writes are ordered on this stream behind the
+        # in-flight replay, so it does not need to drain the stream. Its
+        # last_page_len comes from prepare()'s host copy, which keeps
+        # FlashInfer's plan() free of a blocking D2H read.
+        host_last_page_len = self._host_paged_kv_last_page_len
+        sync_free_decode_plan = (self.is_cuda_graph and self.num_contexts == 0
+                                 and host_last_page_len is not None
+                                 and decode_wrapper._backend != "trtllm-gen")
+
         def decode_plan():
             assert decode_wrapper is not None
             if (self._uses_full_generation_page_table
@@ -2284,10 +2446,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if decode_wrapper._backend == 'trtllm-gen':
                 block_tables = self._build_decode_block_tables(
                     plan_params, wrappers)
+            if sync_free_decode_plan:
+                last_page_len = host_last_page_len[:self.num_generations]
+            else:
+                last_page_len = self.paged_kv_last_page_len[self.num_contexts:]
             decode_wrapper.plan(
                 paged_kv_indptr[:self.num_generations + 1],
                 self.paged_kv_indices[self.num_context_blocks:],
-                self.paged_kv_last_page_len[self.num_contexts:],
+                last_page_len,
                 plan_params.num_heads,
                 plan_params.num_kv_heads,
                 plan_params.head_dim,
@@ -2308,18 +2474,97 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # generation page counts change. trtllm-gen is excluded because it
             # does its own per-step block-table/kv_lens refresh in prepare().
             if self.is_cuda_graph and decode_wrapper._backend != 'trtllm-gen':
-                wrappers.fa2_plan_num_blocks = tuple(
-                    self.num_blocks[self.num_contexts:])
+                wrappers.fa2_plan_num_blocks = self._fa2_decode_plan_key()
             self._publish_decode_wrapper_kv_lens(decode_wrapper)
 
-        # Must sync after append_paged_kv_cache and before plan.
-        torch.cuda.current_stream().synchronize()
+        # A captured graph keeps the cascade kernels for every batch; eager
+        # steps fall back to plain decode when nothing qualifies as shared.
+        use_cascade = (self._cascade_layout is not None
+                       and (self.is_cuda_graph
+                            or self._cascade_layout.shared_pages > 0)
+                       and plan_params.attention_mask_data is None
+                       and plan_params.q_len_per_req == 1
+                       and (plan_params.window_left is None
+                            or plan_params.window_left < 0) and o_dtype is None
+                       and decode_wrapper._backend != "trtllm-gen")
+
+        def cascade_decode_plan():
+            layout = self._cascade_layout
+            if wrappers.cascade_wrapper is None:
+                wrappers.cascade_wrapper = \
+                    flashinfer.MultiLevelCascadeAttentionWrapper(
+                        2,
+                        self.workspace_buffer,
+                        self.kv_layout,
+                        use_cuda_graph=self.is_cuda_graph,
+                        qo_indptr_buf_arr=self._cascade_qo_indptr,
+                        paged_kv_indptr_buf_arr=self._cascade_kv_indptr,
+                        paged_kv_indices_buf_arr=[
+                            self._cascade_shared_indices,
+                            self._cascade_own_indices
+                        ],
+                        paged_kv_last_page_len_buf_arr=self.
+                        _cascade_last_page_len)
+            num_contexts, num_gens = self.num_contexts, self.num_generations
+            if host_last_page_len is not None:
+                last_page_len = host_last_page_len[num_contexts:num_contexts +
+                                                   num_gens]
+            else:
+                last_page_len = self.paged_kv_last_page_len[num_contexts:]
+            shared = layout.shared_pages
+            # Level 0: all decode queries form one query block over the shared
+            # pages (none when the batch does not qualify). Level 1: each
+            # query over its own pages.
+            wrappers.cascade_wrapper.plan(
+                [
+                    torch.tensor([0, num_gens], dtype=torch.int32),
+                    torch.arange(num_gens + 1, dtype=torch.int32)
+                ],
+                [
+                    torch.tensor([0, shared], dtype=torch.int32),
+                    layout.own_indptr
+                ],
+                [
+                    self._cascade_shared_indices[:shared],
+                    self._cascade_own_indices[:layout.num_own_pages]
+                ],
+                [
+                    torch.tensor([self.page_size if shared else 0],
+                                 dtype=torch.int32), last_page_len
+                ],
+                plan_params.num_heads,
+                plan_params.num_kv_heads,
+                plan_params.head_dim,
+                self.page_size,
+                sm_scale=plan_params.sm_scale,
+                q_data_type=plan_params.q_dtype,
+                kv_data_type=plan_params.kv_dtype,
+            )
+            if self.is_cuda_graph:
+                wrappers.fa2_plan_num_blocks = self._fa2_decode_plan_key()
+
+        if sync_free_decode_plan:
+            # Only the pinned staging buffer of this wrapper's previous plan
+            # can still be in use, by that plan's pending H2D copy.
+            if wrappers.decode_plan_event is not None:
+                wrappers.decode_plan_event.synchronize()
+        else:
+            # Must sync after append_paged_kv_cache and before plan.
+            torch.cuda.current_stream().synchronize()
 
         if self.num_contexts > 0:
             prefill_plan()
 
         if self.num_generations > 0:
-            decode_plan()
+            wrappers.cascade_active = use_cascade
+            if use_cascade:
+                cascade_decode_plan()
+            else:
+                decode_plan()
+            if self.is_cuda_graph:
+                if wrappers.decode_plan_event is None:
+                    wrappers.decode_plan_event = torch.cuda.Event()
+                wrappers.decode_plan_event.record()
 
         wrappers.is_planned = True
 
@@ -2756,6 +3001,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                         out=out.view(-1, self.num_heads, self.head_dim))
 
         def decode_forward(plan_params: PlanParams, out: torch.Tensor):
+            cascade = metadata.get_cascade_decode_wrapper(plan_params)
+            if cascade is not None:
+                out.view(-1, self.num_heads, self.head_dim).copy_(
+                    cascade.run(q[num_ctx_tokens:], kv_cache))
+                return
             wrapper = metadata.get_decode_wrapper(plan_params)
             wrapper.run(q[num_ctx_tokens:],
                         kv_cache,

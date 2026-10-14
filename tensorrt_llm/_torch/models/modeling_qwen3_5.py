@@ -552,10 +552,14 @@ def _normalize_qwen35_quant_config_dict(
     scales -- provided the checkpoint uses 16-element scale blocks. 32-element
     dense weight-only exports (``group_size=32``) stay on the W4A16
     dequantization path because the W4A4 GEMMs cannot consume them. MoE expert
-    entries with 32-element blocks are rejected before promotion. Dense MLP keys are
-    additionally re-pathed to the doubled ``.mlp.mlp.`` form to match the
-    ``_DenseMlpAdapter`` runtime module tree. Other W4A16_NVFP4 modules retain
-    their original algorithm.
+    entries with 32-element blocks are rejected before promotion. On SM120 the
+    routed experts are promoted as well (CuteDSL b12x NVFP4 MoE); dense MLP and
+    lm_head stay W4A16_NVFP4 there. The shared expert's projections
+    (``.mlp.shared_expert.{gate,up,down}_proj``) follow the routed experts:
+    promoted to NVFP4 wherever those are, for 16-element scale blocks. Dense
+    MLP keys are additionally re-pathed to the doubled ``.mlp.mlp.`` form to
+    match the ``_DenseMlpAdapter`` runtime module tree. Other W4A16_NVFP4
+    modules retain their original algorithm.
 
     Mutates ``quant_config_dict`` in place (model_config is frozen).
 
@@ -579,7 +583,10 @@ def _normalize_qwen35_quant_config_dict(
         return
 
     n_hidden_layers = getattr(model_config.pretrained_config, "num_hidden_layers", None)
-    convert_to_nvfp4 = get_sm_version() in (100, 103)
+    sm_version = get_sm_version()
+    convert_to_nvfp4 = sm_version in (100, 103)
+    # Routed experts also run W4A4 on SM120, through the CuteDSL b12x NVFP4 path.
+    convert_experts_to_nvfp4 = sm_version in (100, 103, 120)
 
     normalized = {}
     in_proj_fp8 = {}
@@ -626,10 +633,19 @@ def _normalize_qwen35_quant_config_dict(
         if name.endswith(".mlp.experts"):
             ModelConfig._validate_nvfp4_group_size(cfg, name)
         if (
-            convert_to_nvfp4
+            convert_experts_to_nvfp4
             and name.endswith(".mlp.experts")
             and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
         ):
+            cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+        elif (
+            convert_experts_to_nvfp4
+            and re.search(r"\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)$", name)
+            and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+            and _has_nvfp4_gemm_block_width(cfg)
+        ):
+            # The checkpoint ships the shared expert's calibrated input scales,
+            # so it runs W4A4 next to the routed experts.
             cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
         else:
             # Dense MLP (gate_proj/up_proj/down_proj directly under ``.mlp``) is
