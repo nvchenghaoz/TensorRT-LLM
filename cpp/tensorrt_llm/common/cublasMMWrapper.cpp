@@ -493,12 +493,14 @@ bool CublasMMWrapper::checkTactic(cublasOperation_t transa, cublasOperation_t tr
 }
 
 std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasOperation_t transa,
-    cublasOperation_t transb, int const m, int const n, int const k, int const lda, int const ldb, int const ldc)
+    cublasOperation_t transb, int const m, int const n, int const k, int const lda, int const ldb, int const ldc,
+    uint64_t maxWorkspaceBytes)
 {
     TLLM_CHECK_WITH_INFO(
         descriptorsCreated(), "Descriptors are not created! Call createDescriptors before calling this function");
 
-    auto const heuristics = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, mCDesc);
+    auto const heuristics
+        = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, mCDesc, maxWorkspaceBytes);
 
     sync_check_cuda_error(mStream);
 
@@ -507,7 +509,7 @@ std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasO
 
 std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasLtHandle_t lightHandle,
     cublasLtMatmulDesc_t computeDesc, cublasLtMatrixLayout_t Adesc, cublasLtMatrixLayout_t Bdesc,
-    cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc)
+    cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc, uint64_t maxWorkspaceBytes)
 {
 #if TLLM_CUBLAS_VER_LE(11, 4, 2)
     TLLM_CHECK_WITH_INFO(false, "CUBLAS version too low, must be > 11.4.2.");
@@ -517,9 +519,8 @@ std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasL
     cublasLtMatmulPreference_t preference;
     check_cuda_error(cublasLtMatmulPreferenceCreate(&preference));
     check_cuda_error(cublasLtMatmulPreferenceInit(preference));
-    uint64_t workspace_size = CUBLAS_WORKSPACE_SIZE;
     check_cuda_error(cublasLtMatmulPreferenceSetAttribute(
-        preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)));
+        preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &maxWorkspaceBytes, sizeof(maxWorkspaceBytes)));
     // Restrict reduction algorithms for numerical stability and better determinism
     uint32_t reduction_mask = CUBLASLT_REDUCTION_SCHEME_MASK;
     check_cuda_error(cublasLtMatmulPreferenceSetAttribute(

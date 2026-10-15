@@ -274,6 +274,7 @@ def _register_fake():
         out_dtype,
         output_buffer_kind: int = 0,
         group: Optional[List[int]] = None,
+        tactic: int = -1,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]

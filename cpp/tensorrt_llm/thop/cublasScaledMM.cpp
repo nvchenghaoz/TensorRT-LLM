@@ -22,8 +22,12 @@
 #include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
+#include <algorithm>
+#include <cstring>
 #include <cublasLt.h>
+#include <map>
 #include <torch/extension.h>
+#include <tuple>
 #include <unordered_map>
 
 using torch::Tensor;
@@ -184,9 +188,58 @@ inline at::Tensor const& getWorkspaceTensor(c10::Device device, cudaStream_t str
     return workspace_tensors[key];
 }
 
+std::shared_ptr<CublasMMWrapper> const& getCublasWrapper()
+{
+    thread_local std::shared_ptr<CublasMMWrapper> cublasWrapper;
+    if (cublasWrapper == nullptr)
+    {
+        auto cublasHandle = getCublasHandle();
+        auto cublasLtHandle = getCublasLtHandle();
+        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    }
+    return cublasWrapper;
+}
+
+// cuBLASLt algorithms an FP8 GEMM can be tuned over: the heuristic results for the full workspace, then those that
+// only a 1 MiB workspace query returns (at small M that query prefers small-tile kernels the larger one skips).
+// M is rounded down to a power of two, the bucket the AutoTuner profiles, so a tactic index names the same
+// algorithm when tuning and when running. Expects the wrapper's GEMM config and scale pointers to be set.
+std::vector<cublasLtMatmulAlgo_t> const& getFp8Tactics(CublasMMWrapper& cublasWrapper, int32_t m, int32_t n, int32_t k,
+    cudaDataType_t outType, bool fast_acc, void* a_scale, void* b_scale)
+{
+    int32_t const mBucket = m > 0 ? 1 << (31 - __builtin_clz(m)) : 1;
+    using Key = std::tuple<int, int32_t, int32_t, int32_t, int, bool>;
+    thread_local std::map<Key, std::vector<cublasLtMatmulAlgo_t>> cache;
+    int device = 0;
+    check_cuda_error(cudaGetDevice(&device));
+    auto const key = std::make_tuple(device, mBucket, n, k, static_cast<int>(outType), fast_acc);
+    if (auto it = cache.find(key); it != cache.end())
+    {
+        return it->second;
+    }
+    std::vector<cublasLtMatmulAlgo_t> algos;
+    cublasWrapper.createDescriptors(
+        CUBLAS_OP_T, CUBLAS_OP_N, n, mBucket, k, /*lda=*/k, /*ldb=*/k, /*ldc=*/n, /*fastAcc=*/fast_acc);
+    cublasWrapper.setScaleDescriptors(a_scale, b_scale);
+    for (uint64_t maxWorkspace : {static_cast<uint64_t>(CUBLAS_WORKSPACE_SIZE), uint64_t{1} << 20})
+    {
+        for (auto const& h : cublasWrapper.getTactics(CUBLAS_OP_T, CUBLAS_OP_N, n, mBucket, k, k, k, n, maxWorkspace))
+        {
+            bool const known = std::any_of(algos.begin(), algos.end(),
+                [&](cublasLtMatmulAlgo_t const& a) { return std::memcmp(&a, &h.algo, sizeof(a)) == 0; });
+            if (h.state == CUBLAS_STATUS_SUCCESS && h.workspaceSize <= CUBLAS_WORKSPACE_SIZE && !known)
+            {
+                algos.push_back(h.algo);
+            }
+        }
+    }
+    cublasWrapper.destroyDescriptors();
+    return cache.emplace(key, std::move(algos)).first->second;
+}
+
 void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     std::optional<at::Tensor> const& scale_a, std::optional<at::Tensor> const& scale_b,
-    std::optional<at::Tensor> const& bias, bool fast_acc = false)
+    std::optional<at::Tensor> const& bias, bool fast_acc = false, int64_t tactic = -1)
 {
     bool use_scale = false;
     if (scale_a.has_value() && scale_b.has_value())
@@ -198,13 +251,7 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     int32_t n = b.sizes()[1];
     int32_t k = a.sizes()[1];
 
-    thread_local std::shared_ptr<CublasMMWrapper> cublasWrapper;
-    if (cublasWrapper == nullptr)
-    {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
-    }
+    auto const& cublasWrapper = getCublasWrapper();
 
     cudaDataType_t aType = convert_torch_dtype(a.scalar_type());
     cudaDataType_t bType = convert_torch_dtype(b.scalar_type());
@@ -240,15 +287,27 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     cublasWrapper->setStream(stream);
     cublasWrapper->setWorkspace(ws_ptr);
 
-    // set algo according to m/n/k
+    // set algo according to m/n/k, or to the requested tactic
     cublasLtMatmulAlgo_t algo;
+    bool has_algo = false;
+    if (tactic >= 0)
+    {
+        auto const& tactics = getFp8Tactics(*cublasWrapper, m, n, k, outType, fast_acc, a_scale, b_scale);
+        TORCH_CHECK(tactic < static_cast<int64_t>(tactics.size()), "tactic ", tactic, " out of range: ", tactics.size(),
+            " cuBLASLt algorithms for m=", m, " n=", n, " k=", k);
+        algo = tactics[tactic];
+        has_algo = true;
+    }
+    else
+    {
 #if CUDART_VERSION < 12080
-    // nvjet is not supported
-    bool has_algo
-        = find_special_algo_deprecated(algo, cublasWrapper, m, n, k, compType, scaleType, aType, bType, outType);
+        // nvjet is not supported
+        has_algo
+            = find_special_algo_deprecated(algo, cublasWrapper, m, n, k, compType, scaleType, aType, bType, outType);
 #else
-    bool has_algo = find_special_algo(algo, cublasWrapper, m, n, k, compType, scaleType, aType, bType, outType);
+        has_algo = find_special_algo(algo, cublasWrapper, m, n, k, compType, scaleType, aType, bType, outType);
 #endif
+    }
 
     // swap A and B. A is column major, B is row major.
     cublasWrapper->createDescriptors(
@@ -265,7 +324,7 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
 } // namespace
 
 Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    std::optional<at::Tensor> const& bias, Tensor& out)
+    std::optional<at::Tensor> const& bias, Tensor& out, int64_t tactic = -1)
 {
     // Check device
     CHECK_TH_CUDA(mat_a);
@@ -289,13 +348,13 @@ Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor co
     TORCH_CHECK(mat_a.dtype() == torch::kFloat8_e4m3fn);
     TORCH_CHECK(mat_b.dtype() == torch::kFloat8_e4m3fn);
 
-    cublas_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, bias, true);
+    cublas_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, bias, true, tactic);
     return out;
 }
 
 Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
     std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind = 0,
-    c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    c10::optional<torch::List<int64_t>> group = c10::nullopt, int64_t tactic = -1)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
@@ -305,7 +364,20 @@ Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& 
     auto [out, _] = torch_ext::allocate_output(
         output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
-    return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out);
+    return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out, tactic);
+}
+
+// Number of tactics cublas_scaled_mm accepts for this shape and output dtype.
+int64_t cublas_scaled_mm_num_tactics(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a,
+    Tensor const& scale_b, std::optional<c10::ScalarType> out_dtype)
+{
+    auto const& cublasWrapper = getCublasWrapper();
+    cudaDataType_t const outType = convert_torch_dtype(out_dtype.value_or(mat_a.scalar_type()));
+    cublasWrapper->setGemmConfig(convert_torch_dtype(mat_a.scalar_type()), convert_torch_dtype(mat_b.scalar_type()),
+        outType, /*computeType=*/CUDA_R_32F);
+    return static_cast<int64_t>(getFp8Tactics(*cublasWrapper, mat_a.sizes()[0], mat_b.sizes()[1], mat_a.sizes()[1],
+        outType, /*fast_acc=*/true, scale_a.data_ptr(), scale_b.data_ptr())
+                                    .size());
 }
 
 Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias, Tensor& out)
@@ -348,8 +420,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
-        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None)"
+        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None, int tactic=-1)"
         " -> (Tensor out)");
+    m.def(
+        "cublas_scaled_mm_num_tactics(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b,"
+        " ScalarType? out_dtype) -> int");
     m.def(
         "cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype,"
         " int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
@@ -358,5 +433,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("cublas_scaled_mm", &tensorrt_llm::torch_ext::cublas_scaled_mm);
+    m.impl("cublas_scaled_mm_num_tactics", &tensorrt_llm::torch_ext::cublas_scaled_mm_num_tactics);
     m.impl("cublas_mm", &tensorrt_llm::torch_ext::cublas_mm);
 }

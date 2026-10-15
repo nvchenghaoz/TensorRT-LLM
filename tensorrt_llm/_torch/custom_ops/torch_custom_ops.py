@@ -973,13 +973,12 @@ class CublasLtFP4GemmRunner(TunableRunner):
 
 
 class FP8PerTensorGemmRunner(TunableRunner):
-    """FP8 per-tensor-scaled GEMM on cuBLASLt through TRT-LLM's ``cublas_scaled_mm`` or ``torch._scaled_mm``.
+    """FP8 per-tensor-scaled GEMM (``trtllm::cublas_scaled_mm``) tuned over cuBLASLt's algorithms.
 
-    The two pick different cuBLASLt kernels: TRT-LLM lets cuBLASLt choose for a 32 MiB workspace, which favors
-    split-K and wide tiles; PyTorch queries the heuristic for a smaller workspace and gets narrow-tile kernels
-    that are faster at small M. The AutoTuner keeps the faster one per M bucket.
+    Tactic -1 lets cuBLASLt pick for its full workspace (the untuned behavior); tactics 0..n-1 index the
+    candidates ``cublas_scaled_mm_num_tactics`` reports, which add the narrow-tile kernels a small-workspace
+    heuristic query returns and that are faster at small M.
     """
-    TRTLLM_CUBLAS, TORCH_SCALED_MM = 0, 1
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, get_last_power_of_2_num_tokens_buckets,
         last_positive_power_of_2), ),
@@ -998,26 +997,25 @@ class FP8PerTensorGemmRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
-        if self.output_buffer_kind != int(BufferKind.DEFAULT):
-            # torch._scaled_mm cannot write into a special output buffer.
-            return [self.TRTLLM_CUBLAS]
-        return [self.TRTLLM_CUBLAS, self.TORCH_SCALED_MM]
+        mat_a, mat_b, scale_a, scale_b = inputs
+        return list(
+            range(
+                torch.ops.trtllm.cublas_scaled_mm_num_tactics(
+                    mat_a, mat_b, scale_a, scale_b, self.output_dtype)))
 
     def forward(self,
                 inputs: List[torch.Tensor],
                 tactic: int = -1) -> torch.Tensor:
         mat_a, mat_b, scale_a, scale_b = inputs
-        if tactic == self.TORCH_SCALED_MM:
-            return torch._scaled_mm(mat_a,
-                                    mat_b,
-                                    scale_a=scale_a,
-                                    scale_b=scale_b,
-                                    out_dtype=self.output_dtype,
-                                    use_fast_accum=True)
-        return torch.ops.trtllm.cublas_scaled_mm(mat_a, mat_b, scale_a, scale_b,
-                                                 None, self.output_dtype,
+        return torch.ops.trtllm.cublas_scaled_mm(mat_a,
+                                                 mat_b,
+                                                 scale_a,
+                                                 scale_b,
+                                                 None,
+                                                 self.output_dtype,
                                                  self.output_buffer_kind,
-                                                 self.group)
+                                                 self.group,
+                                                 tactic=tactic)
 
 
 @torch.library.custom_op("trtllm::fp8_per_tensor_scaled_mm", mutates_args=())

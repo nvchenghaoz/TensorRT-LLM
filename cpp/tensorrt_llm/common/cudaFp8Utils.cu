@@ -59,6 +59,9 @@ __global__ void scaleMatrixPerTensorVec(
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+    // Dependents synchronize on this grid's completion before reading its output,
+    // so they may launch now and overlap their prologue with this kernel.
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
     float const s = static_cast<float>(input_scale[0]);
@@ -95,10 +98,6 @@ __global__ void scaleMatrixPerTensorVec(
     {
         output[i] = __nv_fp8_e4m3(static_cast<float>(input[i]) * factor);
     }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 template <QuantizeMode QUANTIZE_MODE, bool QUANTIZE, typename T_OUT, typename T_S, typename T_IN>
