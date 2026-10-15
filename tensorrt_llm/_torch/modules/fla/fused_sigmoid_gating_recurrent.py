@@ -215,9 +215,7 @@ def _can_use_flashinfer_gdn_decode(
         return False
     if not _FLASHINFER_GDN_BF16_STATE_AVAILABLE:
         return False
-    # FlashInfer's GDN decode kernel is built for Hopper (SM90) and datacenter
-    # Blackwell (SM100/SM103) only; on consumer Blackwell (SM120) and other archs
-    # it aborts at launch -> fall back to the Triton fused-recurrent kernel.
+    # Other archs fall back to the Triton fused-recurrent kernel.
     if not is_flashinfer_gdn_decode_supported_arch():
         return False
     if initial_state_source is None:
@@ -503,7 +501,9 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_v = v.stride(1)
     stride_a = a.stride(-2)
     stride_b = b.stride(-2)
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    # A [BK, 16] state tile per single-warp program keeps register use low and
+    # gives twice the programs of a 32-wide tile; results are identical.
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 16)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3

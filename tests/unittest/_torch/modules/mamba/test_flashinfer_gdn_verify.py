@@ -34,7 +34,7 @@ def _fi_mtp_available() -> bool:
 
 skip_unsupported = pytest.mark.skipif(
     not _fi_mtp_available(),
-    reason="Requires SM90/SM100/SM103 and a FlashInfer build with "
+    reason="Requires SM90/SM100/SM103/SM120 and a FlashInfer build with "
     "gdn_decode_bf16_state.gated_delta_rule_mtp",
 )
 

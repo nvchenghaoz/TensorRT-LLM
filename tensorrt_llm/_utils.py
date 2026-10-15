@@ -760,13 +760,13 @@ def is_flashinfer_gdn_prefill_supported_arch(sm_version=None):
 
 @lru_cache(maxsize=1)
 def is_flashinfer_gdn_decode_supported_arch(sm_version=None):
-    """Whether FlashInfer ships the GDN bf16-state decode / MTP-verify kernels.
+    """Whether FlashInfer's GDN bf16-state decode / MTP-verify kernels run here.
 
-    These are built only for Hopper (SM90) and datacenter Blackwell (SM100/SM103).
+    Validated on Hopper (SM90), datacenter Blackwell (SM100/SM103) and SM120.
     """
     if sm_version is None:
         sm_version = get_sm_version()
-    return sm_version in (90, 100, 103)
+    return sm_version in (90, 100, 103, 120)
 
 
 def print_all_stacks():

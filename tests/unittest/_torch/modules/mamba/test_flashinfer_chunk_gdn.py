@@ -55,15 +55,15 @@ def test_is_flashinfer_gdn_prefill_supported_arch(sm_version, expected):
         (90, True),  # Hopper
         (100, True),  # datacenter Blackwell (B200)
         (103, True),  # datacenter Blackwell (B300/GB200)
-        (120, False),  # consumer Blackwell: prefill kernel exists, decode does not
-        (121, False),  # consumer Blackwell: prefill kernel exists, decode does not
+        (120, True),  # RTX PRO 6000 Blackwell
+        (121, False),  # GB10 / DGX Spark: not validated
         (89, False),  # Ada
         (80, False),  # Ampere
     ],
 )
 def test_is_flashinfer_gdn_decode_supported_arch(sm_version, expected):
-    """The bf16-state decode / MTP-verify kernels are SM90/SM100/SM103 only --
-    narrower than the prefill set, which also covers SM120/SM121. Pure predicate,
+    """The bf16-state decode / MTP-verify kernels run on SM90/SM100/SM103/SM120 --
+    narrower than the prefill set, which also covers SM121. Pure predicate,
     no GPU required."""
     from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 

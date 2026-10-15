@@ -32,7 +32,7 @@ def _fi_decode_available() -> bool:
 
 SKIP_UNSUPPORTED = pytest.mark.skipif(
     not _fi_decode_available(),
-    reason="Requires SM90/SM100/SM103 and a FlashInfer build with "
+    reason="Requires SM90/SM100/SM103/SM120 and a FlashInfer build with "
     "gdn_decode_bf16_state.gated_delta_rule",
 )
 
