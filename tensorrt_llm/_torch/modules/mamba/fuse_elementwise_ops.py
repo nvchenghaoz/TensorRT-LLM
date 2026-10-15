@@ -17,6 +17,7 @@
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
 
 @triton.jit
@@ -660,3 +661,254 @@ def ssd_output_transpose(
         BLOCK_HD=BLOCK_HD,
         num_warps=NUM_WARPS,
     )
+
+
+@triton.jit
+def _row_sequences(rows, cu_seqlens_ptr, num_seqs, SEARCH_STEPS: tl.constexpr):
+    """Largest s in [0, num_seqs) with cu_seqlens[s] <= row (binary search)."""
+    lo = tl.zeros_like(rows)
+    hi = tl.zeros_like(rows) + num_seqs
+    for _ in tl.static_range(SEARCH_STEPS):
+        mid = (lo + hi + 1) // 2
+        start_mid = tl.load(cu_seqlens_ptr + mid, mask=mid <= num_seqs, other=2147483647)
+        go = start_mid <= rows
+        lo = tl.where(go, mid, lo)
+        hi = tl.where(go, hi, mid - 1)
+    return tl.minimum(lo, num_seqs - 1)
+
+
+@triton.jit
+def _fused_gdn_conv_post_conv_kernel(
+    x_ptr,  # [T, conv_dim] token-major, unit channel stride
+    x_stride_t,
+    w_ptr,  # [conv_dim, WIDTH] contiguous
+    bias_ptr,
+    conv_state_ptr,  # [slots, conv_dim, WIDTH - 1]
+    cs_stride_slot,
+    cs_stride_c,
+    cs_stride_w,
+    cu_seqlens_ptr,
+    cache_idx_ptr,
+    has_init_ptr,
+    num_seqs,
+    a_ptr,
+    a_stride_t,
+    b_ptr,
+    b_stride_t,
+    A_log_ptr,
+    dt_bias_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    g_ptr,
+    beta_ptr,
+    num_tokens,
+    l2_norm_eps,
+    softplus_threshold,
+    NUM_K_HEADS: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    WIDTH: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+):
+    tok_block = tl.program_id(0)
+    head = tl.program_id(
+        1
+    )  # Q heads, then K heads, then V heads: channel block `head` of [Q | K | V]
+    rows = tok_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    row_ok = rows < num_tokens
+    cols = tl.arange(0, HEAD_DIM)
+    chan = head * HEAD_DIM + cols
+
+    seq = _row_sequences(rows, cu_seqlens_ptr, num_seqs, SEARCH_STEPS)
+    pos = rows - tl.load(cu_seqlens_ptr + seq)
+    slot = tl.load(cache_idx_ptr + seq).to(tl.int64)
+    has_init = tl.load(has_init_ptr + seq)
+
+    rows64 = rows.to(tl.int64)
+    state_base = (
+        conv_state_ptr + slot[:, None] * cs_stride_slot + chan[None, :].to(tl.int64) * cs_stride_c
+    )
+    acc = tl.zeros([BLOCK_T, HEAD_DIM], dtype=tl.float32)
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + chan).to(tl.float32)[None, :]
+    # Tap w reads position pos - (WIDTH - 1 - w); before the sequence start it reads old state column
+    # WIDTH - 1 + p (zero without an initial state).
+    for w in tl.static_range(WIDTH):
+        p = pos - (WIDTH - 1 - w)
+        in_seq = p >= 0
+        xv = tl.load(
+            x_ptr + (rows64 - (WIDTH - 1 - w))[:, None] * x_stride_t + chan[None, :],
+            mask=(row_ok & in_seq)[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        sv = tl.load(
+            state_base + (WIDTH - 1 + p)[:, None].to(tl.int64) * cs_stride_w,
+            mask=(row_ok & ~in_seq & has_init)[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        wt = tl.load(w_ptr + chan * WIDTH + w).to(tl.float32)
+        acc = tl.fma(wt[None, :], tl.where(in_seq[:, None], xv, sv), acc)
+    acc = acc * tldevice.rcp_rn(1.0 + tl.exp(-acc))
+    y = acc.to(v_ptr.dtype.element_ty).to(tl.float32)
+
+    if head < 2 * NUM_K_HEADS:
+        y = y * (1.0 / tl.sqrt(tl.sum(y * y, axis=1) + l2_norm_eps))[:, None]
+        offs = (
+            rows64[:, None] * (NUM_K_HEADS * HEAD_DIM)
+            + (head % NUM_K_HEADS) * HEAD_DIM
+            + cols[None, :]
+        )
+        if head < NUM_K_HEADS:
+            tl.store(q_ptr + offs, y.to(q_ptr.dtype.element_ty), mask=row_ok[:, None])
+        else:
+            tl.store(k_ptr + offs, y.to(k_ptr.dtype.element_ty), mask=row_ok[:, None])
+    else:
+        hv = head - 2 * NUM_K_HEADS
+        offs = rows64[:, None] * (NUM_V_HEADS * HEAD_DIM) + hv * HEAD_DIM + cols[None, :]
+        tl.store(v_ptr + offs, y.to(v_ptr.dtype.element_ty), mask=row_ok[:, None])
+        a = tl.load(a_ptr + rows64 * a_stride_t + hv, mask=row_ok, other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + rows64 * b_stride_t + hv, mask=row_ok, other=0.0).to(tl.float32)
+        gate_input = a + tl.load(dt_bias_ptr + hv).to(tl.float32)
+        softplus = tl.where(
+            gate_input <= softplus_threshold, tl.log(1.0 + tl.exp(gate_input)), gate_input
+        )
+        g = -tl.exp(tl.load(A_log_ptr + hv).to(tl.float32)) * softplus
+        tl.store(g_ptr + rows64 * NUM_V_HEADS + hv, g, mask=row_ok)
+        tl.store(
+            beta_ptr + rows64 * NUM_V_HEADS + hv,
+            tl.sigmoid(b).to(beta_ptr.dtype.element_ty),
+            mask=row_ok,
+        )
+
+
+@triton.jit
+def _conv_state_publish_kernel(
+    x_ptr,
+    x_stride_t,
+    conv_state_ptr,
+    cs_stride_slot,
+    cs_stride_c,
+    cs_stride_w,
+    cu_seqlens_ptr,
+    cache_idx_ptr,
+    has_init_ptr,
+    conv_dim,
+    WIDTH: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """New state column w = input at position seq_len - (WIDTH - 1) + w, or old column w + seq_len before it."""
+    s = tl.program_id(0)
+    chan = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    ok = chan < conv_dim
+    start = tl.load(cu_seqlens_ptr + s).to(tl.int64)
+    seq_len = tl.load(cu_seqlens_ptr + s + 1) - tl.load(cu_seqlens_ptr + s)
+    has_init = tl.load(has_init_ptr + s)
+    base = (
+        conv_state_ptr
+        + tl.load(cache_idx_ptr + s).to(tl.int64) * cs_stride_slot
+        + chan.to(tl.int64) * cs_stride_c
+    )
+    # Ascending w: column w only reads old column w + seq_len > w, which is not yet overwritten.
+    for w in tl.static_range(WIDTH - 1):
+        p = seq_len - (WIDTH - 1) + w
+        xv = tl.load(x_ptr + (start + p) * x_stride_t + chan, mask=ok & (p >= 0), other=0.0)
+        sv = tl.load(base + (w + seq_len) * cs_stride_w, mask=ok & (p < 0) & has_init, other=0.0)
+        tl.store(base + w * cs_stride_w, tl.where(p >= 0, xv, sv), mask=ok)
+
+
+def fused_gdn_conv_post_conv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    l2_norm_eps: float = 1e-6,
+    softplus_threshold: float = 20.0,
+    beta_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GDN prefill causal conv1d (SiLU) fused with ``fused_gdn_post_conv``.
+
+    Reads the token-major ``[Q | K | V]`` projection ``x`` (``[num_tokens, conv_dim]``, unit channel stride)
+    once and returns the same Q, K, V, g and beta as ``causal_conv1d_fn`` followed by ``fused_gdn_post_conv``,
+    bit for bit, and updates ``conv_states`` for the sequences in ``cu_seqlens``. Requires
+    ``head_k_dim == head_v_dim``.
+    """
+    T, conv_dim = x.shape
+    width = weight.shape[1]
+    assert x.stride(1) == 1 and weight.is_contiguous() and head_k_dim == head_v_dim
+    assert conv_dim == (2 * num_k_heads + num_v_heads) * head_k_dim
+    q = torch.empty((1, T, num_k_heads, head_k_dim), dtype=x.dtype, device=x.device)
+    k = torch.empty_like(q)
+    v = torch.empty((1, T, num_v_heads, head_v_dim), dtype=x.dtype, device=x.device)
+    g = torch.empty((1, T, num_v_heads), dtype=torch.float32, device=x.device)
+    beta = torch.empty((1, T, num_v_heads), dtype=beta_dtype, device=x.device)
+    num_seqs = cu_seqlens.shape[0] - 1
+    if T == 0 or num_seqs == 0:
+        return q, k, v, g, beta
+    block_t = 16
+    _fused_gdn_conv_post_conv_kernel[(triton.cdiv(T, block_t), 2 * num_k_heads + num_v_heads)](
+        x,
+        x.stride(0),
+        weight,
+        bias if bias is not None else weight,
+        conv_states,
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        cu_seqlens,
+        cache_indices,
+        has_initial_state,
+        num_seqs,
+        a,
+        a.stride(0),
+        b,
+        b.stride(0),
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        T,
+        l2_norm_eps,
+        softplus_threshold,
+        NUM_K_HEADS=num_k_heads,
+        NUM_V_HEADS=num_v_heads,
+        HEAD_DIM=head_k_dim,
+        WIDTH=width,
+        HAS_BIAS=bias is not None,
+        BLOCK_T=block_t,
+        SEARCH_STEPS=max(1, (num_seqs + 1).bit_length()),
+        num_warps=4,
+    )
+    block_c = 256
+    _conv_state_publish_kernel[(num_seqs, triton.cdiv(conv_dim, block_c))](
+        x,
+        x.stride(0),
+        conv_states,
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        cu_seqlens,
+        cache_indices,
+        has_initial_state,
+        conv_dim,
+        WIDTH=width,
+        BLOCK_C=block_c,
+        num_warps=4,
+    )
+    return q, k, v, g, beta

@@ -38,11 +38,7 @@ from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
 from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
-from .fuse_elementwise_ops import (
-    extract_transpose_prefill_slice,
-    fused_gdn_post_conv,
-    pack_gdn_decode_qkv,
-)
+from .fuse_elementwise_ops import fused_gdn_conv_post_conv, fused_gdn_post_conv, pack_gdn_decode_qkv
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import Mamba2Metadata
@@ -265,6 +261,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx)
         self.activation = config.hidden_act
+        # Prefill convolves and splits Q/K/V in one kernel (fused_gdn_conv_post_conv), which needs
+        # SiLU and equal Q/K and V head sizes.
+        self._fused_prefill_conv = self.activation == "silu" and self.head_k_dim == self.head_v_dim
         self.layer_norm_epsilon = config.rms_norm_eps
 
         self.register_to_config = False
@@ -756,22 +755,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             query_start_loc_p = query_start_loc[: num_prefill + 1]
             has_initial_states_p = has_initial_states[:num_prefill]
 
-            mixed_qkv_p_t = extract_transpose_prefill_slice(
-                mixed_qkv_p,
-                mixed_qkv_p.shape[0],
-                0,
-                mixed_qkv_p.shape[1],
-            )
-            mixed_qkv_p_t = causal_conv1d_fn(
-                mixed_qkv_p_t,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_states_to_use,
-                has_initial_state=has_initial_states_p,
-                cache_indices=state_indices_p,
-                query_start_loc=query_start_loc_p,
-            )
+            if is_target_verify or not self._fused_prefill_conv:
+                mixed_qkv_p_t = causal_conv1d_fn(
+                    mixed_qkv_p.t(),
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_states_to_use,
+                    has_initial_state=has_initial_states_p,
+                    cache_indices=state_indices_p,
+                    query_start_loc=query_start_loc_p,
+                )
 
             if is_target_verify:
                 a_d = a[num_prefill_tokens:]
@@ -830,12 +824,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     self.num_v_heads_per_tp,
                     self.head_v_dim,
                 )
-            else:
-                query, key, value, g, beta = fused_gdn_post_conv(
-                    mixed_qkv_p_t,
-                    mixed_qkv_d,
-                    a,
-                    b,
+            elif self._fused_prefill_conv:
+                query, key, value, g, beta = fused_gdn_conv_post_conv(
+                    mixed_qkv_p,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    conv_states_to_use,
+                    query_start_loc_p,
+                    state_indices_p,
+                    has_initial_states_p,
+                    a[:num_prefill_tokens],
+                    b[:num_prefill_tokens],
                     self.A_log,
                     self.dt_bias,
                     self.num_k_heads_per_tp,
@@ -843,15 +842,40 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     self.num_v_heads_per_tp,
                     self.head_v_dim,
                 )
-        else:
-            mixed_qkv_t = extract_transpose_prefill_slice(
+            else:
+                query, key, value, g, beta = fused_gdn_post_conv(
+                    mixed_qkv_p_t,
+                    None,
+                    a[:num_prefill_tokens],
+                    b[:num_prefill_tokens],
+                    self.A_log,
+                    self.dt_bias,
+                    self.num_k_heads_per_tp,
+                    self.head_k_dim,
+                    self.num_v_heads_per_tp,
+                    self.head_v_dim,
+                )
+        elif self._fused_prefill_conv:
+            query, key, value, g, beta = fused_gdn_conv_post_conv(
                 mixed_qkv,
-                mixed_qkv.shape[0],
-                0,
-                mixed_qkv.shape[1],
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_states_to_use,
+                query_start_loc,
+                cache_indices,
+                has_initial_states,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
             )
+        else:
             mixed_qkv_t = causal_conv1d_fn(
-                mixed_qkv_t,
+                mixed_qkv.t(),
                 self.conv1d.weight,
                 self.conv1d.bias,
                 activation=self.activation,
@@ -997,6 +1021,59 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if attn_out_prefill is None:
                 return attn_out_decode
             return torch.cat((attn_out_prefill, attn_out_decode), dim=1)
+
+        if num_decode_tokens > 0:
+            # Decode rows take the recurrent decode kernel, which updates their
+            # pool state in place; only prefill rows run the chunked kernel.
+            if output is None:
+                output = mixed_qkv.new_empty(
+                    (
+                        1,
+                        num_prefill_tokens + num_decode_tokens,
+                        self.num_v_heads_per_tp,
+                        self.head_v_dim,
+                    )
+                )
+            key_dim = self.key_dim_per_tp
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                q=mixed_qkv_d[..., :key_dim].view(
+                    1, num_decode_tokens, self.num_k_heads_per_tp, self.head_k_dim
+                ),
+                k=mixed_qkv_d[..., key_dim : 2 * key_dim].view(
+                    1, num_decode_tokens, self.num_k_heads_per_tp, self.head_k_dim
+                ),
+                v=mixed_qkv_d[..., 2 * key_dim :].view(
+                    1, num_decode_tokens, self.num_v_heads_per_tp, self.head_v_dim
+                ),
+                a=a[num_prefill_tokens:],
+                b=b[num_prefill_tokens:],
+                initial_state_source=ssm_states,
+                initial_state_indices=state_indices_d,
+                cu_seqlens=query_start_loc_long[num_prefill:] - num_prefill_tokens,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                output=output[:, num_prefill_tokens:],
+            )
+            chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                initial_state=ssm_states,
+                initial_state_indices=state_indices_p,
+                inplace_indexed_state_update=True,
+                output_final_state=False,
+                cu_seqlens=query_start_loc_long[: num_prefill + 1],
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+                output=output[:, :num_prefill_tokens],
+                state_workspace=kwargs.get("state_workspace"),
+            )
+            return output
 
         core_attn_out, _ = chunk_gated_delta_rule(
             q=query,
