@@ -1,15 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Tuple
+
 import torch
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from ..utils import compute_swizzled_sf_shape
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.activation import gelu_tanh_and_mul, silu_and_mul
     from flashinfer.norm import (fused_add_rmsnorm, fused_add_rmsnorm_quant,
                                  gemma_fused_add_rmsnorm, gemma_rmsnorm,
                                  rmsnorm)
+    from flashinfer.quantization import silu_and_mul_nvfp4_quantize
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
@@ -20,6 +24,24 @@ if IS_FLASHINFER_AVAILABLE:
     @flashinfer_silu_and_mul.register_fake
     def _(x: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(x).chunk(2, dim=-1)[1].contiguous()
+
+    @torch.library.custom_op("trtllm::flashinfer_silu_and_mul_nvfp4_quantize",
+                             mutates_args=())
+    def flashinfer_silu_and_mul_nvfp4_quantize(
+            x: torch.Tensor,
+            global_scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        fp4, sf = silu_and_mul_nvfp4_quantize(x,
+                                              global_scale,
+                                              enable_pdl=get_env_enable_pdl())
+        return fp4, sf.view(-1)
+
+    @flashinfer_silu_and_mul_nvfp4_quantize.register_fake
+    def _(x: torch.Tensor,
+          global_scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        m, k = x.shape[0], x.shape[-1] // 2
+        sf_rows, sf_cols = compute_swizzled_sf_shape(m, k // 16)
+        return (x.new_empty((m, k // 2), dtype=torch.uint8),
+                x.new_empty((sf_rows * sf_cols, ), dtype=torch.uint8))
 
     @torch.library.custom_op("trtllm::flashinfer_gelu_tanh_and_mul",
                              mutates_args=())

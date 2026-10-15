@@ -9,8 +9,10 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..distributed import AllReduceParams
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
@@ -259,6 +261,16 @@ class GatedMLP(nn.Module):
         return (is_sm_100f() and not self.down_proj.use_cute_dsl_blockscaling_mm
                 and not self.down_proj.disable_deep_gemm)
 
+    def _can_fuse_swiglu_nvfp4_quant(self) -> bool:
+        """Check whether down projection can consume fused SwiGLU NVFP4 output."""
+        # FlashInfer's silu_and_mul_nvfp4_quantize is a CuTe-DSL kernel for
+        # SM100+ that computes plain silu(gate) * up with no clamp.
+        return (IS_FLASHINFER_AVAILABLE and IS_CUTLASS_DSL_AVAILABLE
+                and get_sm_version() >= 100 and self.activation == F.silu
+                and self._is_plain_swiglu() and
+                (self.swiglu_limit is None or self.swiglu_limit == float("inf"))
+                and is_static_nvfp4_input_eligible(self.down_proj))
+
     def _fused_gate_up_swiglu(self, x, fp4_out=False):
         """Fused FC1 GEMM + SwiGLU using CuteDSL dense kernel.
 
@@ -363,6 +375,13 @@ class GatedMLP(nn.Module):
                 use_r128c4_layout = get_sm_version() == 107
                 h2 = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
                     h1, self.swiglu_limit, use_r128c4_layout)
+            elif self._can_fuse_swiglu_nvfp4_quant():
+                if h1.dim() > 2:
+                    fused_output_shape = h1.shape[:-1]
+                    h1 = h1.reshape(-1, h1.shape[-1])
+                h2 = Fp4QuantizedTensor(
+                    *torch.ops.trtllm.flashinfer_silu_and_mul_nvfp4_quantize(
+                        h1, self.down_proj.input_scale))
             else:
                 h2 = self._apply_activation(h1)
 

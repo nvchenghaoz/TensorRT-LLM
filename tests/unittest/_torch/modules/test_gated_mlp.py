@@ -120,3 +120,78 @@ def test_activation_controls_fp8_quant_fusion_capability(
     monkeypatch.setattr(gated_mlp_module, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
 
     assert mlp._can_fuse_swiglu_fp8_quant() is expected
+
+
+def _make_static_nvfp4_down_proj() -> nn.Module:
+    down_proj = _make_down_proj()
+    down_proj.has_nvfp4_activation_quantization = True
+    down_proj.force_dynamic_quantization = False
+    down_proj.input_scale = torch.tensor([448.0 * 6.0 / 8.0])
+    down_proj.pre_quant_scale = None
+    return down_proj
+
+
+@pytest.mark.parametrize(
+    ("sm_version", "swiglu_limit", "swiglu_alpha", "static_input", "expected"),
+    [
+        pytest.param(120, None, None, True, True, id="sm120"),
+        pytest.param(100, float("inf"), None, True, True, id="sm100-infinite-limit"),
+        pytest.param(90, None, None, True, False, id="sm90"),
+        pytest.param(120, 7.0, None, True, False, id="swiglu-limit"),
+        pytest.param(120, None, 1.702, True, False, id="swiglu-oai"),
+        pytest.param(120, None, None, False, False, id="dynamic-input"),
+    ],
+)
+def test_swiglu_nvfp4_quant_fusion_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    sm_version: int,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    static_input: bool,
+    expected: bool,
+) -> None:
+    mlp = GatedMLP(
+        hidden_size=2,
+        intermediate_size=2,
+        bias=False,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+    )
+    mlp.down_proj = _make_static_nvfp4_down_proj()
+    mlp.down_proj.force_dynamic_quantization = not static_input
+    monkeypatch.setattr(gated_mlp_module, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(gated_mlp_module, "IS_FLASHINFER_AVAILABLE", True)
+    monkeypatch.setattr(gated_mlp_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+
+    assert mlp._can_fuse_swiglu_nvfp4_quant() is expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FlashInfer's fused SwiGLU + NVFP4 quantize kernel needs SM100+",
+)
+@pytest.mark.parametrize("shape", [(1, 512), (130, 512), (2, 70, 1024)])
+def test_swiglu_nvfp4_quant_fusion_matches_unfused(shape: tuple[int, ...]) -> None:
+    from tensorrt_llm._torch.modules.swiglu import swiglu
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    torch.manual_seed(0)
+    projected = torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 3
+    mlp = GatedMLP(hidden_size=2, intermediate_size=shape[-1] // 2, bias=False)
+    mlp.gate_up_proj = _make_gate_up_proj(projected, partitioned=True)
+    mlp.down_proj = _make_static_nvfp4_down_proj()
+    mlp.down_proj.input_scale = mlp.down_proj.input_scale.cuda()
+    mlp.down_proj.forward = Mock(
+        side_effect=lambda value, **kwargs: torch.zeros(value.fp4_tensor.shape[0], 2, device="cuda")
+    )
+
+    output = mlp(torch.zeros(*shape[:-1], 2, device="cuda"))
+
+    fused = mlp.down_proj.forward.call_args.args[0]
+    assert isinstance(fused, Fp4QuantizedTensor)
+    expected_fp4, expected_sf = torch.ops.trtllm.fp4_quantize(
+        swiglu(projected.reshape(-1, shape[-1])), mlp.down_proj.input_scale, 16, False
+    )
+    torch.testing.assert_close(fused.fp4_tensor, expected_fp4, rtol=0, atol=0)
+    torch.testing.assert_close(fused.scaling_factor, expected_sf, rtol=0, atol=0)
+    assert output.shape == (*shape[:-1], 2)
