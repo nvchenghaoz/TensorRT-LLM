@@ -436,6 +436,8 @@ def _lm_head_nvfp4_enabled(model_config: ModelConfig) -> bool:
     NVFP4 (W4A4) Linear path and the SM120 Marlin W4A16 path consume it
     directly, cutting the lm_head GEMM's weight traffic 4x vs the bf16 dequant
     fallback -- the decode lm_head is purely weight-bandwidth-bound.
+    Qwen3.8 exports quantize lm_head to NVFP4 (with a calibrated input scale),
+    which runs on the NVFP4 (W4A4) Linear path on all three.
     Conditions mirror what the quantized LMHead supports (see LMHead.__init__
     guards) plus the paths that bypass the Linear machinery entirely:
 
@@ -457,7 +459,7 @@ def _lm_head_nvfp4_enabled(model_config: ModelConfig) -> bool:
     mapping = model_config.mapping
     return (
         cfg is not None
-        and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+        and cfg.quant_algo in (QuantAlgo.W4A16_NVFP4, QuantAlgo.NVFP4)
         and _has_nvfp4_gemm_block_width(cfg)
         and get_sm_version() in (100, 103, 120)
         and not getattr(pretrained, "tie_word_embeddings", False)
@@ -569,7 +571,7 @@ def _normalize_qwen35_quant_config_dict(
 
     The ``lm_head`` entry is kept when ``keep_lm_head_quant`` (see
     _lm_head_nvfp4_enabled) -- promoted to NVFP4 on SM100/103 for 16-element
-    blocks, left W4A16_NVFP4 on SM120 -- and dropped otherwise, including
+    blocks, left W4A16_NVFP4 on SM120, an NVFP4 entry kept as is -- and dropped otherwise, including
     32-element blocks which the mapper dequantizes once at load time:
     a leftover entry would make DecoderModelForCausalLM build a quantized
     LMHead whose weights the mapper had already dequantized to bf16.
@@ -591,7 +593,8 @@ def _normalize_qwen35_quant_config_dict(
         if name == "lm_head":
             if keep_lm_head_quant:
                 # _lm_head_nvfp4_enabled only keeps native 16-element paths.
-                # SM120 uses Marlin; SM100/103 promotes to W4A4.
+                # W4A16_NVFP4: SM120 uses Marlin; SM100/103 promotes to W4A4.
+                # NVFP4 runs W4A4 everywhere.
                 if convert_to_nvfp4 and _has_nvfp4_gemm_block_width(cfg):
                     cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
                 normalized[name] = cfg
