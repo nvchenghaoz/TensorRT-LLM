@@ -14,6 +14,7 @@
 
 import copy
 import functools
+import importlib.util
 import math
 import os
 import sys
@@ -65,6 +66,20 @@ _FORCE_RAGGED_FA2 = False
 """Used for testing."""
 
 _MAX_CUDA_THREADS_PER_BLOCK = 1024
+
+# FlashInfer's `cute-dsl-prims` backend runs FP8-KV paged prefill on SM120 with FP8 math (FP8 Q, K and V in
+# the matmuls; FA2 converts K/V to 16 bit). It covers pages of 16-128 tokens and these head dims, without a
+# custom mask or sliding window.
+_PRIMS_PAGE_SIZES = (16, 32, 64, 128)
+_PRIMS_HEAD_DIMS = (32, 64, 128, 256)
+
+
+@functools.cache
+def _has_sm120_prims() -> bool:
+    """Whether this GPU is SM120 and the installed FlashInfer has the cute-dsl-prims backend."""
+    return (torch.cuda.get_device_capability() == (12, 0) and
+            importlib.util.find_spec("flashinfer.attention.cute_dsl.sm120_fmha")
+            is not None)
 
 
 def _get_attention_layer_indices(kv_cache_manager: Any) -> list[int]:
@@ -1344,15 +1359,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             max_query_tokens_per_sequence = cast(int,
                                                  q_and_kv_seqlens.max().item())
 
-            if flashinfer_backend == "cudnn":
-                # cuDNN ragged prefill uses *element* offsets in qo/kv indptr, not token indptr.
-                key_value_indptr = key_value_indptr.clone(
-                )  # unalias query_output_indptr
-                query_output_indptr[1:].mul_(num_query_output_heads *
-                                             attention_head_dim)
-                key_value_indptr[1:].mul_(num_key_value_heads *
-                                          attention_head_dim)
-
         if (multi_item_params := plan_params.multi_item_params) is not None:
             if flashinfer_backend not in ["fa2", "fa3"]:
                 raise ValueError(
@@ -2194,17 +2200,34 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._plan_params_to_wrappers[plan_params] = wrappers
 
         if wrappers.prefill_wrapper is None:
+            # FP8-KV prefill on SM120 runs on FlashInfer's FP8-math kernel when it covers the configuration.
+            use_prims = (
+                flashinfer_backend == "fa2" and plan_params.kv_dtype
+                in (torch.float8_e4m3fn, plan_params.q_dtype)
+                and plan_params.q_dtype in (torch.float16, torch.bfloat16)
+                and plan_params.head_dim in _PRIMS_HEAD_DIMS
+                and self.page_size in _PRIMS_PAGE_SIZES
+                and self.kv_layout == "HND"
+                and plan_params.attention_mask_data is None and
+                (plan_params.window_left is None or plan_params.window_left < 0)
+                and not self.is_cuda_graph and _has_sm120_prims())
             wrappers.prefill_wrapper = \
                 flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                     self.workspace_buffer,
                     self.kv_layout,
-                    backend=flashinfer_backend,
+                    backend="cute-dsl-prims"
+                    if use_prims else flashinfer_backend,
                     qo_indptr_buf=self.qo_indptr,
                     paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
                     paged_kv_indices_buf=self._paged_kv_indices,
                     paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
                     use_cuda_graph=self.is_cuda_graph)
         prefill_wrapper = wrappers.prefill_wrapper
+        use_prims = prefill_wrapper._backend == "cute-dsl-prims"
+        logger.info_once(
+            f"[bench] FlashInfer paged prefill backend: {prefill_wrapper._backend} "
+            f"(q={plan_params.q_dtype}, kv={plan_params.kv_dtype})",
+            key=f"bench_prefill_backend_{prefill_wrapper._backend}")
 
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
@@ -2233,9 +2256,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 causal=is_causal,
                 sm_scale=plan_params.sm_scale,
                 window_left=window_left,
-                q_data_type=plan_params.q_dtype,
+                q_data_type=(plan_params.kv_dtype
+                             if use_prims else plan_params.q_dtype),
                 kv_data_type=plan_params.kv_dtype,
-                o_data_type=o_dtype,
+                o_data_type=plan_params.q_dtype if use_prims else o_dtype,
                 custom_mask=plan_params.attention_mask_data,
             )
 
@@ -2751,7 +2775,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
         def prefill_forward(plan_params: PlanParams, out: torch.Tensor):
             wrapper = metadata.get_prefill_wrapper(plan_params)
-            wrapper.run(q[:num_ctx_tokens],
+            q_ctx = q[:num_ctx_tokens]
+            # cute-dsl-prims takes Q in the KV cache's FP8 type, at the same unit scale as the cache.
+            if wrapper._backend == "cute-dsl-prims":
+                q_ctx = q_ctx.to(kv_cache.dtype).contiguous()
+            wrapper.run(q_ctx,
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
 
