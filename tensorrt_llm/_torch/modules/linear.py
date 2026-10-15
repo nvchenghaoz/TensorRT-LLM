@@ -815,13 +815,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 group=group,
             )
         else:
-            output = torch.ops.trtllm.cublas_scaled_mm(
+            output = torch.ops.trtllm.fp8_per_tensor_scaled_mm(
                 qinput,
                 module.weight.t(),
-                scale_a=cur_input_scale,
-                scale_b=module.weight_scale,
-                bias=None,
-                out_dtype=module.dtype or input.dtype,
+                cur_input_scale,
+                module.weight_scale,
+                module.dtype or input.dtype,
                 output_buffer_kind=output_buffer_kind,
                 group=group,
             )

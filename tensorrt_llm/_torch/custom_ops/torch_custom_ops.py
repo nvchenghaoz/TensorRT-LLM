@@ -972,6 +972,85 @@ class CublasLtFP4GemmRunner(TunableRunner):
         return result
 
 
+class FP8PerTensorGemmRunner(TunableRunner):
+    """FP8 per-tensor-scaled GEMM on cuBLASLt through TRT-LLM's ``cublas_scaled_mm`` or ``torch._scaled_mm``.
+
+    The two pick different cuBLASLt kernels: TRT-LLM lets cuBLASLt choose for a 32 MiB workspace, which favors
+    split-K and wide tiles; PyTorch queries the heuristic for a smaller workspace and gets narrow-tile kernels
+    that are faster at small M. The AutoTuner keeps the faster one per M bucket.
+    """
+    TRTLLM_CUBLAS, TORCH_SCALED_MM = 0, 1
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+                                 use_cold_l2_cache=True)
+
+    def __init__(self,
+                 output_dtype: torch.dtype,
+                 output_buffer_kind: int = int(BufferKind.DEFAULT),
+                 group: Optional[List[int]] = None):
+        self.output_dtype = output_dtype
+        self.output_buffer_kind = int(output_buffer_kind)
+        self.group = group
+
+    def unique_id(self):
+        return (self.output_dtype, self.output_buffer_kind)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        if self.output_buffer_kind != int(BufferKind.DEFAULT):
+            # torch._scaled_mm cannot write into a special output buffer.
+            return [self.TRTLLM_CUBLAS]
+        return [self.TRTLLM_CUBLAS, self.TORCH_SCALED_MM]
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1) -> torch.Tensor:
+        mat_a, mat_b, scale_a, scale_b = inputs
+        if tactic == self.TORCH_SCALED_MM:
+            return torch._scaled_mm(mat_a,
+                                    mat_b,
+                                    scale_a=scale_a,
+                                    scale_b=scale_b,
+                                    out_dtype=self.output_dtype,
+                                    use_fast_accum=True)
+        return torch.ops.trtllm.cublas_scaled_mm(mat_a, mat_b, scale_a, scale_b,
+                                                 None, self.output_dtype,
+                                                 self.output_buffer_kind,
+                                                 self.group)
+
+
+@torch.library.custom_op("trtllm::fp8_per_tensor_scaled_mm", mutates_args=())
+def fp8_per_tensor_scaled_mm(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    group: Optional[List[int]] = None,
+) -> torch.Tensor:
+    """FP8 per-tensor-scaled ``mat_a @ mat_b`` with the cuBLASLt path chosen by the AutoTuner per M bucket."""
+    runner = FP8PerTensorGemmRunner(out_dtype, output_buffer_kind, group)
+    _, best_tactic = AutoTuner.get().choose_one(
+        "trtllm::fp8_per_tensor_scaled_mm", [runner],
+        FP8PerTensorGemmRunner.tuning_config, [mat_a, mat_b, scale_a, scale_b])
+    return runner(inputs=[mat_a, mat_b, scale_a, scale_b], tactic=best_tactic)
+
+
+@fp8_per_tensor_scaled_mm.register_fake
+def _(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    group: Optional[List[int]] = None,
+) -> torch.Tensor:
+    return mat_a.new_empty((mat_a.size(0), mat_b.size(1)), dtype=out_dtype)
+
+
 class CudaCoreNVFP4Runner(TunableRunner):
     """
     CUDA Core-based NVFP4 GEMM runner.
@@ -1283,6 +1362,9 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             last_positive_power_of_2), ),
         constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+        # Serving streams the weights from DRAM; a warm L2 would favor the
+        # CUDA-core GEMV at small M even where tensor-core kernels are faster.
+        use_cold_l2_cache=True,
     )
 
     def __init__(self,

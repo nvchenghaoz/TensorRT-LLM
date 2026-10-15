@@ -93,5 +93,38 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
             warn(RuntimeWarning("cutlass result is not correct: " + repr(e)))
 
 
+@pytest.mark.skipif(getSMVersion() < 89, reason="FP8 GEMM needs SM89+")
+@pytest.mark.parametrize("m", [1, 12, 64, 300])
+def test_fp8_per_tensor_scaled_mm(m):
+    """Both cuBLASLt paths of fp8_per_tensor_scaled_mm agree with cublas_scaled_mm, before and after tuning."""
+    from tensorrt_llm._torch.autotuner import autotune
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+        FP8PerTensorGemmRunner
+
+    k, n = 5120, 2048
+    torch.random.manual_seed(0)
+    x = (torch.rand((m, k), device="cuda") - 0.5).to(torch.float8_e4m3fn)
+    w = (torch.rand((n, k), device="cuda") - 0.5).to(torch.float8_e4m3fn)
+    scale_x = torch.rand((), device="cuda")
+    scale_w = torch.rand((), device="cuda")
+    ref = torch.ops.trtllm.cublas_scaled_mm(x, w.t(), scale_x, scale_w, None,
+                                            torch.bfloat16)
+    runner = FP8PerTensorGemmRunner(torch.bfloat16)
+    inputs = [x, w.t(), scale_x, scale_w]
+    for tactic in runner.get_valid_tactics(inputs, None):
+        torch.testing.assert_close(runner(inputs=inputs, tactic=tactic),
+                                   ref,
+                                   atol=0.05,
+                                   rtol=0.01)
+    with autotune():
+        torch.ops.trtllm.fp8_per_tensor_scaled_mm(x, w.t(), scale_x, scale_w,
+                                                  torch.bfloat16)
+    torch.testing.assert_close(torch.ops.trtllm.fp8_per_tensor_scaled_mm(
+        x, w.t(), scale_x, scale_w, torch.bfloat16),
+                               ref,
+                               atol=0.05,
+                               rtol=0.01)
+
+
 if __name__ == '__main__':
     test_fp8_scaled_mm(torch.float16, 12, (8192, 10240))
