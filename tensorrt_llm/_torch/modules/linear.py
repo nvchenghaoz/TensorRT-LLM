@@ -792,7 +792,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         nvfp4_decode_gemv = module.__dict__.get("_nvfp4_decode_gemv")
         if (nvfp4_decode_gemv is not None and input.dtype == torch.bfloat16
                 and 0 < input.shape[0] <= _NVFP4_DECODE_GEMV_MAX_ROWS):
-            # Rows <= 4: cuda-core W4A16 GEMV on the decode copy's NVFP4 values.
+            # Rows <= 3: cuda-core W4A16 GEMV on the decode copy's NVFP4 values.
             output = torch.ops.trtllm.nvfp4_w4a16_gemv(input.contiguous(),
                                                        *nvfp4_decode_gemv)
             if len(original_shape) > 2:
@@ -2502,11 +2502,13 @@ def _fp8_nvfp4_decode_copy_enabled(module: Linear) -> bool:
 
 
 # Decode rows <= this run a cuda-core W4A16 NVFP4 GEMV (trtllm::nvfp4_w4a16_gemv)
-# instead of Marlin, for the (N, K) shapes below; rows 5-16 stay on Marlin.
-# The GEMV keeps its own [N, K/2] + [N, K/16] copy of the same NVFP4 values
-# (17.7 MB per (5120, 6144) layer). Kill switch, read at weight load:
-# TRTLLM_NVFP4_DECODE_GEMV=0 builds no GEMV copy (Marlin for every decode row).
-_NVFP4_DECODE_GEMV_MAX_ROWS = 4
+# instead of Marlin, for the (N, K) shapes below; rows 4-16 stay on Marlin
+# (on SM120 the GEMV is 26/25/11% faster than Marlin at 1/2/3 rows for
+# (5120, 6144) and no faster at 4). The GEMV keeps its own [N, K/2] + [N, K/16]
+# copy of the same NVFP4 values (17.7 MB per (5120, 6144) layer). Kill switch,
+# read at weight load: TRTLLM_NVFP4_DECODE_GEMV=0 builds no GEMV copy (Marlin
+# for every decode row).
+_NVFP4_DECODE_GEMV_MAX_ROWS = 3
 _NVFP4_DECODE_GEMV_ENV = "TRTLLM_NVFP4_DECODE_GEMV"
 # GDN out_proj (x48) and gated-attention o_proj (x16) of Qwen3.8-27B.
 _NVFP4_DECODE_GEMV_SHAPES = ((5120, 6144), )

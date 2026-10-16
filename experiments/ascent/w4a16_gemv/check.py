@@ -1,5 +1,5 @@
 # Branch 63 correctness check (untimed): trtllm::nvfp4_w4a16_gemv through the real
-# FP8 Linear (FP8QDQLinearMethod.apply), decode rows 1..4, against
+# FP8 Linear (FP8QDQLinearMethod.apply), decode rows 1.._NVFP4_DECODE_GEMV_MAX_ROWS, against
 #  - the FP32 reference of the original op (FP8 weight * per-tensor scale, FP64 matmul),
 #  - Marlin on the same NVFP4 decode copy (what the base runs for these rows),
 #  - the NVFP4-dequant FP64 reference (same values, exact math).
@@ -7,7 +7,8 @@
 #  GEMV max/mean abs error vs FP32 ref <= Marlin's + 1 BF16 ulp (ulp at max |ref|);
 #  10 warmup + 50 NaN-poisoned CUDA-graph replays bitwise equal to replay 1 (== eager);
 #  kill switch (TRTLLM_NVFP4_DECODE_GEMV=0) builds no GEMV copy and is bitwise Marlin;
-#  rows 5..16 on the GEMV module are bitwise the kill-switch module (Marlin unchanged).
+#  rows above the gate (4..16) on the GEMV module are bitwise the kill-switch module
+#  (Marlin unchanged).
 # Usage: check.py [N,K ...]   (default 5120,6144)
 import json
 import os
@@ -101,7 +102,9 @@ def check_shape(n, k):
     ok_all &= same_marlin
     w_fp32ref = w8.double() * s.double()
     w_nvfp4 = dequant_nvfp4(gemv, n, k)
-    for m in (1, 2, 3, 4):
+    gate = L._NVFP4_DECODE_GEMV_MAX_ROWS
+    res["gemv_max_rows"] = gate
+    for m in range(1, gate + 1):
         rec = dict(gemv_max=0.0, gemv_mean=0.0, marlin_max=0.0, marlin_mean=0.0, gemv_vs_nvfp4ref_max=0.0,
                    marlin_vs_nvfp4ref_max=0.0, ulp=0.0, eq_marlin_frac=0.0)
         draws = 4
@@ -178,13 +181,13 @@ def check_shape(n, k):
         log(f"[check] N={n} K={k} M={m}: " + json.dumps(rec))
     # Rows above the GEMV gate stay on Marlin, bitwise.
     above = True
-    for m in (5, 8, 16):
+    for m in [r for r in (4, 5, 8, 16) if r > gate]:
         gen = torch.Generator(device=dev).manual_seed(500 + m)
         x = (torch.randn(m, k, generator=gen, device=dev) * 0.5).to(torch.bfloat16)
         above &= bool(torch.equal(bits(lin_on(x)), bits(lin_off(x))))
-    res["rows5_16_bitwise_marlin"] = above
+    res["rows_above_gate_bitwise_marlin"] = above
     ok_all &= above
-    log(f"[check] N={n} K={k} rows 5..16 bitwise Marlin: {above}")
+    log(f"[check] N={n} K={k} rows {gate + 1}..16 bitwise Marlin: {above}")
     res["ok"] = bool(ok_all)
     del lin_on, lin_off, w8, w_fp32ref, w_nvfp4
     torch.cuda.empty_cache()
