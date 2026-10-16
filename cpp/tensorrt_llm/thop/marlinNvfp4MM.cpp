@@ -15,10 +15,16 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/marlin/marlin_nvfp4.h"
 #include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <torch/extension.h>
+
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 using torch::Tensor;
 
@@ -26,6 +32,103 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
+
+namespace
+{
+
+// Kill switches, read on every call so one process can capture graphs with
+// either setting: "0" disables, anything else (or unset) enables.
+bool marlinEnvSwitchOn(char const* name)
+{
+    char const* v = std::getenv(name);
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+}
+
+// Persistent zeroed lock workspace for the dense Marlin GEMM.
+//
+// The kernel leaves every lock it uses at 0 when it completes (use_atomic_add
+// and use_fp32_reduce are false: the last slice of each split-K reduction
+// resets its lock in barrier_release, and blocks_per_sm == 1 keeps
+// locks_off < sms), so a buffer zeroed once can be reused by every call that
+// cannot overlap with another call on the same buffer. Calls on one stream are
+// ordered (the kernel issues griddepcontrol.wait before any lock access, so
+// this also holds under PDL), so each stream gets its own slot.
+//
+// The pool is created on the first non-capturing call on a device. A stream
+// without a slot binds a free one with no allocation, which is what a CUDA
+// graph capture stream gets (torch.cuda.graph captures on its own side stream
+// that never runs eager work). With no pool yet or no free slot, the call falls
+// back to a per-call at::zeros workspace, as before.
+constexpr int kMarlinWorkspaceSlots = 32;
+
+struct MarlinWorkspacePool
+{
+    at::Tensor buffer; // [kMarlinWorkspaceSlots * sms] int32, zero-initialized
+    int sms = 0;
+    int nextSlot = 0;
+    std::unordered_map<cudaStream_t, int> slotOfStream;
+};
+
+std::mutex& marlinWorkspaceMutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+// Intentionally leaked so no tensor is released after CUDA teardown at exit.
+std::unordered_map<int, MarlinWorkspacePool*>& marlinWorkspacePools()
+{
+    static auto* pools = new std::unordered_map<int, MarlinWorkspacePool*>();
+    return *pools;
+}
+
+// Returns this stream's zeroed slot (at least `sms` ints), or nullptr to fall back.
+int* getPersistentMarlinWorkspace(Tensor const& like, int device, int sms, cudaStream_t stream)
+{
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    TLLM_CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    bool const capturing = status != cudaStreamCaptureStatusNone;
+
+    std::lock_guard<std::mutex> guard(marlinWorkspaceMutex());
+    auto& pools = marlinWorkspacePools();
+    auto it = pools.find(device);
+    MarlinWorkspacePool* pool = it == pools.end() ? nullptr : it->second;
+    if (pool == nullptr)
+    {
+        if (capturing)
+        {
+            return nullptr;
+        }
+        pool = new MarlinWorkspacePool();
+        pool->sms = sms;
+        pool->buffer = at::zeros({kMarlinWorkspaceSlots * sms}, like.options().dtype(at::kInt));
+        // Make the zero fill visible to every stream that later binds a slot.
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+        pools[device] = pool;
+    }
+    if (pool->sms < sms)
+    {
+        return nullptr;
+    }
+    int slot = -1;
+    auto sit = pool->slotOfStream.find(stream);
+    if (sit != pool->slotOfStream.end())
+    {
+        slot = sit->second;
+    }
+    else
+    {
+        if (pool->nextSlot >= kMarlinWorkspaceSlots)
+        {
+            return nullptr;
+        }
+        slot = pool->nextSlot++;
+        pool->slotOfStream.emplace(stream, slot);
+    }
+    return pool->buffer.data_ptr<int>() + static_cast<int64_t>(slot) * pool->sms;
+}
+
+} // namespace
 
 // Marlin NVFP4 GEMM: W4A(4|16) interface.
 //
@@ -99,7 +202,22 @@ Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional
 
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, mat_a.get_device());
-    auto workspace = at::zeros({sms}, mat_a.options().dtype(at::kInt));
+
+    // Both switches are read per call (uncached) so A/B graphs can coexist in one process.
+    bool const persistentWorkspace = marlinEnvSwitchOn("TRTLLM_MARLIN_PERSISTENT_WORKSPACE");
+    bool const enablePdl = tensorrt_llm::common::getEnvEnablePDL() && marlinEnvSwitchOn("TRTLLM_MARLIN_PDL");
+
+    int* workspacePtr = nullptr;
+    Tensor workspace;
+    if (persistentWorkspace)
+    {
+        workspacePtr = getPersistentMarlinWorkspace(mat_a, mat_a.get_device(), sms, stream);
+    }
+    if (workspacePtr == nullptr)
+    {
+        workspace = at::zeros({sms}, mat_a.options().dtype(at::kInt));
+        workspacePtr = reinterpret_cast<int*>(workspace.data_ptr());
+    }
 
     int num_groups = k / 16;
     int group_size = 16;
@@ -108,12 +226,28 @@ Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional
     // weight_global_scale is BF16, already Marlin-processed (includes 2^119 bias correction)
     ::marlin_nvfp4::marlinNvfp4Gemm(act_bf16.data_ptr(), mat_b.data_ptr(), out.data_ptr(),
         nullptr, // C_tmp
-        scale_b.data_ptr(), weight_global_scale.data_ptr(), m, n, k, reinterpret_cast<int*>(workspace.data_ptr()),
-        num_groups, group_size,
+        scale_b.data_ptr(), weight_global_scale.data_ptr(), m, n, k, workspacePtr, num_groups, group_size,
         false, // use_fp32_reduce
-        stream);
+        stream, enablePdl);
 
     return out;
+}
+
+// Test helper: a copy of the bound slots of the persistent Marlin lock workspace on
+// like's device ([bound_slots * sms] int32; empty when no pool exists). Every entry
+// must read 0 once all Marlin calls have completed.
+Tensor marlin_nvfp4_persistent_workspace_snapshot(Tensor const& like)
+{
+    CHECK_TH_CUDA(like);
+    std::lock_guard<std::mutex> guard(marlinWorkspaceMutex());
+    auto& pools = marlinWorkspacePools();
+    auto it = pools.find(static_cast<int>(like.get_device()));
+    if (it == pools.end())
+    {
+        return at::empty({0}, like.options().dtype(at::kInt));
+    }
+    MarlinWorkspacePool const* pool = it->second;
+    return pool->buffer.narrow(0, 0, static_cast<int64_t>(pool->nextSlot) * pool->sms).clone();
 }
 
 } // namespace torch_ext
@@ -126,9 +260,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "marlin_nvfp4_gemm(Tensor mat_a, Tensor mat_b, Tensor? scale_a, Tensor scale_b, Tensor? alpha,"
         " Tensor weight_global_scale, Tensor? bias, ScalarType? out_dtype,"
         " int size_n, int size_k, int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
+    m.def("marlin_nvfp4_persistent_workspace_snapshot(Tensor like) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("marlin_nvfp4_gemm", &tensorrt_llm::torch_ext::marlin_nvfp4_gemm);
+    m.impl("marlin_nvfp4_persistent_workspace_snapshot",
+        &tensorrt_llm::torch_ext::marlin_nvfp4_persistent_workspace_snapshot);
 }

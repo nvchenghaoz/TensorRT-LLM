@@ -256,6 +256,15 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     bool use_fp32_reduce, // whether to use fp32 global reduce
     int max_shared_mem)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // PDL: order every A / scale / lock read and every C write after the
+    // immediate predecessor grid (a no-op when launched without the
+    // programmatic-serialization attribute). The grid is a single wave (one
+    // CTA per SM), so dependents may be launched right away; they must issue
+    // their own griddepcontrol.wait before touching C or the lock workspace.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     // Each threadblock processes one "stripe" of the B matrix with (roughly) the
     // same size, which might involve multiple column "slices" (of width 16 *
     // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM

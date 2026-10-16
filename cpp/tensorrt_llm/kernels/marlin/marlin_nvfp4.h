@@ -38,9 +38,11 @@ inline bool isMarlinNvfp4DenseSmSupported(int sm)
 void dequantFp4Activations(
     void const* act_fp4, void const* act_sf, float const* alpha, void* act_bf16, int m, int k, cudaStream_t stream);
 
+// enable_pdl: launch with programmatic stream serialization (the kernel waits on
+// its predecessor with griddepcontrol.wait before any global memory access).
 void marlinNvfp4Gemm(void const* act_bf16, void const* weight, void* output, void* C_tmp, void const* weight_sf,
     void const* global_scale_bf16, int m, int n, int k, int* workspace, int num_groups, int group_size,
-    bool use_fp32_reduce, cudaStream_t stream);
+    bool use_fp32_reduce, cudaStream_t stream, bool enable_pdl = false);
 
 void marlinNvfp4MoeGemmDispatcher(void const* A, void const* B, void* C, void* C_tmp, void const* b_scales,
     void const* global_scale, void const* sorted_token_ids, void const* expert_ids, void const* num_tokens_past_padded,

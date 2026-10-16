@@ -24,6 +24,7 @@
 #include "marlin_nvfp4_template.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <algorithm>
 #include <cuda_bf16.h>
@@ -121,7 +122,7 @@ exec_config_t determine_exec_config(int prob_m, int prob_n, int prob_k, int thre
 
 void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void const* b_s, void const* g_s, int prob_m,
     int prob_n, int prob_k, int* locks, int num_groups, int group_size, bool use_fp32_reduce, int dev,
-    cudaStream_t stream)
+    cudaStream_t stream, bool enable_pdl)
 {
     constexpr int num_bits = 4;
 
@@ -206,18 +207,26 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
 
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new);
 
+        // The kernel starts with griddepcontrol.wait, so a PDL launch orders all of
+        // its memory accesses (A, scales, locks, C) after the predecessor grid; that
+        // also serializes the launches of this loop, which share `locks`.
+        int4 const* b_bias_null = nullptr;
+        float const* a_scales_null = nullptr;
+        int4 const* zp_null = nullptr;
+        int const* g_idx_null = nullptr;
         // clang-format off
-    kernel<<<blocks, num_threads, max_shared_mem_new, stream>>>(
-        A_ptr, B_ptr, C_ptr, C_tmp_ptr,
-        nullptr,  // b_bias
-        nullptr,  // a_scales
-        b_s_ptr, g_s_ptr,
-        nullptr,  // zp
-        nullptr,  // g_idx
-        num_groups, prob_m_split, prob_n, prob_k, lda, locks,
-        false,  // has_bias
-        false,  // use_atomic_add
-        use_fp32_reduce, max_shared_mem_new);
+        tensorrt_llm::common::launchWithPdl("marlin_nvfp4", enable_pdl, kernel, dim3(blocks), dim3(num_threads),
+            static_cast<size_t>(max_shared_mem_new), stream,
+            A_ptr, B_ptr, C_ptr, C_tmp_ptr,
+            b_bias_null,    // b_bias
+            a_scales_null,  // a_scales
+            b_s_ptr, g_s_ptr,
+            zp_null,        // zp
+            g_idx_null,     // g_idx
+            num_groups, prob_m_split, prob_n, prob_k, lda, locks,
+            false,  // has_bias
+            false,  // use_atomic_add
+            use_fp32_reduce, max_shared_mem_new);
         // clang-format on
 
         A_ptr += prob_m_split * (lda / 8);
@@ -324,7 +333,7 @@ void dequantFp4Activations(
 
 void marlinNvfp4Gemm(void const* act_bf16, void const* weight, void* output, void* C_tmp, void const* weight_sf,
     void const* global_scale_bf16, int m, int n, int k, int* workspace, int num_groups, int group_size,
-    bool use_fp32_reduce, cudaStream_t stream)
+    bool use_fp32_reduce, cudaStream_t stream, bool enable_pdl)
 {
     int const sm = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(isMarlinNvfp4DenseSmSupported(sm),
@@ -333,8 +342,10 @@ void marlinNvfp4Gemm(void const* act_bf16, void const* weight, void* output, voi
     int dev;
     cudaGetDevice(&dev);
 
+    // griddepcontrol needs SM90+; on SM89 launch without the PDL attribute.
+    bool const pdl = enable_pdl && sm >= 90;
     ::marlin::marlin_mm_nvfp4(act_bf16, weight, output, C_tmp, weight_sf, global_scale_bf16, m, n, k, workspace,
-        num_groups, group_size, use_fp32_reduce, dev, stream);
+        num_groups, group_size, use_fp32_reduce, dev, stream, pdl);
 }
 
 } // namespace marlin_nvfp4
