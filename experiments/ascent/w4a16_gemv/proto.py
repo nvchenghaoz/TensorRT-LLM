@@ -86,13 +86,13 @@ __device__ __forceinline__ float bf_hi(uint32_t v) { return __uint_as_float(v & 
 // [N, K/16] E4M3, activations BF16 [M, K], out BF16 [M, N] = (x @ dequant(W)^T) * g.
 // CTA = ROWS output rows x all K; thread t owns K chunks (t + s*BLOCK)*32, s < KS
 // (K == KS*BLOCK*32). All of the CTA's weight + SF loads are issued before the PDL wait.
-template <int M, int ROWS, int BLOCK, int KS, bool EARLY>
-__global__ void __launch_bounds__(BLOCK) w4a16_gemv(uint8_t const* __restrict__ w, uint8_t const* __restrict__ sf,
+template <int M, int ROWS, int BLOCK, int KS, bool EARLY, int MINB, bool GUARD>
+__global__ void __launch_bounds__(BLOCK, MINB) w4a16_gemv(uint8_t const* __restrict__ w, uint8_t const* __restrict__ sf,
     __nv_bfloat16 const* __restrict__ x, __nv_bfloat16* __restrict__ out, float g, int n, int k, int mtot) {
     int const tid = threadIdx.x;
-    int const n0 = blockIdx.y * ROWS;
-    int const m0 = blockIdx.x * M;
-    int const mv = min(M, mtot - m0);
+    int const n0 = blockIdx.x * ROWS;
+    int const m0 = blockIdx.y * M;
+    int const mv = GUARD ? min(M, mtot - m0) : M;
     x += (size_t)m0 * k;
     out += (size_t)m0 * n;
     int const kb = k / 2;    // weight row bytes
@@ -197,22 +197,23 @@ void pdl_launch(Kern kern, dim3 grid, dim3 block, uint8_t const* w, uint8_t cons
     C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kern, w, sf, x, o, g, n, k, m));
 }
 
-template <int TM, int ROWS, int BLOCK, int KS, bool EARLY>
+template <int TM, int ROWS, int BLOCK, int KS, bool EARLY, int MINB, bool GUARD>
 bool lv(int m, uint8_t const* w, uint8_t const* sf, __nv_bfloat16 const* x, __nv_bfloat16* o, float g, int n, int k) {
     if (k != KS * BLOCK * 32 || n % ROWS != 0) return false;
-    pdl_launch(w4a16_gemv<TM, ROWS, BLOCK, KS, EARLY>, dim3((m + TM - 1) / TM, n / ROWS), dim3(BLOCK), w, sf, x, o,
-        g, n, k, m);
+    pdl_launch(w4a16_gemv<TM, ROWS, BLOCK, KS, EARLY, MINB, GUARD>, dim3(n / ROWS, (m + TM - 1) / TM), dim3(BLOCK),
+        w, sf, x, o, g, n, k, m);
     return true;
 }
 
-template <int ROWS, int BLOCK, int KS, bool EARLY>
+template <int ROWS, int BLOCK, int KS, bool EARLY, int MINB = 1>
 bool bym(int m, uint8_t const* w, uint8_t const* sf, __nv_bfloat16 const* x, __nv_bfloat16* o, float g, int n, int k) {
     switch (m) {
-    case 1: return lv<1, ROWS, BLOCK, KS, EARLY>(m, w, sf, x, o, g, n, k);
-    case 2: return lv<2, ROWS, BLOCK, KS, EARLY>(m, w, sf, x, o, g, n, k);
-    case 3: return lv<3, ROWS, BLOCK, KS, EARLY>(m, w, sf, x, o, g, n, k);
+    case 1: return lv<1, ROWS, BLOCK, KS, EARLY, MINB, false>(m, w, sf, x, o, g, n, k);
+    case 2: return lv<2, ROWS, BLOCK, KS, EARLY, MINB, false>(m, w, sf, x, o, g, n, k);
+    case 3: return lv<3, ROWS, BLOCK, KS, EARLY, MINB, false>(m, w, sf, x, o, g, n, k);
+    case 4: return lv<4, ROWS, BLOCK, KS, EARLY, MINB, false>(m, w, sf, x, o, g, n, k);
     }
-    return lv<4, ROWS, BLOCK, KS, EARLY>(m, w, sf, x, o, g, n, k);
+    return lv<4, ROWS, BLOCK, KS, EARLY, MINB, true>(m, w, sf, x, o, g, n, k);
 }
 
 bool dispatch(int vid, int m, uint8_t const* w, uint8_t const* sf, __nv_bfloat16 const* x, __nv_bfloat16* o,
@@ -230,6 +231,11 @@ bool dispatch(int vid, int m, uint8_t const* w, uint8_t const* sf, __nv_bfloat16
     case 10: return bym<2, 192, 1, true>(m, w, sf, x, o, g, n, k);
     case 11: return bym<4, 96, 2, true>(m, w, sf, x, o, g, n, k);
     case 12: return bym<8, 96, 2, true>(m, w, sf, x, o, g, n, k);
+    case 13: return bym<2, 192, 1, true, 4>(m, w, sf, x, o, g, n, k);
+    case 14: return bym<4, 192, 1, true, 4>(m, w, sf, x, o, g, n, k);
+    case 15: return bym<2, 192, 1, true, 5>(m, w, sf, x, o, g, n, k);
+    case 16: return bym<4, 192, 1, true, 3>(m, w, sf, x, o, g, n, k);
+    case 17: return bym<1, 192, 1, true, 6>(m, w, sf, x, o, g, n, k);
     }
     return false;
 }
@@ -250,7 +256,8 @@ torch::Tensor run(int64_t vid, torch::Tensor x, torch::Tensor w, torch::Tensor s
 CPP = "torch::Tensor run(int64_t vid, torch::Tensor x, torch::Tensor w, torch::Tensor sf, double g);"
 
 VIDS = {"r4b192": 1, "r8b192": 2, "r16b192": 3, "r4b96": 4, "r8b96": 5, "r8b192e": 6, "r4b192e": 7,
-        "r2b192": 8, "r16b96": 9, "r2b192e": 10, "r4b96e": 11, "r8b96e": 12}
+        "r2b192": 8, "r16b96": 9, "r2b192e": 10, "r4b96e": 11, "r8b96e": 12,
+        "r2e_mb4": 13, "r4e_mb4": 14, "r2e_mb5": 15, "r4e_mb3": 16, "r1e_mb6": 17}
 if os.environ.get("PROTO_MS"):
     MS = [int(v) for v in os.environ["PROTO_MS"].split(",")]
 
