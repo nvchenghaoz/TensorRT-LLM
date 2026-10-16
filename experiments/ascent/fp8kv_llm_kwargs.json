@@ -1,0 +1,13 @@
+{
+  "cuda_graph_config": {"max_batch_size": 8},
+  "enable_chunked_prefill": true,
+  "kv_cache_config": {
+    "enable_block_reuse": true,
+    "mamba_state_config": {"additional_snapshot_offsets_from_start": [32768]}
+  },
+  "max_batch_size": 8,
+  "max_num_tokens": 8192,
+  "max_seq_len": 36864,
+  "tensor_parallel_size": 1,
+  "pipeline_parallel_size": 1
+}

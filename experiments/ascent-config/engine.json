@@ -1,5 +1,9 @@
 {
   "kv_cache_config": {
-    "dtype": "fp8"
+    "dtype": "fp8",
+    "enable_block_reuse": true,
+    "mamba_state_config": {
+      "additional_snapshot_offsets_from_start": [32768]
+    }
   }
 }
