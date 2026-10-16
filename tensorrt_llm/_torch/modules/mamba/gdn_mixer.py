@@ -309,6 +309,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=False,
         )
+        # Decode (<= 16 rows) runs on a load-time NVFP4 W4A16 copy of the FP8
+        # per-tensor weight via Marlin when eligible (SM 12.x, static input
+        # scale); see FP8QDQLinearMethod.transform_weights. Disable with
+        # TRTLLM_GDN_INPROJ_NVFP4_DECODE=0.
+        self.in_proj_qkvz._nvfp4_decode_copy = True
         self.in_proj_ba = Linear(
             self.hidden_size,
             self.num_v_heads * 2,

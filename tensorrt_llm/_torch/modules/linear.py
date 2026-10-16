@@ -778,6 +778,27 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
 
+        nvfp4_decode_weight = getattr(module, "_nvfp4_decode_weight", None)
+        if (nvfp4_decode_weight is not None and input.dtype == torch.bfloat16
+                and input.shape[0] <= _FP8_NVFP4_DECODE_MAX_ROWS):
+            # Decode-only W4A16 NVFP4 copy of this FP8 weight (Marlin).
+            output = torch.ops.trtllm.marlin_nvfp4_gemm(
+                input.contiguous(),
+                nvfp4_decode_weight,
+                scale_a=None,
+                scale_b=module._nvfp4_decode_scale,
+                alpha=None,
+                weight_global_scale=module._nvfp4_decode_global_scale,
+                bias=None,
+                out_dtype=torch.bfloat16,
+                size_n=module.out_features,
+                size_k=module.in_features,
+            )
+            if len(original_shape) > 2:
+                output = output.reshape(*original_shape[:-1],
+                                        output.shape[-1])
+            return output
+
         static_input_scale = self.get_static_input_scale(module)
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
@@ -844,6 +865,15 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
+
+    def transform_weights(self, module: Linear) -> None:
+        # Opt-in decode-only NVFP4 W4A16 copy (see _build_fp8_nvfp4_decode_copy).
+        # Runs after the FP8 weight and per-tensor scale are final; the FP8
+        # weight is kept for prefill / mixed batches. Linear.transform_weights
+        # calls this once per (re)load, so a reload rebuilds the copy.
+        module._nvfp4_decode_weight = None
+        if _fp8_nvfp4_decode_copy_enabled(module):
+            _build_fp8_nvfp4_decode_copy(module)
 
     def load_kv_scales(self, weights: List[Dict]):
         k_scale, v_scale = [], []
@@ -2346,6 +2376,184 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
         return self._restore_output(output, original_shape, bias=None)
 
 
+def _pack_nvfp4_weight_for_marlin(
+        weight: torch.Tensor, weight_scale: torch.Tensor,
+        weight_scale_2: torch.Tensor, size_n: int, size_k: int,
+        group_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack a checkpoint-layout NVFP4 weight for the Marlin W4A16 GEMM.
+
+    Args:
+        weight: packed E2M1 weight [size_n, size_k // 2].
+        weight_scale: swizzled E4M3 block scales (as produced by fp4_quantize
+            or stored in an NVFP4 checkpoint).
+        weight_scale_2: FP32 per-tensor global scale (dequant multiplier).
+
+    Returns:
+        (marlin_weight, marlin_scale, weight_global_scale) for
+        torch.ops.trtllm.marlin_nvfp4_gemm with size_n / size_k padded to
+        multiples of 128 / 64.
+    """
+    from tensorrt_llm.quantization.utils import marlin_utils
+
+    assert size_k % group_size == 0, (
+        f"size_k {size_k} must be divisible by group_size {group_size}")
+
+    size_k_pad = fp4_utils.pad_up(size_k, 64)
+    size_n_pad = fp4_utils.pad_up(size_n, 128)
+    num_groups = size_k // group_size
+    scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+        weight_scale.view(size_n_pad, -1))
+    scale_2d = scale_unswizzled[:size_n, :num_groups]
+
+    if size_k_pad != size_k or size_n_pad != size_n:
+        num_groups_pad = size_k_pad // group_size
+        weight = F.pad(weight,
+                       (0, (size_k_pad - size_k) // 2, 0, size_n_pad - size_n))
+        # Marlin's S0E5M3 fast dequantization requires a non-zero scale for
+        # zero-weight K padding. 0x08 is the smallest normal E4M3 value.
+        scale_2d = F.pad(scale_2d, (0, num_groups_pad - num_groups),
+                         value=0x08)
+        scale_2d = F.pad(scale_2d, (0, 0, 0, size_n_pad - size_n), value=0)
+
+    qweight_int32 = weight.view(torch.int32).T.contiguous()
+    perm = torch.empty(0, dtype=torch.int32, device=weight.device)
+    marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
+        b_q_weight=qweight_int32,
+        perm=perm,
+        size_k=size_k_pad,
+        size_n=size_n_pad,
+        num_bits=4,
+        is_a_8bit=False,
+    )
+
+    scale_2d = scale_2d.view(torch.float8_e4m3fn).T.contiguous()
+    marlin_scale = marlin_utils.marlin_permute_scales(scale_2d.to(torch.half),
+                                                      size_k_pad,
+                                                      size_n_pad,
+                                                      group_size=group_size)
+    marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
+
+    if (weight_scale_2.numel() == 0 or not torch.isfinite(weight_scale_2).all()
+            or weight_scale_2.item() == 0):
+        weight_scale_2 = torch.tensor([1.0],
+                                      dtype=torch.float32,
+                                      device=weight.device)
+    weight_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
+        weight_scale_2.to(torch.bfloat16))
+    return marlin_weight, marlin_scale, weight_global_scale
+
+
+# Decode-time (rows <= this) NVFP4 W4A16 copy of an FP8 per-tensor weight.
+_FP8_NVFP4_DECODE_MAX_ROWS = 16
+_FP8_NVFP4_DECODE_ENV = "TRTLLM_GDN_INPROJ_NVFP4_DECODE"
+
+
+def _fp8_nvfp4_decode_copy_enabled(module: Linear) -> bool:
+    """Whether to build a decode-only NVFP4 W4A16 copy of an FP8 weight.
+
+    Opt-in per module (``module._nvfp4_decode_copy``); requires SM 12.x, the
+    exact FP8QDQ per-tensor method with a static input scale, BF16 module
+    dtype, the Marlin ops, and the kill-switch env var not set to 0.
+    """
+    if not getattr(module, "_nvfp4_decode_copy", False):
+        return False
+    if os.environ.get(_FP8_NVFP4_DECODE_ENV, "1") == "0":
+        return False
+    if type(module.quant_method) is not FP8QDQLinearMethod:
+        return False
+    if get_sm_version() not in (120, 121):
+        return False
+    if getattr(module, "dtype", None) != torch.bfloat16:
+        return False
+    if module.bias is not None:
+        return False
+    if module.quant_method.get_static_input_scale(module) is None:
+        return False
+    if (module.in_features % 64 != 0 or module.out_features % 128 != 0):
+        return False
+    return (hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
+            and hasattr(torch.ops.trtllm, "gptq_marlin_repack")
+            and hasattr(torch.ops.trtllm, "fp4_quantize"))
+
+
+def _build_fp8_nvfp4_decode_copy(module: Linear) -> None:
+    """Quantize an FP8 per-tensor weight to NVFP4 and pack it for Marlin.
+
+    The FP8 weight (value * weight_scale) is re-quantized to NVFP4: E2M1
+    values, one E4M3 scale per 16 K-elements, and a power-of-two FP32 global
+    scale g so Marlin's BF16 global-scale multiply is exact. The FP8 weight is
+    kept for rows > _FP8_NVFP4_DECODE_MAX_ROWS (prefill / mixed batches).
+    """
+    weight_fp8 = module.weight.data
+    weight_scale = module.weight_scale.data.float().reshape(())
+    size_n, size_k = module.out_features, module.in_features
+    assert weight_fp8.dtype == torch.float8_e4m3fn
+    assert tuple(weight_fp8.shape) == (size_n, size_k)
+
+    # FP8 values are exact in BF16; fold the per-tensor scale into the
+    # quantizer's global scale instead of rounding value * scale to BF16.
+    w_vals = weight_fp8.to(torch.bfloat16)
+    amax = w_vals.abs().amax().float() * weight_scale
+    amax = torch.clamp(amax, min=torch.finfo(torch.float32).tiny)
+    g = torch.exp2(torch.ceil(torch.log2(amax / (448.0 * 6.0))))
+    # fp4_quantize computes SF = e4m3(blockmax(x) / 6 * gs) and
+    # e2m1(x / (SF / gs)); with x = W / s and gs = s / g this gives
+    # SF = e4m3(blockmax(W) / (6 g)) and dequant W ~= e2m1 * SF * g.
+    quant_global = (weight_scale / g).reshape(1).to(torch.float32)
+    w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(w_vals, quant_global, 16,
+                                                False, True)
+    del w_vals
+
+    marlin_weight, marlin_scale, weight_global_scale = (
+        _pack_nvfp4_weight_for_marlin(w_fp4,
+                                      w_sf,
+                                      g.reshape(1).to(torch.float32),
+                                      size_n=size_n,
+                                      size_k=size_k,
+                                      group_size=16))
+
+    if os.environ.get(_FP8_NVFP4_DECODE_ENV + "_REPORT", "0") == "1":
+        _report_fp8_nvfp4_decode_copy(module, w_fp4, w_sf, g, weight_scale)
+    del w_fp4, w_sf
+
+    module._nvfp4_decode_weight = marlin_weight
+    module._nvfp4_decode_scale = marlin_scale
+    module._nvfp4_decode_global_scale = weight_global_scale
+
+
+def _report_fp8_nvfp4_decode_copy(module: Linear, w_fp4: torch.Tensor,
+                                  w_sf: torch.Tensor, g: torch.Tensor,
+                                  weight_scale: torch.Tensor) -> None:
+    """Log block-scale statistics and the NVFP4-vs-FP8 weight error."""
+    size_n, size_k = module.out_features, module.in_features
+    sf = torch.ops.trtllm.block_scale_interleave_reverse(
+        w_sf.view(size_n, -1))[:, :size_k // 16].contiguous()
+    sf_bits = sf.view(torch.uint8)
+    n_zero = int((sf_bits == 0).sum().item())
+    # E4M3 subnormals: exponent field 0, mantissa != 0.
+    n_sub = int((((sf_bits & 0x78) == 0) & ((sf_bits & 0x07) != 0)).sum().item())
+    sf_f = sf.view(torch.float8_e4m3fn).float()
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=w_fp4.device)
+    packed = w_fp4.view(torch.uint8)
+    vals = torch.stack([lut[(packed & 0xF).long()], lut[(packed >> 4).long()]],
+                       dim=-1).reshape(size_n, size_k)
+    w_q = (vals.view(size_n, size_k // 16, 16) * sf_f.unsqueeze(-1)).reshape(
+        size_n, size_k) * g
+    w_ref = module.weight.data.float() * weight_scale
+    rel_rms = ((w_q - w_ref).norm() / w_ref.norm()).item()
+    _report_fp8_nvfp4_decode_copy.count = getattr(_report_fp8_nvfp4_decode_copy,
+                                                  "count", 0) + 1
+    # Only reached with TRTLLM_GDN_INPROJ_NVFP4_DECODE_REPORT=1.
+    logger.warning(
+        f"[nvfp4_decode_copy] #{_report_fp8_nvfp4_decode_copy.count} "
+        f"N={size_n} K={size_k} g=2^{int(torch.log2(g).item())} "
+        f"zero_sf={n_zero} subnormal_sf={n_sub} of {sf_bits.numel()} "
+        f"rel_rms_err={rel_rms:.5f}")
+
+
 class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     """W4A16 NVFP4 linear backed by Marlin."""
 
@@ -2391,63 +2599,13 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
                 or "marlin" in getattr(module, "nvfp4_allowed_backends", ()))
 
     def transform_weights(self, module: Linear) -> None:
-        from tensorrt_llm.quantization.utils import marlin_utils
-
-        weight = module.weight.data
-        weight_scale = module.weight_scale.data
-        size_n = module.out_features
-        size_k = module.in_features
-        group_size = module.scaling_vector_size
-
-        assert size_k % group_size == 0, (
-            f"size_k {size_k} must be divisible by group_size {group_size}")
-
-        size_k_pad = fp4_utils.pad_up(size_k, 64)
-        size_n_pad = fp4_utils.pad_up(size_n, 128)
-        num_groups = size_k // group_size
-        scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            weight_scale.view(size_n_pad, -1))
-        scale_2d = scale_unswizzled[:size_n, :num_groups]
-
-        if size_k_pad != size_k or size_n_pad != size_n:
-            num_groups_pad = size_k_pad // group_size
-            weight = F.pad(weight,
-                           (0,
-                            (size_k_pad - size_k) // 2, 0, size_n_pad - size_n))
-            # Marlin's S0E5M3 fast dequantization requires a non-zero scale for
-            # zero-weight K padding. 0x08 is the smallest normal E4M3 value.
-            scale_2d = F.pad(scale_2d, (0, num_groups_pad - num_groups),
-                             value=0x08)
-            scale_2d = F.pad(scale_2d, (0, 0, 0, size_n_pad - size_n), value=0)
-
-        qweight_int32 = weight.view(torch.int32).T.contiguous()
-        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
-        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
-            b_q_weight=qweight_int32,
-            perm=perm,
-            size_k=size_k_pad,
-            size_n=size_n_pad,
-            num_bits=4,
-            is_a_8bit=False,
-        )
-
-        scale_2d = scale_2d.view(torch.float8_e4m3fn).T.contiguous()
-        marlin_scale = marlin_utils.marlin_permute_scales(scale_2d.to(
-            torch.half),
-                                                          size_k_pad,
-                                                          size_n_pad,
-                                                          group_size=group_size)
-        marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
-
-        weight_scale_2 = module.weight_scale_2.data
-        if (weight_scale_2.numel() == 0
-                or not torch.isfinite(weight_scale_2).all()
-                or weight_scale_2.item() == 0):
-            weight_scale_2 = torch.tensor([1.0],
-                                          dtype=torch.float32,
-                                          device=weight.device)
-        weight_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
-            weight_scale_2.to(torch.bfloat16))
+        marlin_weight, marlin_scale, weight_global_scale = (
+            _pack_nvfp4_weight_for_marlin(module.weight.data,
+                                          module.weight_scale.data,
+                                          module.weight_scale_2.data,
+                                          size_n=module.out_features,
+                                          size_k=module.in_features,
+                                          group_size=module.scaling_vector_size))
 
         module.weight = Parameter(marlin_weight, requires_grad=False)
         module.weight_scale = Parameter(marlin_scale, requires_grad=False)
