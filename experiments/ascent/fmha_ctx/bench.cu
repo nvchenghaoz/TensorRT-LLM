@@ -1,25 +1,17 @@
 // SM120 e4m3 tiled context FMHA harness (branch 16, idea 45).
-//
-// Instantiates fused_multihead_attention::device_flash_attention_nl_tiled with the same template
-// arguments as the generated TU of
-//   fmha_v2_flash_attention_e4m3_fp32_64_128_S_q_paged_kv_256_causal_output_bf16_sm120_kernel_nl_tiled
-// (setup.py flash_attention_kernel_template; GENERATE_CUBIN => head_interleaved=False, flags 0x1027)
-// from whatever cpp/kernels/fmha_v2/src tree is on the include path, and launches it the way the
-// generated launcher does (grid (ceil(s/64), h, b), Kernel_traits_nl_tiled::BYTES_PER_SMEM).
-//
-// Shapes: Qwen3.8-27B full attention, 24 q / 4 kv heads, head 256, e4m3 paged KV (32-token pages,
-// kv scale 1.0), e4m3 Q, BF16 O, causal over past + new tokens. Prefix pages are aliased across
-// sequences (serving block reuse).
-//
-// Build: nvcc -O3 -std=c++17 --expt-extended-lambda --expt-relaxed-constexpr -DUSE_DEMO_BERT_PARAMS=1
-//        -DGENERATE_CUBIN=1 -gencode arch=compute_120f,code=sm_120f -I<tree>/cpp/kernels/fmha_v2/src
-//        bench.cu -o bench -lcuda
-//
-// Usage: bench --cases c1,c4,... [--warmup 10] [--iters 50] [--dump DIR]
-//   Every call (warmup and timed) is preceded by a reset point: NaN-poison of O (0xFF bytes) and a
-//   384 MiB L2 read-flush (both untimed). Each call is timed with its own CUDA event pair. After every
-//   call the output hash is taken (untimed) and compared with call 1; Q / KV pool hashes are checked
-//   unchanged at the end. Last stdout line: CASES_JSON {...}.
+// Instantiates fused_multihead_attention::device_flash_attention_nl_tiled with the template arguments of the
+// generated fmha_v2_flash_attention_e4m3_fp32_64_128_S_q_paged_kv_256_causal_output_bf16_sm120_kernel_nl_tiled
+// (setup.py flash_attention_kernel_template, GENERATE_CUBIN so head_interleaved=False, flags 0x1027) from the
+// fmha_v2/src tree on the include path, and launches it like the generated launcher: grid (ceil(s/64), h, b),
+// 128 threads, Kernel_traits_nl_tiled::BYTES_PER_SMEM dynamic smem.
+// Shapes: 24 q / 4 kv heads, head 256, e4m3 Q and paged e4m3 KV (32-token pages, kv scale 1.0), BF16 O, causal over
+// past + new tokens, prefix pages aliased across sequences (serving block reuse).
+// Every call (warmup and timed) has a reset point first: NaN-poison of O (0xFF bytes) and a 384 MiB L2 read-flush,
+// both untimed. Each call is timed with its own CUDA event pair. After every call the output hash is compared with
+// call 1 (untimed). Q and KV pool hashes are checked unchanged at the end.
+// Output lines: KINFO regs local_bytes dyn_smem occupancy store_o_from_regs
+//               RESULT case b ctas median p10 p90 min noise mismatches calls nonfinite inputs_ok out_hash
+//               META case b max_blocks q_lens... past_lens...   (with --dump DIR, which also writes O, Q, pool, offsets)
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -38,26 +30,26 @@
 #include <type_traits>
 #include <vector>
 
-#define CK(x)                                                                                                          \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        cudaError_t e_ = (x);                                                                                          \
-        if (e_ != cudaSuccess)                                                                                         \
-        {                                                                                                              \
-            fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #x, __FILE__, __LINE__, cudaGetErrorString(e_));           \
-            exit(2);                                                                                                   \
-        }                                                                                                              \
-    } while (0)
+static void ck(cudaError_t e, int line)
+{
+    if (e != cudaSuccess)
+    {
+        fprintf(stderr, "CUDA error at line %d: %s\n", line, cudaGetErrorString(e));
+        exit(2);
+    }
+}
+
+#define CK(x) ck((x), __LINE__)
 
 static constexpr uint32_t kFlags = 0x1027u; // LDGSTS q|k|v (0x7), !head_interleaved (0x20), tiled (0x1000)
 
-// The kernel traits of the causal kernel and of the launcher (which takes BYTES_PER_SMEM from the padding one).
+// The causal kernel traits, and the launcher traits (the launcher takes BYTES_PER_SMEM from the padding traits).
 using Kt_causal = fmha::Kernel_traits_v2_paged_kv_cache<fmha::Ada_qmma_e4m3_fp32_traits, 128, 256, 0, 64, 4, 1, 1,
     kFlags | 0x200, 3, true, nv_bfloat16>;
 using Kt_launch = fmha::Kernel_traits_v2_paged_kv_cache<fmha::Ada_qmma_e4m3_fp32_traits, 128, 256, 0, 64, 4, 1, 1,
     kFlags | 0x200, 2, true, nv_bfloat16, 0, 0, 0>;
 
-// Reports whether the tree has the register-direct O epilogue (0 on main).
+// Whether the tree has the register-direct O epilogue (0 on main).
 template <typename T, typename = void>
 struct Store_o_from_regs
 {
@@ -78,8 +70,6 @@ extern "C" __global__ void fmha_v2_flash_attention_e4m3_fp32_64_128_S_q_paged_kv
 
 #define KERNEL fmha_v2_flash_attention_e4m3_fp32_64_128_S_q_paged_kv_256_causal_output_bf16_sm120_kernel_nl_tiled
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 __device__ __forceinline__ uint64_t mix64(uint64_t x)
 {
     x ^= x >> 33;
@@ -90,14 +80,14 @@ __device__ __forceinline__ uint64_t mix64(uint64_t x)
     return x;
 }
 
-// Approximately N(0, std) values (Irwin-Hall of 4 bytes), quantized to e4m3.
-__global__ void fill_e4m3(__nv_fp8_e4m3* p, size_t n, uint64_t seed, float stdev)
+// Approximately N(0, 1) values (Irwin-Hall of 4 bytes), quantized to e4m3.
+__global__ void fill_e4m3(__nv_fp8_e4m3* p, size_t n, uint64_t seed)
 {
     for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
     {
         uint64_t a = mix64(seed * 0x9E3779B97F4A7C15ULL + i);
         float u = (float) ((a & 0xff) + ((a >> 8) & 0xff) + ((a >> 16) & 0xff) + ((a >> 24) & 0xff)) / 255.f - 2.f;
-        p[i] = __nv_fp8_e4m3(u * stdev * 1.7320508f);
+        p[i] = __nv_fp8_e4m3(u * 1.7320508f);
     }
 }
 
@@ -125,8 +115,7 @@ __global__ void count_nonfinite(__nv_bfloat16 const* p, size_t n, unsigned long 
     unsigned long long c = 0;
     for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
     {
-        float v = __bfloat162float(p[i]);
-        c += !isfinite(v);
+        c += !isfinite(__bfloat162float(p[i]));
     }
     for (int o = 16; o > 0; o /= 2)
     {
@@ -152,8 +141,6 @@ __global__ void flush_read(uint4 const* p, size_t n, int* sink)
         *sink = acc;
     }
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Problem
 {
@@ -189,7 +176,6 @@ static void build(Problem& p, uint64_t seed)
     int min_past = *std::min_element(p.past_lens.begin(), p.past_lens.end());
     p.shared_blocks = p.alias ? min_past / p.tpb : 0;
     std::vector<int> nblk(p.b);
-    p.max_blocks = 0;
     p.total_blocks = 2 * p.shared_blocks;
     p.h_cu_q.assign(p.b + 1, 0);
     p.h_cu_kv.assign(p.b + 1, 0);
@@ -203,20 +189,15 @@ static void build(Problem& p, uint64_t seed)
         p.h_cu_kv[i + 1] = p.h_cu_kv[i] + kv;
     }
     p.total_q = p.h_cu_q[p.b];
-    // Block offsets [b][2][max_blocks]: shared K blocks [0, S), shared V blocks [S, 2S), then private ones.
+    // Block offsets [b][2][max_blocks]: shared K blocks [0, S), shared V blocks [S, 2S), then private K/V pairs.
     p.h_offs.assign((size_t) p.b * 2 * p.max_blocks, 0);
     int cursor = 2 * p.shared_blocks;
     for (int i = 0; i < p.b; ++i)
     {
         for (int j = 0; j < nblk[i]; ++j)
         {
-            int32_t kb, vb;
-            if (j < p.shared_blocks)
-            {
-                kb = j;
-                vb = p.shared_blocks + j;
-            }
-            else
+            int32_t kb = j, vb = p.shared_blocks + j;
+            if (j >= p.shared_blocks)
             {
                 kb = cursor++;
                 vb = cursor++;
@@ -240,11 +221,11 @@ static void build(Problem& p, uint64_t seed)
     CK(cudaMemcpy(p.offs, p.h_offs.data(), p.h_offs.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(p.cu_q, p.h_cu_q.data(), (p.b + 1) * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(p.cu_kv, p.h_cu_kv.data(), (p.b + 1) * 4, cudaMemcpyHostToDevice));
-    // Serving: bmm1 = dequantQ * dequantK / sqrt(d) (kv scale 1.0), [1] = [0] * log2(e); bmm2 = quantO * dequantV.
+    // As serving: bmm1 = dequantQ * dequantK / sqrt(d) with kv scale 1.0, [1] = [0] * log2(e); bmm2 = quantO * dequantV.
     float h_scales[4] = {1.f / 16.f, 1.f / 16.f * 1.4426950408889634f, 1.f, 0.f};
     CK(cudaMemcpy(p.scales, h_scales, sizeof(h_scales), cudaMemcpyHostToDevice));
-    fill_e4m3<<<1024, 256>>>(reinterpret_cast<__nv_fp8_e4m3*>(p.q), p.q_bytes, seed * 3 + 1, 1.0f);
-    fill_e4m3<<<4096, 256>>>(reinterpret_cast<__nv_fp8_e4m3*>(p.pool), p.pool_bytes, seed * 3 + 2, 1.0f);
+    fill_e4m3<<<1024, 256>>>(reinterpret_cast<__nv_fp8_e4m3*>(p.q), p.q_bytes, seed * 3 + 1);
+    fill_e4m3<<<4096, 256>>>(reinterpret_cast<__nv_fp8_e4m3*>(p.pool), p.pool_bytes, seed * 3 + 2);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
@@ -301,32 +282,24 @@ static void release(Problem& p)
 
 static dim3 grid_of(Problem const& p)
 {
-    // Generated launcher: ctas_per_o_row = ceil(d / Cta_tile_o::N) = 1; loop_iters = ceil(s / 64).
+    // As the generated launcher: ctas_per_o_row = ceil(d / Cta_tile_o::N) = 1, loop_iters = ceil(s / 64).
     using Cta_tile_o = typename Kt_launch::Cta_tile_o;
     int ctas_per_o_row = (p.params.d + Cta_tile_o::N - 1) / Cta_tile_o::N;
     int loop_iters = (p.params.s + 64 - 1) / 64;
     return dim3(loop_iters * ctas_per_o_row, p.params.h, p.params.b);
 }
 
-static void launch(Problem& p, cudaStream_t st)
-{
-    KERNEL<<<grid_of(p), Kt_launch::THREADS, Kt_launch::BYTES_PER_SMEM, st>>>(p.params);
-}
-
-static unsigned long long hash_dev(void const* ptr, size_t bytes, unsigned long long* d_tmp, cudaStream_t st)
+static unsigned long long run_reduce(int which, void const* ptr, size_t bytes, unsigned long long* d_tmp, cudaStream_t st)
 {
     CK(cudaMemsetAsync(d_tmp, 0, 8, st));
-    hash_buf<<<1024, 256, 0, st>>>(reinterpret_cast<uint64_t const*>(ptr), bytes / 8, d_tmp);
-    unsigned long long h = 0;
-    CK(cudaMemcpyAsync(&h, d_tmp, 8, cudaMemcpyDeviceToHost, st));
-    CK(cudaStreamSynchronize(st));
-    return h;
-}
-
-static unsigned long long nonfinite_dev(void const* ptr, size_t elems, unsigned long long* d_tmp, cudaStream_t st)
-{
-    CK(cudaMemsetAsync(d_tmp, 0, 8, st));
-    count_nonfinite<<<1024, 256, 0, st>>>(reinterpret_cast<__nv_bfloat16 const*>(ptr), elems, d_tmp);
+    if (which == 0)
+    {
+        hash_buf<<<1024, 256, 0, st>>>(reinterpret_cast<uint64_t const*>(ptr), bytes / 8, d_tmp);
+    }
+    else
+    {
+        count_nonfinite<<<1024, 256, 0, st>>>(reinterpret_cast<__nv_bfloat16 const*>(ptr), bytes / 2, d_tmp);
+    }
     unsigned long long h = 0;
     CK(cudaMemcpyAsync(&h, d_tmp, 8, cudaMemcpyDeviceToHost, st));
     CK(cudaStreamSynchronize(st));
@@ -346,46 +319,46 @@ static void write_file(std::string const& path, void const* dev, size_t bytes)
     std::vector<char> h(bytes);
     CK(cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost));
     FILE* f = fopen(path.c_str(), "wb");
-    if (!f)
+    if (!f || fwrite(h.data(), 1, bytes, f) != bytes)
     {
         fprintf(stderr, "cannot write %s\n", path.c_str());
         exit(3);
     }
-    fwrite(h.data(), 1, bytes, f);
     fclose(f);
 }
 
 static bool make_case(std::string const& name, Problem& p)
 {
     p.name = name;
+    int const P = 32768;
     if (name == "c1")
-    { // 1 x 2048 new tokens over 32768 cached.
-        p.q_lens = {2048};
-        p.past_lens = {32768};
+    {
+        p.q_lens = {2048}; // 1 x 2048 new tokens over 32768 cached (32 x 24 = 768 CTAs)
+        p.past_lens = {P};
     }
     else if (name == "c2")
     {
         p.q_lens = {2048, 2048};
-        p.past_lens = {32768, 32768};
+        p.past_lens = {P, P};
     }
     else if (name == "c4")
     {
         p.q_lens = {2048, 2048, 2048, 2048};
-        p.past_lens = {32768, 32768, 32768, 32768};
+        p.past_lens = {P, P, P, P};
     }
     else if (name == "c1_1984")
-    { // 31 x 24 = 744 CTAs (area-lead tail probe).
-        p.q_lens = {1984};
-        p.past_lens = {32768};
+    {
+        p.q_lens = {1984}; // 31 x 24 = 744 CTAs (tail-wave probe)
+        p.past_lens = {P};
     }
     else if (name == "ragged")
-    { // Row guard: 2000 and 1 new tokens over the shared prefix.
-        p.q_lens = {2000, 1};
-        p.past_lens = {32768, 32768};
+    {
+        p.q_lens = {2000, 1}; // row guard
+        p.past_lens = {P, P};
     }
     else if (name == "empty")
-    { // Empty cache, s = 2048.
-        p.q_lens = {2048};
+    {
+        p.q_lens = {2048}; // empty cache
         p.past_lens = {0};
         p.alias = false;
     }
@@ -402,19 +375,19 @@ int main(int argc, char** argv)
     std::string dump;
     int warmup = 10, iters = 50;
     uint64_t seed = 1234;
-    for (int i = 1; i < argc; ++i)
+    for (int i = 1; i + 1 < argc; i += 2)
     {
         std::string a = argv[i];
-        if (a == "--cases" && i + 1 < argc)
-            cases = argv[++i];
-        else if (a == "--warmup" && i + 1 < argc)
-            warmup = atoi(argv[++i]);
-        else if (a == "--iters" && i + 1 < argc)
-            iters = atoi(argv[++i]);
-        else if (a == "--dump" && i + 1 < argc)
-            dump = argv[++i];
-        else if (a == "--seed" && i + 1 < argc)
-            seed = strtoull(argv[++i], nullptr, 10);
+        if (a == "--cases")
+            cases = argv[i + 1];
+        else if (a == "--warmup")
+            warmup = atoi(argv[i + 1]);
+        else if (a == "--iters")
+            iters = atoi(argv[i + 1]);
+        else if (a == "--dump")
+            dump = argv[i + 1];
+        else if (a == "--seed")
+            seed = strtoull(argv[i + 1], nullptr, 10);
     }
 
     cudaDeviceProp prop;
@@ -429,10 +402,10 @@ int main(int argc, char** argv)
     int occ = 0;
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, KERNEL, Kt_launch::THREADS, smem));
     int const from_regs = Store_o_from_regs<Kt_causal>::VALUE;
-    printf("[info] %s sms=%d smem_per_sm=%zu | kernel regs=%d local=%zu static_smem=%zu dyn_smem=%d threads=%d "
-           "store_o_from_regs=%d occupancy=%d CTAs/SM\n",
-        prop.name, prop.multiProcessorCount, prop.sharedMemPerMultiprocessor, fa.numRegs, fa.localSizeBytes,
-        fa.sharedSizeBytes, smem, Kt_launch::THREADS, from_regs, occ);
+    printf("KINFO %d %zu %d %d %d\n", fa.numRegs, fa.localSizeBytes, smem, occ, from_regs);
+    printf("[info] %s sms=%d smem_per_sm=%zu regs=%d local=%zu dyn_smem=%d occupancy=%d store_o_from_regs=%d\n",
+        prop.name, prop.multiProcessorCount, prop.sharedMemPerMultiprocessor, fa.numRegs, fa.localSizeBytes, smem, occ,
+        from_regs);
     fflush(stdout);
 
     cudaStream_t st;
@@ -449,17 +422,15 @@ int main(int argc, char** argv)
     CK(cudaEventCreate(&ev0));
     CK(cudaEventCreate(&ev1));
 
-    std::string json = "{\"cases\": {";
     bool all_ok = true;
     size_t pos = 0;
-    bool first_case = true;
-    while (pos <= cases.size())
+    while (pos < cases.size())
     {
         size_t comma = cases.find(',', pos);
-        std::string cname = cases.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-        pos = comma == std::string::npos ? cases.size() + 1 : comma + 1;
-        if (cname.empty())
-            continue;
+        if (comma == std::string::npos)
+            comma = cases.size();
+        std::string cname = cases.substr(pos, comma - pos);
+        pos = comma + 1;
         Problem p;
         if (!make_case(cname, p))
         {
@@ -468,13 +439,11 @@ int main(int argc, char** argv)
         }
         build(p, seed);
         dim3 g = grid_of(p);
-        unsigned long long q_hash0 = hash_dev(p.q, p.q_bytes, d_tmp, st);
-        unsigned long long kv_hash0 = hash_dev(p.pool, p.pool_bytes, d_tmp, st);
-
+        unsigned long long q_hash0 = run_reduce(0, p.q, p.q_bytes, d_tmp, st);
+        unsigned long long kv_hash0 = run_reduce(0, p.pool, p.pool_bytes, d_tmp, st);
         std::vector<float> times;
-        unsigned long long out_hash1 = 0;
+        unsigned long long out_hash1 = 0, nonfinite = 0;
         int mismatches = 0;
-        unsigned long long nonfinite_max = 0;
         int const total = warmup + iters;
         for (int it = 0; it < total; ++it)
         {
@@ -483,7 +452,7 @@ int main(int argc, char** argv)
             flush_read<<<prop.multiProcessorCount * 4, 512, 0, st>>>(
                 reinterpret_cast<uint4 const*>(flush_buf), flush_bytes / 16, d_sink);
             CK(cudaEventRecord(ev0, st));
-            launch(p, st);
+            KERNEL<<<g, Kt_launch::THREADS, smem, st>>>(p.params);
             CK(cudaEventRecord(ev1, st));
             CK(cudaGetLastError());
             CK(cudaEventSynchronize(ev1));
@@ -493,74 +462,41 @@ int main(int argc, char** argv)
             {
                 times.push_back(ms);
             }
-            unsigned long long hsh = hash_dev(p.o, p.o_bytes, d_tmp, st);
-            unsigned long long nf = nonfinite_dev(p.o, p.o_bytes / 2, d_tmp, st);
-            nonfinite_max = std::max(nonfinite_max, nf);
+            unsigned long long hsh = run_reduce(0, p.o, p.o_bytes, d_tmp, st);
+            nonfinite = std::max(nonfinite, run_reduce(1, p.o, p.o_bytes, d_tmp, st));
             if (it == 0)
             {
                 out_hash1 = hsh;
             }
-            else if (hsh != out_hash1)
-            {
-                ++mismatches;
-            }
+            mismatches += hsh != out_hash1;
             if (it == 0 || it == warmup || it == total - 1)
             {
-                printf("[%s] call %d/%d: %.4f ms out_hash=%016llx nonfinite=%llu\n", cname.c_str(), it + 1, total, ms,
-                    hsh, nf);
+                printf("[%s] call %d/%d %.4f ms out_hash %016llx\n", cname.c_str(), it + 1, total, ms, hsh);
                 fflush(stdout);
             }
         }
-        unsigned long long q_hash1 = hash_dev(p.q, p.q_bytes, d_tmp, st);
-        unsigned long long kv_hash1 = hash_dev(p.pool, p.pool_bytes, d_tmp, st);
-        bool inputs_ok = q_hash0 == q_hash1 && kv_hash0 == kv_hash1;
-        bool ok = mismatches == 0 && inputs_ok && nonfinite_max == 0;
-        all_ok = all_ok && ok;
+        bool inputs_ok = q_hash0 == run_reduce(0, p.q, p.q_bytes, d_tmp, st)
+            && kv_hash0 == run_reduce(0, p.pool, p.pool_bytes, d_tmp, st);
+        all_ok = all_ok && mismatches == 0 && inputs_ok && nonfinite == 0;
         double med = pct(times, 0.5), p10 = pct(times, 0.1), p90 = pct(times, 0.9);
         double mn = *std::min_element(times.begin(), times.end());
-        printf("[%s] b=%d s_max=%d grid=(%u,%u,%u)=%u CTAs: median %.4f ms p10 %.4f p90 %.4f min %.4f | "
-               "repeat mismatches %d/%d nonfinite %llu inputs_unchanged %d out_hash %016llx kv_hash %016llx\n",
-            cname.c_str(), p.b, p.s_max, g.x, g.y, g.z, g.x * g.y * g.z, med, p10, p90, mn, mismatches, total - 1,
-            nonfinite_max, (int) inputs_ok, out_hash1, kv_hash0);
+        printf("RESULT %s %d %u %.5f %.5f %.5f %.5f %.5f %d %d %llu %d %016llx\n", cname.c_str(), p.b, g.x * g.y * g.z,
+            med, p10, p90, mn, (p90 - p10) / med, mismatches, total, nonfinite, (int) inputs_ok, out_hash1);
         fflush(stdout);
         if (!dump.empty())
         {
             write_file(dump + "/" + cname + "_o.bin", p.o, p.o_bytes);
             write_file(dump + "/" + cname + "_q.bin", p.q, p.q_bytes);
             write_file(dump + "/" + cname + "_pool.bin", p.pool, p.pool_bytes);
-            FILE* f = fopen((dump + "/" + cname + "_meta.json").c_str(), "w");
-            fprintf(f, "{\"b\": %d, \"h\": %d, \"h_kv\": %d, \"d\": %d, \"tpb\": %d, \"max_blocks\": %d, \"q_lens\": [",
-                p.b, p.h, p.h_kv, p.d, p.tpb, p.max_blocks);
+            write_file(dump + "/" + cname + "_offs.bin", p.offs, p.h_offs.size() * 4);
+            printf("META %s %d %d", cname.c_str(), p.b, p.max_blocks);
             for (int i = 0; i < p.b; ++i)
-                fprintf(f, "%s%d", i ? ", " : "", p.q_lens[i]);
-            fprintf(f, "], \"past_lens\": [");
+                printf(" %d", p.q_lens[i]);
             for (int i = 0; i < p.b; ++i)
-                fprintf(f, "%s%d", i ? ", " : "", p.past_lens[i]);
-            fprintf(f, "], \"offsets\": [");
-            for (size_t i = 0; i < p.h_offs.size(); ++i)
-                fprintf(f, "%s%d", i ? ", " : "", p.h_offs[i]);
-            fprintf(f, "], \"scale_bmm1\": %.9g, \"scale_bmm2\": 1.0, \"calls\": %d, \"repeat_mismatches\": %d, "
-                       "\"inputs_unchanged\": %s, \"nonfinite\": %llu}\n",
-                1.0 / 16.0, total, mismatches, inputs_ok ? "true" : "false", nonfinite_max);
-            fclose(f);
+                printf(" %d", p.past_lens[i]);
+            printf("\n");
         }
-        char buf[1024];
-        snprintf(buf, sizeof(buf),
-            "%s\"%s\": {\"b\": %d, \"ctas\": %u, \"kernel_ms\": %.5f, \"p10_ms\": %.5f, \"p90_ms\": %.5f, \"min_ms\": "
-            "%.5f, \"noise_floor\": %.5f, \"repeat_mismatches\": %d, \"calls\": %d, \"nonfinite\": %llu, "
-            "\"inputs_unchanged\": %s, \"out_hash\": \"%016llx\"}",
-            first_case ? "" : ", ", cname.c_str(), p.b, g.x * g.y * g.z, med, p10, p90, mn, (p90 - p10) / med,
-            mismatches, total, nonfinite_max, inputs_ok ? "true" : "false", out_hash1);
-        json += buf;
-        first_case = false;
         release(p);
     }
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-        "}, \"kernel\": {\"regs\": %d, \"local_bytes\": %zu, \"dyn_smem\": %d, \"occupancy_ctas_per_sm\": %d, "
-        "\"store_o_from_regs\": %d}, \"ok\": %s}",
-        fa.numRegs, fa.localSizeBytes, smem, occ, from_regs, all_ok ? "true" : "false");
-    json += hdr;
-    printf("CASES_JSON %s\n", json.c_str());
     return all_ok ? 0 : 1;
 }
