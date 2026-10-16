@@ -10,13 +10,15 @@
 # unique + 128 decoded tokens per request, max_seq_len 36864. Sub-sequence counts per batch are given explicitly
 # (default 48 at B=1/2/4: the graph-captured count of the base heuristic; 47 is also exercised).
 #
-#   bench : CUDA-graph replay timed with CUDA events; before every call (outside the timed region) the output is
+#   bench : output.class is "reordered" when any config's count differs from 48 (the base's graph-captured count),
+#           "exact" otherwise. CUDA-graph replay timed with CUDA events; before every call (outside the timed region) the output is
 #           NaN-poisoned and the L2 is flushed with a 384 MiB read sweep. kernel_ms = 10-90% trimmed mean (event
 #           timestamps are quantized to ~1 us on this GPU); median/p10/p90 reported too.
 #   check : (1) per config, the same call sequence as the timed loop (rounds x (warmup + iters), poison + flush before
 #           every call) for the unmodified original (git base commit) and the candidate: every call bitwise vs the
 #           first call and vs the original's same call, semaphores back to 0 after every call, outputs finite;
-#           (2) one process, fixed-seed interleaving of counts {48 at B=1,2,3,4,8; 47,31,23,11 at B=2,3,4,8} covering
+#           (2) one process, fixed-seed interleaving of INTERLEAVE (48 at B=1,2,3,4,8; 47 at B=1,2,4; 94 at B=1;
+#           the one-wave caps 23/15/11 at B=2/3/4) covering
 #           every ordered transition, shared semaphore/scratch buffers, same checks; (3) FP32 PyTorch reference of the
 #           same math from the stored FP8 KV and scale: candidate max/mean abs error <= 1.5x the original's;
 #           (4) read-only inputs hashed before/after.
@@ -64,6 +66,7 @@ SEQ_LEN = 32768 + 2048 + 128
 Q_SCALE = 1.0
 KV_SCALE = 0.5 if KV_DTYPE == "fp8" else 1.0  # the kernel reads the scale only for a quantized cache
 NB_SEM = 1024
+BASE_GRAPH_NB_SUB_SEQ = 48  # computeMultiBlockCount at max_past_kv_length 36864 (what the base's CUDA graphs capture)
 MACROS = {
     "INPUT_FP16": "0", "DTYPE": "__nv_bfloat16", "GENERATE_CUBIN": "1", "NDEBUG": "1", "HEAD_ELEMS": "256",
     "BEAM_WIDTH": "1", "CACHE_ELEM_ENUM": "2" if KV_DTYPE == "fp8" else "0", "TOKENS_PER_PAGE": "32",
@@ -274,7 +277,15 @@ def mode_bench(a):
     prim, extra = parse_configs(a.configs), parse_configs(a.extra_configs)
     inp = build_inputs(max(b for b, _ in prim + extra))
     flush = Flusher(a.flush_mb)
-    res = {"batch": {}, "output": {"class": "exact"}, "extra": {}}
+    # Output class: a different sub-sequence count than the base heuristic's graph-captured count (48 at max_seq_len
+    # 36864) moves split points and merge order, so the result is reordered, not bitwise equal to the base kernel.
+    differs = sorted({f"{b}x{m}" for b, m in prim if m != BASE_GRAPH_NB_SUB_SEQ})
+    if differs:
+        res_class = {"class": "reordered", "basis": f"nb_sub_seq differs from the base heuristic's graph-captured count "
+                     f"{BASE_GRAPH_NB_SUB_SEQ} at {','.join(differs)}; tolerance evidence from --mode check FP32 reference"}
+    else:
+        res_class = {"class": "exact", "basis": f"every config at the base count {BASE_GRAPH_NB_SUB_SEQ}"}
+    res = {"batch": {}, "output": res_class, "extra": {}}
     for b, m in prim:
         res["batch"][str(b)] = time_config(kern, inp, flush, b, m, a)
         s = res["batch"][str(b)]
@@ -290,7 +301,8 @@ def mode_bench(a):
     print(json.dumps(res), flush=True)
 
 
-INTERLEAVE = [(1, 48), (2, 48), (3, 48), (4, 48), (8, 48), (1, 47), (2, 47), (4, 47), (1, 94)]
+INTERLEAVE = [(1, 48), (2, 48), (3, 48), (4, 48), (8, 48), (1, 47), (2, 47), (4, 47), (1, 94), (2, 23), (3, 15),
+              (4, 11)]
 
 
 def run_sequence(kern, inp, flush, seq):
