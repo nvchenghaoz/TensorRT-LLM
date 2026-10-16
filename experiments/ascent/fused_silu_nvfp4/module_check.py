@@ -97,10 +97,19 @@ res["kernels_fused_M1"] = kf
 res["kernels_unfused_M1"] = ku
 print("fused kernels", kf, flush=True)
 print("unfused kernels", ku, flush=True)
-has_q = any("quantize_with_block_size" in k for k in kf)
-has_s = any("silu_and_mul" in k for k in kf)
-has_f = any("fused_silu_mul_nvfp4" in k for k in kf)
-res["fused_list_ok"] = (not has_q) and (not has_s) and has_f
+
+def between_gemms(ks):
+    # Kernels between the gate_up GEMM and the down_proj GEMM (the first
+    # quantize_with_block_size is gate_up's own input quantize).
+    gi = [i for i, k in enumerate(ks) if "Gemm" in k or "gemm" in k]
+    return ks[gi[0] + 1:gi[-1]] if len(gi) >= 2 else ks
+
+
+bf, bu = between_gemms(kf), between_gemms(ku)
+res["between_gemms_fused"] = bf
+res["between_gemms_unfused"] = bu
+res["fused_list_ok"] = (len(bf) == 1 and "fused_silu_mul_nvfp4" in bf[0]
+                        and len(bu) == 2)
 passed = passed and res["fused_list_ok"] and res["gate_open"]
 print(json.dumps({"passed": passed,
                   "compared": "GatedMLP NVFP4 W4A4 output, fused path vs "
