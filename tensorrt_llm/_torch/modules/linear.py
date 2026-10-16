@@ -51,6 +51,7 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, replace_parameter_and_save_metadata,
                      unswizzle_sf)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
+from .small_n_gemv import maybe_small_n_gemv
 
 
 class WeightMode(str, enum.Enum):
@@ -624,6 +625,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if _should_apply_low_m_gemm(input) and not getattr(
                 module, "use_custom_cublas_mm", False):
             output = apply_low_m_gemm(module, input, module.weight, bias)
+            if output is not None:
+                return output
+        # SM120/121: decode-size BF16 Linears with a tiny output width (GDN
+        # in_proj_ba, N=96) run on a CUDA-core Triton GEMV instead of the
+        # latency-bound cuBLAS wmma/dot kernels. Returns None (fall through)
+        # for any shape, dtype or layout outside its static route table.
+        if (bias is None and getattr(module, "enable_cuda_core", False)
+                and not getattr(module, "use_custom_cublas_mm", False)):
+            output = maybe_small_n_gemv(input, module.weight)
             if output is not None:
                 return output
         # CuTe DSL BF16 GEMM path for Blackwell / SM107
