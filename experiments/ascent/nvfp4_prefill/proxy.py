@@ -136,8 +136,10 @@ def main():
     if os.path.exists(eng):
         with open(eng) as fh:
             kvc.update(json.load(fh).get("kv_cache_config", {}))
-    log(f"arm={args.arm} env TRTLLM_FP8_PREFILL_NVFP4_GDN="
-        f"{os.environ.get('TRTLLM_FP8_PREFILL_NVFP4_GDN')} kvc={kvc}")
+    envs = {k: os.environ.get(k) for k in (
+        "TRTLLM_FP8_PREFILL_NVFP4_GDN", "TRTLLM_FP8_PREFILL_NVFP4_ATTN_QKV",
+        "TRTLLM_FP8_PREFILL_NVFP4_ATTN_O", "TRTLLM_FP8_PREFILL_NVFP4_GDN_OUT")}
+    log(f"arm={args.arm} env {envs} kvc={kvc}")
     t0 = time.time()
     llm = LLM(model=args.ckpt,
               kv_cache_config=KvCacheConfig(**kvc),
@@ -162,10 +164,13 @@ def main():
         model = llm._executor.engine.model_engine.model
         lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2,
                             -3, -4, -6], device="cuda")
-        mods = [(n, m) for n, m in model.named_modules()
-                if n.endswith("in_proj_qkvz")
-                and fpn.get_prefill_nvfp4_copy(m) is not None]
-        for n, m in mods[::6]:
+        mods = []
+        for suf in ("in_proj_qkvz", "qkv_proj", "o_proj", "out_proj"):
+            ms = [(n, m) for n, m in model.named_modules()
+                  if n.endswith(suf)
+                  and fpn.get_prefill_nvfp4_copy(m) is not None]
+            mods += ms[::max(1, len(ms) // 3)][:3]
+        for n, m in mods:
             w = (m.weight.float() * m.weight_scale.float()).to(torch.bfloat16)
             g = fpn.get_prefill_nvfp4_copy(m)[4]
             q, sf = torch.ops.trtllm.fp4_quantize(
@@ -227,6 +232,7 @@ def main():
            "short": nsh, "nvfp4_copies": stats_load["built"],
            "nvfp4_copy_bytes": stats_load["bytes"],
            "nvfp4_calls": stats["calls"], "weight_relrms": relrms,
+           "nvfp4_groups": stats.get("groups"), "env": envs,
            "items": items}
     with open(args.out, "w") as fh:
         json.dump(out, fh)
