@@ -43,7 +43,8 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
 from .multimodal_data import serialize_item
-from .prefix_token_cache import create_prefix_token_cache
+from .prefix_token_cache import (create_prefix_token_cache,
+                                 tokenizer_adds_no_special_tokens)
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -170,6 +171,11 @@ class DefaultInputProcessor(InputProcessor):
         # None when disabled or the tokenizer cannot support the cache.
         self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
                                     if enable_tokenization_cache else None)
+        # The cache tokenizes without special tokens; requests asking for them
+        # get the same ids when the tokenizer adds none.
+        self._prefix_token_cache_any_special = (
+            self._prefix_token_cache is not None
+            and tokenizer_adds_no_special_tokens(tokenizer))
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -177,9 +183,10 @@ class DefaultInputProcessor(InputProcessor):
         """The default input processor handles only tokenization."""
         if self.tokenizer is None:
             raise ValueError("tokenizer is required to tokenize string prompt")
-        # Only when the tokenizer would be called exactly as the cache calls it.
+        # Only when the tokenizer would return what the cache returns.
         if (self._prefix_token_cache is not None
-                and not sampling_params.add_special_tokens
+                and (not sampling_params.add_special_tokens
+                     or self._prefix_token_cache_any_special)
                 and sampling_params.truncate_prompt_tokens is None):
             with nvtx_range_debug("tokenize prompt"), nvtx_range_debug(
                     "prefix cache"):
@@ -291,12 +298,19 @@ class BaseMultimodalInputProcessor(ABC):
         self._prefix_token_cache_tokenizer = tokenizer
         self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
                                     if enable_tokenization_cache else None)
+        # Requests asking for special tokens can use the cache too when the
+        # tokenizer adds none.
+        self._prefix_token_cache_any_special = (
+            self._prefix_token_cache is not None
+            and tokenizer_adds_no_special_tokens(tokenizer))
 
     def _encode_with_tokenization_cache(
             self, prompt: str,
             sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
-        if (self._prefix_token_cache is None or sampling_params is None
-                or sampling_params.add_special_tokens
+        if (getattr(self, "_prefix_token_cache", None) is None
+                or sampling_params is None
+                or (sampling_params.add_special_tokens
+                    and not self._prefix_token_cache_any_special)
                 or sampling_params.truncate_prompt_tokens is not None):
             return None
         return self._prefix_token_cache.encode(
