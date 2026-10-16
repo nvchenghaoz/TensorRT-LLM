@@ -1564,6 +1564,10 @@ __device__ inline void addAttentionSinks(
     }
 }
 
+// With PDL, issue the first K/V tile loads of a sub-sequence before griddepcontrol.wait when that tile cannot hold the
+// token the preceding RoPE/KV-append kernel writes (see earlyKV in kernel_mha_impl). Q always waits.
+#define XQA_PDL_EARLY_KV (ENABLE_PDL == 2 && !SPEC_DEC && BEAM_WIDTH == 1 && USE_PAGED_KV_CACHE)
+
 #ifdef NDEBUG
 __device__ __forceinline__
 #else
@@ -1722,7 +1726,9 @@ CUBIN_EXPORT __global__
 
 #if ENABLE_PDL
     preExit();
+#if !XQA_PDL_EARLY_KV
     acqBulk();
+#endif
 #endif
 
     constexpr bool qkSwizzle = true;
@@ -1764,7 +1770,8 @@ CUBIN_EXPORT __global__
         ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
     }
 #else
-    if (warpIdx.z == 0)
+    // Issued by the gemm0 warps: here, or with XQA_PDL_EARLY_KV after the first K tile prefetch and the PDL wait.
+    auto const loadQ = [&]()
     {
         // map from idxQHead to idxHead in q input.
         auto const localQHeadIdxMap = [nbQHeads, idxReq, idxHeadGrp](uint32_t idxHeadLocal) -> uint32_t
@@ -1793,7 +1800,13 @@ CUBIN_EXPORT __global__
         copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, isFullTile, warpTile.y>(
             warpIdx.x, smem.q[warpIdx.y][0], src, nbValidRows, localQHeadIdxMap);
         ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
+    };
+#if !XQA_PDL_EARLY_KV
+    if (warpIdx.z == 0)
+    {
+        loadQ();
     }
+#endif
 #endif
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
@@ -1842,6 +1855,17 @@ CUBIN_EXPORT __global__
         return seqIter < nbCtxCtaTiles;
 #endif
     };
+#if XQA_PDL_EARLY_KV
+    // PDL overlap with the preceding RoPE/KV-append kernel, which writes Q and the new token's K/V at position
+    // cacheSeqLen - 1. When this sub-sequence's first CTA tile ends before that token (and no cyclic window can wrap
+    // the write onto it), its pages were written by earlier steps, so its first K part and V tile are loaded before
+    // the PDL wait; Q and every later tile are loaded after it. Otherwise wait first, as before.
+    bool const earlyKV = !rtIsReallySliding && (ctaTile.x * (seqIterInit + 1) < cacheSeqLen);
+    if (!earlyKV)
+    {
+        acqBulk();
+    }
+#endif
     if (warpIdx.z == 0)
     {
         float const qkScale = qScale * (isKVCacheQuantized ? kvCacheScale[0] : 1.f)
@@ -1982,6 +2006,13 @@ CUBIN_EXPORT __global__
         __syncwarp();
 #endif
         loadKTilePart(seqIterInit, 0, 0);
+#if XQA_PDL_EARLY_KV
+        if (earlyKV)
+        {
+            acqBulk();
+        }
+        loadQ();
+#endif
         ldgsts::commitGroup(); // @fixme: do prefetch for next iter tile if last part
         idxCurrSMemKBuf++;
 
@@ -2401,6 +2432,12 @@ CUBIN_EXPORT __global__
 
         loadVTilePart(seqIterInit, 0, 0, 0);
         commitVTileLoad(idxCurrSMemVBuf.next());
+#if XQA_PDL_EARLY_KV
+        if (earlyKV)
+        {
+            acqBulk();
+        }
+#endif
         idxCurrSMemVBuf++;
         ParityOrNone<grpLoadV> vBarParity{};
         // @fixme: do prefetch for next iter tile if last part

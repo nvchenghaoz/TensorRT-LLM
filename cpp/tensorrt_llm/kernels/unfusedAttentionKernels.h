@@ -211,6 +211,10 @@ struct QKVPreprocessingParams
     bool generation_phase{false};
     // The input contains Q only and the existing KV cache must not be updated.
     bool q_only_input{false};
+    // PDL: release the dependent grid right after this kernel's own grid-dependency wait instead of at its end.
+    // Only for dependents that wait (griddepcontrol.wait) before reading anything this kernel writes; set by the
+    // SM120/121 XQA HMMA decode path, whose kernel_mha prefetches only older KV pages before its wait.
+    bool early_pdl_trigger{false};
     int multi_processor_count{0};
     int rotary_vision_start{0};
     int rotary_vision_length{0};

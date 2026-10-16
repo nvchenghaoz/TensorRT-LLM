@@ -358,6 +358,9 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
             preprocessingParams.separate_q_kv_output = true;
             preprocessingParams.quantized_fp8_output = false;
             preprocessingParams.generation_phase = true;
+            // SM120/121 HMMA kernel_mha waits (griddepcontrol.wait) before loading Q or any KV tile that holds the
+            // new token, so the RoPE kernel may release it right after its own grid-dependency wait.
+            preprocessingParams.early_pdl_trigger = isHMMAKernel && !isSpecDec && (mSM == 120 || mSM == 121);
             preprocessingParams.multi_processor_count = multiprocessorCount;
             preprocessingParams.rotary_vision_start = xqaParams.rotary_vision_start;
             preprocessingParams.rotary_vision_length = xqaParams.rotary_vision_length;
