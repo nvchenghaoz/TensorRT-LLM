@@ -44,6 +44,9 @@ endif()
 # only compiles for the sm_120 family; it is added explicitly to the sm_120 arch
 # target below, not to the all-arch source list.
 list(FILTER SRC_CU EXCLUDE REGEX "skip_softmax_sm120/.*")
+# The sm_120 e4m3 last q-tile KV split (hand-written, sm_120 family only) is
+# added to the sm_120 arch target below as well.
+list(FILTER SRC_CU EXCLUDE REGEX "last_tile_split_sm120/.*")
 
 add_library(context_attention_src OBJECT)
 
@@ -102,6 +105,7 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
       APPEND
       arch_files
       "${CMAKE_CURRENT_SOURCE_DIR}/skip_softmax_sm120/fused_multihead_flash_attention_ws_sm120.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/last_tile_split_sm120/fmha_v2_e4m3_last_tile_split_sm120.cu"
     )
   endif()
   if(arch_files)
