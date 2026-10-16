@@ -401,7 +401,15 @@ def part_e():
         kind = type(hs).__name__
         return layer.mlp(hs), res, kind
 
-    for m in [1, 2, 4, 16, 2048]:
+    default_min = mq._POST_ATTN_NVFP4_MIN_ROWS
+    print("E default min rows", default_min, flush=True)
+    cases = [(m, True) for m in [1, 2, 4, 16, 2048]]
+    cases += [(m, False) for m in [1, 4, 16, 2048, 4096]]
+    for m, forced in cases:
+        # forced: threshold 1, so the fused wiring runs at every M;
+        # default: decode sizes must stay on main's path.
+        mq._POST_ATTN_NVFP4_MIN_ROWS = 1 if forced else default_min
+        expect_fused = forced or m >= default_min
         x, r_pristine = make_inputs(m, 555 + m, "plain")
         r = r_pristine.clone()
         ref, rref, kref = run(x.clone(), r, False)
@@ -428,12 +436,16 @@ def part_e():
                 if not (torch.equal(go, ref) and torch.equal(gr, rref)):
                     gbad += 1
             del g
-        out[f"M{m}"] = {"mlp_out_and_residual_eq": eq, "kind_fused": kfu,
-                        "kind_killswitch": kref, "graph_bad": gbad,
-                        "nan": bool(torch.isnan(ref.float()).any())}
-        passed = (passed and eq and kfu == "Fp4QuantizedTensor"
+        key = f"M{m}_{'forced' if forced else 'default'}"
+        out[key] = {"mlp_out_and_residual_eq": eq, "kind_fused": kfu,
+                    "expect_fused": expect_fused,
+                    "kind_killswitch": kref, "graph_bad": gbad,
+                    "nan": bool(torch.isnan(ref.float()).any())}
+        passed = (passed and eq
+                  and (kfu == "Fp4QuantizedTensor") == expect_fused
                   and kref == "Tensor" and gbad in (None, 0))
-        print("E", m, out[f"M{m}"], flush=True)
+        print("E", key, out[key], flush=True)
+    mq._POST_ATTN_NVFP4_MIN_ROWS = default_min
     os.environ["TRTLLM_GEMMA_NORM_NVFP4_FUSE"] = "1"
     return passed, out
 

@@ -522,6 +522,14 @@ def _post_attn_nvfp4_eligible(layer) -> bool:
             and gate_up.in_features == _GEMMA_NVFP4_HIDDEN)
 
 
+# The fused kernel (one 64-thread program per row) is latency-bound at decode
+# sizes and slower there than FlashInfer's norm + fp4_quantize (8.0 vs 4.1 us
+# at M=1, branch 57 pair 577/578); it is faster from 2048 rows up (60.4 vs
+# 63.6 us at 2048, 212 vs 284 us at 8192). So only prefill-sized calls fuse.
+_POST_ATTN_NVFP4_MIN_ROWS = int(
+    os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_MIN_ROWS", "2048"))
+
+
 def _post_attention_norm(layer, hidden_states, residual, lora_params):
     """post_attention_layernorm; on the fused path its output is the gate_up
     input already quantized to NVFP4 (an Fp4QuantizedTensor)."""
@@ -530,7 +538,7 @@ def _post_attention_norm(layer, hidden_states, residual, lora_params):
         ok = _post_attn_nvfp4_eligible(layer)
         layer._post_attn_nvfp4_ok = ok
     if (ok and not lora_params and hidden_states.dim() == 2
-            and hidden_states.shape[0] > 0
+            and hidden_states.shape[0] >= max(1, _POST_ATTN_NVFP4_MIN_ROWS)
             and hidden_states.dtype == torch.bfloat16
             and residual is not None and residual.shape == hidden_states.shape
             and residual.dtype == torch.bfloat16
