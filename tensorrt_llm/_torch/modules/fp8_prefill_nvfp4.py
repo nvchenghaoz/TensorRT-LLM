@@ -21,6 +21,12 @@ Per-group switches (=0 disables that group's copies, =1 enables):
                                      opt-in: it produces the K/V written to
                                      the KV cache; kept out of the default
                                      for the shared precision budget)
+  TRTLLM_FP8_PREFILL_NVFP4_ATTN_QG   gated-attention qkv_proj, Q+gate columns
+                                     only (default on): the W4A4 GEMM's K/V
+                                     columns are overwritten by main's FP8
+                                     per-tensor GEMM on the K/V weight rows,
+                                     so the KV cache keeps FP8 precision.
+                                     ATTN_QKV=1 (whole qkv) takes precedence.
 """
 
 import math
@@ -35,6 +41,7 @@ ENV_GDN_IN_PROJ_QKVZ = "TRTLLM_FP8_PREFILL_NVFP4_GDN"
 ENV_ATTN_QKV = "TRTLLM_FP8_PREFILL_NVFP4_ATTN_QKV"
 ENV_ATTN_O = "TRTLLM_FP8_PREFILL_NVFP4_ATTN_O"
 ENV_GDN_OUT = "TRTLLM_FP8_PREFILL_NVFP4_GDN_OUT"
+ENV_ATTN_QG = "TRTLLM_FP8_PREFILL_NVFP4_ATTN_QG"
 # Rows <= MAX_DECODE_ROWS keep the FP8 path (decode, CUDA graphs).
 MAX_DECODE_ROWS = 16
 _SF_VEC = 16
@@ -147,6 +154,20 @@ def _main_decoder_layers(model: torch.nn.Module) -> list:
     return out
 
 
+def _attn_q_gate_cols(attn: torch.nn.Module) -> int:
+    """Q+gate column count of a gated-attention fused qkv_proj (layout
+    q+gate | k | v, see Attention's qkv_shard_indices_mapping), or 0."""
+    q_size = getattr(attn, "q_size", None)
+    kv_size = getattr(attn, "kv_size", None)
+    n = getattr(attn.qkv_proj, "out_features", None)
+    if not all(isinstance(v, int) for v in (q_size, kv_size, n)):
+        return 0
+    split = n - 2 * kv_size
+    if split != 2 * q_size or not 0 < split < n or kv_size % 8 != 0:
+        return 0
+    return split
+
+
 def build_fp8_prefill_nvfp4_copies(model: torch.nn.Module) -> int:
     """Model walk after post-load: copies for every GDN in_proj_qkvz, plus
     gated-attention qkv_proj / o_proj and GDN out_proj of the main decoder
@@ -156,8 +177,8 @@ def build_fp8_prefill_nvfp4_copies(model: torch.nn.Module) -> int:
         qkvz = mod.__dict__.get("_modules", {}).get("in_proj_qkvz")
         if qkvz is not None and maybe_build_prefill_nvfp4_copy(qkvz):
             n += 1
-    counts = {ENV_GDN_IN_PROJ_QKVZ: n, ENV_ATTN_QKV: 0, ENV_ATTN_O: 0,
-              ENV_GDN_OUT: 0}
+    counts = {ENV_GDN_IN_PROJ_QKVZ: n, ENV_ATTN_QKV: 0, ENV_ATTN_QG: 0,
+              ENV_ATTN_O: 0, ENV_GDN_OUT: 0}
     from ..attention.attention import Attention
     from .mamba.gdn_mixer import Qwen3NextGatedDeltaNet
     for layer in _main_decoder_layers(model):
@@ -165,10 +186,16 @@ def build_fp8_prefill_nvfp4_copies(model: torch.nn.Module) -> int:
         # attn_output_gate: qkv_proj / o_proj inputs are always BF16.
         if isinstance(attn, Attention) and getattr(attn, "attn_output_gate",
                                                    False):
-            for proj, env in ((attn.qkv_proj, ENV_ATTN_QKV),
-                              (attn.o_proj, ENV_ATTN_O)):
-                if maybe_build_prefill_nvfp4_copy(proj, env):
-                    counts[env] += 1
+            qkv = attn.qkv_proj
+            if maybe_build_prefill_nvfp4_copy(qkv, ENV_ATTN_QKV):
+                counts[ENV_ATTN_QKV] += 1
+            else:
+                split = _attn_q_gate_cols(attn)
+                if split and maybe_build_prefill_nvfp4_copy(qkv, ENV_ATTN_QG):
+                    get_prefill_nvfp4_copy(qkv).split = split
+                    counts[ENV_ATTN_QG] += 1
+            if maybe_build_prefill_nvfp4_copy(attn.o_proj, ENV_ATTN_O):
+                counts[ENV_ATTN_O] += 1
         gdn = getattr(layer, "linear_attn", None)
         if isinstance(gdn, Qwen3NextGatedDeltaNet) and \
                 maybe_build_prefill_nvfp4_copy(gdn.out_proj, ENV_GDN_OUT):
@@ -184,13 +211,16 @@ def build_fp8_prefill_nvfp4_copies(model: torch.nn.Module) -> int:
 class _PrefillNVFP4Copy:
     """Load-time NVFP4 copy; called from FP8QDQLinearMethod.apply."""
 
-    __slots__ = ("w_fp4", "w_sf", "act_global", "alpha", "g", "group")
+    __slots__ = ("w_fp4", "w_sf", "act_global", "alpha", "g", "group",
+                 "split")
 
     def __init__(self, w_fp4, w_sf, act_global, alpha, g,
                  group=ENV_GDN_IN_PROJ_QKVZ):
         self.w_fp4, self.w_sf = w_fp4, w_sf
         self.act_global, self.alpha, self.g = act_global, alpha, g
         self.group = group
+        # Columns [split:) are recomputed on the FP8 path (None: all W4A4).
+        self.split = None
 
     def __getitem__(self, i):
         return (self.w_fp4, self.w_sf, self.act_global, self.alpha, self.g)[i]
@@ -219,6 +249,22 @@ def prefill_nvfp4_apply(copy, module: torch.nn.Module, input: torch.Tensor,
         alpha,
         module.dtype or input.dtype,
         allowed_backends="cutlass,cublaslt,cuda_core")
+    split = copy.split
+    if split is not None:
+        # Columns [split:) (attn K/V) keep main's FP8 per-tensor path: static
+        # E4M3 quant + cuBLASLt scaled GEMM on the contiguous K/V weight rows,
+        # written over the W4A4 output's K/V columns (no cat).
+        s = module.input_scale
+        qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            input, s)
+        kv = torch.ops.trtllm.cublas_scaled_mm(
+            qinput,
+            module.weight[split:].t(),
+            scale_a=s,
+            scale_b=module.weight_scale,
+            bias=None,
+            out_dtype=module.dtype or input.dtype)
+        output[:, split:].copy_(kv)
     if len(original_shape) > 2:
         output = output.reshape(*original_shape[:-1], output.shape[-1])
     if bias is not None:
