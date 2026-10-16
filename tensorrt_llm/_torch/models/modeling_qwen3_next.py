@@ -50,8 +50,11 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fused_gemma_add_rmsnorm_nvfp4 import (
+    SUPPORTED_HIDDEN_SIZE as _GEMMA_NVFP4_HIDDEN, fused_gemma_add_rmsnorm_nvfp4)
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode
+from ..modules.linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
+                              is_static_nvfp4_input_eligible)
 from ..modules.low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -61,7 +64,8 @@ from ..moe.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                              RenormalizeNaiveMoeRoutingMethod,
                              RoutingMethodType, create_moe)
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
+from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
+                     create_lm_head_tp_mapping)
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
@@ -480,6 +484,65 @@ def _create_mlp(model_config, aux_stream, layer_idx):
     )
 
 
+def _post_attn_nvfp4_eligible(layer) -> bool:
+    """Whether post_attention_layernorm and the dense MLP gate_up's static
+    NVFP4 input quantize can run as one Triton kernel, bitwise-equal to
+    FlashInfer gemma_fused_add_rmsnorm + fp4_quantize. SM12x, H=5120 only.
+    TRTLLM_GEMMA_NORM_NVFP4_FUSE=0 turns it off."""
+    if os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_FUSE", "1") == "0":
+        return False
+    if get_sm_version() // 10 != 12:
+        return False
+    from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+    if not IS_FLASHINFER_AVAILABLE:
+        return False
+    # The fused kernel reproduces FlashInfer's CuTe-DSL norm, not norm.cuh.
+    from flashinfer.norm import _use_cuda_norm
+    norm = layer.post_attention_layernorm
+    if (not norm.use_gemma or norm.use_cuda_tile
+            or norm.weight.dtype != torch.bfloat16
+            or norm.weight.numel() != _GEMMA_NVFP4_HIDDEN
+            or _use_cuda_norm(norm.weight.device)):
+        return False
+    mlp = getattr(layer, "mlp", None)
+    if not isinstance(mlp, _DenseMlpAdapter):
+        return False
+    gm = mlp.mlp
+    gate_up = getattr(gm, "gate_up_proj", None)
+    if not isinstance(gm, GatedMLP) or gm.split_gate_up or gate_up is None:
+        return False
+    return (type(gate_up.quant_method) is NVFP4LinearMethod
+            and not gate_up.uses_marlin_nvfp4
+            and not gate_up.requires_unquantized_activation
+            and is_static_nvfp4_input_eligible(gate_up)
+            and getattr(gate_up, "scaling_vector_size", None) == 16
+            and not NVFP4LinearMethod.use_tunable_quantize
+            and getattr(gate_up, "_locality_domain_weight_shards",
+                        None) is None and gate_up.lora is None
+            and gate_up.in_features == _GEMMA_NVFP4_HIDDEN)
+
+
+def _post_attention_norm(layer, hidden_states, residual, lora_params):
+    """post_attention_layernorm; on the fused path its output is the gate_up
+    input already quantized to NVFP4 (an Fp4QuantizedTensor)."""
+    ok = layer.__dict__.get("_post_attn_nvfp4_ok")
+    if ok is None:
+        ok = _post_attn_nvfp4_eligible(layer)
+        layer._post_attn_nvfp4_ok = ok
+    if (ok and not lora_params and hidden_states.dim() == 2
+            and hidden_states.shape[0] > 0
+            and hidden_states.dtype == torch.bfloat16
+            and residual is not None and residual.shape == hidden_states.shape
+            and residual.dtype == torch.bfloat16
+            and hidden_states.is_contiguous() and residual.is_contiguous()):
+        norm = layer.post_attention_layernorm
+        fp4, sf = fused_gemma_add_rmsnorm_nvfp4(
+            hidden_states, residual, norm.weight, norm.variance_epsilon,
+            layer.mlp.mlp.gate_up_proj.input_scale)
+        return Fp4QuantizedTensor(fp4, sf), residual
+    return layer.post_attention_layernorm(hidden_states, residual)
+
+
 class Qwen3NextLinearDecoderLayer(DecoderLayer):
 
     def __init__(
@@ -587,8 +650,8 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
                 ))
         else:
             # No fusion
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = _post_attention_norm(
+                self, hidden_states, residual, lora_params)
 
         # Qwen3NextSparseMoeBlock does not implement do_finalize=False. Defer
         # only its final all-reduce so the decoder can fuse it with RMSNorm.
@@ -779,8 +842,8 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                 ))
         else:
             # No fusion
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = _post_attention_norm(
+                self, hidden_states, residual, lora_params)
 
         # The fully-fused do_finalize=False MoE path (MoEAllReduce on the
         # unfinalized expert output) is not implemented by Qwen3NextSparseMoeBlock

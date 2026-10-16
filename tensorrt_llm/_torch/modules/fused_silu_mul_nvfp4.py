@@ -18,11 +18,27 @@ Bitwise contract:
     in the low nibble).
 """
 
+import os
+
 import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
 
 _SF_VEC = 16
+
+
+@triton.jit
+def _gdc_wait_with_memory_clobber():
+    # griddepcontrol.wait with a memory clobber, so no load or store of this
+    # kernel can be scheduled above it.
+    tl.inline_asm_elementwise(
+        "griddepcontrol.wait; // dummy $0",
+        "=r,~{memory}",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @triton.jit
@@ -92,7 +108,13 @@ def fused_silu_mul_nvfp4_kernel(fp4_ptr, sf_ptr, x_ptr, x_stride, scale_ptr, M,
                                 d, swiglu_alpha: tl.constexpr,
                                 swiglu_beta: tl.constexpr,
                                 BLOCK_SIZE: tl.constexpr,
-                                NUM_K_TILES: tl.constexpr) -> None:
+                                NUM_K_TILES: tl.constexpr,
+                                USE_PDL: tl.constexpr = False) -> None:
+    if USE_PDL:
+        # Let the consumer GEMM launch (and prefetch its weights) now; every
+        # access of this kernel stays behind the wait.
+        tl.extra.cuda.gdc_launch_dependents()
+        _gdc_wait_with_memory_clobber()
     i = tl.program_id(axis=0).to(tl.int64)
     j = tl.program_id(axis=1)
     NSF: tl.constexpr = BLOCK_SIZE // 16
@@ -181,6 +203,9 @@ def _launch(x: torch.Tensor, global_scale: torch.Tensor, fp4: torch.Tensor,
     grid_rows = m + (1 if m % 128 != 0 else 0)
     if grid_rows > 0:
         grid = (grid_rows, triton.cdiv(d, block))
+        # PDL only while the whole grid is resident at once (one wave), so
+        # early-launched consumer CTAs never wait behind unscheduled ones.
+        use_pdl = (_PDL_ENABLED and grid[0] * grid[1] < _num_sms(x.device))
         fused_silu_mul_nvfp4_kernel[grid](
             fp4.view(torch.int32),
             sf,
@@ -193,8 +218,24 @@ def _launch(x: torch.Tensor, global_scale: torch.Tensor, fp4: torch.Tensor,
             swiglu_beta=0.0,
             BLOCK_SIZE=block,
             NUM_K_TILES=num_k_tiles,
+            USE_PDL=use_pdl,
             num_warps=4,
+            launch_pdl=use_pdl,
         )
+
+
+# TRTLLM_FUSED_SILU_NVFP4_PDL=0 restores the plain launch.
+_PDL_ENABLED = (os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+                and os.environ.get("TRTLLM_FUSED_SILU_NVFP4_PDL", "1") != "0")
+_NUM_SMS = None
+
+
+def _num_sms(device: torch.device) -> int:
+    global _NUM_SMS
+    if _NUM_SMS is None:
+        _NUM_SMS = torch.cuda.get_device_properties(
+            device).multi_processor_count
+    return _NUM_SMS
 
 
 @torch.library.custom_op("trtllm::fused_silu_mul_nvfp4", mutates_args=())
