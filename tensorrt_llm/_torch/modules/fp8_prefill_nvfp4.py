@@ -12,7 +12,15 @@ and gets a load-time NVFP4 copy of the same weight for prefill (rows > 16):
   with alpha = (s / 6) * g.
 
 Output class: precision (NVFP4 W4A4 on prefill-time copies of FP8 weights).
-Kill switch: TRTLLM_FP8_PREFILL_NVFP4_GDN=0 disables the copies.
+Per-group switches (=0 disables that group's copies, =1 enables):
+  TRTLLM_FP8_PREFILL_NVFP4_GDN       GDN in_proj_qkvz (default on)
+  TRTLLM_FP8_PREFILL_NVFP4_ATTN_O    gated-attention o_proj (default on)
+  TRTLLM_FP8_PREFILL_NVFP4_GDN_OUT   GDN out_proj (default on; its gated norm
+                                     then emits BF16 for rows > 16)
+  TRTLLM_FP8_PREFILL_NVFP4_ATTN_QKV  gated-attention qkv_proj (default OFF,
+                                     opt-in: it produces the K/V written to
+                                     the KV cache; kept out of the default
+                                     for the shared precision budget)
 """
 
 import math
@@ -24,6 +32,9 @@ import torch
 from tensorrt_llm.logger import logger
 
 ENV_GDN_IN_PROJ_QKVZ = "TRTLLM_FP8_PREFILL_NVFP4_GDN"
+ENV_ATTN_QKV = "TRTLLM_FP8_PREFILL_NVFP4_ATTN_QKV"
+ENV_ATTN_O = "TRTLLM_FP8_PREFILL_NVFP4_ATTN_O"
+ENV_GDN_OUT = "TRTLLM_FP8_PREFILL_NVFP4_GDN_OUT"
 # Rows <= MAX_DECODE_ROWS keep the FP8 path (decode, CUDA graphs).
 MAX_DECODE_ROWS = 16
 _SF_VEC = 16
@@ -32,14 +43,21 @@ _E2M1_MAX = 6.0
 
 _ATTR = "_fp8_prefill_nvfp4"
 _stats = {"built": 0, "bytes": 0, "calls": 0}
+# Per-group copy count / bytes / prefill calls (group = kill-switch env).
+_group_stats = {}
+
+
+_ENV_DEFAULT = {ENV_ATTN_QKV: "0"}
 
 
 def _env_enabled(name: str) -> bool:
-    return os.environ.get(name, "1") != "0"
+    return os.environ.get(name, _ENV_DEFAULT.get(name, "1")) != "0"
 
 
 def prefill_nvfp4_stats() -> dict:
-    return dict(_stats)
+    out = dict(_stats)
+    out["groups"] = {k: dict(v) for k, v in _group_stats.items()}
+    return out
 
 
 def maybe_build_prefill_nvfp4_copy(module: torch.nn.Module,
@@ -92,10 +110,14 @@ def maybe_build_prefill_nvfp4_copy(module: torch.nn.Module,
                              device=w.device)
     # Plain attribute (not a Parameter/buffer): not part of the state dict.
     module.__dict__[_ATTR] = _PrefillNVFP4Copy(w_fp4, w_sf, act_global, alpha,
-                                               g)
+                                               g, env_name)
+    nbytes = (w_fp4.numel() * w_fp4.element_size() +
+              w_sf.numel() * w_sf.element_size())
     _stats["built"] += 1
-    _stats["bytes"] += (w_fp4.numel() * w_fp4.element_size() +
-                        w_sf.numel() * w_sf.element_size())
+    _stats["bytes"] += nbytes
+    gs = _group_stats.setdefault(env_name, {"built": 0, "bytes": 0, "calls": 0})
+    gs["built"] += 1
+    gs["bytes"] += nbytes
     if _stats["built"] == 1:
         logger.info(
             f"[fp8_prefill_nvfp4] built NVFP4 prefill copy for "
@@ -108,24 +130,61 @@ def get_prefill_nvfp4_copy(module: torch.nn.Module):
     return module.__dict__.get(_ATTR)
 
 
+def _main_decoder_layers(model: torch.nn.Module) -> list:
+    """The main decoder stack (model.model.layers[:num_hidden_layers])."""
+    inner = getattr(model, "model", None)
+    layers = getattr(inner, "layers", None)
+    if not isinstance(layers, torch.nn.ModuleList):
+        return []
+    n = getattr(inner, "num_hidden_layers", None)
+    layers = list(layers)
+    return layers[:n] if isinstance(n, int) else layers
+
+
 def build_fp8_prefill_nvfp4_copies(model: torch.nn.Module) -> int:
-    """Model walk after post-load: copies for every GDN in_proj_qkvz."""
+    """Model walk after post-load: copies for every GDN in_proj_qkvz, plus
+    gated-attention qkv_proj / o_proj and GDN out_proj of the main decoder
+    layers (matched by module class, not by name)."""
     n = 0
     for mod in model.modules():
         qkvz = mod.__dict__.get("_modules", {}).get("in_proj_qkvz")
         if qkvz is not None and maybe_build_prefill_nvfp4_copy(qkvz):
             n += 1
-    return n
+    counts = {ENV_GDN_IN_PROJ_QKVZ: n, ENV_ATTN_QKV: 0, ENV_ATTN_O: 0,
+              ENV_GDN_OUT: 0}
+    from ..attention.attention import Attention
+    from .mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+    for layer in _main_decoder_layers(model):
+        attn = getattr(layer, "self_attn", None)
+        # attn_output_gate: qkv_proj / o_proj inputs are always BF16.
+        if isinstance(attn, Attention) and getattr(attn, "attn_output_gate",
+                                                   False):
+            for proj, env in ((attn.qkv_proj, ENV_ATTN_QKV),
+                              (attn.o_proj, ENV_ATTN_O)):
+                if maybe_build_prefill_nvfp4_copy(proj, env):
+                    counts[env] += 1
+        gdn = getattr(layer, "linear_attn", None)
+        if isinstance(gdn, Qwen3NextGatedDeltaNet) and \
+                maybe_build_prefill_nvfp4_copy(gdn.out_proj, ENV_GDN_OUT):
+            counts[ENV_GDN_OUT] += 1
+    total = sum(counts.values())
+    if total:
+        logger.info(f"[fp8_prefill_nvfp4] NVFP4 W4A4 prefill copies per group "
+                    f"(rows > {MAX_DECODE_ROWS}): {counts}; "
+                    f"{_stats['bytes'] / 2**30:.2f} GiB")
+    return total
 
 
 class _PrefillNVFP4Copy:
     """Load-time NVFP4 copy; called from FP8QDQLinearMethod.apply."""
 
-    __slots__ = ("w_fp4", "w_sf", "act_global", "alpha", "g")
+    __slots__ = ("w_fp4", "w_sf", "act_global", "alpha", "g", "group")
 
-    def __init__(self, w_fp4, w_sf, act_global, alpha, g):
+    def __init__(self, w_fp4, w_sf, act_global, alpha, g,
+                 group=ENV_GDN_IN_PROJ_QKVZ):
         self.w_fp4, self.w_sf = w_fp4, w_sf
         self.act_global, self.alpha, self.g = act_global, alpha, g
+        self.group = group
 
     def __getitem__(self, i):
         return (self.w_fp4, self.w_sf, self.act_global, self.alpha, self.g)[i]
@@ -141,6 +200,9 @@ def prefill_nvfp4_apply(copy, module: torch.nn.Module, input: torch.Tensor,
     w_fp4, w_sf, act_global, alpha = (copy.w_fp4, copy.w_sf, copy.act_global,
                                       copy.alpha)
     _stats["calls"] += 1
+    gs = _group_stats.get(copy.group)
+    if gs is not None:
+        gs["calls"] += 1
     act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(input, act_global, _SF_VEC,
                                                     False)
     output = torch.ops.trtllm.nvfp4_gemm(
