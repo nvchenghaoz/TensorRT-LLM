@@ -19,6 +19,15 @@
 
 #include <fused_multihead_flash_attention_kernel_noloop_tiled.h>
 
+// The last q-tile KV split (branch 31, idea 76), when the tree has it: --split -1 (auto, as the TRT-LLM dispatch),
+// --split k (k pieces where the split applies), --split 0 (off, the default: the generated kernel alone).
+#if __has_include(<fused_multihead_flash_attention_kernel_noloop_tiled_last_tile_split.h>)
+#include <fused_multihead_flash_attention_kernel_noloop_tiled_last_tile_split.h>
+#define HAVE_LAST_TILE_SPLIT 1
+#else
+#define HAVE_LAST_TILE_SPLIT 0
+#endif
+
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -280,13 +289,18 @@ static void release(Problem& p)
     cudaFree(p.scales);
 }
 
-static dim3 grid_of(Problem const& p)
+static dim3 grid_of(bert::Fused_multihead_attention_params_v2 const& params)
 {
     // As the generated launcher: ctas_per_o_row = ceil(d / Cta_tile_o::N) = 1, loop_iters = ceil(s / 64).
     using Cta_tile_o = typename Kt_launch::Cta_tile_o;
-    int ctas_per_o_row = (p.params.d + Cta_tile_o::N - 1) / Cta_tile_o::N;
-    int loop_iters = (p.params.s + 64 - 1) / 64;
-    return dim3(loop_iters * ctas_per_o_row, p.params.h, p.params.b);
+    int ctas_per_o_row = (params.d + Cta_tile_o::N - 1) / Cta_tile_o::N;
+    int loop_iters = (params.s + 64 - 1) / 64;
+    return dim3(loop_iters * ctas_per_o_row, params.h, params.b);
+}
+
+static dim3 grid_of(Problem const& p)
+{
+    return grid_of(p.params);
 }
 
 static unsigned long long run_reduce(int which, void const* ptr, size_t bytes, unsigned long long* d_tmp, cudaStream_t st)
@@ -362,6 +376,16 @@ static bool make_case(std::string const& name, Problem& p)
         p.past_lens = {0};
         p.alias = false;
     }
+    else if (name == "one")
+    {
+        p.q_lens = {1}; // 1 new token (a single q-tile: never split)
+        p.past_lens = {P};
+    }
+    else if (name == "c1_2000")
+    {
+        p.q_lens = {2000}; // b = 1, partial last q-tile
+        p.past_lens = {P};
+    }
     else
     {
         return false;
@@ -374,6 +398,7 @@ int main(int argc, char** argv)
     std::string cases = "c1,c2,c4,c1_1984";
     std::string dump;
     int warmup = 10, iters = 50;
+    int split = 0;
     uint64_t seed = 1234;
     for (int i = 1; i + 1 < argc; i += 2)
     {
@@ -388,6 +413,8 @@ int main(int argc, char** argv)
             dump = argv[i + 1];
         else if (a == "--seed")
             seed = strtoull(argv[i + 1], nullptr, 10);
+        else if (a == "--split")
+            split = atoi(argv[i + 1]);
     }
 
     cudaDeviceProp prop;
@@ -407,6 +434,40 @@ int main(int argc, char** argv)
         prop.name, prop.multiProcessorCount, prop.sharedMemPerMultiprocessor, fa.numRegs, fa.localSizeBytes, smem, occ,
         from_regs);
     fflush(stdout);
+
+#if HAVE_LAST_TILE_SPLIT
+    namespace lts = fused_multihead_attention::last_tile_split;
+    using Ws = lts::Workspace<Kt_causal>;
+    static_assert(Kt_causal::BYTES_PER_SMEM == Kt_launch::BYTES_PER_SMEM, "");
+    // The constants of the TRT-LLM dispatch (last_tile_split_sm120/fmha_v2_e4m3_last_tile_split_sm120.cu).
+    constexpr int kMaxPiecesTotal = 384, kMaxPieces = 16, kMaxBatch = 2;
+    float4* ws_acc = nullptr;
+    float4* ws_stats = nullptr;
+    int slots = 0;
+    if (split != 0)
+    {
+        CK(cudaMalloc(&ws_acc, sizeof(float4) * Ws::ACC_FLOAT4S_PER_PIECE * kMaxPiecesTotal));
+        CK(cudaMalloc(&ws_stats, sizeof(float4) * Ws::STATS_FLOAT4S_PER_PIECE * kMaxPiecesTotal));
+        auto piece_fn = lts::fmha_v2_nl_tiled_last_tile_piece_kernel<Kt_causal>;
+        auto merge_fn = lts::fmha_v2_nl_tiled_last_tile_merge_kernel<Kt_causal>;
+        cudaFuncAttributes fb, fc;
+        CK(cudaFuncGetAttributes(&fb, piece_fn));
+        CK(cudaFuncGetAttributes(&fc, merge_fn));
+        int occ_b = 0;
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_b, piece_fn, Kt_causal::THREADS, smem));
+        // Slots of launch A: the generated kernel's own occupancy at the launcher's smem.
+        slots = prop.multiProcessorCount * occ;
+        printf("[split] mode %d slots %d piece_kernel regs %d local %zu occ %d merge_kernel regs %d local %zu\n", split,
+            slots, fb.numRegs, fb.localSizeBytes, occ_b, fc.numRegs, fc.localSizeBytes);
+        fflush(stdout);
+    }
+#else
+    if (split != 0)
+    {
+        printf("[split] not available in this tree; running the generated kernel alone\n");
+        split = 0;
+    }
+#endif
 
     cudaStream_t st;
     CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
@@ -439,6 +500,44 @@ int main(int argc, char** argv)
         }
         build(p, seed);
         dim3 g = grid_of(p);
+        // The split: launch A = the generated kernel on s - 64 (q-tiles 0 .. Q-2), then B (pieces) and C (merge).
+        int pieces = 0;
+        bert::Fused_multihead_attention_params_v2 params_a = p.params;
+        dim3 g_a = g;
+        int const q_loop_last = (p.params.s + 64 - 1) / 64 - 1;
+#if HAVE_LAST_TILE_SPLIT
+        if (split != 0)
+        {
+            // Auto: as the TRT-LLM dispatch (last_tile_split_sm120: at most 2 sequences). A fixed k: any batch.
+            int const auto_k
+                = lts::choose_num_pieces(p.b, p.h, p.params.s, 64, slots, kMaxPiecesTotal, kMaxPieces, kMaxBatch);
+            int const any_k
+                = lts::choose_num_pieces(p.b, p.h, p.params.s, 64, slots, kMaxPiecesTotal, kMaxPieces, INT_MAX);
+            pieces = split < 0 ? auto_k : (any_k > 0 ? std::min(split, kMaxPiecesTotal / (p.b * p.h)) : 0);
+            if (pieces > 0)
+            {
+                params_a.s -= 64;
+                g_a = grid_of(params_a);
+            }
+            printf("SPLIT %s pieces %d q_loop_last %d ctas_a %u ctas_b %d\n", cname.c_str(), pieces, q_loop_last,
+                g_a.x * g_a.y * g_a.z, pieces * p.b * p.h);
+            fflush(stdout);
+        }
+#endif
+        auto launch = [&]()
+        {
+            if (pieces > 0)
+            {
+#if HAVE_LAST_TILE_SPLIT
+                KERNEL<<<g_a, Kt_launch::THREADS, smem, st>>>(params_a);
+                CK(lts::launch_last_tile_split<Kt_causal>(p.params, q_loop_last, pieces, ws_acc, ws_stats, st));
+#endif
+            }
+            else
+            {
+                KERNEL<<<g, Kt_launch::THREADS, smem, st>>>(p.params);
+            }
+        };
         unsigned long long q_hash0 = run_reduce(0, p.q, p.q_bytes, d_tmp, st);
         unsigned long long kv_hash0 = run_reduce(0, p.pool, p.pool_bytes, d_tmp, st);
         std::vector<float> times;
@@ -449,10 +548,18 @@ int main(int argc, char** argv)
         {
             // Reset point: NaN-poison O, then read-flush L2 (both untimed).
             CK(cudaMemsetAsync(p.o, 0xFF, p.o_bytes, st));
+#if HAVE_LAST_TILE_SPLIT
+            if (pieces > 0)
+            {
+                // The split's workspace too (every piece must write what the merge reads).
+                CK(cudaMemsetAsync(ws_acc, 0xFF, sizeof(float4) * Ws::ACC_FLOAT4S_PER_PIECE * kMaxPiecesTotal, st));
+                CK(cudaMemsetAsync(ws_stats, 0xFF, sizeof(float4) * Ws::STATS_FLOAT4S_PER_PIECE * kMaxPiecesTotal, st));
+            }
+#endif
             flush_read<<<prop.multiProcessorCount * 4, 512, 0, st>>>(
                 reinterpret_cast<uint4 const*>(flush_buf), flush_bytes / 16, d_sink);
             CK(cudaEventRecord(ev0, st));
-            KERNEL<<<g, Kt_launch::THREADS, smem, st>>>(p.params);
+            launch();
             CK(cudaEventRecord(ev1, st));
             CK(cudaGetLastError());
             CK(cudaEventSynchronize(ev1));

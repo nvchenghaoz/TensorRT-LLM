@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cuda_runtime_api.h>
 #include <iomanip>
 #include <sstream>
@@ -271,6 +272,23 @@ void run_skip_softmax_bf16_d256_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
 void run_skip_softmax_bf16_d128_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
+// Last q-tile KV split for the e4m3 head-256 causal paged-KV tiled kernel, defined in
+// last_tile_split_sm120/fmha_v2_e4m3_last_tile_split_sm120.cu (same sm_120 target). Runs the generated launcher on
+// q-tiles 0 .. Q-2 plus a split of the last q-tile and returns true, or returns false (nothing launched).
+bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(Fused_multihead_attention_params_v2& params,
+    Launch_params const& launch_params,
+    void (*launcher)(Fused_multihead_attention_params_v2&, Launch_params const&, cudaStream_t), cudaStream_t stream);
+
+namespace
+{
+// The generated kernel the split replicates (its traits are instantiated in the split TU).
+bool isE4m3D256CausalPagedKvTiledSm120Kernel(char const* name)
+{
+    static constexpr char kName[]
+        = "fmha_v2_flash_attention_e4m3_fp32_64_128_S_q_paged_kv_256_causal_output_bf16_sm120_kernel_nl_tiled";
+    return name != nullptr && std::strcmp(name, kName) == 0;
+}
+} // namespace
 #endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
 
 void FusedMultiHeadAttentionXMMAKernelV2::run(
@@ -364,6 +382,26 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
     if (kernelMeta.launcher != nullptr)
     {
+#if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
+        // sm_120 / sm_121 e4m3 head-256 causal paged-KV tiled context FMHA: when the last q-tile of the grid makes a
+        // tail wave, run it split along KV (see last_tile_split_sm120/). Everything else runs the launcher as before.
+        if ((mSM == kSM_120 || mSM == kSM_121) && mInputDataType == DATA_TYPE_E4M3 && mOutputDataType == DATA_TYPE_BF16
+            && params.d == 256 && params.dv == 256 && launch_params.flash_attention && launch_params.granular_tiling
+            && !launch_params.warp_specialization && launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
+            && launch_params.attention_input_layout == AttentionInputLayout::Q_PAGED_KV && !params.has_alibi
+            && !launch_params.enableAttnLogitSoftcapping && !launch_params.interleaved && !params.is_s_padded
+            // (The causal kernel ignores sliding_window_size, which the runner sets to the max kv length when no window
+            // applies; a sliding window or chunked attention uses the SLIDING_OR_CHUNKED_CAUSAL mask type instead.)
+            && params.softmax_stats_ptr == nullptr && params.attention_sinks_ptr == nullptr
+            && launch_params.sage_block_size_q == 0 && launch_params.sage_block_size_k == 0
+            && launch_params.sage_block_size_v == 0 && !launch_params.enableSkipSoftmax
+            && isE4m3D256CausalPagedKvTiledSm120Kernel(kernelMeta.mFuncName)
+            && run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(
+                params, launch_params, kernelMeta.launcher, stream))
+        {
+            return;
+        }
+#endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
         kernelMeta.launcher(params, launch_params, stream);
         return;
     }
