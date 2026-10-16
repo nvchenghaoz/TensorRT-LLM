@@ -1283,6 +1283,9 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             last_positive_power_of_2), ),
         constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+        # Profile with rotated input copies (cold L2): decode weights stream
+        # from DRAM in serving, so L2-warm timings mis-rank small-M tactics.
+        use_cold_l2_cache=True,
     )
 
     def __init__(self,
