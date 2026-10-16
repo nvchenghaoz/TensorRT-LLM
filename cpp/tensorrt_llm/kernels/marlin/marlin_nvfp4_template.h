@@ -789,8 +789,13 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride) : (stages * s_sh_stage);
     int4* sh_s = sh_zp + (stages * zp_sh_stage);
     int4* sh_a = sh_s + sh_s_size;
-    // full_k only: [kMarlinNvfp4FullKMaxStripes][16 accumulators][threads] fp32 partial sums.
-    float* sh_fk = reinterpret_cast<float*>(sh_a + stages * a_sh_stage);
+    // full_k only: every warp's partial sums of every stripe, [stripe][16 accumulators][threads]
+    // fp32, written once the pipeline has drained into the (then unused) B stage buffers.
+    float* sh_fk = reinterpret_cast<float*>(sh_b);
+    static_assert(!full_k || kMarlinNvfp4FullKMaxStripes * 16 * threads * 4 <= sh_b_size * 16,
+        "full_k stripe stash must fit in the B pipeline buffers");
+    // full_k only: this thread's partial sums of the stripes finished so far (registers).
+    float fk_park[kMarlinNvfp4FullKMaxStripes - 1][16];
 
     // Register storage for double buffer of shared memory reads.
     FragA frag_a[2][thread_m_blocks];
@@ -1462,6 +1467,20 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     {
         if constexpr (full_k)
         {
+            // Every warp is past its last shared-memory read of the pipeline.
+            __syncthreads();
+#pragma unroll
+            for (int s = 0; s < kMarlinNvfp4FullKMaxStripes - 1; s++)
+            {
+                if (s < fk_stripe)
+                {
+#pragma unroll
+                    for (int f = 0; f < 16; f++)
+                    {
+                        sh_fk[(s * 16 + f) * threads + threadIdx.x] = fk_park[s][f];
+                    }
+                }
+            }
 #pragma unroll
             for (int j = 0; j < 4; j++)
             {
@@ -1499,6 +1518,8 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                     }
                 }
             }
+            // write_result reuses these bytes (sh_red aliases sh_b).
+            __syncthreads();
         }
     };
 
@@ -1910,12 +1931,19 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                 if (--fk_left == 0 && slice_iters != 0)
                 {
 #pragma unroll
-                    for (int j = 0; j < 4; j++)
+                    for (int s = 0; s < kMarlinNvfp4FullKMaxStripes - 1; s++)
                     {
-#pragma unroll
-                        for (int g = 0; g < 4; g++)
+                        if (s == fk_stripe)
                         {
-                            sh_fk[((fk_stripe * 4 + j) * 4 + g) * threads + threadIdx.x] = frag_c[0][j][0][g];
+#pragma unroll
+                            for (int j = 0; j < 4; j++)
+                            {
+#pragma unroll
+                                for (int g = 0; g < 4; g++)
+                                {
+                                    fk_park[s][j * 4 + g] = frag_c[0][j][0][g];
+                                }
+                            }
                         }
                     }
                     fk_stripe++;
