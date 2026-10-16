@@ -14,7 +14,7 @@ from types import SimpleNamespace as NS
 import torch
 
 V, K = 248320, 5120
-MS = (1, 2, 4, 8)
+MS = (1, 2, 4, 8, 16)  # 8/16 also cover MTP verify/draft shapes
 WARM, ITERS = 10, 100
 
 

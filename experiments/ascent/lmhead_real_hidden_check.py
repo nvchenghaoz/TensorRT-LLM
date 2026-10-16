@@ -1,13 +1,13 @@
 # Real-hidden-state accuracy + determinism + CUDA-graph capture check for the
 # Qwen3.8-27B-NVFP4 lm_head on SM120.
 # 1) Loads the model with the LLM API in-process (TLLM_WORKER_USE_SINGLE_PROCESS=1),
-#    CUDA graphs for batch 1/2/4, and hooks LMHead.forward to record the real
-#    final hidden states fed to lm_head (eager steps: prefill and batch-16 decode)
+#    CUDA graphs for batch 1/2/4/8/16, and hooks LMHead.forward to record the real
+#    final hidden states fed to lm_head (eager steps: prefill and batch-20 decode)
 #    and every lm_head call made during CUDA-graph capture.
-# 2) Runs decode at batch 1/2/4 (graph replay) to show the graph path works.
+# 2) Runs decode at batch 1/2/4/8/16 (graph replay) to show the graph path works.
 # 3) Builds main's lm_head (load-time BF16 dequant, cuBLAS) and this tree's
 #    lm_head (Marlin W4A16 on the branch) from the checkpoint tensors and reports
-#    max/mean abs logit error vs an FP64 exact-dequant reference at M=1,2,4 on the
+#    max/mean abs logit error vs an FP64 exact-dequant reference at M=1..16 on the
 #    real hidden states, plus 100 repeated eager calls and 100 graph replays
 #    (bitwise vs the first call).
 # usage: python lmhead_real_hidden_check.py <checkpoint>
@@ -39,7 +39,12 @@ PROMPTS = [
     "To be, or not to be, that is the question:",
     "The derivative of sin(x) * x^2 with respect to x is",
     "Here is a haiku about autumn leaves:\n",
+    "The three laws of thermodynamics are",
+    "A good recipe for pancakes needs",
+    "import numpy as np\n\n# compute the mean of each row of a matrix\n",
+    "The largest planet in the solar system is",
 ]
+GRAPH_BS = [1, 2, 4, 8, 16]  # 8/16 also cover MTP verify/draft shapes
 
 
 def main():
@@ -60,41 +65,48 @@ def main():
             rec["eager_calls"].append(int(x.shape[0]))
             if sum(r.shape[0] for r in rec["rows"]) < 256:
                 rec["rows"].append(x.to("cpu", copy=True))
+        elif rec.get("on2") is not None:
+            rec["on2"].append(int(input.reshape(-1, input.shape[-1]).shape[0]))
         return orig(self, input, *a, **kw)
 
     emb.LMHead.forward = fwd
     lb.log("loading LLM ...")
-    llm = LLM(model=ckpt, max_batch_size=16, max_seq_len=4096, max_num_tokens=8192,
+    llm = LLM(model=ckpt, max_batch_size=24, max_seq_len=4096, max_num_tokens=8192,
               kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.25,
                                             enable_block_reuse=False),
-              cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]))
+              cuda_graph_config=CudaGraphConfig(batch_sizes=GRAPH_BS))
     lb.log("LLM ready; lm_head method=%s graph-capture lm_head calls (M)=%s" %
            (rec["method"], rec["capture_calls"]))
     sp = SamplingParams(max_tokens=24, temperature=0.0)
+    # Batch of len(PROMPTS)=20 has no graph (padding off), so decode runs eager
+    # and the hook sees the real final hidden states.
     rec["on"] = True
-    outs16 = llm.generate(PROMPTS, sp)
+    outs_e = llm.generate(PROMPTS, sp)
     rec["on"] = False
-    text16 = [o.outputs[0].text for o in outs16]
-    tok16 = [list(o.outputs[0].token_ids) for o in outs16]
-    for p, t in zip(PROMPTS[:4], text16[:4]):
-        lb.log("  [b16] %r -> %r" % (p[:40], t[:80]))
+    tok_e = [list(o.outputs[0].token_ids) for o in outs_e]
+    for p, o in zip(PROMPTS[:4], outs_e[:4]):
+        lb.log("  [eager b%d] %r -> %r" % (len(PROMPTS), p[:40], o.outputs[0].text[:80]))
     n_eager_before = len(rec["eager_calls"])
-    # Graph path: decode at batch 1, 2, 4 replays the captured graphs.
-    rec["on2"] = True
+    # Graph path: decode at batch 1/2/4/8/16 replays the captured graphs; the hook
+    # counts eager lm_head calls (expected: prefill only, no decode steps).
     graph_runs = {}
-    for b in (1, 2, 4):
+    for b in GRAPH_BS:
+        rec["on2"] = []
         outs = llm.generate(PROMPTS[:b], sp)
+        eager_calls = rec["on2"]
+        rec["on2"] = None
         toks = [list(o.outputs[0].token_ids) for o in outs]
         graph_runs[str(b)] = {
             "n_tokens": [len(t) for t in toks],
-            "token_match_vs_batch16_eager": [
-                sum(int(a == c) for a, c in zip(t, tok16[i])) / max(1, len(t))
+            "eager_lm_head_calls_M": eager_calls,
+            "token_match_vs_eager_batch": [
+                sum(int(a == c) for a, c in zip(t, tok_e[i])) / max(1, len(t))
                 for i, t in enumerate(toks)],
             "text0": outs[0].outputs[0].text[:80]}
         lb.log("  [graph b%d] %s" % (b, graph_runs[str(b)]))
     capture_calls = list(rec["capture_calls"])
     method = rec["method"]
-    rows = torch.cat(rec["rows"])[:64].cuda()
+    rows = torch.cat(rec["rows"])[::4][:64].cuda()
     lb.log("captured %d real hidden rows (eager lm_head calls before graph runs: %d, M=%s)" %
            (rows.shape[0], n_eager_before, sorted(set(rec["eager_calls"]))))
     emb.LMHead.forward = orig
@@ -111,9 +123,13 @@ def main():
     report = {"model_lm_head_method": method, "graph_capture_lm_head_calls_M": capture_calls,
               "graph_runs": graph_runs, "n_real_rows": int(rows.shape[0]),
               "bf16_output_rounding_floor_max_abs": floor, "per_M": {}}
-    ok = (method == tree_arm and len(capture_calls) > 0
-          and all(min(v["n_tokens"]) > 0 for v in graph_runs.values()))
-    for m in (1, 2, 4):
+    graph_ok = {str(b): (b in capture_calls
+                         and min(graph_runs[str(b)]["n_tokens"]) == sp.max_tokens
+                         and len(graph_runs[str(b)]["eager_lm_head_calls_M"]) <= 2)
+                for b in GRAPH_BS}
+    report["graph_ok_per_batch"] = graph_ok
+    ok = method == tree_arm and all(graph_ok.values())
+    for m in (1, 2, 4, 8, 16):
         outs = {"main": [], "tree": []}
         with torch.inference_mode():
             for r0 in range(0, rows.shape[0], m):
