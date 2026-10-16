@@ -195,9 +195,6 @@ struct Kernel_traits_
 
     static constexpr int CTA_O_TILE_K = Traits_tile_size::CTA_O_TILE_K;
 
-    // Do we need to reload Q due to splitting the D ?
-    static constexpr int RELOAD_Q = static_cast<int>(CTA_P_TILE_K) != static_cast<int>(D);
-
     // The CTA description for the 1st GEMM.
     using Cta_tile_p = typename Traits_p::template Cta_tile_extd<CTA_P_TILE_M, CTA_P_TILE_N, CTA_P_TILE_K, S, VALID_D,
         WARPS_M, WARPS_N, 1>;
@@ -281,9 +278,43 @@ struct Kernel_traits_
     // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
     static constexpr int CTAS_PER_HEAD = CTAS_PER_HEAD_;
 
+    // The global memory tile to store O.
+    using Gmem_tile_o = Gmem_tile_o_<Traits_e, Cta_tile_o, CTAS_PER_HEAD>;
+    // The shared memory tile for O.
+    using Smem_tile_o = fmha::Smem_tile_o<Traits_e, Cta_tile_o>;
+
+    // Make sure the number of threads match.
+    static_assert((int) Gmem_tile_o::THREADS_PER_ROW == (int) Smem_tile_o::THREADS_PER_ROW, "");
+
+    // The register-direct variant of Gmem_tile_o (if any).
+    using Gmem_tile_o_from_regs_selector = fmha::v2::Gmem_tile_o_from_regs_selector<Gmem_tile_o>;
+
+    // Do we store O straight from the accumulators, without staging it in shared memory? Only in the tiled
+    // no-loop flash attention kernel (device_flash_attention_nl_tiled) with QMMA FP32 accumulators, 16-bit
+    // output and a 64 x 256 O tile on 4x1x1 warps (the SM120 FP8 head-256 kernels): there the staging only
+    // permutes data, and its FP32 tile (64 KB) would set the shared memory size of the kernel.
+    static constexpr bool STORE_O_FROM_REGS = NO_LOOP && USE_GRANULAR_TILING && Gmem_tile_o_from_regs_selector::VALUE
+        && std::is_same<Traits_e, fmha::Ada_qmma_e4m3_fp32_traits>::value && Cta_tile_o::M == 64
+        && Cta_tile_o::N == 256 && Cta_tile_o::VALID_N == Cta_tile_o::N && Cta_tile_o::WARPS_M == 4
+        && Cta_tile_o::WARPS_N == 1 && Cta_tile_o::WARPS_K == 1;
+
+    // The global memory tile to store O from the accumulators (only used if STORE_O_FROM_REGS).
+    using Gmem_tile_o_from_regs = typename Gmem_tile_o_from_regs_selector::Type;
+
+    // Do we keep the whole Q tile (all D / CTA_P_TILE_K column chunks) resident in shared memory, loading it once
+    // (in the first KV step) instead of re-loading it for every KV tile? Only for the STORE_O_FROM_REGS kernels
+    // (SM120 FP8 head-256, 64 x 256 Q tile = 4 chunks of 64 x 64 e4m3): 4 Q buffers = 16 KB, total shared memory
+    // 49152 B, which keeps 2 CTAs/SM. The same Q bytes reach the same MMAs (bitwise identical output).
+    static constexpr bool Q_RESIDENT
+        = STORE_O_FROM_REGS && D % CTA_P_TILE_K == 0 && D / CTA_P_TILE_K == 4 && VALID_D == D;
+
+    // Do we need to reload Q due to splitting the D ?
+    static constexpr int RELOAD_Q = static_cast<int>(CTA_P_TILE_K) != static_cast<int>(D) && !Q_RESIDENT;
+
     // The number of shared memory buffers to build a software pipeline for Q, K and V.
-    static constexpr int BUFFERS_PER_TILE_SMEM_Q
-        = (USE_GRANULAR_TILING && D > 64) || (USE_LDGSTS_Q && !NO_LOOP) ? 2 : 1;
+    static constexpr int BUFFERS_PER_TILE_SMEM_Q = Q_RESIDENT
+        ? D / CTA_P_TILE_K
+        : ((USE_GRANULAR_TILING && D > 64) || (USE_LDGSTS_Q && !NO_LOOP) ? 2 : 1);
 
     static constexpr int BUFFERS_PER_TILE_SMEM_K = USE_GRANULAR_TILING ? 2 : 1;
 
@@ -318,29 +349,6 @@ struct Kernel_traits_
 
     // The shared memory tile to swizzle V.
     using Smem_tile_v = fmha::Smem_tile_v<Traits_o, Cta_tile_o, BUFFERS_PER_TILE_SMEM_V>;
-
-    // The global memory tile to store O.
-    using Gmem_tile_o = Gmem_tile_o_<Traits_e, Cta_tile_o, CTAS_PER_HEAD>;
-    // The shared memory tile for O.
-    using Smem_tile_o = fmha::Smem_tile_o<Traits_e, Cta_tile_o>;
-
-    // Make sure the number of threads match.
-    static_assert((int) Gmem_tile_o::THREADS_PER_ROW == (int) Smem_tile_o::THREADS_PER_ROW, "");
-
-    // The register-direct variant of Gmem_tile_o (if any).
-    using Gmem_tile_o_from_regs_selector = fmha::v2::Gmem_tile_o_from_regs_selector<Gmem_tile_o>;
-
-    // Do we store O straight from the accumulators, without staging it in shared memory? Only in the tiled
-    // no-loop flash attention kernel (device_flash_attention_nl_tiled) with QMMA FP32 accumulators, 16-bit
-    // output and a 64 x 256 O tile on 4x1x1 warps (the SM120 FP8 head-256 kernels): there the staging only
-    // permutes data, and its FP32 tile (64 KB) would set the shared memory size of the kernel.
-    static constexpr bool STORE_O_FROM_REGS = NO_LOOP && USE_GRANULAR_TILING && Gmem_tile_o_from_regs_selector::VALUE
-        && std::is_same<Traits_e, fmha::Ada_qmma_e4m3_fp32_traits>::value && Cta_tile_o::M == 64
-        && Cta_tile_o::N == 256 && Cta_tile_o::VALID_N == Cta_tile_o::N && Cta_tile_o::WARPS_M == 4
-        && Cta_tile_o::WARPS_N == 1 && Cta_tile_o::WARPS_K == 1;
-
-    // The global memory tile to store O from the accumulators (only used if STORE_O_FROM_REGS).
-    using Gmem_tile_o_from_regs = typename Gmem_tile_o_from_regs_selector::Type;
 
     // The number of threads.
     static constexpr int THREADS = Cta_tile_p::THREADS_PER_CTA;

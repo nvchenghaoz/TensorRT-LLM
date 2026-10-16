@@ -17,8 +17,10 @@ import numpy as np
 import torch
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "87bcb21958a58c5bf22327e50aa0fdfee07db213"
-CASES = ["c1", "c4", "ragged", "empty"]
-WARMUP, ITERS = 10, 50
+# Overridable (defaults unchanged): FMHA_CHECK_CASES=c1,c2,... FMHA_CHECK_WARMUP=10 FMHA_CHECK_ITERS=100
+CASES = os.environ.get("FMHA_CHECK_CASES", "c1,c4,ragged,empty").split(",")
+WARMUP = int(os.environ.get("FMHA_CHECK_WARMUP", "10"))
+ITERS = int(os.environ.get("FMHA_CHECK_ITERS", "50"))
 W = "/tmp/fmha_ctx_check"
 HERE = os.path.dirname(os.path.abspath(__file__))
 TREE = os.getcwd()
