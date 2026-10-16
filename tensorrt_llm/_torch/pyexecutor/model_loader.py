@@ -1796,9 +1796,9 @@ class ModelLoader:
         from ..modules.linear import (log_fp8_nvfp4_decode_copies,
                                       mark_marlin_fork_sites)
         log_fp8_nvfp4_decode_copies(model)
-        # GDN in_proj_qkvz Marlin (beside the in_proj_ba fork) keeps a per-call
-        # lock workspace at rows >= 2 (kill switch
-        # TRTLLM_MARLIN_FORK_FRESH_WORKSPACE=0).
+        # Opt-in TRTLLM_MARLIN_FORK_FRESH_WORKSPACE=1: GDN in_proj_qkvz Marlin
+        # (beside the in_proj_ba fork) keeps a per-call lock workspace at
+        # rows >= 2. Default: no site marked.
         mark_marlin_fork_sites(model)
 
     @staticmethod
