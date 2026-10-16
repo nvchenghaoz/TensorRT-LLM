@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <algorithm>
-#include <climits>
 #include <cmath>
 #include <cstring>
 #include <cuda_runtime_api.h>
@@ -391,8 +390,9 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
             && !launch_params.warp_specialization && launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
             && launch_params.attention_input_layout == AttentionInputLayout::Q_PAGED_KV && !params.has_alibi
             && !launch_params.enableAttnLogitSoftcapping && !launch_params.interleaved && !params.is_s_padded
+            // (The causal kernel ignores sliding_window_size, which the runner sets to the max kv length when no window
+            // applies; a sliding window or chunked attention uses the SLIDING_OR_CHUNKED_CAUSAL mask type instead.)
             && params.softmax_stats_ptr == nullptr && params.attention_sinks_ptr == nullptr
-            && params.sliding_window_size == INT_MAX && params.log2_chunked_attention_size == 0
             && launch_params.sage_block_size_q == 0 && launch_params.sage_block_size_k == 0
             && launch_params.sage_block_size_v == 0 && !launch_params.enableSkipSoftmax
             && isE4m3D256CausalPagedKvTiledSm120Kernel(kernelMeta.mFuncName)
