@@ -1,7 +1,8 @@
 # Two checks for the Marlin persistent workspace + PDL change.
 # Part 1 (timing diagnostic): the GDN decode fork. Per layer, in one CUDA graph:
 #   gemma fused add RMSNorm (PDL) -> fork: main = Marlin in_proj_qkvz (16384,5120),
-#   aux = BF16 in_proj_ba F.linear (96,5120) (cuBLAS, as on base 2cc9d697) -> join ->
+#   aux = BF16 in_proj_ba (96,5120) through the tree's own route (maybe_small_n_gemv on main
+#   >= c3bb99c8, else cuBLAS F.linear as on base 2cc9d697) -> join ->
 #   elementwise consumer of both (non-PDL, like causal_conv1d_update) -> gemma RMSNorm on Marlin out.
 #   Mirrors maybe_execute_in_parallel. Arms A/W/B replayed alternately, cold L2 (6 copies).
 # Part 2 (correctness): the lm_head shape N=248320, K=5120 at M=1/2/4, arms A/W/B: eager outputs
@@ -18,6 +19,17 @@ import torch.nn.functional as F  # noqa: E402
 
 import tensorrt_llm._torch.custom_ops  # noqa: E402,F401
 from tensorrt_llm._torch.modules.linear import _pack_nvfp4_weight_for_marlin  # noqa: E402
+
+try:  # main >= c3bb99c8 routes BF16 in_proj_ba at M <= 4 to a Triton small-N GEMV (branch 10)
+    from tensorrt_llm._torch.modules.small_n_gemv import maybe_small_n_gemv  # noqa: E402
+except ImportError:  # older base: cuBLAS only
+    def maybe_small_n_gemv(x, w):
+        return None
+
+
+def in_proj_ba(x, w):
+    y = maybe_small_n_gemv(x, w)
+    return F.linear(x, w) if y is None else y
 
 dev = torch.device("cuda")
 EPS = 1e-6
@@ -105,7 +117,7 @@ for m in (1, 2, 4):
                 y = marlin(xs[i], ws[i], N, K)
                 with torch.cuda.stream(AUX):
                     ev0[i].wait()
-                    ba = F.linear(xs[i], wba[i])
+                    ba = in_proj_ba(xs[i], wba[i])
                     ev1[i].record()
                 ev1[i].wait()
                 z = y[:, :NBA] + ba
