@@ -412,6 +412,274 @@ def mode_check(a):
     print(json.dumps(report), flush=True)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# pdlcheck: race test for branch 65's PDL early K/V loads (idea 133). Before every kernel_mha call a writer kernel is
+# PDL-launched; it runs griddepcontrol.wait, then griddepcontrol.launch_dependents (like the early-trigger RoPE kernel),
+# spins ~spin_ns, then writes fresh per-call values into Q and into the new token's K and V (position seqLen - 1).
+# kernel_mha is launched with the programmatic-stream-serialization attribute, so it may start while the writer spins.
+# Writer + kernel_mha are captured in one CUDA graph (eager fallback logged). The base tree's kernel (which waits before
+# any load) and the candidate run the same sequences with the same per-call values; every candidate call must equal
+# the base call bitwise. Negative control: the writer also rewrites token 0 (inside CTA 0's first tile, loaded before
+# the wait by the candidate), which must make the candidate differ from base, showing the test can catch a race.
+WRITER_SRC = r"""
+__device__ __forceinline__ unsigned int mix32(unsigned int x)
+{
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+__device__ __forceinline__ unsigned int h4(unsigned int call, unsigned int a, unsigned int b, unsigned int c)
+{
+    return mix32(call * 0x9E3779B1U ^ mix32(a * 0x85EBCA6BU ^ mix32(b * 0xC2B2AE35U ^ mix32(c + 0x27D4EB2FU))));
+}
+__device__ __forceinline__ unsigned char fp8val(unsigned int h)
+{
+    return (unsigned char) ((h & 0x80U) | ((h >> 8) % 0x48U)); // e4m3, |x| <= 3.75, never NaN
+}
+extern "C" __global__ void xqa_pdl_writer(unsigned short* q, unsigned char* pool, int const* pages,
+    unsigned int const* callCtr, unsigned int maxPages, unsigned int pos, unsigned int negPos, unsigned int spinNs)
+{
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do
+    {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    } while (t - t0 < spinNs);
+    unsigned int const call = *(volatile unsigned int const*) callCtr;
+    unsigned int const b = blockIdx.x;
+    for (unsigned int i = threadIdx.x; i < NB_Q_HEADS * HEAD_DIM; i += blockDim.x)
+    {
+        float const f = (float) (h4(call, b, i, 1U) >> 9) * (4.0f / 8388608.0f) - 2.0f;
+        q[b * NB_Q_HEADS * HEAD_DIM + i] = (unsigned short) (__float_as_uint(f) >> 16);
+    }
+    for (int which = 0; which < 2; ++which)
+    {
+        unsigned int const p = which == 0 ? pos : negPos;
+        if (p == 0xFFFFFFFFU)
+            continue;
+        for (unsigned int i = threadIdx.x; i < 2 * NB_K_HEADS * HEAD_DIM; i += blockDim.x)
+        {
+            unsigned int const kv = i / (NB_K_HEADS * HEAD_DIM);
+            unsigned int const head = (i / HEAD_DIM) % NB_K_HEADS;
+            unsigned int const d = i % HEAD_DIM;
+            int const page = pages[(b * 2 + kv) * maxPages + p / TOKENS_PER_PAGE];
+            unsigned long long const off
+                = (((unsigned long long) page * NB_K_HEADS + head) * TOKENS_PER_PAGE + p % TOKENS_PER_PAGE) * HEAD_DIM + d;
+            // the new token's pages are per request (value depends on b); token negPos is in the shared prefix, so
+            // every block writes the same value there
+            pool[off] = fp8val(which == 0 ? h4(call, b, i, 2U) : h4(call, 0xABCDU, i, 3U));
+        }
+    }
+}
+"""
+
+
+class Writer:
+
+    def __init__(self):
+        prog = ck(nvrtc.nvrtcCreateProgram(WRITER_SRC.encode(), b"xqa_pdl_writer.cu", 0, [], []), "create writer")
+        opts = [b"-arch=sm_120", f"-DNB_Q_HEADS={NB_Q_HEADS}U".encode(), f"-DNB_K_HEADS={NB_K_HEADS}U".encode(),
+                f"-DHEAD_DIM={HEAD_DIM}U".encode(), f"-DTOKENS_PER_PAGE={TOKENS_PER_PAGE}U".encode()]
+        if int(nvrtc.nvrtcCompileProgram(prog, len(opts), opts)[0]) != 0:
+            size = ck(nvrtc.nvrtcGetProgramLogSize(prog), "logsize")
+            buf = b" " * size
+            nvrtc.nvrtcGetProgramLog(prog, buf)
+            raise RuntimeError("writer compile failed:\n" + buf.decode(errors="replace"))
+        size = ck(nvrtc.nvrtcGetCUBINSize(prog), "cubinsize")
+        cubin = b" " * size
+        ck(nvrtc.nvrtcGetCUBIN(prog, cubin), "getcubin")
+        self._img = np.frombuffer(cubin, dtype=np.uint8).copy()
+        self.mod = ck(cu.cuModuleLoadData(self._img.ctypes.data), "cuModuleLoadData writer")
+        self.func = ck(cu.cuModuleGetFunction(self.mod, b"xqa_pdl_writer"), "cuModuleGetFunction writer")
+
+
+def launch_ex(func, grid, block, smem, args_ptr, pdl):
+    cfg = cu.CUlaunchConfig()
+    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = grid
+    cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = block
+    cfg.sharedMemBytes = smem
+    cfg.hStream = cu.CUstream(torch.cuda.current_stream().cuda_stream)
+    if pdl:
+        attr = cu.CUlaunchAttribute()
+        attr.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
+        attr.value.programmaticStreamSerializationAllowed = 1
+        cfg.attrs = [attr]
+        cfg.numAttrs = 1
+    else:
+        cfg.numAttrs = 0
+    ck(cu.cuLaunchKernelEx(cfg, func, args_ptr, 0), "cuLaunchKernelEx")
+
+
+class PdlRunner:
+    """writer (PDL) -> kernel_mha (PDL) for one (batch, nb_sub_seq), captured in a CUDA graph."""
+
+    def __init__(self, kern, writer, inp, batch, nsub, neg_pos, spin_ns, use_graph):
+        self.inp, self.batch = inp, batch
+        self.args = Args(inp, batch)
+        self.grid = (nsub, NB_K_HEADS, batch)
+        self.wobjs = [ctypes.c_uint64(inp["q"].data_ptr()), ctypes.c_uint64(inp["pool"].data_ptr()),
+                      ctypes.c_uint64(inp["pages"].data_ptr()), ctypes.c_uint64(inp["ctr"].data_ptr()),
+                      ctypes.c_uint32(MAX_PAGES), ctypes.c_uint32(SEQ_LEN - 1),
+                      ctypes.c_uint32(0xFFFFFFFF if neg_pos is None else neg_pos), ctypes.c_uint32(spin_ns)]
+        self.warr = (ctypes.c_void_p * len(self.wobjs))(*[ctypes.addressof(o) for o in self.wobjs])
+        self.kern, self.writer = kern, writer
+        self.graph = None
+        # one eager launch first (module/function loading outside capture); call index 0 is never used by a real call,
+        # and every real call's writer rewrites everything that call reads
+        inp["ctr"].fill_(0)
+        self._launch()
+        torch.cuda.synchronize()
+        if use_graph:
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._launch()
+            torch.cuda.synchronize()
+            self.graph = g
+
+    def _launch(self):
+        launch_ex(self.writer.func, (self.batch, 1, 1), (128, 1, 1), 0, ctypes.addressof(self.warr), True)
+        launch_ex(self.kern.func, self.grid, (128, 1, 2), self.kern.smem, self.args.ptr, True)
+
+    def call(self, flush, call_idx):
+        self.inp["out"].fill_(float("nan"))
+        flush()
+        self.inp["ctr"].fill_(call_idx)
+        if self.graph is not None:
+            self.graph.replay()
+        else:
+            self._launch()
+
+    def out(self):
+        return self.inp["out"][:self.batch]
+
+
+def run_pdl_sequence(kern, writer, inp, flush, seq, pristine, neg_pos, spin_ns, use_graph):
+    """Restores Q/pool, runs seq with call indices 1..len(seq); returns outputs, semaphore flags, graph used."""
+    inp["q"].copy_(pristine["q"])
+    inp["pool"].copy_(pristine["pool"])
+    torch.cuda.synchronize()
+    runners, outs, semok = {}, [], []
+    for t, (b, m) in enumerate(seq):
+        if (b, m) not in runners:
+            try:
+                runners[(b, m)] = PdlRunner(kern, writer, inp, b, m, neg_pos, spin_ns, use_graph)
+            except Exception as e:  # noqa: BLE001
+                log(f"graph capture failed for {b}x{m} ({e}); eager PDL launches instead")
+                torch.cuda.synchronize()
+                use_graph = False
+                runners[(b, m)] = PdlRunner(kern, writer, inp, b, m, neg_pos, spin_ns, False)
+        r = runners[(b, m)]
+        r.call(flush, t + 1)
+        outs.append(r.out().clone())
+        semok.append((inp["sem"] == 0).all())
+    torch.cuda.synchronize()
+    graphs = all(r.graph is not None for r in runners.values())
+    return outs, [bool(x.item()) for x in semok], graphs
+
+
+def mode_pdlcheck(a):
+    assert KV_DTYPE == "fp8", "pdlcheck writes e4m3 K/V; run with XQA_KV_DTYPE=fp8"
+    base = extract_base_tree(a.base_commit)
+    orig = Kernel(base)
+    cand = Kernel(os.path.join(os.getcwd(), "cpp/kernels/xqa"))
+    writer = Writer()
+    log(f"candidate smem {cand.smem} regs {cand.regs}; original ({a.base_commit[:8]}) smem {orig.smem} "
+        f"regs {orig.regs}; writer spin {a.spin_ns} ns")
+    prim = parse_configs(a.configs)
+    inp = build_inputs(8)
+    inp["ctr"] = torch.zeros(1, dtype=torch.int32, device="cuda")
+    pristine = dict(q=inp["q"].clone(), pool=inp["pool"].clone())
+    ro0 = hashlib.sha256(tbytes(inp["pages"]) + tbytes(inp["seqlen"]) + tbytes(inp["kvscale"])).hexdigest()
+    flush = Flusher(a.flush_mb)
+    report, passed = {"repeated": {}, "interleaved": {}, "negative_control": {}}, True
+    n_calls = a.rounds * (a.warmup + a.iters)
+    use_graph = not a.pdl_eager
+
+    def arms(seq, neg_pos):
+        r = {}
+        for name, kern in (("original", orig), ("candidate", cand)):
+            outs, semok, graphs = run_pdl_sequence(kern, writer, inp, flush, seq, pristine, neg_pos, a.spin_ns,
+                                                   use_graph)
+            r[name] = dict(outs=outs, sem=all(semok), graphs=graphs,
+                           finite=all(bool(torch.isfinite(o.float()).all().item()) for o in outs))
+        neq = sum(0 if torch.equal(x, y) else 1 for x, y in zip(r["candidate"]["outs"], r["original"]["outs"]))
+        # fresh values every call: consecutive outputs of one count must differ (the writer's data is consumed)
+        changed = sum(1 for i in range(1, len(seq)) if seq[i] == seq[i - 1]
+                      and not torch.equal(r["original"]["outs"][i], r["original"]["outs"][i - 1]))
+        same_cfg = sum(1 for i in range(1, len(seq)) if seq[i] == seq[i - 1])
+        return r, neq, changed, same_cfg
+
+    # (1) repeated sequences per config
+    for (b, m) in prim:
+        r, neq, changed, same_cfg = arms([(b, m)] * n_calls, None)
+        ok = neq == 0 and r["candidate"]["sem"] and r["candidate"]["finite"] and r["original"]["finite"] \
+            and changed == same_cfg
+        report["repeated"][f"B{b}_m{m}"] = dict(calls=n_calls, candidate_calls_not_equal_original=neq,
+                                                candidate_equals_original_every_call=neq == 0,
+                                                candidate_semaphores_zero_after_every_call=r["candidate"]["sem"],
+                                                candidate_finite=r["candidate"]["finite"],
+                                                output_changes_every_call=changed == same_cfg,
+                                                cuda_graph=r["candidate"]["graphs"] and r["original"]["graphs"],
+                                                passed=ok)
+        passed &= ok
+        log(f"pdl repeated B={b} m={m}: {n_calls} calls, cand!=orig {neq}, sem0 {r['candidate']['sem']}, finite "
+            f"{r['candidate']['finite']}, outputs change every call {changed}/{same_cfg}, graph "
+            f"{r['candidate']['graphs']} -> {'PASS' if ok else 'FAIL'}")
+        del r
+    # (2) interleaving of every count, every ordered transition
+    pairs = [(i, j) for i in range(len(INTERLEAVE)) for j in range(len(INTERLEAVE)) if i != j]
+    random.Random(20261014).shuffle(pairs)
+    seq = [INTERLEAVE[k] for p in pairs for k in p]
+    r, neq, _, _ = arms(seq, None)
+    ok = neq == 0 and r["candidate"]["sem"] and r["candidate"]["finite"]
+    report["interleaved"] = dict(calls=len(seq), configs=[f"{b}x{m}" for b, m in INTERLEAVE],
+                                 candidate_calls_not_equal_original=neq, candidate_equals_original_every_call=neq == 0,
+                                 candidate_semaphores_zero_after_every_call=r["candidate"]["sem"],
+                                 candidate_finite=r["candidate"]["finite"],
+                                 cuda_graph=r["candidate"]["graphs"] and r["original"]["graphs"], passed=ok)
+    passed &= ok
+    log(f"pdl interleaved: {len(seq)} calls, cand!=orig {neq}, sem0 {r['candidate']['sem']} -> "
+        f"{'PASS' if ok else 'FAIL'}")
+    del r
+    # (3) negative control: the writer also rewrites token 0, inside CTA 0's first tile (loaded before the wait by
+    # the candidate). The candidate must then differ from the original on some calls; original vs original stays equal.
+    neg_all = True
+    for (b, m) in parse_configs(a.neg_configs):
+        nseq = [(b, m)] * a.neg_calls
+        r, neq, _, _ = arms(nseq, 0)
+        outs2, _, _ = run_pdl_sequence(orig, writer, inp, flush, nseq, pristine, 0, a.spin_ns, use_graph)
+        orig_det = all(torch.equal(x, y) for x, y in zip(outs2, r["original"]["outs"]))
+        detected = neq > 0 and orig_det
+        neg_all &= detected
+        report["negative_control"][f"B{b}_m{m}"] = dict(calls=a.neg_calls, rewritten_token=0,
+                                                        candidate_calls_not_equal_original=neq,
+                                                        original_repeat_deterministic=orig_det,
+                                                        race_detected=detected)
+        log(f"negative control B={b} m={m}: token 0 rewritten after the trigger; cand!=orig on {neq}/{a.neg_calls} "
+            f"calls; original deterministic {orig_det} -> {'DETECTED (expected)' if detected else 'NOT DETECTED'}")
+        del r, outs2
+    report["negative_control_all_detected"] = neg_all
+    passed &= neg_all
+    inp["q"].copy_(pristine["q"])
+    inp["pool"].copy_(pristine["pool"])
+    ro1 = hashlib.sha256(tbytes(inp["pages"]) + tbytes(inp["seqlen"]) + tbytes(inp["kvscale"])).hexdigest()
+    report["readonly_inputs_unchanged"] = ro0 == ro1
+    passed &= ro0 == ro1
+    report["passed"] = bool(passed)
+    report["compared_against"] = (f"unmodified mha.cu at {a.base_commit} under the same PDL writer sequence (bitwise, "
+                                  "every call)")
+    report["setup"] = dict(writer="PDL launch; griddepcontrol.wait -> launch_dependents -> spin -> writes per-call Q "
+                           f"and K/V at position {SEQ_LEN - 1}", spin_ns=a.spin_ns,
+                           kernel_mha="launched with CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION",
+                           poison="output NaN-filled and L2 flushed before every call", kv_dtype=KV_DTYPE,
+                           seq_len=SEQ_LEN, shared_prefix=PREFIX)
+    report["candidate_source_sha256"] = cand.src_sha
+    report["original_source_sha256"] = orig.src_sha
+    print(json.dumps(report), flush=True)
+
+
 def extract_base_tree(commit):
     d = tempfile.mkdtemp(prefix="xqa_base_")
     tar = subprocess.run(["git", "archive", commit, "cpp/kernels/xqa"], check=True, capture_output=True).stdout
@@ -438,7 +706,11 @@ def mode_verify(a):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["bench", "check", "verify"], default="bench")
+    p.add_argument("--mode", choices=["bench", "check", "verify", "pdlcheck"], default="bench")
+    p.add_argument("--spin-ns", type=int, default=3000)
+    p.add_argument("--neg-configs", default="1x47,4x11")
+    p.add_argument("--neg-calls", type=int, default=60)
+    p.add_argument("--pdl-eager", action="store_true")
     p.add_argument("--configs", default="1x48,2x48,4x48")
     p.add_argument("--extra-configs", default="")
     p.add_argument("--warmup", type=int, default=20)
@@ -453,7 +725,7 @@ def main():
     torch.zeros(1, device="cuda")
     ck(cu.cuInit(0), "cuInit")
     log(f"device {torch.cuda.get_device_name()} cwd {os.getcwd()}")
-    {"bench": mode_bench, "check": mode_check}[a.mode](a)
+    {"bench": mode_bench, "check": mode_check, "pdlcheck": mode_pdlcheck}[a.mode](a)
 
 
 if __name__ == "__main__":
