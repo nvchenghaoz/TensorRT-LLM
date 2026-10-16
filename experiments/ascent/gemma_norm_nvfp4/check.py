@@ -429,6 +429,9 @@ def part_e():
             g, go = capture(fn)
             gbad = 0
             for _ in range(WARM + ITERS):
+                # main's FlashInfer norm writes its output into x in place,
+                # so restore x as well as the residual before every replay.
+                gx.copy_(x)
                 gr.copy_(r_pristine)
                 go.fill_(float("nan"))
                 g.replay()
