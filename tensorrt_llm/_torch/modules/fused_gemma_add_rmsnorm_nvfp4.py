@@ -161,12 +161,15 @@ def _pair_sum(v, N: tl.constexpr):
 
 
 @triton.jit
-def fused_gemma_add_rmsnorm_nvfp4_kernel(fp4_ptr, sf_ptr, x_ptr, r_ptr, w_ptr,
-                                         scale_ptr, M, x_stride, r_stride,
-                                         eps, NUM_K_TILES: tl.constexpr,
+def fused_gemma_add_rmsnorm_nvfp4_kernel(fp4_ptr, sf_ptr, sfw_ptr, x_ptr, r_ptr,
+                                         w_ptr, scale_ptr, M, x_stride,
+                                         r_stride, eps,
+                                         NUM_K_TILES: tl.constexpr,
                                          USE_PDL: tl.constexpr,
                                          EARLY_TRIGGER: tl.constexpr) -> None:
-    # x/r/w/fp4 pointers are int32 views (packed BF16 pairs / 8 FP4 codes).
+    # x/r/w/fp4 pointers are int32 views (packed BF16 pairs / 8 FP4 codes);
+    # sfw_ptr is the SF buffer viewed as int32 words (padding rows only).
+    tl.static_assert(NUM_K_TILES % 8 == 0)
     row = tl.program_id(axis=0).to(tl.int64)
     kk = tl.arange(0, 32)
     tt = kk[:, None] * 2 + tl.arange(0, 2)[None, :]  # [32, 2] thread ids
@@ -235,14 +238,19 @@ def fused_gemma_add_rmsnorm_nvfp4_kernel(fp4_ptr, sf_ptr, x_ptr, r_ptr, w_ptr,
                 tl.extra.cuda.gdc_launch_dependents()
             _gdc_wait_with_memory_clobber()
         # One extra program zeroes the SF padding rows [M, ceil128(M)), as
-        # quantize_with_block_size does.
+        # quantize_with_block_size does. In the 128x4 swizzle every 32-bit
+        # word holds the 4 SF bytes of one row (c % 4 = 0..3), so the last
+        # m-tile is NUM_K_TILES * 128 words: word w -> k-tile w // 128,
+        # row (w % 4) * 32 + (w % 128) // 4. Contiguous int32 stores of the
+        # padding rows' words never touch a real row's bytes.
         m0 = (M // 128) * 128
-        rows = m0 + tl.arange(0, 128).to(tl.int64)
-        rmask = tl.broadcast_to((rows >= M)[:, None], [128, 32])
-        for j in tl.static_range(10):
-            cols = j * 32 + kk
-            off = _sf_offset(rows[:, None], cols[None, :], NUM_K_TILES)
-            tl.store(sf_ptr + off, tl.zeros([128, 32], tl.uint8), mask=rmask)
+        tile_w = sfw_ptr + (M // 128) * (NUM_K_TILES * 128)
+        for c in tl.static_range(NUM_K_TILES // 8):
+            w = c * 1024 + tl.arange(0, 1024)
+            within = w % 128
+            rr = (within % 4) * 32 + within // 4
+            tl.store(tile_w + w, tl.zeros([1024], tl.int32),
+                     mask=(m0 + rr) >= M)
 
 
 _NUM_SMS: Optional[int] = None
@@ -274,6 +282,7 @@ def _launch(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
     fused_gemma_add_rmsnorm_nvfp4_kernel[(grid_rows, )](
         fp4.view(torch.int32),
         sf,
+        sf.view(torch.int32),
         x.view(torch.int32),
         residual.view(torch.int32),
         weight.view(torch.int32),
