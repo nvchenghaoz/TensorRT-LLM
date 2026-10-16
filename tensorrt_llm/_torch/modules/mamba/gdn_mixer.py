@@ -34,7 +34,7 @@ from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...speculative import SpecMetadata
 from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
-from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
+from ..linear import _FP8_NVFP4_DECODE_MAX_ROWS, FP8QDQLinearMethod, Linear, TensorParallelMode
 from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
@@ -62,6 +62,11 @@ def _use_flashinfer_gdn_prefill() -> bool:
         os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
         and is_flashinfer_gdn_prefill_supported_arch()
     )
+
+
+def _gdn_out_proj_nvfp4_decode_requested() -> bool:
+    """Whether to request the decode-only NVFP4 copy of GDN out_proj."""
+    return os.environ.get("TRTLLM_GDN_OUTPROJ_NVFP4_DECODE", "1") != "0"
 
 
 @functools.lru_cache(maxsize=1)
@@ -373,6 +378,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=False,
         )
+        # Decode (<= 16 rows) out_proj also runs on a load-time NVFP4 W4A16
+        # Marlin copy; the gated norm then emits BF16 for those rows (see
+        # _postprocess_gdn_output). Disable with
+        # TRTLLM_GDN_OUTPROJ_NVFP4_DECODE=0 (or TRTLLM_GDN_INPROJ_NVFP4_DECODE=0).
+        self.out_proj._nvfp4_decode_copy = _gdn_out_proj_nvfp4_decode_requested()
 
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.Attention]}
         self.aux_stream = aux_stream
@@ -432,12 +442,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # output whose (heads, head_dim) block is contiguous per token; the
         # gated norm reads it through its token stride instead of packing a
         # copy.
+        fp8_scale = self.norm.fp8_scale
+        if (
+            z.shape[0] <= _FP8_NVFP4_DECODE_MAX_ROWS
+            and getattr(self.out_proj, "_nvfp4_decode_weight", None) is not None
+        ):
+            # BF16 rows go to out_proj's NVFP4 W4A16 decode copy (Marlin).
+            fp8_scale = None
         attn_out = rms_norm_gated_token_major(
             attn_out.reshape(-1, self.head_v_dim),
             z,
             self.norm.weight,
             self.norm.eps,
-            fp8_scale=self.norm.fp8_scale,
+            fp8_scale=fp8_scale,
         )
         attn_out = attn_out.view(-1, self.value_dim_per_tp)
         return self.out_proj(attn_out, all_reduce_params=all_reduce_params)
