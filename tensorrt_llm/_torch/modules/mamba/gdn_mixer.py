@@ -34,6 +34,7 @@ from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...speculative import SpecMetadata
 from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
+from ..fp8_prefill_nvfp4 import maybe_build_prefill_nvfp4_copy
 from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
 from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -384,6 +385,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def post_load_weights(self) -> None:
         self.cache_derived_state()
+        # Prefill (rows > 16) NVFP4 W4A4 copy of the FP8 in_proj_qkvz (SM12x).
+        maybe_build_prefill_nvfp4_copy(self.in_proj_qkvz)
 
     def _compute_tokenwise_inputs(self, hidden_states: torch.Tensor):
         def _compute_projected_states_qkvz():

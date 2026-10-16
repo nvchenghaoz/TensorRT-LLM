@@ -50,6 +50,7 @@ from ..locality_domain_utils import _copy_to_new_cuda_allocation
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, replace_parameter_and_save_metadata,
                      unswizzle_sf)
+from .fp8_prefill_nvfp4 import MAX_DECODE_ROWS, prefill_nvfp4_apply
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 
 
@@ -777,6 +778,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
+
+        nvfp4_copy = module.__dict__.get("_fp8_prefill_nvfp4")
+        if (nvfp4_copy is not None and input.dtype == torch.bfloat16
+                and input.shape[0] > MAX_DECODE_ROWS):
+            return prefill_nvfp4_apply(nvfp4_copy, module, input,
+                                       original_shape, bias)
 
         static_input_scale = self.get_static_input_scale(module)
         cur_input_scale = module.input_scale
