@@ -209,7 +209,8 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
 
         // The kernel starts with griddepcontrol.wait, so a PDL launch orders all of
         // its memory accesses (A, scales, locks, C) after the predecessor grid; that
-        // also serializes the launches of this loop, which share `locks`.
+        // also serializes the launches of this loop, which share `locks`. Only a PDL
+        // launch (flag in the last argument) triggers dependents early.
         int4 const* b_bias_null = nullptr;
         float const* a_scales_null = nullptr;
         int4 const* zp_null = nullptr;
@@ -226,7 +227,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
             num_groups, prob_m_split, prob_n, prob_k, lda, locks,
             false,  // has_bias
             false,  // use_atomic_add
-            use_fp32_reduce, max_shared_mem_new);
+            use_fp32_reduce, max_shared_mem_new | (enable_pdl ? kMarlinNvfp4PdlLaunchFlag : 0));
         // clang-format on
 
         A_ptr += prob_m_split * (lda / 8);
