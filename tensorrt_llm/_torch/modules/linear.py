@@ -789,6 +789,16 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             input = input.reshape(-1, input.shape[-1])
 
         nvfp4_decode_weight = getattr(module, "_nvfp4_decode_weight", None)
+        nvfp4_decode_gemv = module.__dict__.get("_nvfp4_decode_gemv")
+        if (nvfp4_decode_gemv is not None and input.dtype == torch.bfloat16
+                and 0 < input.shape[0] <= _NVFP4_DECODE_GEMV_MAX_ROWS):
+            # Rows <= 4: cuda-core W4A16 GEMV on the decode copy's NVFP4 values.
+            output = torch.ops.trtllm.nvfp4_w4a16_gemv(input.contiguous(),
+                                                       *nvfp4_decode_gemv)
+            if len(original_shape) > 2:
+                output = output.reshape(*original_shape[:-1],
+                                        output.shape[-1])
+            return output
         if (nvfp4_decode_weight is not None and input.dtype == torch.bfloat16
                 and input.shape[0] <= _FP8_NVFP4_DECODE_MAX_ROWS):
             # Decode-only W4A16 NVFP4 copy of this FP8 weight (Marlin).
@@ -886,6 +896,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         # weight is kept for prefill / mixed batches. Linear.transform_weights
         # calls this once per (re)load, so a reload rebuilds the copy.
         module._nvfp4_decode_weight = None
+        module._nvfp4_decode_gemv = None
         if _fp8_nvfp4_decode_copy_enabled(module):
             _build_fp8_nvfp4_decode_copy(module)
 
@@ -2490,6 +2501,25 @@ def _fp8_nvfp4_decode_copy_enabled(module: Linear) -> bool:
             and hasattr(torch.ops.trtllm, "fp4_quantize"))
 
 
+# Decode rows <= this run a cuda-core W4A16 NVFP4 GEMV (trtllm::nvfp4_w4a16_gemv)
+# instead of Marlin, for the (N, K) shapes below; rows 5-16 stay on Marlin.
+# The GEMV keeps its own [N, K/2] + [N, K/16] copy of the same NVFP4 values
+# (17.7 MB per (5120, 6144) layer). Kill switch, read at weight load:
+# TRTLLM_NVFP4_DECODE_GEMV=0 builds no GEMV copy (Marlin for every decode row).
+_NVFP4_DECODE_GEMV_MAX_ROWS = 4
+_NVFP4_DECODE_GEMV_ENV = "TRTLLM_NVFP4_DECODE_GEMV"
+# GDN out_proj (x48) and gated-attention o_proj (x16) of Qwen3.8-27B.
+_NVFP4_DECODE_GEMV_SHAPES = ((5120, 6144), )
+
+
+def _nvfp4_decode_gemv_enabled(module: Linear) -> bool:
+    if os.environ.get(_NVFP4_DECODE_GEMV_ENV, "1") == "0":
+        return False
+    if (module.out_features, module.in_features) not in _NVFP4_DECODE_GEMV_SHAPES:
+        return False
+    return hasattr(torch.ops.trtllm, "nvfp4_w4a16_gemv")
+
+
 def _build_fp8_nvfp4_decode_copy(module: Linear) -> None:
     """Quantize an FP8 per-tensor weight to NVFP4 and pack it for Marlin.
 
@@ -2528,6 +2558,14 @@ def _build_fp8_nvfp4_decode_copy(module: Linear) -> None:
 
     if os.environ.get(_FP8_NVFP4_DECODE_ENV + "_REPORT", "0") == "1":
         _report_fp8_nvfp4_decode_copy(module, w_fp4, w_sf, g, weight_scale)
+    if _nvfp4_decode_gemv_enabled(module):
+        # Same NVFP4 values in the GEMV layout: packed E2M1 rows [N, K/2] and
+        # linear E4M3 block scales [N, K/16].
+        sf_linear = torch.ops.trtllm.block_scale_interleave_reverse(
+            w_sf.view(size_n, -1))[:, :size_k // 16].contiguous()
+        module._nvfp4_decode_gemv = (w_fp4.view(torch.uint8).contiguous(),
+                                     sf_linear.view(torch.uint8),
+                                     float(g.item()))
     del w_fp4, w_sf
 
     module._nvfp4_decode_weight = marlin_weight
@@ -2579,13 +2617,18 @@ def mark_marlin_fork_sites(model: torch.nn.Module) -> int:
 def log_fp8_nvfp4_decode_copies(model: torch.nn.Module) -> None:
     """One load-time log line: decode NVFP4 W4A16 copies built, per (N, K)."""
     shapes: Dict[Tuple[int, int], int] = {}
+    gemv_shapes: Dict[Tuple[int, int], int] = {}
     for mod in model.modules():
         if getattr(mod, "_nvfp4_decode_weight", None) is not None:
             key = (mod.out_features, mod.in_features)
             shapes[key] = shapes.get(key, 0) + 1
+            if mod.__dict__.get("_nvfp4_decode_gemv") is not None:
+                gemv_shapes[key] = gemv_shapes.get(key, 0) + 1
     if shapes:
         logger.info(f"[nvfp4_decode_copy] built {sum(shapes.values())} "
-                    f"decode NVFP4 W4A16 copies (N,K)->count: {shapes}")
+                    f"decode NVFP4 W4A16 copies (N,K)->count: {shapes}; "
+                    f"rows <= {_NVFP4_DECODE_GEMV_MAX_ROWS} cuda-core GEMV "
+                    f"copies: {gemv_shapes}")
 
 
 def _report_fp8_nvfp4_decode_copy(module: Linear, w_fp4: torch.Tensor,

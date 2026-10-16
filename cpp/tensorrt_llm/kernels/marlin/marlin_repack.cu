@@ -17,8 +17,13 @@
 
 #include "marlin.cuh"
 #include "marlin_nvfp4.h"
+#include "nvfp4_w4a16_gemv.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 namespace marlin
 {
@@ -348,3 +353,227 @@ void gptq_marlin_repack_dispatch(uint32_t const* b_q_weight_ptr, uint32_t const*
 } // namespace marlin_nvfp4
 
 #undef CALL_IF
+
+// ---------------------------------------------------------------------------
+// Cuda-core W4A16 NVFP4 GEMV for decode rows (see nvfp4_w4a16_gemv.h).
+//
+// A CTA owns kGemvRows output rows across the whole K; thread t owns the 32
+// K-elements [32 t, 32 t + 32) (K == 32 * BLOCK), i.e. 16 weight bytes and two
+// E4M3 block scales per row. Every weight/scale load is issued before
+// griddepcontrol.wait (they do not depend on the producer of x), and
+// dependents are triggered once the FMAs are done, before the reduction. The
+// summation order is fixed (per 16-block FP32 partials, warp xor-shuffle tree,
+// warps in index order), so repeated calls are bitwise identical.
+
+namespace marlin_nvfp4
+{
+namespace
+{
+
+constexpr int kGemvRows = 2;
+
+template <int M, int BLOCK>
+__global__ void __launch_bounds__(BLOCK) nvfp4W4a16GemvKernel(uint8_t const* __restrict__ w,
+    uint8_t const* __restrict__ sf, __nv_bfloat16 const* __restrict__ x, __nv_bfloat16* __restrict__ out, float g,
+    int n, int k)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    int const tid = threadIdx.x;
+    int const n0 = blockIdx.x * kGemvRows;
+    int const kb = k / 2;  // weight row bytes
+    int const ksf = k / 16; // scale row bytes
+
+    int4 wq[kGemvRows];
+    uint32_t ws[kGemvRows];
+#pragma unroll
+    for (int r = 0; r < kGemvRows; ++r)
+    {
+        uint8_t const* p = w + static_cast<size_t>(n0 + r) * kb + tid * 16;
+        asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.s32 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(wq[r].x), "=r"(wq[r].y), "=r"(wq[r].z), "=r"(wq[r].w)
+                     : "l"(p));
+    }
+#pragma unroll
+    for (int r = 0; r < kGemvRows; ++r)
+    {
+        ws[r] = __ldg(reinterpret_cast<uint16_t const*>(sf + static_cast<size_t>(n0 + r) * ksf + tid * 2));
+    }
+
+    // x is produced by the previous kernel.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+
+    uint32_t xa[M][16];
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+    {
+        int4 const* p = reinterpret_cast<int4 const*>(x + static_cast<size_t>(m) * k + tid * 32);
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+        {
+            int4 const v = p[q];
+            xa[m][q * 4 + 0] = v.x;
+            xa[m][q * 4 + 1] = v.y;
+            xa[m][q * 4 + 2] = v.z;
+            xa[m][q * 4 + 3] = v.w;
+        }
+    }
+
+    float acc[M][kGemvRows];
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+    {
+#pragma unroll
+        for (int r = 0; r < kGemvRows; ++r)
+        {
+            acc[m][r] = 0.f;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < kGemvRows; ++r)
+    {
+        // 16 packed E2M1 bytes -> 32 floats (element 2b = low nibble of byte b).
+        float wf[32];
+        uint32_t const* wv = reinterpret_cast<uint32_t const*>(&wq[r]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            uint32_t h[4];
+            asm volatile(
+                "{\n.reg .b8 b0, b1, b2, b3;\n"
+                "mov.b32 {b0, b1, b2, b3}, %4;\n"
+                "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
+                "cvt.rn.f16x2.e2m1x2 %1, b1;\n"
+                "cvt.rn.f16x2.e2m1x2 %2, b2;\n"
+                "cvt.rn.f16x2.e2m1x2 %3, b3;\n}\n"
+                : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
+                : "r"(wv[i]));
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                float2 const f = __half22float2(reinterpret_cast<__half2 const&>(h[j]));
+                wf[i * 8 + j * 2] = f.x;
+                wf[i * 8 + j * 2 + 1] = f.y;
+            }
+        }
+        __nv_fp8_e4m3 s8;
+        s8.__x = static_cast<__nv_fp8_storage_t>(ws[r] & 0xff);
+        float const s0 = static_cast<float>(s8);
+        s8.__x = static_cast<__nv_fp8_storage_t>((ws[r] >> 8) & 0xff);
+        float const s1 = static_cast<float>(s8);
+#pragma unroll
+        for (int m = 0; m < M; ++m)
+        {
+            float p0 = 0.f;
+            float p1 = 0.f;
+#pragma unroll
+            for (int l = 0; l < 8; ++l)
+            {
+                p0 = fmaf(__uint_as_float(xa[m][l] << 16), wf[2 * l], p0);
+                p0 = fmaf(__uint_as_float(xa[m][l] & 0xffff0000u), wf[2 * l + 1], p0);
+            }
+#pragma unroll
+            for (int l = 8; l < 16; ++l)
+            {
+                p1 = fmaf(__uint_as_float(xa[m][l] << 16), wf[2 * l], p1);
+                p1 = fmaf(__uint_as_float(xa[m][l] & 0xffff0000u), wf[2 * l + 1], p1);
+            }
+            acc[m][r] = fmaf(p0, s0, acc[m][r]);
+            acc[m][r] = fmaf(p1, s1, acc[m][r]);
+        }
+    }
+
+    // Dependents still wait for this grid's completion before reading out.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+
+    constexpr int kWarps = BLOCK / 32;
+    __shared__ float red[kWarps][M * kGemvRows];
+    int const lane = tid & 31;
+    int const warp = tid >> 5;
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+    {
+#pragma unroll
+        for (int r = 0; r < kGemvRows; ++r)
+        {
+            float v = acc[m][r];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+            {
+                v += __shfl_xor_sync(0xffffffffu, v, o);
+            }
+            if (lane == 0)
+            {
+                red[warp][m * kGemvRows + r] = v;
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < M * kGemvRows; i += BLOCK)
+    {
+        float v = 0.f;
+#pragma unroll
+        for (int j = 0; j < kWarps; ++j)
+        {
+            v += red[j][i];
+        }
+        int const m = i / kGemvRows;
+        int const r = i % kGemvRows;
+        out[static_cast<size_t>(m) * n + n0 + r] = __float2bfloat16(v * g);
+    }
+#endif
+}
+
+template <int BLOCK>
+bool launchNvfp4W4a16Gemv(void const* x, void const* w, void const* sf, void* out, float g, int m, int n, int k,
+    bool enable_pdl, cudaStream_t stream)
+{
+    auto const* wp = static_cast<uint8_t const*>(w);
+    auto const* sp = static_cast<uint8_t const*>(sf);
+    auto const* xp = static_cast<__nv_bfloat16 const*>(x);
+    auto* op = static_cast<__nv_bfloat16*>(out);
+    dim3 const grid(n / kGemvRows);
+    dim3 const block(BLOCK);
+    auto launch = [&](auto kernel)
+    {
+        tensorrt_llm::common::launchWithPdl(
+            "nvfp4_w4a16_gemv", enable_pdl, kernel, grid, block, 0, stream, wp, sp, xp, op, g, n, k);
+        return true;
+    };
+    switch (m)
+    {
+    case 1: return launch(&nvfp4W4a16GemvKernel<1, BLOCK>);
+    case 2: return launch(&nvfp4W4a16GemvKernel<2, BLOCK>);
+    case 3: return launch(&nvfp4W4a16GemvKernel<3, BLOCK>);
+    case 4: return launch(&nvfp4W4a16GemvKernel<4, BLOCK>);
+    default: return false;
+    }
+}
+
+} // namespace
+
+bool nvfp4W4a16GemvSupported(int n, int k)
+{
+    int const sm = tensorrt_llm::common::getSMVersion();
+    if (sm != 120 && sm != 121)
+    {
+        return false;
+    }
+    return n > 0 && n % kGemvRows == 0 && (k == 6144 || k == 5120);
+}
+
+bool nvfp4W4a16Gemv(void const* x, void const* w, void const* sf, void* out, float g, int m, int n, int k,
+    bool enable_pdl, cudaStream_t stream)
+{
+    if (m < 1 || m > kNvfp4W4a16GemvMaxRows || !nvfp4W4a16GemvSupported(n, k))
+    {
+        return false;
+    }
+    if (k == 6144)
+    {
+        return launchNvfp4W4a16Gemv<192>(x, w, sf, out, g, m, n, k, enable_pdl, stream);
+    }
+    return launchNvfp4W4a16Gemv<160>(x, w, sf, out, g, m, n, k, enable_pdl, stream);
+}
+
+} // namespace marlin_nvfp4

@@ -23,8 +23,9 @@ def log(*a):
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "bench"
 dev = torch.device("cuda")
-N, K = 5120, 6144
-C = 16
+N, K = int(os.environ.get("PROTO_N", "5120")), int(os.environ.get("PROTO_K", "6144"))
+# >= 256 MB of distinct NVFP4 weight+scale bytes per arm (cold L2)
+C = max(6, -(-256 * 2**20 // (N * K // 2 + N * K // 16)))
 WARMUP, ITERS = 10, 60
 MS = [1, 2, 3, 4]
 
@@ -236,6 +237,9 @@ bool dispatch(int vid, int m, uint8_t const* w, uint8_t const* sf, __nv_bfloat16
     case 15: return bym<2, 192, 1, true, 5>(m, w, sf, x, o, g, n, k);
     case 16: return bym<4, 192, 1, true, 3>(m, w, sf, x, o, g, n, k);
     case 17: return bym<1, 192, 1, true, 6>(m, w, sf, x, o, g, n, k);
+    case 18: return bym<2, 160, 1, true>(m, w, sf, x, o, g, n, k);
+    case 19: return bym<4, 160, 1, true>(m, w, sf, x, o, g, n, k);
+    case 20: return bym<8, 160, 1, true>(m, w, sf, x, o, g, n, k);
     }
     return false;
 }
@@ -257,7 +261,8 @@ CPP = "torch::Tensor run(int64_t vid, torch::Tensor x, torch::Tensor w, torch::T
 
 VIDS = {"r4b192": 1, "r8b192": 2, "r16b192": 3, "r4b96": 4, "r8b96": 5, "r8b192e": 6, "r4b192e": 7,
         "r2b192": 8, "r16b96": 9, "r2b192e": 10, "r4b96e": 11, "r8b96e": 12,
-        "r2e_mb4": 13, "r4e_mb4": 14, "r2e_mb5": 15, "r4e_mb3": 16, "r1e_mb6": 17}
+        "r2e_mb4": 13, "r4e_mb4": 14, "r2e_mb5": 15, "r4e_mb3": 16, "r1e_mb6": 17,
+        "r2b160e": 18, "r4b160e": 19, "r8b160e": 20}
 if os.environ.get("PROTO_MS"):
     MS = [int(v) for v in os.environ["PROTO_MS"].split(",")]
 
