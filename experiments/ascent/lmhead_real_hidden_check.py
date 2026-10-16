@@ -123,9 +123,17 @@ def main():
     report = {"model_lm_head_method": method, "graph_capture_lm_head_calls_M": capture_calls,
               "graph_runs": graph_runs, "n_real_rows": int(rows.shape[0]),
               "bf16_output_rounding_floor_max_abs": floor, "per_M": {}}
+    # Context and mixed context+decode steps run eager by design (requests of
+    # one generate() call arrive staggered, so a batch of b has a few of them);
+    # every pure-decode step replays the graph. Require the lm_head to be in the
+    # captured graph for batch b and most of the 23 decode steps to bypass eager.
+    for b in GRAPH_BS:
+        r = graph_runs[str(b)]
+        r["steps_without_eager_lm_head"] = sp.max_tokens - len(r["eager_lm_head_calls_M"])
     graph_ok = {str(b): (b in capture_calls
                          and min(graph_runs[str(b)]["n_tokens"]) == sp.max_tokens
-                         and len(graph_runs[str(b)]["eager_lm_head_calls_M"]) <= 2)
+                         and len(graph_runs[str(b)]["eager_lm_head_calls_M"])
+                         <= sp.max_tokens // 4)
                 for b in GRAPH_BS}
     report["graph_ok_per_batch"] = graph_ok
     ok = method == tree_arm and all(graph_ok.values())
