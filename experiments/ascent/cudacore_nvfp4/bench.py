@@ -41,7 +41,7 @@ ROUNDS = 2
 WARMUP, ITERS = 10, 60
 TIME_MS = [1, 2, 3, 4]
 BATCH_MS = [1, 2, 4]
-CHECK_MS = [1, 2, 3, 4, 8]
+CHECK_MS = [1, 2, 3, 4, 5, 6, 7, 8]
 TUNE_MS = [1, 2, 4, 8]
 FP8_MAX, E2M1_MAX = 448.0, 6.0
 DEFAULT_BACKENDS = "cutlass,cublaslt,cuda_core"
@@ -275,10 +275,14 @@ def bench():
             rec["gemv_exposed_us"] = round(rec["chain"]["us"] - rec["quant"]["us"], 2)
             detail[f"{name}/M{m}"] = rec
             log(f"[{ARM}] {name} M={m} ({ncall} calls/replay): " + json.dumps(rec))
-            if name == "gate_up" and m in BATCH_MS:
+            if m in BATCH_MS:
+                # kernel_ms = one dense-MLP layer's NVFP4 GEMV chains: gate_up + down (medians).
                 med, p90, p10 = stats(ts["chain"])
-                batch[str(m)] = {"kernel_ms": round(med, 6), "noise_floor": round((p90 - p10) / med, 4),
-                                 "p90_ms": round(p90, 6)}
+                b = batch.setdefault(str(m), {"kernel_ms": 0.0, "noise_floor": 0.0, "p90_ms": 0.0})
+                b["kernel_ms"] = round(b["kernel_ms"] + med, 6)
+                b["p90_ms"] = round(b["p90_ms"] + p90, 6)
+                b["noise_floor"] = max(b["noise_floor"], round((p90 - p10) / med, 4))
+                b[name + "_ms"] = round(med, 6)
             del graphs
             torch.cuda.synchronize()
     res = {"batch": batch, "output": {"class": "exact"}, "arm": ARM, "hashes": hashes,
@@ -330,6 +334,8 @@ def check(expected):
             rep_ok = True
             max_dev_eager = 0.0
             for it in range(WARMUP + ITERS):
+                for o in gouts:  # NaN-poison every output before each replay
+                    o.fill_(float("nan"))
                 g.replay()
                 torch.cuda.synchronize()
                 cur = torch.stack(gouts)
@@ -360,8 +366,8 @@ def check(expected):
             del g, gouts
         del wdq
     report["passed"] = ok
-    report["compared_against"] = ("main's fp4_quantize -> block_scale_interleave_reverse -> "
-                                  "cuda_core_nvfp4_gemm output hashes (baseline arm of the pair)")
+    report["compared_against"] = ("main's fp4_quantize -> cuda_core_nvfp4_gemm(act_sf_swizzled) chain "
+                                  "output hashes, M=1..8, from the baseline arm of the pair (argv[2])")
     log(json.dumps(report))
 
 
