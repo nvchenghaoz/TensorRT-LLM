@@ -546,6 +546,19 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
             else if (!isSpecDec)
             {
                 multiBlock = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessorCount);
+                // SM120/121 HMMA kernel_mha (head 256) runs at 1 CTA/SM. For batch >= 2, cap the sub-sequence
+                // count at one CTA wave (mha.cu's own launcher rule, computeNbSubSeqPerSeqMHA: SMs / (B * kvHeads))
+                // so all CTAs of a call are co-resident and share the reused prefix pages in L2. Batch 1 is
+                // unchanged. TRTLLM_XQA_BLOCKS_PER_SEQUENCE still takes precedence.
+                if (isHMMAKernel && (mSM == 120 || mSM == 121) && xqaParams.head_size == 256
+                    && xqaParams.batch_size >= 2 && !tensorrt_llm::common::getEnvXqaBlocksPerSequence().has_value())
+                {
+                    uint32_t const oneWave = std::max<uint32_t>(1U,
+                        static_cast<uint32_t>(multiprocessorCount)
+                            / (static_cast<uint32_t>(xqaParams.batch_size)
+                                * static_cast<uint32_t>(xqaParams.num_kv_heads)));
+                    multiBlock = std::min(multiBlock, oneWave);
+                }
             }
         }
         uint32_t const nbKVHeads = xqaParams.num_kv_heads;
