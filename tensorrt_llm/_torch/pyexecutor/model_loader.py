@@ -1788,6 +1788,10 @@ class ModelLoader:
             if post_load_weights is not None and not getattr(
                     module, '_weights_removed', False):
                 post_load_weights()
+        # SM12x: prefill-time NVFP4 W4A4 copies of FP8 GDN in_proj_qkvz
+        # (kill switch TRTLLM_FP8_PREFILL_NVFP4_GDN=0).
+        from ..modules.fp8_prefill_nvfp4 import build_fp8_prefill_nvfp4_copies
+        build_fp8_prefill_nvfp4_copies(model)
 
     @staticmethod
     def _reset_weights_transformed(model: DecoderModelForCausalLM) -> None:

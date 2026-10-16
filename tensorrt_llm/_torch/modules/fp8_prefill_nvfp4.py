@@ -91,7 +91,8 @@ def maybe_build_prefill_nvfp4_copy(module: torch.nn.Module,
                              dtype=torch.float32,
                              device=w.device)
     # Plain attribute (not a Parameter/buffer): not part of the state dict.
-    module.__dict__[_ATTR] = (w_fp4, w_sf, act_global, alpha, g)
+    module.__dict__[_ATTR] = _PrefillNVFP4Copy(w_fp4, w_sf, act_global, alpha,
+                                               g)
     _stats["built"] += 1
     _stats["bytes"] += (w_fp4.numel() * w_fp4.element_size() +
                         w_sf.numel() * w_sf.element_size())
@@ -107,11 +108,38 @@ def get_prefill_nvfp4_copy(module: torch.nn.Module):
     return module.__dict__.get(_ATTR)
 
 
+def build_fp8_prefill_nvfp4_copies(model: torch.nn.Module) -> int:
+    """Model walk after post-load: copies for every GDN in_proj_qkvz."""
+    n = 0
+    for mod in model.modules():
+        qkvz = mod.__dict__.get("_modules", {}).get("in_proj_qkvz")
+        if qkvz is not None and maybe_build_prefill_nvfp4_copy(qkvz):
+            n += 1
+    return n
+
+
+class _PrefillNVFP4Copy:
+    """Load-time NVFP4 copy; called from FP8QDQLinearMethod.apply."""
+
+    __slots__ = ("w_fp4", "w_sf", "act_global", "alpha", "g")
+
+    def __init__(self, w_fp4, w_sf, act_global, alpha, g):
+        self.w_fp4, self.w_sf = w_fp4, w_sf
+        self.act_global, self.alpha, self.g = act_global, alpha, g
+
+    def __getitem__(self, i):
+        return (self.w_fp4, self.w_sf, self.act_global, self.alpha, self.g)[i]
+
+    def __call__(self, module, input, original_shape, bias):
+        return prefill_nvfp4_apply(self, module, input, original_shape, bias)
+
+
 def prefill_nvfp4_apply(copy, module: torch.nn.Module, input: torch.Tensor,
                         original_shape: torch.Size,
                         bias: Optional[torch.Tensor]) -> torch.Tensor:
     """NVFP4 W4A4 prefill GEMM on a 2D BF16 input with rows > 16."""
-    w_fp4, w_sf, act_global, alpha, _ = copy
+    w_fp4, w_sf, act_global, alpha = (copy.w_fp4, copy.w_sf, copy.act_global,
+                                      copy.alpha)
     _stats["calls"] += 1
     act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(input, act_global, _SF_VEC,
                                                     False)

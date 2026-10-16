@@ -782,6 +782,9 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
             if static_input_scale is not None:
+                nvfp4_prefill = module.__dict__.get("_fp8_prefill_nvfp4")
+                if nvfp4_prefill is not None and input.shape[0] > 16 and input.dtype == torch.bfloat16:
+                    return nvfp4_prefill(module, input, original_shape, bias)
                 # Static quantization
                 qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     input, static_input_scale)
