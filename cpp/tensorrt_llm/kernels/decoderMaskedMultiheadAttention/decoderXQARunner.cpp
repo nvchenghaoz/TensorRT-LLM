@@ -548,6 +548,18 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
                 multiBlock = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessorCount);
             }
         }
+
+        // SM120/121 HMMA decode (kernel_mha at 1 CTA/SM), head 256, batch 1: the heuristic gives 48 sub-sequences,
+        // i.e. 48 x nbKVHeads(4) = 192 CTAs on 188 SMs, a 1.02-wave grid whose 4-CTA tail costs a whole wave. Cap the
+        // count at one CTA wave (47 on 188 SMs with 4 KV heads). Not applied when TRTLLM_XQA_BLOCKS_PER_SEQUENCE is set.
+        if (xqaParams.multi_block_mode && !isSpecDec && isHMMAKernel && (mSM == 120 || mSM == 121)
+            && xqaParams.head_size == 256 && xqaParams.batch_size == 1
+            && !tensorrt_llm::common::getEnvXqaBlocksPerSequence().has_value())
+        {
+            uint32_t const oneWave = std::max<uint32_t>(
+                1U, static_cast<uint32_t>(multiprocessorCount) / static_cast<uint32_t>(xqaParams.num_kv_heads));
+            multiBlock = std::min(multiBlock, oneWave);
+        }
         uint32_t const nbKVHeads = xqaParams.num_kv_heads;
         auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multiBlock, nbKVHeads * xqaParams.batch_size}
                                            : dim3{multiBlock, nbKVHeads, xqaParams.batch_size});
