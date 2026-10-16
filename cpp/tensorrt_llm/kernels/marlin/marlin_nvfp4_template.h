@@ -54,6 +54,21 @@ namespace MARLIN_NAMESPACE_NAME
 // dependents right after its griddepcontrol.wait instead of at grid completion.
 constexpr int kMarlinNvfp4PdlLaunchFlag = 1 << 30;
 
+// full_k kernels (template flag): the host launches one CTA per n-tile column
+// (gridDim.x == n_tiles, a single m block) and stores, in bits
+// [kMarlinNvfp4FullKGridShift, +13) of max_shared_mem, the grid size G of the
+// default launch it replaces. The default launch splits every column's k tiles
+// at multiples of iters(G) over several CTAs and chains their partial sums
+// through the BF16 output (highest k stripe first, each step fp32 add of the
+// BF16 partial, then BF16 rounding). A full_k CTA streams its column without
+// draining its pipeline, parks each warp's partial sums of every stripe in
+// shared memory at those same boundaries (accumulators restart from zero, as in
+// a new CTA), and replays the in-CTA warp reduction and the BF16 chain at the
+// end, so its output is bitwise equal to the default launch's.
+constexpr int kMarlinNvfp4FullKGridShift = 17;
+constexpr int kMarlinNvfp4FullKGridMask = (1 << 13) - 1;
+constexpr int kMarlinNvfp4FullKMaxStripes = 4;
+
 // Empty kernel stub outside the architectures supported by dense Marlin.
 #if defined(__CUDA_ARCH__) && !MARLIN_NVFP4_DENSE_DEVICE_SUPPORTED
 
@@ -68,8 +83,9 @@ template <typename scalar_t,   // compute dtype, nv_bfloat16
                                // only works when thread_m_blocks == 1
     int const stages,          // number of stages for the async global->shared
                                // fetch pipeline
-    int group_blocks           // number of consecutive 16x16 blocks
+    int const group_blocks,    // number of consecutive 16x16 blocks
                                // with a separate quantization scale
+    bool full_k                // see kMarlinNvfp4FullKGridShift
                                // (implicit const: trailing NTTP)
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS)
@@ -229,8 +245,9 @@ template <typename scalar_t,                        // compute dtype, nv_bfloat1
                                                     // only works when thread_m_blocks == 1
     int const stages,                               // number of stages for the async global->shared
                                                     // fetch pipeline
-    int group_blocks                                // number of consecutive 16x16 blocks
+    int const group_blocks,                         // number of consecutive 16x16 blocks
                                                     // with a separate quantization scale
+    bool full_k                                     // see kMarlinNvfp4FullKGridShift
                                                     // (implicit const: trailing NTTP)
     >
 __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shape mxk
@@ -363,6 +380,26 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
             // in the middle of group.
             iters = (group_blocks / thread_k_blocks) * div_ceil(iters, (group_blocks / thread_k_blocks));
         }
+    }
+
+    // full_k: stripe length of the replaced default launch (the host guarantees a
+    // single m block and n_tiles <= G, so that launch has no part1 tiles), and the
+    // tiles left in the current stripe of this CTA's column.
+    int fk_iters = 0;
+    int fk_left = 0;
+    int fk_stripe = 0;
+    if constexpr (full_k)
+    {
+        static_assert(m_block_size_8 && thread_m_blocks == 1 && threads == 128 && thread_n_blocks == 4
+                && !has_act_order && group_blocks != -1 && group_blocks != 0,
+            "full_k is only instantiated for the 128-thread 8-row 64-wide tile");
+        int const fk_grid = (max_shared_mem >> kMarlinNvfp4FullKGridShift) & kMarlinNvfp4FullKGridMask;
+        fk_iters = div_ceil(k_tiles * n_tiles, fk_grid);
+        if constexpr (group_blocks >= thread_k_blocks)
+        {
+            fk_iters = (group_blocks / thread_k_blocks) * div_ceil(fk_iters, (group_blocks / thread_k_blocks));
+        }
+        fk_left = fk_iters - (k_tiles * static_cast<int>(blockIdx.x)) % fk_iters;
     }
 
     int slice_row = 0;
@@ -752,6 +789,8 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride) : (stages * s_sh_stage);
     int4* sh_s = sh_zp + (stages * zp_sh_stage);
     int4* sh_a = sh_s + sh_s_size;
+    // full_k only: [kMarlinNvfp4FullKMaxStripes][16 accumulators][threads] fp32 partial sums.
+    float* sh_fk = reinterpret_cast<float*>(sh_a + stages * a_sh_stage);
 
     // Register storage for double buffer of shared memory reads.
     FragA frag_a[2][thread_m_blocks];
@@ -1412,6 +1451,57 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
         }
     };
 
+    // full_k: for each parked stripe, replay the replaced launch's in-CTA warp
+    // reduction (thread_block_reduce with 4 k-warps leaves w0 + (w1 + (w3 + w2)) in
+    // warp 0), then its global chain (global_reduce_fp16, slice_idx 0 = highest-k
+    // stripe first): every stripe but the highest adds the BF16 partial of the
+    // stripe above it in fp32, and every stripe but the lowest (the "last" block,
+    // which hands fp32 to write_result) rounds its sum to BF16. Leaves the result in
+    // warp 0's frag_c, as thread_block_reduce + global_reduce_fp16 would.
+    auto full_k_reduce = [&]()
+    {
+        if constexpr (full_k)
+        {
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+#pragma unroll
+                for (int g = 0; g < 4; g++)
+                {
+                    sh_fk[((fk_stripe * 4 + j) * 4 + g) * threads + threadIdx.x] = frag_c[0][j][0][g];
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x < 32)
+            {
+                float acc[16] = {};
+                for (int s = fk_stripe; s >= 0; s--)
+                {
+#pragma unroll
+                    for (int f = 0; f < 16; f++)
+                    {
+                        float const* p = &sh_fk[(s * 16 + f) * threads + threadIdx.x];
+                        float r = p[0] + (p[32] + (p[96] + p[64]));
+                        if (s != fk_stripe)
+                        {
+                            r += acc[f];
+                        }
+                        acc[f] = s != 0 ? MarlinType<scalar_t>::num2float(MarlinType<scalar_t>::float2num(r)) : r;
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                {
+#pragma unroll
+                    for (int g = 0; g < 4; g++)
+                    {
+                        frag_c[0][j][0][g] = acc[j * 4 + g];
+                    }
+                }
+            }
+        }
+    };
+
     // Since multiple threadblocks may process parts of the same column slice, we
     // finally have to globally reduce over the results. As the striped
     // partitioning minimizes the number of such reductions and our outputs are
@@ -1812,6 +1902,27 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                 }
             }
             slice_iters--;
+            if constexpr (full_k)
+            {
+                // This tile ends a stripe of the replaced launch: park this thread's
+                // partial sums and restart the accumulators from zero, as that
+                // launch's next CTA would. The pipeline keeps streaming.
+                if (--fk_left == 0 && slice_iters != 0)
+                {
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                    {
+#pragma unroll
+                        for (int g = 0; g < 4; g++)
+                        {
+                            sh_fk[((fk_stripe * 4 + j) * 4 + g) * threads + threadIdx.x] = frag_c[0][j][0][g];
+                        }
+                    }
+                    fk_stripe++;
+                    fk_left = fk_iters;
+                    zero_accums();
+                }
+            }
             if (slice_iters == 0)
             {
                 break;
@@ -1911,7 +2022,14 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                 }
             }
 
-            thread_block_reduce();
+            if constexpr (full_k)
+            {
+                full_k_reduce();
+            }
+            else
+            {
+                thread_block_reduce();
+            }
 
             if (has_bias && last)
             {
