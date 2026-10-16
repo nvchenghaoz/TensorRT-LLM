@@ -1793,8 +1793,13 @@ class ModelLoader:
         from ..modules.fp8_prefill_nvfp4 import build_fp8_prefill_nvfp4_copies
         build_fp8_prefill_nvfp4_copies(model)
         # One line: decode-only NVFP4 W4A16 copies of FP8 weights, per (N, K).
-        from ..modules.linear import log_fp8_nvfp4_decode_copies
+        from ..modules.linear import (log_fp8_nvfp4_decode_copies,
+                                      mark_marlin_fork_sites)
         log_fp8_nvfp4_decode_copies(model)
+        # GDN in_proj_qkvz Marlin (beside the in_proj_ba fork) keeps a per-call
+        # lock workspace at rows >= 2 (kill switch
+        # TRTLLM_MARLIN_FORK_FRESH_WORKSPACE=0).
+        mark_marlin_fork_sites(model)
 
     @staticmethod
     def _reset_weights_transformed(model: DecoderModelForCausalLM) -> None:
