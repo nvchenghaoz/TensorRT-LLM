@@ -26,8 +26,20 @@ namespace kernels
 {
 namespace cuda_core_gemm_nvfp4
 {
+// Offset of scale-factor column col_idx of row row_idx in the 128x4 swizzled SF layout
+// (same math as get_sf_out_offset_128x4 without batching). col_idx is even here, so the SF
+// pair (col_idx, col_idx + 1) is contiguous and can be read with one 2-byte load.
+__device__ __forceinline__ int swizzledSfOffset(int row_idx, int col_idx, int num_sf_tiles_k)
+{
+    int const tile_offset = ((row_idx / 128) * num_sf_tiles_k + col_idx / 4) * 512;
+    return tile_offset + (row_idx % 32) * 16 + ((row_idx % 128) / 32) * 4 + col_idx % 4;
+}
+
+// ACT_SF_SWIZZLED: scale_a is in the 128x4 swizzled layout written by fp4_quantize
+// (isSfSwizzledLayout=True) instead of the linear [m, k / 16] layout. Both read the same bytes,
+// so the output is identical.
 template <typename InputType, typename OutputType, typename ScaleType, SizeType32 TILE_M, SizeType32 TILE_N,
-    SizeType32 BLOCK_SIZE>
+    SizeType32 BLOCK_SIZE, bool ACT_SF_SWIZZLED>
 __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType const* __restrict__ weight,
     ScaleType const* __restrict__ scale_a, ScaleType const* __restrict__ scale_w, float const alpha,
     OutputType* __restrict__ output, OutputType const* __restrict__ bias, SizeType32 m, SizeType32 n, SizeType32 k)
@@ -65,34 +77,64 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
     output += tile_id_m * n + tile_id_n;
     OutputType const* __restrict__ bias_tile = (bias != nullptr) ? bias + tile_id_n : nullptr;
 
-    scale_a += tile_id_m * k / nvfp4_scale_granularity;
+    if constexpr (!ACT_SF_SWIZZLED)
+    {
+        scale_a += tile_id_m * k / nvfp4_scale_granularity;
+    }
+
+    int const num_cols_sf = k / nvfp4_scale_granularity;
+    int const num_sf_tiles_k = (num_cols_sf + 4 - 1) / 4;
+
+    // Raw weight and weight-SF registers of the current K step. Weights and their scale factors are
+    // constant (they are never written by a preceding kernel), so the loads of the first K step are
+    // issued before the PDL wait and overlap the tail of the producer kernel.
+    VecType tile_w_quantized[TILE_N];
+    ScaleVecType tile_w_scale_fp8x2[TILE_N];
+    auto load_weight_step = [&](SizeType32 idx_k)
+    {
+#pragma unroll
+        for (SizeType32 j = 0; j < TILE_N; ++j)
+        {
+            tile_w_quantized[j] = reinterpret_cast<VecType const*>(weight + (j * k + idx_k) / 2)[0];
+        }
+#pragma unroll
+        for (SizeType32 j = 0; j < TILE_N; ++j)
+        {
+            int const dst_idx = swizzledSfOffset(tile_id_n + j, idx_k / nvfp4_scale_granularity, num_sf_tiles_k);
+            tile_w_scale_fp8x2[j] = reinterpret_cast<ScaleVecType const*>(scale_w + dst_idx)[0];
+        }
+    };
+
+    SizeType32 const first_idx_k = tid * step_k;
+    if (first_idx_k < k)
+    {
+        load_weight_step(first_idx_k);
+    }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
 
-    int const num_cols_sf = k / nvfp4_scale_granularity;
-    int const num_sf_tiles_k = (num_cols_sf + 4 - 1) / 4;
-    for (SizeType32 idx_k = tid * step_k; idx_k < k; idx_k += tile_k)
+    for (SizeType32 idx_k = first_idx_k; idx_k < k; idx_k += tile_k)
     {
+        if (idx_k != first_idx_k)
+        {
+            load_weight_step(idx_k);
+        }
+#pragma unroll
         for (SizeType32 j = 0; j < TILE_N; ++j)
         {
-            auto tile_w_quantized = reinterpret_cast<VecType const*>(weight + (j * k + idx_k) / 2)[0];
 #pragma unroll
             for (SizeType32 cvt_idx = 0; cvt_idx < k_cvt_count; ++cvt_idx)
             {
                 reinterpret_cast<CvtResType*>(tile_w)[j * k_cvt_count + cvt_idx]
-                    = Converter::convert(reinterpret_cast<CvtSrcType*>(&tile_w_quantized)[cvt_idx]);
+                    = Converter::convert(reinterpret_cast<CvtSrcType*>(&tile_w_quantized[j])[cvt_idx]);
             }
         }
+#pragma unroll
         for (SizeType32 j = 0; j < TILE_N; ++j)
         {
-            int const row_idx = tile_id_n + j;
-            int const col_idx = idx_k / nvfp4_scale_granularity;
-            int const tile_offset = ((row_idx / 128) * num_sf_tiles_k + col_idx / 4) * 512;
-            int const dst_idx = tile_offset + (row_idx % 32) * 16 + ((row_idx % 128) / 32) * 4 + col_idx % 4;
-            auto tile_w_scale_fp8x2 = reinterpret_cast<ScaleVecType const*>(scale_w + dst_idx)[0];
-            const char2 tmp = reinterpret_cast<char2 const&>(tile_w_scale_fp8x2);
+            const char2 tmp = reinterpret_cast<char2 const&>(tile_w_scale_fp8x2[j]);
             tile_w_scale[j * step_k_scale + 0] = static_cast<float>(reinterpret_cast<__nv_fp8_e4m3 const&>(tmp.x));
             tile_w_scale[j * step_k_scale + 1] = static_cast<float>(reinterpret_cast<__nv_fp8_e4m3 const&>(tmp.y));
         }
@@ -106,8 +148,10 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
                 reinterpret_cast<CvtResType*>(tile_a)[cvt_idx]
                     = Converter::convert(reinterpret_cast<CvtSrcType*>(&tile_a_quantized)[cvt_idx]);
             }
-            auto tile_a_scale_fp8x2
-                = reinterpret_cast<ScaleVecType const*>(scale_a + (i * k + idx_k) / nvfp4_scale_granularity)[0];
+            int const a_sf_idx = ACT_SF_SWIZZLED
+                ? swizzledSfOffset(tile_id_m + i, idx_k / nvfp4_scale_granularity, num_sf_tiles_k)
+                : (i * k + idx_k) / nvfp4_scale_granularity;
+            auto tile_a_scale_fp8x2 = reinterpret_cast<ScaleVecType const*>(scale_a + a_sf_idx)[0];
             const char2 tmp = reinterpret_cast<char2 const&>(tile_a_scale_fp8x2);
             tile_a_scale[0] = static_cast<float>(reinterpret_cast<__nv_fp8_e4m3 const&>(tmp.x));
             tile_a_scale[1] = static_cast<float>(reinterpret_cast<__nv_fp8_e4m3 const&>(tmp.y));
@@ -168,13 +212,13 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
 }
 
 template <typename InputType, typename OutputType, typename ScaleType, SizeType32 TILE_M, SizeType32 TILE_N,
-    SizeType32 BLOCK_SIZE>
+    SizeType32 BLOCK_SIZE, bool ACT_SF_SWIZZLED>
 __global__ void cudaCoreGemmFp4(InputType const* __restrict__ act, InputType const* __restrict__ weight,
     ScaleType const* __restrict__ scale_a, ScaleType const* __restrict__ scale_w, float const* alpha_ptr,
     OutputType* __restrict__ output, OutputType const* __restrict__ bias, SizeType32 m, SizeType32 n, SizeType32 k)
 {
     float alpha = alpha_ptr[0];
-    cudaCoreGemmImpl<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE>(
+    cudaCoreGemmImpl<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, ACT_SF_SWIZZLED>(
         reinterpret_cast<InputType const*>(act), reinterpret_cast<InputType const*>(weight),
         reinterpret_cast<ScaleType const*>(scale_a), reinterpret_cast<ScaleType const*>(scale_w), alpha,
         reinterpret_cast<OutputType*>(output), reinterpret_cast<OutputType const*>(bias), m, n, k);
@@ -189,6 +233,12 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
     // thousands wide) and only grid.x allows more than 65535 blocks. M is safe on grid.y
     // because it never exceeds cudaCoreGemmTemplateMaxM.
     dim3 grid(params.n / TILE_N, params.m / TILE_M);
+
+    using KernelFn = void (*)(InputType const*, InputType const*, ScaleType const*, ScaleType const*, float const*,
+        OutputType*, OutputType const*, SizeType32, SizeType32, SizeType32);
+    KernelFn const cudaCoreGemmFp4Kernel = params.act_sf_swizzled
+        ? &cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, true>
+        : &cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, false>;
 
     if (tensorrt_llm::common::getEnvEnablePDL())
     {
@@ -207,8 +257,7 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
 
         if (params.scale_a && params.scale_b && params.alpha_ptr)
         {
-            TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig,
-                cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE>,
+            TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, cudaCoreGemmFp4Kernel,
                 reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
                 reinterpret_cast<ScaleType const*>(params.scale_a), reinterpret_cast<ScaleType const*>(params.scale_b),
                 params.alpha_ptr, reinterpret_cast<OutputType*>(params.output),
@@ -219,7 +268,7 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
     {
         if (params.scale_a && params.scale_b && params.alpha_ptr)
         {
-            cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+            cudaCoreGemmFp4Kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
                 reinterpret_cast<ScaleType const*>(params.scale_a), reinterpret_cast<ScaleType const*>(params.scale_b),
                 params.alpha_ptr, reinterpret_cast<OutputType*>(params.output),

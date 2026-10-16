@@ -1457,7 +1457,8 @@ def _register_fake():
           bias: Optional[torch.Tensor],
           out_dtype: Optional[torch.dtype],
           output_buffer_kind: int = 0,
-          group: Optional[List[int]] = None):
+          group: Optional[List[int]] = None,
+          act_sf_swizzled: bool = False):
         # mat_a: [M, K/2], mat_b: [N, K/2]
         # Output should be [M, N] with dtype=out_dtype
         m = mat_a.shape[0]
