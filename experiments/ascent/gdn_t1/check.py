@@ -36,13 +36,13 @@ def log(*args):
     print(*args, flush=True)
 
 
-H, HV, K, V = 16, 32, 128, 128
+H, HV, K, V = 16, 48, 128, 128
 KEY_DIM, VAL_DIM = H * K, HV * V
 CONV_DIM = 2 * KEY_DIM + VAL_DIM
 QKVZ_DIM = CONV_DIM + VAL_DIM
 SLOTS, WARMUP, ITERS, LAYERS = 16, 20, 100, 30
 SCALE = K**-0.5
-RATIO = 1.5
+RATIO = 1.25
 dev = torch.device("cuda")
 flush_buf = torch.ones(64 * 1024 * 1024, dtype=torch.float32, device=dev)
 
@@ -498,7 +498,7 @@ def main():
                     "20+100 repeated execution with timed-loop resets, graph "
                     "replay with changed inputs/indices, PAD index, varlen "
                     "fallback",
-        "tolerance": "candidate max/mean abs error <= 1.5x original's; "
+        "tolerance": "candidate max/mean abs error <= 1.25x original's; "
                      "repeated invocations bitwise identical",
         "bitwise_vs_original": bitwise_vs_original,
         "num_failures": len(failures),

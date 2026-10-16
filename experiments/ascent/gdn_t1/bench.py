@@ -1,8 +1,8 @@
 # GDN decode (fused_sigmoid_gating_delta_rule_update) microbenchmark.
 # Self-contained: runs unchanged against main (generic Triton kernel) and the
 # candidate (T == 1 kernel), so it can be passed inline with `python -c`.
-# Serving shapes of Qwen3.6-35B-A3B GDN layers at TP=1: H=16, HV=32, K=V=128;
-# q/k/v are strided views of the in_proj_qkvz output (row stride 12288), a/b are
+# Serving shapes of Qwen3.8-27B GDN layers at TP=1: H=16, HV=48, K=V=128;
+# q/k/v are strided views of the in_proj_qkvz output (row stride 16384), a/b are
 # column slices of the in_proj_ba output; bf16 state pool [slots, HV, V, K]
 # with non-identity state indices. One CUDA graph = 30 GDN layers (distinct
 # pools/inputs), like one decode step. Before every iteration (outside the
@@ -27,7 +27,7 @@ def log(*args):
     print(*args, flush=True)
 
 
-H, HV, K, V = 16, 32, 128, 128
+H, HV, K, V = 16, 48, 128, 128
 KEY_DIM, VAL_DIM = H * K, HV * V
 CONV_DIM = 2 * KEY_DIM + VAL_DIM
 QKVZ_DIM = CONV_DIM + VAL_DIM
