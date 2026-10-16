@@ -39,7 +39,8 @@ SHAPES = {"gate_up": (34816, 5120), "down": (5120, 17408)}
 COPIES = {"gate_up": 4, "down": 8}
 ROUNDS = 2
 WARMUP, ITERS = 10, 60
-TIME_MS = [1, 2, 4]
+TIME_MS = [1, 2, 3, 4]
+BATCH_MS = [1, 2, 4]
 CHECK_MS = [1, 2, 3, 4, 8]
 TUNE_MS = [1, 2, 4, 8]
 FP8_MAX, E2M1_MAX = 448.0, 6.0
@@ -191,7 +192,46 @@ def stats(ts):
     return med, q(0.9), q(0.1)
 
 
+def probe():
+    import subprocess
+    res = {}
+    try:
+        q = ("name,ecc.mode.current,clocks.sm,clocks.mem,clocks_throttle_reasons.active,"
+             "temperature.gpu,power.draw")
+        cmd = ["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader"]
+        if os.environ.get("CUDA_VISIBLE_DEVICES", "").startswith("GPU-"):
+            cmd += ["-i", os.environ["CUDA_VISIBLE_DEVICES"].split(",")[0]]
+        res["nvidia_smi"] = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception as e:  # pragma: no cover
+        res["nvidia_smi"] = repr(e)[:100]
+    for label, nbytes, fn in (("read_2GB", 2 << 30, None), ("d2d_1GB", 1 << 30, "copy")):
+        src = torch.ones(nbytes // 4, dtype=torch.float32, device=dev)
+        dst = torch.empty_like(src) if fn == "copy" else None
+        ts = []
+        for it in range(25):
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            if fn == "copy":
+                dst.copy_(src)
+            else:
+                src.sum()
+            e1.record()
+            e1.synchronize()
+            if it >= 5:
+                ts.append(e0.elapsed_time(e1))
+        med, p90, _ = stats(ts)
+        mult = 2 if fn == "copy" else 1
+        res[label + "_TBps_med"] = round(mult * nbytes / (med * 1e-3) / 1e12, 3)
+        res[label + "_TBps_p90"] = round(mult * nbytes / (p90 * 1e-3) / 1e12, 3)
+        del src, dst
+    torch.cuda.empty_cache()
+    log(f"[{ARM}] probe: " + json.dumps(res))
+    return res
+
+
 def bench():
+    dram = probe()
     data = build()
     picks = tune(data)
     hashes = {}
@@ -229,18 +269,20 @@ def bench():
                 rec[vn] = {"us": round(med * 1e3, 2), "p90_us": round(p90 * 1e3, 2),
                            "p10_us": round(p10 * 1e3, 2), "nf": round((p90 - p10) / med, 4)}
                 if vn != "quant":
-                    rec[vn]["TBps"] = round(d["wbytes"] / (med * 1e-3) / 1e12, 3)
+                    tb = d["wbytes"] / (med * 1e-3) / 1e12
+                    rec[vn]["TBps"] = round(tb, 3)
+                    rec[vn]["pct_read"] = round(100 * tb / dram["read_2GB_TBps_med"], 1)
             rec["gemv_exposed_us"] = round(rec["chain"]["us"] - rec["quant"]["us"], 2)
             detail[f"{name}/M{m}"] = rec
             log(f"[{ARM}] {name} M={m} ({ncall} calls/replay): " + json.dumps(rec))
-            if name == "gate_up":
+            if name == "gate_up" and m in BATCH_MS:
                 med, p90, p10 = stats(ts["chain"])
                 batch[str(m)] = {"kernel_ms": round(med, 6), "noise_floor": round((p90 - p10) / med, 4),
                                  "p90_ms": round(p90, 6)}
             del graphs
             torch.cuda.synchronize()
     res = {"batch": batch, "output": {"class": "exact"}, "arm": ARM, "hashes": hashes,
-           "picks": picks, "detail": detail}
+           "picks": picks, "dram": dram, "detail": detail}
     log(json.dumps(res))
 
 
