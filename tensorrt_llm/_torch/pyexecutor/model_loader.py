@@ -1792,6 +1792,9 @@ class ModelLoader:
         # (kill switch TRTLLM_FP8_PREFILL_NVFP4_GDN=0).
         from ..modules.fp8_prefill_nvfp4 import build_fp8_prefill_nvfp4_copies
         build_fp8_prefill_nvfp4_copies(model)
+        # One line: decode-only NVFP4 W4A16 copies of FP8 weights, per (N, K).
+        from ..modules.linear import log_fp8_nvfp4_decode_copies
+        log_fp8_nvfp4_decode_copies(model)
 
     @staticmethod
     def _reset_weights_transformed(model: DecoderModelForCausalLM) -> None:

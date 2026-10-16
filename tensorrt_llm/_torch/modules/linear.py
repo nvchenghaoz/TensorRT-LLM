@@ -2524,6 +2524,18 @@ def _build_fp8_nvfp4_decode_copy(module: Linear) -> None:
     module._nvfp4_decode_global_scale = weight_global_scale
 
 
+def log_fp8_nvfp4_decode_copies(model: torch.nn.Module) -> None:
+    """One load-time log line: decode NVFP4 W4A16 copies built, per (N, K)."""
+    shapes: Dict[Tuple[int, int], int] = {}
+    for mod in model.modules():
+        if getattr(mod, "_nvfp4_decode_weight", None) is not None:
+            key = (mod.out_features, mod.in_features)
+            shapes[key] = shapes.get(key, 0) + 1
+    if shapes:
+        logger.info(f"[nvfp4_decode_copy] built {sum(shapes.values())} "
+                    f"decode NVFP4 W4A16 copies (N,K)->count: {shapes}")
+
+
 def _report_fp8_nvfp4_decode_copy(module: Linear, w_fp4: torch.Tensor,
                                   w_sf: torch.Tensor, g: torch.Tensor,
                                   weight_scale: torch.Tensor) -> None:
