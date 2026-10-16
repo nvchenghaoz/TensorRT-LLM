@@ -88,9 +88,13 @@ __device__ __forceinline__ float bf_hi(uint32_t v) { return __uint_as_float(v & 
 // (K == KS*BLOCK*32). All of the CTA's weight + SF loads are issued before the PDL wait.
 template <int M, int ROWS, int BLOCK, int KS, bool EARLY>
 __global__ void __launch_bounds__(BLOCK) w4a16_gemv(uint8_t const* __restrict__ w, uint8_t const* __restrict__ sf,
-    __nv_bfloat16 const* __restrict__ x, __nv_bfloat16* __restrict__ out, float g, int n, int k) {
+    __nv_bfloat16 const* __restrict__ x, __nv_bfloat16* __restrict__ out, float g, int n, int k, int mtot) {
     int const tid = threadIdx.x;
-    int const n0 = blockIdx.x * ROWS;
+    int const n0 = blockIdx.y * ROWS;
+    int const m0 = blockIdx.x * M;
+    int const mv = min(M, mtot - m0);
+    x += (size_t)m0 * k;
+    out += (size_t)m0 * n;
     int const kb = k / 2;    // weight row bytes
     int const ks = k / 16;   // SF row bytes
     int4 wq[ROWS][KS];
@@ -114,7 +118,8 @@ __global__ void __launch_bounds__(BLOCK) w4a16_gemv(uint8_t const* __restrict__ 
             int4 const* p = reinterpret_cast<int4 const*>(x + (size_t)m * k + (tid + s * BLOCK) * 32);
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
-                int4 v = p[q];
+                int4 v = make_int4(0, 0, 0, 0);
+                if (m < mv) v = p[q];
                 xa[m][s][q * 4 + 0] = v.x;
                 xa[m][s][q * 4 + 1] = v.y;
                 xa[m][s][q * 4 + 2] = v.z;
@@ -171,14 +176,14 @@ __global__ void __launch_bounds__(BLOCK) w4a16_gemv(uint8_t const* __restrict__ 
 #pragma unroll
         for (int j = 0; j < NW; ++j) v += red[j][i];
         int const m = i / ROWS, r = i % ROWS;
-        out[(size_t)m * n + n0 + r] = __float2bfloat16(v * g);
+        if (m < mv) out[(size_t)m * n + n0 + r] = __float2bfloat16(v * g);
     }
     if constexpr (!EARLY) pdl_trigger();
 }
 
 template <typename Kern>
 void pdl_launch(Kern kern, dim3 grid, dim3 block, uint8_t const* w, uint8_t const* sf, __nv_bfloat16 const* x,
-    __nv_bfloat16* o, float g, int n, int k) {
+    __nv_bfloat16* o, float g, int n, int k, int m) {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = grid;
     cfg.blockDim = block;
@@ -189,25 +194,25 @@ void pdl_launch(Kern kern, dim3 grid, dim3 block, uint8_t const* w, uint8_t cons
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kern, w, sf, x, o, g, n, k));
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kern, w, sf, x, o, g, n, k, m));
 }
 
-template <int M, int ROWS, int BLOCK, int KS, bool EARLY>
-bool lv(uint8_t const* w, uint8_t const* sf, __nv_bfloat16 const* x, __nv_bfloat16* o, float g, int n, int k) {
+template <int TM, int ROWS, int BLOCK, int KS, bool EARLY>
+bool lv(int m, uint8_t const* w, uint8_t const* sf, __nv_bfloat16 const* x, __nv_bfloat16* o, float g, int n, int k) {
     if (k != KS * BLOCK * 32 || n % ROWS != 0) return false;
-    pdl_launch(w4a16_gemv<M, ROWS, BLOCK, KS, EARLY>, dim3(n / ROWS), dim3(BLOCK), w, sf, x, o, g, n, k);
+    pdl_launch(w4a16_gemv<TM, ROWS, BLOCK, KS, EARLY>, dim3((m + TM - 1) / TM, n / ROWS), dim3(BLOCK), w, sf, x, o,
+        g, n, k, m);
     return true;
 }
 
 template <int ROWS, int BLOCK, int KS, bool EARLY>
 bool bym(int m, uint8_t const* w, uint8_t const* sf, __nv_bfloat16 const* x, __nv_bfloat16* o, float g, int n, int k) {
     switch (m) {
-    case 1: return lv<1, ROWS, BLOCK, KS, EARLY>(w, sf, x, o, g, n, k);
-    case 2: return lv<2, ROWS, BLOCK, KS, EARLY>(w, sf, x, o, g, n, k);
-    case 3: return lv<3, ROWS, BLOCK, KS, EARLY>(w, sf, x, o, g, n, k);
-    case 4: return lv<4, ROWS, BLOCK, KS, EARLY>(w, sf, x, o, g, n, k);
+    case 1: return lv<1, ROWS, BLOCK, KS, EARLY>(m, w, sf, x, o, g, n, k);
+    case 2: return lv<2, ROWS, BLOCK, KS, EARLY>(m, w, sf, x, o, g, n, k);
+    case 3: return lv<3, ROWS, BLOCK, KS, EARLY>(m, w, sf, x, o, g, n, k);
     }
-    return false;
+    return lv<4, ROWS, BLOCK, KS, EARLY>(m, w, sf, x, o, g, n, k);
 }
 
 bool dispatch(int vid, int m, uint8_t const* w, uint8_t const* sf, __nv_bfloat16 const* x, __nv_bfloat16* o,
@@ -222,6 +227,9 @@ bool dispatch(int vid, int m, uint8_t const* w, uint8_t const* sf, __nv_bfloat16
     case 7: return bym<4, 192, 1, true>(m, w, sf, x, o, g, n, k);
     case 8: return bym<2, 192, 1, false>(m, w, sf, x, o, g, n, k);
     case 9: return bym<16, 96, 2, false>(m, w, sf, x, o, g, n, k);
+    case 10: return bym<2, 192, 1, true>(m, w, sf, x, o, g, n, k);
+    case 11: return bym<4, 96, 2, true>(m, w, sf, x, o, g, n, k);
+    case 12: return bym<8, 96, 2, true>(m, w, sf, x, o, g, n, k);
     }
     return false;
 }
@@ -242,7 +250,9 @@ torch::Tensor run(int64_t vid, torch::Tensor x, torch::Tensor w, torch::Tensor s
 CPP = "torch::Tensor run(int64_t vid, torch::Tensor x, torch::Tensor w, torch::Tensor sf, double g);"
 
 VIDS = {"r4b192": 1, "r8b192": 2, "r16b192": 3, "r4b96": 4, "r8b96": 5, "r8b192e": 6, "r4b192e": 7,
-        "r2b192": 8, "r16b96": 9}
+        "r2b192": 8, "r16b96": 9, "r2b192e": 10, "r4b96e": 11, "r8b96e": 12}
+if os.environ.get("PROTO_MS"):
+    MS = [int(v) for v in os.environ["PROTO_MS"].split(",")]
 
 
 def build_ext():
