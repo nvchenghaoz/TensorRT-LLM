@@ -36,7 +36,7 @@ from ...speculative import SpecMetadata
 from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
 from ..fp8_prefill_nvfp4 import get_prefill_nvfp4_copy
 from ..linear import _FP8_NVFP4_DECODE_MAX_ROWS, FP8QDQLinearMethod, Linear, TensorParallelMode
-from ..multi_stream_utils import maybe_execute_in_parallel
+from ..multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
 from .fuse_elementwise_ops import (
@@ -212,6 +212,15 @@ def _verify_intermediate_state_indices(
             max(kv_cache_manager.get_max_resource_count(), num_decodes), device
         )
     return indices[:num_decodes]
+
+
+# Eager prefill steps with at least this many rows run GDN in_proj_ba (BF16,
+# N=96) on aux_stream beside the W4A4 in_proj_qkvz instead of after it; same
+# kernels and inputs, so outputs are bitwise unchanged. Decode, smaller
+# prefill, CUDA-graph capture and torch.compile keep the serial
+# _compute_tokenwise_inputs path. 0 disables the fork at every row count.
+# Read at call time.
+_PREFILL_BA_FORK_MIN_ROWS = int(os.environ.get("TRTLLM_GDN_PREFILL_BA_FORK_MIN_ROWS", "4096"))
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
@@ -424,6 +433,52 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # no split/reshape kernel. Downstream consumers (causal_conv1d,
         # the GDN decode kernels, the gated norm) read these row-strided
         # views in place.
+        num_tokens = projected_states_qkvz.shape[0]
+        mixed_qkv = projected_states_qkvz[:, : self.conv_dim_per_tp]
+        z = projected_states_qkvz[:, self.conv_dim_per_tp :].view(
+            num_tokens, self.num_v_heads_per_tp, self.head_v_dim
+        )
+        b = projected_states_ba[:, : self.num_v_heads_per_tp]
+        a = projected_states_ba[:, self.num_v_heads_per_tp :]
+
+        return mixed_qkv, z, a, b
+
+    def _compute_tokenwise_inputs_routed(self, hidden_states: torch.Tensor):
+        """Fork in_proj_ba for large eager prefill; otherwise main's path."""
+        threshold = _PREFILL_BA_FORK_MIN_ROWS
+        if (
+            threshold > 0
+            and hidden_states.shape[0] >= max(threshold, _FP8_NVFP4_DECODE_MAX_ROWS + 1)
+            and self.aux_stream is not None
+            and not do_multi_stream()
+            and not is_torch_compiling()
+            and not torch.cuda.is_current_stream_capturing()
+            and not is_in_breakable_cuda_graph()
+        ):
+            return self._compute_tokenwise_inputs_prefill_fork(hidden_states)
+        return self._compute_tokenwise_inputs(hidden_states)
+
+    def _compute_tokenwise_inputs_prefill_fork(self, hidden_states: torch.Tensor):
+        """Eager-prefill fork in maybe_execute_in_parallel's order.
+
+        in_proj_qkvz runs on the current stream, in_proj_ba on aux_stream after
+        an event recorded before qkvz, and the current stream waits for ba
+        before anything reads it. The ba output is allocated on aux_stream;
+        its block is only reused by a later aux_stream allocation, which is
+        enqueued behind the next fork's wait on the current stream, so every
+        reader of this output on the current stream finishes first.
+        """
+        main_event = self.event_dict[EventType.Main]
+        ba_event = self.event_dict[EventType.Attention]
+        main_event.record()
+        projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+        with torch.cuda.stream(self.aux_stream):
+            main_event.wait()
+            projected_states_ba = self.in_proj_ba(hidden_states)
+            ba_event.record()
+        ba_event.wait()
+
+        # Same column-slice views as _compute_tokenwise_inputs.
         num_tokens = projected_states_qkvz.shape[0]
         mixed_qkv = projected_states_qkvz[:, : self.conv_dim_per_tp]
         z = projected_states_qkvz[:, self.conv_dim_per_tp :].view(
@@ -1107,7 +1162,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         spec_metadata: Optional[SpecMetadata] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
-        mixed_qkv, z, a, b = self._compute_tokenwise_inputs(hidden_states)
+        mixed_qkv, z, a, b = self._compute_tokenwise_inputs_routed(hidden_states)
 
         use_breakable_cuda_graph = not is_torch_compiling() and is_in_breakable_cuda_graph()
         if self.register_to_config and (is_torch_compiling() or use_breakable_cuda_graph):
