@@ -455,15 +455,29 @@ def _lm_head_nvfp4_enabled(model_config: ModelConfig) -> bool:
     cfg = qcd.get("lm_head")
     pretrained = model_config.pretrained_config
     mapping = model_config.mapping
+    sm_version = get_sm_version()
+    if cfg is None:
+        return False
+    if cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
+        algo_supported = sm_version in (100, 103, 120)
+    elif cfg.quant_algo == QuantAlgo.NVFP4:
+        # SM120/121: a W4A4 NVFP4 lm_head entry runs weight-only on Marlin
+        # (rewritten to W4A16_NVFP4 by _normalize_qwen35_quant_config_dict)
+        # instead of being dequantized to a 4x larger bf16 weight at load.
+        algo_supported = _is_sm120_family(sm_version)
+    else:
+        algo_supported = False
     return (
-        cfg is not None
-        and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+        algo_supported
         and _has_nvfp4_gemm_block_width(cfg)
-        and get_sm_version() in (100, 103, 120)
         and not getattr(pretrained, "tie_word_embeddings", False)
         and not mapping.enable_attention_dp
         and getattr(pretrained, "vocab_size", 0) % mapping.tp_size == 0
     )
+
+
+def _is_sm120_family(sm_version: int) -> bool:
+    return sm_version in (120, 121)
 
 
 def _has_nvfp4_gemm_block_width(cfg: QuantConfig | None) -> bool:
@@ -594,6 +608,13 @@ def _normalize_qwen35_quant_config_dict(
                 # SM120 uses Marlin; SM100/103 promotes to W4A4.
                 if convert_to_nvfp4 and _has_nvfp4_gemm_block_width(cfg):
                     cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+                elif (
+                    _is_sm120_family(get_sm_version())
+                    and cfg.quant_algo == QuantAlgo.NVFP4
+                ):
+                    # SM120/121 has no W4A4 lm_head path worth taking: run the
+                    # checkpoint's NVFP4 weights weight-only on Marlin.
+                    cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.W4A16_NVFP4})
                 normalized[name] = cfg
             else:
                 # Make the fallback visible: the checkpoint quantizes lm_head
