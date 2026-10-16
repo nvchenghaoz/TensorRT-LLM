@@ -327,6 +327,21 @@ struct Kernel_traits_
     // Make sure the number of threads match.
     static_assert((int) Gmem_tile_o::THREADS_PER_ROW == (int) Smem_tile_o::THREADS_PER_ROW, "");
 
+    // The register-direct variant of Gmem_tile_o (if any).
+    using Gmem_tile_o_from_regs_selector = fmha::v2::Gmem_tile_o_from_regs_selector<Gmem_tile_o>;
+
+    // Do we store O straight from the accumulators, without staging it in shared memory? Only in the tiled
+    // no-loop flash attention kernel (device_flash_attention_nl_tiled) with QMMA FP32 accumulators, 16-bit
+    // output and a 64 x 256 O tile on 4x1x1 warps (the SM120 FP8 head-256 kernels): there the staging only
+    // permutes data, and its FP32 tile (64 KB) would set the shared memory size of the kernel.
+    static constexpr bool STORE_O_FROM_REGS = NO_LOOP && USE_GRANULAR_TILING && Gmem_tile_o_from_regs_selector::VALUE
+        && std::is_same<Traits_e, fmha::Ada_qmma_e4m3_fp32_traits>::value && Cta_tile_o::M == 64
+        && Cta_tile_o::N == 256 && Cta_tile_o::VALID_N == Cta_tile_o::N && Cta_tile_o::WARPS_M == 4
+        && Cta_tile_o::WARPS_N == 1 && Cta_tile_o::WARPS_K == 1;
+
+    // The global memory tile to store O from the accumulators (only used if STORE_O_FROM_REGS).
+    using Gmem_tile_o_from_regs = typename Gmem_tile_o_from_regs_selector::Type;
+
     // The number of threads.
     static constexpr int THREADS = Cta_tile_p::THREADS_PER_CTA;
 
@@ -345,16 +360,19 @@ struct Kernel_traits_
     // The amount of shared memory needed to load/store O.
     static constexpr int BYTES_PER_SMEM_O = Smem_tile_o::BYTES_PER_TILE;
 
-    // The amount of shared memory needed to load Q and store O.
-    static constexpr int BYTES_PER_SMEM_QO
-        = NO_LOOP ? Smem_tile_o::BYTES_PER_TILE : Smem_tile_q::BYTES_PER_TILE + BYTES_PER_SMEM_O;
+    // The amount of shared memory needed to load Q and store O (O does not use shared memory when it is
+    // stored from the accumulators).
+    static constexpr int BYTES_PER_SMEM_QO = STORE_O_FROM_REGS
+        ? 0
+        : (NO_LOOP ? Smem_tile_o::BYTES_PER_TILE : Smem_tile_q::BYTES_PER_TILE + BYTES_PER_SMEM_O);
 
     // The amount of shared memory needed for Q, K, V and O.
     static constexpr int BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE;
 
     // Make sure we have enough shared memory.
-    static_assert((NO_LOOP ? Smem_tile_o::BYTES_PER_TILE : Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE)
-            <= BYTES_PER_SMEM,
+    static_assert(STORE_O_FROM_REGS
+            || (NO_LOOP ? Smem_tile_o::BYTES_PER_TILE : Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE)
+                <= BYTES_PER_SMEM,
         "");
 };
 
