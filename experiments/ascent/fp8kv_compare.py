@@ -44,9 +44,17 @@ def main():
         "fp8_repeat_identical_tokens": b.get("repeat_identical_tokens"),
         "fp8_repeat_identical_logprobs": b.get("repeat_identical_logprobs"),
         "bf16_repeat_identical_tokens": a.get("repeat_identical_tokens"),
+        "fp8_bench_request_cached": b.get("bench_request_cached"),
+        "fp8_bench_request_graph_replays": b.get("bench_request_graph_replays"),
+        "bf16_bench_request_graph_replays": a.get("bench_request_graph_replays"),
+        "fp8_cuda_graphs": b.get("cuda_graphs"),
+        "fp8_v_amax_per_layer": {k: v for k, v in (b.get("v_amax") or {}).items() if v},
+        "fp8_k_amax_postnorm_per_layer": {
+            k: v for k, v in (b.get("k_amax_postnorm") or {}).items() if v},
     }
     out["passed"] = bool(out["fp8_repeat_identical_tokens"]
                          and out["fp8_repeat_identical_logprobs"]
+                         and (out["fp8_bench_request_graph_replays"] or 0) > 0
                          and (out["fp8_v_amax_max"] or 0) < 448.0
                          and (out["fp8_k_amax_max"] or 0) < 448.0)
     print(json.dumps(out))

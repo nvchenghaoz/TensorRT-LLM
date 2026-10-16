@@ -151,6 +151,35 @@ def main():
     _, _, dt, cached = gen(prefix + suffix(101), 4, logprobs=False)
     log(f"warm reuse {dt:.2f}s cached={cached}")
 
+    # CUDA-graph evidence: captured graph keys + replays during the request
+    graph_info = []
+    me = llm._executor.engine.model_engine
+    seen = set()
+
+    def scan(obj, path, depth):
+        if depth > 2 or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        g = getattr(obj, "graphs", None)
+        if isinstance(g, dict) and g:
+            graph_info.append({"path": path, "n_graphs": len(g),
+                               "keys": [str(k) for k in list(g.keys())[:16]]})
+        for a in ("cuda_graph_runner", "runner", "decoder_runner",
+                  "_cuda_graph_runner", "model_runner"):
+            sub = getattr(obj, a, None)
+            if sub is not None:
+                scan(sub, f"{path}.{a}", depth + 1)
+
+    scan(me, "model_engine", 0)
+    replays = {"n": 0}
+    _orig_replay = torch.cuda.CUDAGraph.replay
+
+    def _counting_replay(self, *a, **k):
+        replays["n"] += 1
+        return _orig_replay(self, *a, **k)
+
+    torch.cuda.CUDAGraph.replay = _counting_replay
+
     # profiled reuse request (benchmark shape)
     if args.profile:
         torch.cuda.synchronize()
@@ -160,9 +189,13 @@ def main():
     if args.profile:
         torch.cuda.synchronize()
         torch.cuda.cudart().cudaProfilerStop()
-    log(f"bench-shape request {dt:.2f}s cached={cached}")
+    torch.cuda.CUDAGraph.replay = _orig_replay
+    log(f"bench-shape request {dt:.2f}s cached={cached} "
+        f"graph_replays={replays['n']} graphs={graph_info}")
     res["bench_request_s"] = dt
     res["bench_request_cached"] = cached
+    res["bench_request_graph_replays"] = replays["n"]
+    res["cuda_graphs"] = graph_info
 
     # repeated-call determinism: 3 identical greedy requests
     rep = []
