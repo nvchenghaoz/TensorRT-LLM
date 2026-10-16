@@ -131,14 +131,20 @@ def get_prefill_nvfp4_copy(module: torch.nn.Module):
 
 
 def _main_decoder_layers(model: torch.nn.Module) -> list:
-    """The main decoder stack (model.model.layers[:num_hidden_layers])."""
-    inner = getattr(model, "model", None)
-    layers = getattr(inner, "layers", None)
-    if not isinstance(layers, torch.nn.ModuleList):
-        return []
-    n = getattr(inner, "num_hidden_layers", None)
-    layers = list(layers)
-    return layers[:n] if isinstance(n, int) else layers
+    """Decoder layers [:num_hidden_layers] of every DecoderModel in the tree
+    (the root may wrap the LM, e.g. Qwen3_5ForConditionalGeneration.llm)."""
+    from ..models.modeling_utils import DecoderModel
+    out = []
+    for mod in model.modules():
+        if not isinstance(mod, DecoderModel):
+            continue
+        layers = getattr(mod, "layers", None)
+        if not isinstance(layers, torch.nn.ModuleList):
+            continue
+        n = getattr(mod, "num_hidden_layers", None)
+        layers = list(layers)
+        out.extend(layers[:n] if isinstance(n, int) else layers)
+    return out
 
 
 def build_fp8_prefill_nvfp4_copies(model: torch.nn.Module) -> int:

@@ -117,8 +117,15 @@ s_out = 1.1 * max(
 log(f"input scales qkv {s_q:.4g} o {s_o:.4g} out {s_out:.4g}")
 
 # ---------------- synthetic model ----------------
-root, inner = nn.Module(), nn.Module()
-root.model = inner
+# root.llm.model mirrors Qwen3_5ForConditionalGeneration.llm.model (a
+# DecoderModel); the base tree's walk ignores these modules either way.
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel  # noqa: E402
+
+root, llm = nn.Module(), nn.Module()
+inner = DecoderModel.__new__(DecoderModel)
+nn.Module.__init__(inner)
+root.llm = llm
+llm.model = inner
 layers, qkv_m, o_m, out_m, gdn_m = [], [], [], [], []
 for i in range(R):
     L = nn.Module()
