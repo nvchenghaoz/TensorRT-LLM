@@ -365,6 +365,8 @@ class Mamba2Metadata:
                                               dtype=torch.bool,
                                               device="cuda")
         self.use_initial_states = False
+        # Host gate: True only when every context in this step has initial state.
+        self.all_initial_states = False
         self.chunk_indices: torch.Tensor = None
         self.chunk_offsets: torch.Tensor = None
 
@@ -511,6 +513,7 @@ class Mamba2Metadata:
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)
 
+        self.all_initial_states = False
         if num_contexts > 0:
             torch.cumsum(context_lens,
                          dim=0,
@@ -562,6 +565,8 @@ class Mamba2Metadata:
             # Keep a host boolean gate for chunk metadata construction.
             self.use_initial_states = bool(
                 self.has_initial_states_cpu[:num_contexts].any())
+            self.all_initial_states = bool(
+                self.has_initial_states_cpu[:num_contexts].all())
 
             if self.use_initial_states:
                 _extra = compute_extra_chunks_cpu(attn_metadata.seq_lens,
