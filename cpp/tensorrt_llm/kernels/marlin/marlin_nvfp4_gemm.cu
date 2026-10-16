@@ -27,6 +27,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -120,6 +121,42 @@ exec_config_t determine_exec_config(int prob_m, int prob_n, int prob_k, int thre
     return exec_cfg;
 }
 
+// Full-K launch (kernel template flag full_k, see kMarlinNvfp4FullKGridShift):
+// TRTLLM_MARLIN_FULLK, read per call; "0" restores the split-K launch.
+bool marlin_full_k_enabled()
+{
+    char const* v = std::getenv("TRTLLM_MARLIN_FULLK");
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+}
+
+// Dynamic shared memory the full_k kernel addresses: the kernel's own layout for
+// BF16 A, 8-row m block, no act_order / zero points, plus the stripe stash.
+int full_k_smem_bytes(int threads, int thread_n_blocks, int thread_k_blocks, int group_blocks, int stages)
+{
+    int const b_sh_stage = ((thread_n_blocks * 16) * 16 / 8 / 4) * thread_k_blocks;
+    int const sh_red = (2 * thread_n_blocks + 1) * 16;
+    int const sh_b = stages * b_sh_stage;
+    int const sh_bias = thread_n_blocks * 16 / 8;
+    int const red_b = std::max(std::max(sh_red, sh_b), std::min(sh_red, sh_b) + sh_bias);
+    int const s_tb_groups = group_blocks < thread_k_blocks ? thread_k_blocks / group_blocks : 1;
+    int const s_sh_stage = s_tb_groups * thread_n_blocks;
+    int const a_sh_stage = (16 * thread_k_blocks / 8) * 8;
+    int const int4s = red_b + stages * s_sh_stage + stages * a_sh_stage;
+    return int4s * 16 + kMarlinNvfp4FullKMaxStripes * 16 * threads * static_cast<int>(sizeof(float));
+}
+
+// Largest number of split-K stripes the default `grid`-CTA launch gives one column.
+int full_k_max_stripes(int k_tiles, int n_tiles, int grid)
+{
+    int const iters = div_ceil(k_tiles * n_tiles, grid);
+    int most = 0;
+    for (int c = 0; c < n_tiles; c++)
+    {
+        most = std::max(most, ((c + 1) * k_tiles - 1) / iters - (c * k_tiles) / iters + 1);
+    }
+    return most;
+}
+
 void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void const* b_s, void const* g_s, int prob_m,
     int prob_n, int prob_k, int* locks, int num_groups, int group_size, bool use_fp32_reduce, int dev,
     cudaStream_t stream, bool enable_pdl)
@@ -205,6 +242,26 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
             break;
         }
 
+        // GDN out_proj / attention o_proj (n=5120, k=6144) at decode rows <= 8: one CTA
+        // per 64-wide column with an 8-stage pipeline instead of `blocks` split-K CTAs
+        // with 4 stages. The kernel replays the split-K launch's reduction chain, so the
+        // output is bitwise equal to it.
+        int grid = blocks;
+        int full_k_flags = 0;
+        if (m_block_size_8 && thread_m_blocks == 1 && num_threads == 128 && thread_n == 64 && thread_k == 128
+            && group_blocks == 1 && prob_n == 5120 && prob_k == 6144 && exec_cfg.blocks_per_sm == 1
+            && !use_fp32_reduce && blocks <= kMarlinNvfp4FullKGridMask && prob_n / thread_n <= blocks
+            && max_shared_mem_new < (1 << kMarlinNvfp4FullKGridShift)
+            && full_k_max_stripes(prob_k / thread_k, prob_n / thread_n, blocks) <= kMarlinNvfp4FullKMaxStripes
+            && full_k_smem_bytes(num_threads, thread_n_blocks, thread_k_blocks, group_blocks, 8)
+                <= max_shared_mem_new - 512
+            && marlin_full_k_enabled())
+        {
+            kernel = Marlin<nv_bfloat16, 128, 1, 4, 8, true, 8, 1, true>;
+            grid = prob_n / thread_n;
+            full_k_flags = blocks << kMarlinNvfp4FullKGridShift;
+        }
+
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new);
 
         // The kernel starts with griddepcontrol.wait, so a PDL launch orders all of
@@ -216,7 +273,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
         int4 const* zp_null = nullptr;
         int const* g_idx_null = nullptr;
         // clang-format off
-        tensorrt_llm::common::launchWithPdl("marlin_nvfp4", enable_pdl, kernel, dim3(blocks), dim3(num_threads),
+        tensorrt_llm::common::launchWithPdl("marlin_nvfp4", enable_pdl, kernel, dim3(grid), dim3(num_threads),
             static_cast<size_t>(max_shared_mem_new), stream,
             A_ptr, B_ptr, C_ptr, C_tmp_ptr,
             b_bias_null,    // b_bias
@@ -227,7 +284,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
             num_groups, prob_m_split, prob_n, prob_k, lda, locks,
             false,  // has_bias
             false,  // use_atomic_add
-            use_fp32_reduce, max_shared_mem_new | (enable_pdl ? kMarlinNvfp4PdlLaunchFlag : 0));
+            use_fp32_reduce, max_shared_mem_new | full_k_flags | (enable_pdl ? kMarlinNvfp4PdlLaunchFlag : 0));
         // clang-format on
 
         A_ptr += prob_m_split * (lda / 8);
@@ -253,6 +310,7 @@ template __global__ void Marlin<nv_bfloat16, 128, 3, 4, 8, false, 4, 1>( MARLIN_
 template __global__ void Marlin<nv_bfloat16, 256, 4, 16, 4, false, 4, 1>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 128, 4, 8, 4, false, 4, 1>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 128, 4, 4, 8, false, 4, 1>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, true,  8, 1, true>( MARLIN_KERNEL_PARAMS );
 
 // clang-format on
 
