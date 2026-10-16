@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from collections.abc import Callable
 from typing import Optional, Union
 
@@ -17,8 +18,10 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
-from .linear import (Linear, TensorParallelMode, WeightMode,
-                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
+from .fused_silu_mul_nvfp4 import fused_silu_mul_nvfp4  # noqa: F401
+from .linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
+                     WeightMode, WeightsLoadingConfig,
+                     is_static_nvfp4_input_eligible)
 from .swiglu import swiglu, swiglu_2in
 
 
@@ -61,6 +64,9 @@ class GatedMLP(nn.Module):
         # never reaches GatedMLP simply does not share. Necessary, not
         # sufficient: _can_share_gate_up_quantization() adds the per-call gates.
         self._maybe_share_gate_up_quantize = False
+        # Lazily decided (needs created/loaded weights): whether SwiGLU and
+        # down_proj's NVFP4 input quantize run as one Triton kernel.
+        self._fused_swiglu_nvfp4_ok: Optional[bool] = None
         self.swiglu_limit = float(
             swiglu_limit) if swiglu_limit is not None else None
         # SwiGLU-OAI shape parameters, left None for plain SwiGLU, where the
@@ -387,6 +393,43 @@ class GatedMLP(nn.Module):
         return (is_sm_100f() and not self.down_proj.use_cute_dsl_blockscaling_mm
                 and not self.down_proj.disable_deep_gemm)
 
+    def _can_fuse_swiglu_nvfp4_quant(self) -> bool:
+        """Whether SwiGLU + down_proj's static NVFP4 input quantize can run as
+        one Triton kernel (fused_silu_mul_nvfp4), bitwise-equal to
+        silu_and_mul + fp4_quantize. SM12x dense W4A4 only."""
+        if self._fused_swiglu_nvfp4_ok is None:
+            down, gate_up = self.down_proj, getattr(self, "gate_up_proj", None)
+            ok = (os.environ.get("TRTLLM_FUSED_SILU_NVFP4", "1") != "0"
+                  and get_sm_version() // 10 == 12
+                  and not self.split_gate_up and gate_up is not None
+                  and self.activation == F.silu and self._is_plain_swiglu()
+                  and self.swiglu_limit is None)
+            if ok:
+                ok = (type(down.quant_method) is NVFP4LinearMethod
+                      and type(gate_up.quant_method) is NVFP4LinearMethod
+                      and not down.uses_marlin_nvfp4
+                      and not gate_up.uses_marlin_nvfp4
+                      and not down.requires_unquantized_activation
+                      and is_static_nvfp4_input_eligible(down)
+                      and getattr(down, "scaling_vector_size", None) == 16
+                      and not NVFP4LinearMethod.use_tunable_quantize
+                      and getattr(down, "_locality_domain_weight_shards",
+                                  None) is None
+                      and down.in_features % 64 == 0
+                      and gate_up.out_features == 2 * down.in_features)
+            self._fused_swiglu_nvfp4_ok = bool(ok)
+        return self._fused_swiglu_nvfp4_ok
+
+    def _fused_swiglu_nvfp4(self, h1):
+        """SwiGLU + NVFP4 quantize of down_proj's input in one kernel."""
+        lead_shape = h1.shape[:-1]
+        h1_2d = h1.reshape(-1, h1.shape[-1]) if h1.dim() > 2 else h1
+        fp4, sf = torch.ops.trtllm.fused_silu_mul_nvfp4(
+            h1_2d, self.down_proj.input_scale)
+        if h1.dim() > 2:
+            fp4 = fp4.reshape(*lead_shape, fp4.shape[-1])
+        return Fp4QuantizedTensor(fp4, sf)
+
     def _fused_gate_up_swiglu(self, x, fp4_out=False):
         """Fused FC1 GEMM + SwiGLU using CuteDSL dense kernel.
 
@@ -507,6 +550,10 @@ class GatedMLP(nn.Module):
                 use_r128c4_layout = get_sm_version() == 107
                 h2 = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
                     h1, self.swiglu_limit, use_r128c4_layout)
+            elif (self._can_fuse_swiglu_nvfp4_quant()
+                  and h1.dtype == torch.bfloat16 and h1.stride(-1) == 1
+                  and (h1.dim() == 2 or h1.is_contiguous())):
+                h2 = self._fused_swiglu_nvfp4(h1)
             else:
                 h2 = self._apply_activation(h1)
 
