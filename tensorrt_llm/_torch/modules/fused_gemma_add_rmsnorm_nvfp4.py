@@ -98,41 +98,33 @@ def _load_w(w_ptr, tt, j: tl.constexpr):
 
 
 @triton.jit
-def _load_h(x_row, r_row, tt, j: tl.constexpr):
-    # h = f32(x) + f32(r) for thread tt's 8 columns 512*j + 8*tt + v.
-    # Loaded once: pass 2 keeps h in registers, so no load ever follows an
-    # in-place residual store (which would serialize the column blocks).
+def _sumsq_j(x_row, r_row, tt, j: tl.constexpr, acc):
     base = j * 256 + tt * 4
-    x0 = tl.load(x_row + base)
-    r0 = tl.load(r_row + base)
-    x1 = tl.load(x_row + base + 1)
-    r1 = tl.load(r_row + base + 1)
-    x2 = tl.load(x_row + base + 2)
-    r2 = tl.load(r_row + base + 2)
-    x3 = tl.load(x_row + base + 3)
-    r3 = tl.load(r_row + base + 3)
-    return (_lo(x0) + _lo(r0), _hi(x0) + _hi(r0), _lo(x1) + _lo(r1),
-            _hi(x1) + _hi(r1), _lo(x2) + _lo(r2), _hi(x2) + _hi(r2),
-            _lo(x3) + _lo(r3), _hi(x3) + _hi(r3))
-
-
-@triton.jit
-def _acc_sq(acc, h0, h1, h2, h3, h4, h5, h6, h7):
-    # Sequential fma.rn over v = 0..7 (same order as the DSL kernel).
-    acc = tl.fma(h0, h0, acc)
-    acc = tl.fma(h1, h1, acc)
-    acc = tl.fma(h2, h2, acc)
-    acc = tl.fma(h3, h3, acc)
-    acc = tl.fma(h4, h4, acc)
-    acc = tl.fma(h5, h5, acc)
-    acc = tl.fma(h6, h6, acc)
-    acc = tl.fma(h7, h7, acc)
+    for p in tl.static_range(4):
+        xu = tl.load(x_row + base + p)
+        ru = tl.load(r_row + base + p)
+        h0 = _lo(xu) + _lo(ru)
+        h1 = _hi(xu) + _hi(ru)
+        acc = tl.fma(h0, h0, acc)
+        acc = tl.fma(h1, h1, acc)
     return acc
 
 
 @triton.jit
-def _norm_pair(r_row, off, h0, h1, g, rstd):
-    # Residual = bf16(h), in place.
+def _load_xr(x_row, r_row, tt, j: tl.constexpr):
+    # The 4 packed x and r words of thread tt for column block j.
+    base = j * 256 + tt * 4
+    return (tl.load(x_row + base), tl.load(r_row + base),
+            tl.load(x_row + base + 1), tl.load(r_row + base + 1),
+            tl.load(x_row + base + 2), tl.load(r_row + base + 2),
+            tl.load(x_row + base + 3), tl.load(r_row + base + 3))
+
+
+@triton.jit
+def _norm_pair(r_row, off, xu, ru, g, rstd):
+    h0 = _lo(xu) + _lo(ru)
+    h1 = _hi(xu) + _hi(ru)
+    # Residual = bf16(h), in place (its x/r words were loaded earlier).
     tl.store(r_row + off, _bf16_bits(h0) | (_bf16_bits(h1) << 16))
     y0 = _bf16_round(h0 * rstd * (_lo(g) + 1.0))
     y1 = _bf16_round(h1 * rstd * (_hi(g) + 1.0))
@@ -140,14 +132,17 @@ def _norm_pair(r_row, off, h0, h1, g, rstd):
 
 
 @triton.jit
-def _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, j: tl.constexpr, h0, h1,
-                  h2, h3, h4, h5, h6, h7, g0, g1, g2, g3, rstd, s, r6, inv_s,
+def _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, j: tl.constexpr, x0, r0,
+                  x1, r1, x2, r2, x3, r3, g0, g1, g2, g3, rstd, s, r6, inv_s,
                   NUM_K_TILES: tl.constexpr):
+    # Pass 2 for column block j. Its x/r words come from the caller, which
+    # issues block j + 1's loads before this block's in-place residual
+    # stores, so the 10 blocks do not serialize on store -> load ordering.
     base = j * 256 + tt * 4
-    y0, y1 = _norm_pair(r_row, base, h0, h1, g0, rstd)
-    y2, y3 = _norm_pair(r_row, base + 1, h2, h3, g1, rstd)
-    y4, y5 = _norm_pair(r_row, base + 2, h4, h5, g2, rstd)
-    y6, y7 = _norm_pair(r_row, base + 3, h6, h7, g3, rstd)
+    y0, y1 = _norm_pair(r_row, base, x0, r0, g0, rstd)
+    y2, y3 = _norm_pair(r_row, base + 1, x1, r1, g1, rstd)
+    y4, y5 = _norm_pair(r_row, base + 2, x2, r2, g2, rstd)
+    y6, y7 = _norm_pair(r_row, base + 3, x3, r3, g3, rstd)
 
     a = tl.maximum(tl.maximum(tl.maximum(tl.abs(y0), tl.abs(y1)),
                               tl.maximum(tl.abs(y2), tl.abs(y3))),
@@ -209,27 +204,9 @@ def fused_gemma_add_rmsnorm_nvfp4_kernel(fp4_ptr, sf_ptr, sfw_ptr, x_ptr, r_ptr,
 
         x_row = x_ptr + row * x_stride
         r_row = r_ptr + row * r_stride
-        h00, h01, h02, h03, h04, h05, h06, h07 = _load_h(x_row, r_row, tt, 0)
-        h10, h11, h12, h13, h14, h15, h16, h17 = _load_h(x_row, r_row, tt, 1)
-        h20, h21, h22, h23, h24, h25, h26, h27 = _load_h(x_row, r_row, tt, 2)
-        h30, h31, h32, h33, h34, h35, h36, h37 = _load_h(x_row, r_row, tt, 3)
-        h40, h41, h42, h43, h44, h45, h46, h47 = _load_h(x_row, r_row, tt, 4)
-        h50, h51, h52, h53, h54, h55, h56, h57 = _load_h(x_row, r_row, tt, 5)
-        h60, h61, h62, h63, h64, h65, h66, h67 = _load_h(x_row, r_row, tt, 6)
-        h70, h71, h72, h73, h74, h75, h76, h77 = _load_h(x_row, r_row, tt, 7)
-        h80, h81, h82, h83, h84, h85, h86, h87 = _load_h(x_row, r_row, tt, 8)
-        h90, h91, h92, h93, h94, h95, h96, h97 = _load_h(x_row, r_row, tt, 9)
         acc = tl.zeros([32, 2], dtype=tl.float32)
-        acc = _acc_sq(acc, h00, h01, h02, h03, h04, h05, h06, h07)
-        acc = _acc_sq(acc, h10, h11, h12, h13, h14, h15, h16, h17)
-        acc = _acc_sq(acc, h20, h21, h22, h23, h24, h25, h26, h27)
-        acc = _acc_sq(acc, h30, h31, h32, h33, h34, h35, h36, h37)
-        acc = _acc_sq(acc, h40, h41, h42, h43, h44, h45, h46, h47)
-        acc = _acc_sq(acc, h50, h51, h52, h53, h54, h55, h56, h57)
-        acc = _acc_sq(acc, h60, h61, h62, h63, h64, h65, h66, h67)
-        acc = _acc_sq(acc, h70, h71, h72, h73, h74, h75, h76, h77)
-        acc = _acc_sq(acc, h80, h81, h82, h83, h84, h85, h86, h87)
-        acc = _acc_sq(acc, h90, h91, h92, h93, h94, h95, h96, h97)
+        for j in tl.static_range(10):
+            acc = _sumsq_j(x_row, r_row, tt, j, acc)
         # Adjacent-pair tree over the 64 per-thread partials.
         s32 = tl.sum(acc, axis=1)
         s16 = _pair_sum(s32, 32)
@@ -246,36 +223,49 @@ def fused_gemma_add_rmsnorm_nvfp4_kernel(fp4_ptr, sf_ptr, sfw_ptr, x_ptr, r_ptr,
         r6 = _rcp_approx_ftz(tl.full([32], 6.0, tl.float32))
         inv_s = _rcp_approx_ftz(s_v)
         fp4_row = fp4_ptr + row * 640
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 0, h00, h01, h02,
-                      h03, h04, h05, h06, h07, w00, w01, w02, w03, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 1, h10, h11, h12,
-                      h13, h14, h15, h16, h17, w10, w11, w12, w13, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 2, h20, h21, h22,
-                      h23, h24, h25, h26, h27, w20, w21, w22, w23, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 3, h30, h31, h32,
-                      h33, h34, h35, h36, h37, w30, w31, w32, w33, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 4, h40, h41, h42,
-                      h43, h44, h45, h46, h47, w40, w41, w42, w43, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 5, h50, h51, h52,
-                      h53, h54, h55, h56, h57, w50, w51, w52, w53, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 6, h60, h61, h62,
-                      h63, h64, h65, h66, h67, w60, w61, w62, w63, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 7, h70, h71, h72,
-                      h73, h74, h75, h76, h77, w70, w71, w72, w73, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 8, h80, h81, h82,
-                      h83, h84, h85, h86, h87, w80, w81, w82, w83, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
-        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 9, h90, h91, h92,
-                      h93, h94, h95, h96, h97, w90, w91, w92, w93, rstd, s_v,
-                      r6, inv_s, NUM_K_TILES)
+        # Pass 2 with a 2-block load lookahead (three rotating buffers): the
+        # x/r words of block j are loaded two blocks before block j's
+        # in-place residual stores, so loads never queue behind stores.
+        a0, a1, a2, a3, a4, a5, a6, a7 = _load_xr(x_row, r_row, tt, 0)
+        b0, b1, b2, b3, b4, b5, b6, b7 = _load_xr(x_row, r_row, tt, 1)
+        c0, c1, c2, c3, c4, c5, c6, c7 = _load_xr(x_row, r_row, tt, 2)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 0, a0, a1, a2, a3,
+                      a4, a5, a6, a7, w00, w01, w02, w03, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
+        a0, a1, a2, a3, a4, a5, a6, a7 = _load_xr(x_row, r_row, tt, 3)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 1, b0, b1, b2, b3,
+                      b4, b5, b6, b7, w10, w11, w12, w13, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
+        b0, b1, b2, b3, b4, b5, b6, b7 = _load_xr(x_row, r_row, tt, 4)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 2, c0, c1, c2, c3,
+                      c4, c5, c6, c7, w20, w21, w22, w23, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
+        c0, c1, c2, c3, c4, c5, c6, c7 = _load_xr(x_row, r_row, tt, 5)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 3, a0, a1, a2, a3,
+                      a4, a5, a6, a7, w30, w31, w32, w33, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
+        a0, a1, a2, a3, a4, a5, a6, a7 = _load_xr(x_row, r_row, tt, 6)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 4, b0, b1, b2, b3,
+                      b4, b5, b6, b7, w40, w41, w42, w43, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
+        b0, b1, b2, b3, b4, b5, b6, b7 = _load_xr(x_row, r_row, tt, 7)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 5, c0, c1, c2, c3,
+                      c4, c5, c6, c7, w50, w51, w52, w53, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
+        c0, c1, c2, c3, c4, c5, c6, c7 = _load_xr(x_row, r_row, tt, 8)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 6, a0, a1, a2, a3,
+                      a4, a5, a6, a7, w60, w61, w62, w63, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
+        a0, a1, a2, a3, a4, a5, a6, a7 = _load_xr(x_row, r_row, tt, 9)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 7, b0, b1, b2, b3,
+                      b4, b5, b6, b7, w70, w71, w72, w73, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 8, c0, c1, c2, c3,
+                      c4, c5, c6, c7, w80, w81, w82, w83, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
+        _norm_quant_j(r_row, fp4_row, sf_ptr, row, tt, kk, 9, a0, a1, a2, a3,
+                      a4, a5, a6, a7, w90, w91, w92, w93, rstd, s_v, r6, inv_s,
+                      NUM_K_TILES)
     else:
         if USE_PDL:
             if EARLY_TRIGGER:
