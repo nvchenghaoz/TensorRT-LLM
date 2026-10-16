@@ -40,6 +40,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
     cos_sin_ptr,
     positions_ptr,
     num_tokens,
+    positions_stride_section,
     max_positions,
     qkv_stride_token,
     qkv_out_stride_token,
@@ -116,7 +117,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
                 ),
             )
             position = tl.load(
-                positions_ptr + section * num_tokens + token,
+                positions_ptr + section * positions_stride_section + token,
                 mask=rotary_mask,
                 other=0,
             ).to(tl.int64)
@@ -195,11 +196,17 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
     if use_mrope:
         assert mrope_section1 > 0 and mrope_section2 > 0
         assert positions.numel() == 3 * num_tokens
+        # reshape keeps a [3, 1, max_tokens] buffer slice a strided view; the
+        # kernel reads section rows through positions_stride_section.
         positions = positions.reshape(3, num_tokens)
+        if num_tokens > 1 and positions.stride(-1) != 1:
+            positions = positions.contiguous()
+        positions_stride_section = positions.stride(0)
     else:
         assert positions.numel() == num_tokens
         positions = positions.reshape(-1)
-    assert positions.is_contiguous()
+        assert positions.is_contiguous()
+        positions_stride_section = 0
     assert positions.dtype in (torch.int32, torch.int64)
 
     q_size = num_q_heads * head_dim
@@ -224,6 +231,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
         cos_sin,
         positions,
         num_tokens,
+        positions_stride_section,
         cos_sin.shape[0],
         qkv.stride(0),
         qkv_out.stride(0),

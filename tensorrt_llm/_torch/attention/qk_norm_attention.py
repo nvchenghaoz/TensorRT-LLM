@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -29,6 +30,11 @@ from .attention import Attention
 from .backends.interface import PositionalEmbeddingParams
 from .kernels.fused_qk_norm_rope_gate import (fused_qkv_gemma_rmsnorm_rope_gate,
                                               fused_sigmoid_mul_inplace)
+
+# Kill switch: TRTLLM_ROPE_GATE_STRIDED_POS=0 restores the per-layer
+# positions.contiguous() copy before the fused rope-gate kernel.
+_ROPE_GATE_STRIDED_POS = os.environ.get("TRTLLM_ROPE_GATE_STRIDED_POS",
+                                        "1") != "0"
 
 
 # Move out from this class
@@ -276,7 +282,11 @@ class QKNormRoPEAttention(Attention):
             self.q_norm.weight,
             self.k_norm.weight,
             self.rotary_emb.rotary_cos_sin,
-            positions.contiguous(),
+            # The kernel reads strided MRoPE section rows directly (decode
+            # positions are a slice of a [3, 1, max_tokens] buffer), so no
+            # per-layer copy is needed.
+            positions
+            if _ROPE_GATE_STRIDED_POS else positions.contiguous(),
             self.q_norm.variance_epsilon,
             self.num_heads,
             self.num_key_value_heads,
