@@ -20,16 +20,8 @@ import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor
 
-from tok_common import (PromptMaker, hf_tokenizer, load_real_prompts, load_tokenizer, log,
-                        make_processor, processor_cache, request_plan)
-
-
-def common_prefix(texts):
-    from tensorrt_llm.inputs.prefix_token_cache import _common_prefix_len
-    p = texts[0]
-    for t in texts[1:]:
-        p = p[:_common_prefix_len(p, t)]
-    return p
+from tok_common import (PromptMaker, common_prefix, hf_tokenizer, load_real_prompts,
+                        load_tokenizer, log, make_processor, processor_cache, request_plan)
 
 
 def main():

@@ -17,9 +17,9 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from tok_common import (PromptMaker, env_info, hf_tokenizer, load_real_prompts,
-                        load_tokenizer, log, make_processor, pct, processor_cache,
-                        request_plan)
+from tok_common import (PromptMaker, common_prefix, env_info, hf_tokenizer,
+                        load_real_prompts, load_tokenizer, log, make_processor, pct,
+                        processor_cache, request_plan)
 
 
 def main():
@@ -108,11 +108,7 @@ def main():
     real, info = load_real_prompts(args.ckpt)
     real_detail = {"info": info}
     if real is not None:
-        from tensorrt_llm.inputs.prefix_token_cache import _common_prefix_len
-        rows = real[1] + real[2] + real[4]
-        shared = rows[0]
-        for t in rows[1:]:
-            shared = shared[:_common_prefix_len(shared, t)]
+        shared = common_prefix(real[1] + real[2] + real[4])
         proc = make_processor(args.ckpt, tok, enable_cache=True)
         ms, n = run_one(f"{shared.rstrip()} {maker.sample(2048)}")
         real_detail["prime_ms"] = round(ms, 3)

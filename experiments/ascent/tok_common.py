@@ -122,6 +122,22 @@ def load_real_prompts(ckpt):
     return prompts, info
 
 
+def common_prefix(texts):
+    """Longest common prefix of all texts (self-contained: runs on main too)."""
+    p = texts[0]
+    for t in texts[1:]:
+        n = min(len(p), len(t))
+        lo = 0
+        step = 8192
+        while lo < n and p[lo:lo + step] == t[lo:lo + step]:
+            lo += step
+        hi = min(lo + step, n)
+        while lo < hi and p[lo] == t[lo]:
+            lo += 1
+        p = p[:lo]
+    return p
+
+
 def request_plan(maker, prefix, warmup, measured, concs=(1, 2, 4)):
     """Per concurrency: (conc, warmup prompts, measured prompts), in benchmark order."""
     plan = []
