@@ -366,8 +366,8 @@ def check(expected):
             del g, gouts
         del wdq
     report["passed"] = ok
-    report["compared_against"] = ("main's fp4_quantize -> block_scale_interleave_reverse -> "
-                                  "cuda_core_nvfp4_gemm output hashes (baseline arm of the pair)")
+    report["compared_against"] = ("main's fp4_quantize -> cuda_core_nvfp4_gemm(act_sf_swizzled) chain "
+                                  "output hashes, M=1..8, from the baseline arm of the pair (argv[2])")
     log(json.dumps(report))
 
 
