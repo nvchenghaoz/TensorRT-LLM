@@ -142,8 +142,10 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     // Allocate the shared memory tile loader for V.
     Smem_tile_v smem_v(&smem_[Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE], tidx);
 
-    // Allocate the global memory tile loader for O.
-    Gmem_tile_o gmem_o(
+    // Allocate the global memory tile loader for O (it stores straight from the accumulators if STORE_O_FROM_REGS).
+    using Gmem_tile_o_store = std::conditional_t<Kernel_traits::STORE_O_FROM_REGS,
+        typename Kernel_traits::Gmem_tile_o_from_regs, Gmem_tile_o>;
+    Gmem_tile_o_store gmem_o(
         params, binfo, tidx, q_loop * Gmem_tile_o::ROWS, o_part * Cta_tile_o::N * Gmem_tile_o::BYTES_PER_ELEMENT);
     // Allocate the shared memory tile loader for O. We use the same as K so be careful!!!
     Smem_tile_o smem_o(&smem_[Kernel_traits::NO_LOOP ? 0 : Smem_tile_q::BYTES_PER_TILE], tidx);
@@ -588,32 +590,42 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     {
         fmha::depbar_<USE_LDGSTS, 0>();
     }
-    // Wait for last round of LDS K/V to finish
-    __syncthreads();
+
+    if constexpr (Kernel_traits::STORE_O_FROM_REGS)
+    {
+        // O does not go through shared memory: write each thread's accumulators to the same (row, col)
+        // that the shared-memory round trip below would give them (bitwise identical output).
+        gmem_o.store(acc_o);
+    }
+    else
+    {
+        // Wait for last round of LDS K/V to finish
+        __syncthreads();
 
 // Loop over MMAS_M.
 #pragma unroll
-    for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii)
-    {
-
-        // Swizzle the elements and do the final reduction.
-        smem_o.store(acc_o, ii);
-
-        // Make sure the data is in shared memory.
-        __syncthreads();
-
-        // Load from shared memory.
-        uint4 out[Gmem_tile_o::STGS_PER_LOOP];
-        smem_o.load(out);
-
-        // Make sure the data was read from shared memory.
-        if (ii < Gmem_tile_o::LOOPS - 1)
+        for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii)
         {
-            __syncthreads();
-        }
 
-        // Output the values.
-        gmem_o.store(out, ii);
+            // Swizzle the elements and do the final reduction.
+            smem_o.store(acc_o, ii);
+
+            // Make sure the data is in shared memory.
+            __syncthreads();
+
+            // Load from shared memory.
+            uint4 out[Gmem_tile_o::STGS_PER_LOOP];
+            smem_o.load(out);
+
+            // Make sure the data was read from shared memory.
+            if (ii < Gmem_tile_o::LOOPS - 1)
+            {
+                __syncthreads();
+            }
+
+            // Output the values.
+            gmem_o.store(out, ii);
+        }
     }
     if (params.softmax_stats_ptr != nullptr)
     {
