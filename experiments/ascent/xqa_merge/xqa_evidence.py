@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-# Self-contained evidence harness for XQA kernel_mha (SM120 HMMA, NVRTC-JIT path) at the Qwen3.6-35B-A3B decode shape.
+# Self-contained evidence harness for XQA kernel_mha (SM120 HMMA, NVRTC-JIT path) at the Qwen3.8-27B-NVFP4 decode shape
+# (env XQA_KV_DTYPE / XQA_KV_HEADS / XQA_HEAD_GRP select another shape, e.g. the earlier Qwen3.6 FP8 / 2 / 8).
 # No local imports, so it can run inline (python -c) in any source tree; it compiles <cwd>/cpp/kernels/xqa/mha.cu.
 #
-# Kernel compiled exactly like decoderXQAImplJIT/nvrtcWrapper (same NVRTC options and macros: BF16 Q/output, FP8-E4M3
-# paged KV cache, head 256, 8 Q heads per KV head, 32 tokens/block, beam 1), launched like DecoderXQARunner::runImpl
-# (grid {nbSubSeq, nbKHeads, batch}, block {128,1,2}, dynamic smem = smemSize, no PDL attribute in either arm).
-# Inputs: synthetic, fixed seed, serving shapes: 16 Q / 2 KV heads, 32768-token shared prefix (block reuse) + 2048
+# Kernel compiled exactly like decoderXQAImplJIT/nvrtcWrapper (same NVRTC options and macros: BF16 Q/output, BF16
+# paged KV cache by default, head 256, 6 Q heads per KV head, 32 tokens/block, beam 1), launched like
+# DecoderXQARunner::runImpl (grid {nbSubSeq, nbKHeads, batch}, block {128,1,2}, dynamic smem = smemSize, no PDL).
+# Inputs: synthetic, fixed seed, serving shapes: 24 Q / 4 KV heads, 32768-token shared prefix (block reuse) + 2048
 # unique + 128 decoded tokens per request, max_seq_len 36864. Sub-sequence counts per batch are given explicitly
-# (default: 48/47/23 at B=1/2/4 = the counts branch 4 puts on main; 48 = the pre-branch-4 default).
+# (default 48 at B=1/2/4: the graph-captured count of the base heuristic; 47 is also exercised).
 #
 #   bench : CUDA-graph replay timed with CUDA events; before every call (outside the timed region) the output is
 #           NaN-poisoned and the L2 is flushed with a 384 MiB read sweep. kernel_ms = 10-90% trimmed mean (event
@@ -48,17 +49,25 @@ CUDA_HEADERS = [
     "cuda_bf16.h", "cuda_bf16.hpp", "cuda_fp16.h", "cuda_fp16.hpp", "cuda_fp8.h", "cuda_fp8.hpp", "vector_types.h",
     "vector_functions.h", "device_types.h"
 ]
-NB_K_HEADS, HEAD_GRP, HEAD_DIM, TOKENS_PER_PAGE = 2, 8, 256, 32
+# Shape (env-overridable): default = this run's Qwen3.8-27B-NVFP4 full-attention decode, 24 Q / 4 KV heads, BF16 KV.
+# XQA_KV_DTYPE=fp8 XQA_KV_HEADS=2 XQA_HEAD_GRP=8 reproduces the earlier Qwen3.6-35B-A3B shape.
+KV_DTYPE = os.environ.get("XQA_KV_DTYPE", "bf16")
+assert KV_DTYPE in ("bf16", "fp8"), KV_DTYPE
+NB_K_HEADS = int(os.environ.get("XQA_KV_HEADS", "4"))
+HEAD_GRP = int(os.environ.get("XQA_HEAD_GRP", "6"))
+HEAD_DIM, TOKENS_PER_PAGE = 256, 32
 NB_Q_HEADS = NB_K_HEADS * HEAD_GRP
 MAX_SEQ_LEN = 36864
 MAX_PAGES = MAX_SEQ_LEN // TOKENS_PER_PAGE
 PREFIX = 32768
 SEQ_LEN = 32768 + 2048 + 128
-Q_SCALE, KV_SCALE = 1.0, 0.5
+Q_SCALE = 1.0
+KV_SCALE = 0.5 if KV_DTYPE == "fp8" else 1.0  # the kernel reads the scale only for a quantized cache
 NB_SEM = 1024
 MACROS = {
     "INPUT_FP16": "0", "DTYPE": "__nv_bfloat16", "GENERATE_CUBIN": "1", "NDEBUG": "1", "HEAD_ELEMS": "256",
-    "BEAM_WIDTH": "1", "CACHE_ELEM_ENUM": "2", "TOKENS_PER_PAGE": "32", "HEAD_GRP_SIZE": "8", "M_TILESIZE": "8",
+    "BEAM_WIDTH": "1", "CACHE_ELEM_ENUM": "2" if KV_DTYPE == "fp8" else "0", "TOKENS_PER_PAGE": "32",
+    "HEAD_GRP_SIZE": str(HEAD_GRP), "M_TILESIZE": str(HEAD_GRP),
     "USE_CUSTOM_BARRIER": "1", "SLIDING_WINDOW": "1", "LOW_PREC_OUTPUT": "0", "USE_INPUT_KV": "0", "ROPE_STYLE": "0",
     "ROPE_ELEMS": "64", "IS_SPEC_DEC_TREE": "0", "SKIP_SOFTMAX_ATTN": "0",
     "__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__": "1", "__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__": "1"
@@ -147,7 +156,7 @@ def build_inputs(bmax, seed=1234):
     prefix_blocks = PREFIX // TOKENS_PER_PAGE
     uniq = nbp - prefix_blocks
     pool = (torch.randn((prefix_blocks + bmax * uniq) * 2, NB_K_HEADS, TOKENS_PER_PAGE, HEAD_DIM, generator=g,
-                        device="cuda") * 2.0).to(torch.float8_e4m3fn)
+                        device="cuda") * 2.0).to(torch.float8_e4m3fn if KV_DTYPE == "fp8" else torch.bfloat16)
     pages = torch.zeros(bmax, 1, 2, MAX_PAGES, dtype=torch.int32)
     for b in range(bmax):
         blk = torch.tensor(list(range(prefix_blocks)) + [prefix_blocks + b * uniq + j for j in range(uniq)],
@@ -176,7 +185,7 @@ def readonly_hash(inp):
 
 
 def reference(inp, batch):
-    """Independent FP32 attention over the dequantized FP8 KV (scale applied), rounded once to BF16."""
+    """Independent FP32 attention over the stored KV (FP8 dequantized with its scale, or BF16), rounded once to BF16."""
     torch.backends.cuda.matmul.allow_tf32 = False
     nbp, outs = inp["nbp"], []
     for b in range(batch):
@@ -281,7 +290,7 @@ def mode_bench(a):
     print(json.dumps(res), flush=True)
 
 
-INTERLEAVE = [(1, 48), (2, 48), (3, 48), (4, 48), (8, 48), (2, 47), (3, 31), (4, 23), (8, 11)]
+INTERLEAVE = [(1, 48), (2, 48), (3, 48), (4, 48), (8, 48), (1, 47), (2, 47), (4, 47), (1, 94)]
 
 
 def run_sequence(kern, inp, flush, seq):
@@ -382,9 +391,12 @@ def mode_check(a):
     passed &= h0 == h1
     report["passed"] = bool(passed)
     report["compared_against"] = (f"unmodified original mha.cu at {a.base_commit} (bitwise, every call) and an "
-                                  "independent FP32 PyTorch attention over the dequantized FP8 KV (<=1.5x original "
+                                  f"independent FP32 PyTorch attention over the stored {KV_DTYPE} KV (<=1.5x original "
                                   "max/mean abs error)")
+    report["shape"] = dict(kv_dtype=KV_DTYPE, kv_heads=NB_K_HEADS, q_heads_per_kv=HEAD_GRP, head_dim=HEAD_DIM,
+                           seq_len=SEQ_LEN, shared_prefix=PREFIX, tokens_per_page=TOKENS_PER_PAGE)
     report["candidate_source_sha256"] = cand.src_sha
+    report["original_source_sha256"] = orig.src_sha
     print(json.dumps(report), flush=True)
 
 
@@ -415,7 +427,7 @@ def mode_verify(a):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["bench", "check", "verify"], default="bench")
-    p.add_argument("--configs", default="1x48,2x47,4x23")
+    p.add_argument("--configs", default="1x48,2x48,4x48")
     p.add_argument("--extra-configs", default="")
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=100)
