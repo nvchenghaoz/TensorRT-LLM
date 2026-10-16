@@ -32,7 +32,7 @@ def heartbeat(tag):
 
 def run_arm(arm, ckpt, out_path):
     heartbeat(arm)
-    if arm == "A":
+    if arm in ("A", "A2"):
         os.environ["TRTLLM_MARLIN_PERSISTENT_WORKSPACE"] = "0"
         os.environ["TRTLLM_MARLIN_PDL"] = "0"
     else:
@@ -93,20 +93,7 @@ def run_arm(arm, ckpt, out_path):
     llm.shutdown()
 
 
-def main(ckpt, workdir):
-    os.makedirs(workdir, exist_ok=True)
-    paths = {}
-    for arm in ("A", "B"):
-        p = os.path.join(workdir, f"e2e_{arm}.json")
-        paths[arm] = p
-        t0 = time.time()
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), "arm", arm, ckpt, p])
-        log(f"arm {arm} exit {r.returncode} in {time.time() - t0:.0f}s")
-        if r.returncode != 0:
-            print(json.dumps({"passed": False, "error": f"arm {arm} failed rc={r.returncode}"}))
-            return
-    a = json.load(open(paths["A"]))
-    b = json.load(open(paths["B"]))
+def compare(a, b):
     same_ids, same_lp, diffs = 0, 0, []
     for k in a["items"]:
         ia, ib = a["items"][k], b["items"][k]
@@ -118,11 +105,40 @@ def main(ckpt, workdir):
             d = next((i for i, (x, y) in enumerate(zip(ia["ids"], ib["ids"])) if x != y), None)
             diffs.append({"item": k, "ids_equal": si, "lp_equal": sl, "first_token_div": d})
     n = len(a["items"])
-    res = {"passed": same_ids == n and same_lp == n, "n_sequences": n,
-           "identical_token_ids": same_ids, "identical_logprobs": same_lp, "diffs": diffs,
-           "graphs_captured_A": a["graphs_captured"], "graphs_captured_B": b["graphs_captured"],
+    return {"n_sequences": n, "identical_token_ids": same_ids, "identical_logprobs": same_lp,
+            "exact": same_ids == n and same_lp == n, "diffs": diffs}
+
+
+def main(ckpt, workdir):
+    # Arms run in order A (switches off; tunes and saves the AutoTuner cache), B (switches on),
+    # A2 (switches off again, control). B and A2 load A's AutoTuner cache so every arm runs the
+    # same GEMM tactics (the AutoTuner's near-tie picks otherwise differ between processes).
+    os.makedirs(workdir, exist_ok=True)
+    cache = os.path.join(workdir, "autotuner_cache.json")
+    if os.path.exists(cache):
+        os.remove(cache)
+    os.environ["TLLM_AUTOTUNER_CACHE_PATH"] = cache
+    paths = {}
+    for arm in ("A", "B", "A2"):
+        p = os.path.join(workdir, f"e2e_{arm}.json")
+        paths[arm] = p
+        t0 = time.time()
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "arm", arm, ckpt, p])
+        log(f"arm {arm} exit {r.returncode} in {time.time() - t0:.0f}s; cache exists {os.path.exists(cache)}")
+        if r.returncode != 0:
+            print(json.dumps({"passed": False, "error": f"arm {arm} failed rc={r.returncode}"}))
+            return
+    a = json.load(open(paths["A"]))
+    b = json.load(open(paths["B"]))
+    a2 = json.load(open(paths["A2"]))
+    ab = compare(a, b)
+    aa2 = compare(a, a2)
+    a2b = compare(a2, b)
+    res = {"passed": ab["exact"] and a2b["exact"], "A_vs_B": ab, "A2_vs_B": a2b, "A_vs_A2_control": aa2,
+           "graphs_captured_B": b["graphs_captured"],
            "workspace_A": a["workspace"], "workspace_B": b["workspace"],
-           "compared": "greedy token ids + logprobs, switches off (A) vs on (B), 16 SHORT x 48 + 4 LONG_GEN x 256"}
+           "compared": "greedy token ids + logprobs, switches off (A, A2) vs on (B), 16 SHORT x 48 + "
+                       "4 LONG_GEN x 256, shared AutoTuner cache"}
     print(json.dumps(res))
 
 
