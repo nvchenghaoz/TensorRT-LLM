@@ -44,6 +44,7 @@ from .fuse_elementwise_ops import (
     fused_gdn_post_conv,
     pack_gdn_decode_qkv,
 )
+from .gdn_prefill_conv import gdn_fused_transpose_conv_enabled, gdn_prefill_transpose_conv
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import Mamba2Metadata
@@ -751,6 +752,50 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         return core_attn_out
 
+    def _prefill_transpose_conv(
+        self,
+        mixed_qkv_p: torch.Tensor,
+        conv_states: torch.Tensor,
+        has_initial_states_p: torch.Tensor,
+        cache_indices_p: torch.Tensor,
+        query_start_loc_p: torch.Tensor,
+        allow_fused: bool = True,
+    ) -> torch.Tensor:
+        """Causal conv1d over token-major prefill rows -> channel-major [conv_dim, T].
+
+        The fused Triton kernel reads the in_proj_qkvz column view directly and is
+        bitwise equal to the transpose + in-place C++ conv below. It is used from
+        TRTLLM_GDN_FUSED_TRANSPOSE_CONV_MIN_TOKENS (4096) prefill tokens;
+        TRTLLM_GDN_FUSED_TRANSPOSE_CONV=0 restores the two-kernel path.
+        """
+        if allow_fused and gdn_fused_transpose_conv_enabled(mixed_qkv_p.shape[0]):
+            return gdn_prefill_transpose_conv(
+                mixed_qkv_p,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_states,
+                query_start_loc_p,
+                cache_indices_p,
+                has_initial_states_p,
+                activation=self.activation,
+            )
+        mixed_qkv_p_t = extract_transpose_prefill_slice(
+            mixed_qkv_p,
+            mixed_qkv_p.shape[0],
+            0,
+            mixed_qkv_p.shape[1],
+        )
+        return causal_conv1d_fn(
+            mixed_qkv_p_t,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            activation=self.activation,
+            conv_states=conv_states,
+            has_initial_state=has_initial_states_p,
+            cache_indices=cache_indices_p,
+            query_start_loc=query_start_loc_p,
+        )
+
     def forward_extend(
         self,
         conv_states,
@@ -785,21 +830,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             query_start_loc_p = query_start_loc[: num_prefill + 1]
             has_initial_states_p = has_initial_states[:num_prefill]
 
-            mixed_qkv_p_t = extract_transpose_prefill_slice(
+            mixed_qkv_p_t = self._prefill_transpose_conv(
                 mixed_qkv_p,
-                mixed_qkv_p.shape[0],
-                0,
-                mixed_qkv_p.shape[1],
-            )
-            mixed_qkv_p_t = causal_conv1d_fn(
-                mixed_qkv_p_t,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_states_to_use,
-                has_initial_state=has_initial_states_p,
-                cache_indices=state_indices_p,
-                query_start_loc=query_start_loc_p,
+                conv_states_to_use,
+                has_initial_states_p,
+                state_indices_p,
+                query_start_loc_p,
+                allow_fused=not is_target_verify,
             )
 
             if is_target_verify:
@@ -873,21 +910,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     self.head_v_dim,
                 )
         else:
-            mixed_qkv_t = extract_transpose_prefill_slice(
+            mixed_qkv_t = self._prefill_transpose_conv(
                 mixed_qkv,
-                mixed_qkv.shape[0],
-                0,
-                mixed_qkv.shape[1],
-            )
-            mixed_qkv_t = causal_conv1d_fn(
-                mixed_qkv_t,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_states_to_use,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
+                conv_states_to_use,
+                has_initial_states,
+                cache_indices,
+                query_start_loc,
             )
             query, key, value, g, beta = fused_gdn_post_conv(
                 mixed_qkv_t,
