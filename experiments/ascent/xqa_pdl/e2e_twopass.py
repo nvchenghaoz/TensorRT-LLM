@@ -23,7 +23,12 @@ import time
 
 os.environ.setdefault("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
-PREFIX, SUFFIX, OSL, N_PER_GROUP = 32768, 2048, 256, 8
+PREFIX, SUFFIX, N_PER_GROUP = 32768, 2048, 8
+OSL = int(os.environ.get("E2E_OSL", "256"))
+# E2E_BATCH_WAIT_MS > 0: the executor waits that long to collect a group's requests, so every c2/c4 group is admitted
+# in one iteration in both arms and both passes (without it, host timing can split a group across iterations, which
+# changes batch composition and therefore numerics, independently of the kernel under test).
+BATCH_WAIT_MS = float(os.environ.get("E2E_BATCH_WAIT_MS", "0"))
 GROUPS = (("c1", 1), ("c2", 2), ("c4", 4))
 
 
@@ -92,11 +97,14 @@ def main(ckpt):
 
     engine_json = json.load(open("experiments/ascent-config/engine.json"))
     log("engine.json:", json.dumps(engine_json))
+    log("TRTLLM_ENABLE_PDL=%s (unset = getEnvEnablePDL default true on SM>=90); batch_wait_timeout_ms=%s; osl=%d"
+        % (os.environ.get("TRTLLM_ENABLE_PDL"), BATCH_WAIT_MS, OSL))
     kvc = dict(engine_json.get("kv_cache_config", dict()))
     assert kvc.get("dtype") == "fp8", kvc
     t0 = time.time()
     llm = LLM(model=ckpt, max_seq_len=36864, max_batch_size=8, max_num_tokens=8192, enable_chunked_prefill=True,
-              cuda_graph_config=CudaGraphConfig(max_batch_size=8), kv_cache_config=KvCacheConfig(**kvc))
+              cuda_graph_config=CudaGraphConfig(max_batch_size=8), kv_cache_config=KvCacheConfig(**kvc),
+              batch_wait_timeout_ms=BATCH_WAIT_MS)
     log("LLM ready in %.1fs; decode graphs captured at batch sizes %s" % (time.time() - t0, sorted(captures)))
     tok = llm.tokenizer
     n = N_PER_GROUP * len(GROUPS)
@@ -108,8 +116,8 @@ def main(ckpt):
     def run_pass(tag):
         res = dict()
         for gi, (g, conc) in enumerate(GROUPS):
-            cur["phase"] = "%s:%s" % (tag, g)
             for s in range(0, N_PER_GROUP, conc):
+                cur["phase"] = "%s:%s:call%d" % (tag, g, s // conc)
                 idx = [gi * N_PER_GROUP + s + j for j in range(conc)]
                 t = time.time()
                 outs = llm.generate([prompts[i] for i in idx], sp, use_tqdm=False)
@@ -150,7 +158,8 @@ def main(ckpt):
                decode_graph_batch_sizes_replayed=dec_bs, pass2_prefix_reused_all=warm_ok,
                all_ids_sha=digest_ids([p1[k]["ids"] for k in sorted(p1)]),
                all_lp_sha=hashlib.sha256("".join(per[k]["lp_sha"] for k in sorted(per)).encode()).hexdigest(),
-               engine_json=engine_json, prompts="%d x (%d shared prefix + %d unique), %d greedy tokens, logprobs=1; "
+               engine_json=engine_json, batch_wait_timeout_ms=BATCH_WAIT_MS, osl=OSL,
+               trtllm_enable_pdl_env=os.environ.get("TRTLLM_ENABLE_PDL"), prompts="%d x (%d shared prefix + %d unique), %d greedy tokens, logprobs=1; "
                "c1/c2/c4 groups of 8" % (n, PREFIX, SUFFIX, OSL), per_prompt=per,
                compared="pass2 vs pass1 in this arm; compare all_ids_sha/all_lp_sha/per_prompt across the pair arms")
     print(json.dumps(res), flush=True)
