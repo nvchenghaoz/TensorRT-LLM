@@ -1477,7 +1477,8 @@ def _register_fake():
           size_n: int,
           size_k: int,
           output_buffer_kind: int = 0,
-          group: Optional[List[int]] = None):
+          group: Optional[List[int]] = None,
+          workspace_mode: int = 0):
         # mat_a: [M, K/2] FP4 packed (or BF16 when W4A16)
         # mat_b: Marlin-packed weights
         # Output: [M, size_n] with dtype=out_dtype

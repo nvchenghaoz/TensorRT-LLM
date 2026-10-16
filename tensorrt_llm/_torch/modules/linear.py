@@ -803,6 +803,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 out_dtype=torch.bfloat16,
                 size_n=module.out_features,
                 size_k=module.in_features,
+                workspace_mode=_marlin_workspace_mode(module, input.shape[0]),
             )
             if len(original_shape) > 2:
                 output = output.reshape(*original_shape[:-1],
@@ -2532,6 +2533,47 @@ def _build_fp8_nvfp4_decode_copy(module: Linear) -> None:
     module._nvfp4_decode_weight = marlin_weight
     module._nvfp4_decode_scale = marlin_scale
     module._nvfp4_decode_global_scale = weight_global_scale
+
+
+# Marlin decode calls that run beside an aux-stream fork branch keep a per-call
+# zeroed lock workspace (marlin_nvfp4_gemm workspace_mode=1) from this many rows
+# on. A Marlin CTA takes all of an SM120 SM's shared memory and the grid is one
+# CTA per SM; the zero-fill kernel in front of it lets the branch's kernel (GDN
+# in_proj_ba) take SMs first instead of running after Marlin. At 1 row the
+# persistent workspace + PDL path is faster even beside the fork.
+_MARLIN_FORK_FRESH_WORKSPACE_MIN_ROWS = 2
+# Kill switch: TRTLLM_MARLIN_FORK_FRESH_WORKSPACE=0 marks no site (every call
+# uses the persistent workspace + PDL path).
+_MARLIN_FORK_FRESH_WORKSPACE_ENV = "TRTLLM_MARLIN_FORK_FRESH_WORKSPACE"
+
+
+def _marlin_workspace_mode(module: Linear, rows: int) -> int:
+    min_rows = module.__dict__.get("_marlin_fresh_workspace_min_rows")
+    return 1 if min_rows is not None and rows >= min_rows else 0
+
+
+def mark_marlin_fork_sites(model: torch.nn.Module) -> int:
+    """Post-load walk: flag each GDN in_proj_qkvz decode copy that runs in
+    parallel with in_proj_ba on the aux stream (maybe_execute_in_parallel)."""
+    if os.environ.get(_MARLIN_FORK_FRESH_WORKSPACE_ENV, "1") == "0":
+        return 0
+    n = 0
+    for mod in model.modules():
+        children = mod.__dict__.get("_modules", {})
+        qkvz = children.get("in_proj_qkvz")
+        if (qkvz is None or children.get("in_proj_ba") is None or
+                getattr(qkvz, "_nvfp4_decode_weight", None) is None):
+            continue
+        qkvz._marlin_fresh_workspace_min_rows = (
+            _MARLIN_FORK_FRESH_WORKSPACE_MIN_ROWS)
+        n += 1
+    if n:
+        logger.info(
+            f"[marlin_fork] {n} GDN in_proj_qkvz decode copies keep a per-call "
+            f"Marlin workspace at rows >= "
+            f"{_MARLIN_FORK_FRESH_WORKSPACE_MIN_ROWS}; kill switch "
+            f"{_MARLIN_FORK_FRESH_WORKSPACE_ENV}=0")
+    return n
 
 
 def log_fp8_nvfp4_decode_copies(model: torch.nn.Module) -> None:

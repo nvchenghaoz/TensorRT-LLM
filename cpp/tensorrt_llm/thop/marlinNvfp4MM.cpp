@@ -148,11 +148,18 @@ int* getPersistentMarlinWorkspace(Tensor const& like, int device, int sms, cudaS
 // size_k:             reduction dimension K
 // output_buffer_kind: output allocation kind (0=default, 1=userbuffers, 2=nccl_window)
 // group:              communicator ranks, used when output_buffer_kind selects an NCCL window
+// workspace_mode:     0 = persistent lock workspace + PDL launch (subject to the
+//                     TRTLLM_MARLIN_PERSISTENT_WORKSPACE / TRTLLM_MARLIN_PDL kill switches);
+//                     1 = per-call zeroed workspace and no PDL. Mode 1 is for a call that runs beside
+//                     an aux-stream fork branch: the zero-fill kernel in front of Marlin lets the
+//                     branch's kernel take SMs before Marlin's one-CTA-per-SM, full-smem grid does.
 Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional<Tensor> const& scale_a,
     Tensor const& scale_b, std::optional<Tensor> const& alpha, Tensor const& weight_global_scale,
     std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t size_n, int64_t size_k,
-    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt,
+    int64_t workspace_mode = 0)
 {
+    TORCH_CHECK(workspace_mode == 0 || workspace_mode == 1, "workspace_mode must be 0 or 1, got ", workspace_mode);
     CHECK_TH_CUDA(mat_a);
     TORCH_CHECK(mat_a.scalar_type() == FLOAT4_E2M1X2 || mat_a.scalar_type() == at::ScalarType::BFloat16,
         "mat_a must be FP4 E2M1X2 or BFloat16, got ", mat_a.scalar_type());
@@ -204,8 +211,10 @@ Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, mat_a.get_device());
 
     // Both switches are read per call (uncached) so A/B graphs can coexist in one process.
-    bool const persistentWorkspace = marlinEnvSwitchOn("TRTLLM_MARLIN_PERSISTENT_WORKSPACE");
-    bool const enablePdl = tensorrt_llm::common::getEnvEnablePDL() && marlinEnvSwitchOn("TRTLLM_MARLIN_PDL");
+    bool const forkSafe = workspace_mode == 1;
+    bool const persistentWorkspace = !forkSafe && marlinEnvSwitchOn("TRTLLM_MARLIN_PERSISTENT_WORKSPACE");
+    bool const enablePdl
+        = !forkSafe && tensorrt_llm::common::getEnvEnablePDL() && marlinEnvSwitchOn("TRTLLM_MARLIN_PDL");
 
     int* workspacePtr = nullptr;
     Tensor workspace;
@@ -259,7 +268,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "marlin_nvfp4_gemm(Tensor mat_a, Tensor mat_b, Tensor? scale_a, Tensor scale_b, Tensor? alpha,"
         " Tensor weight_global_scale, Tensor? bias, ScalarType? out_dtype,"
-        " int size_n, int size_k, int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
+        " int size_n, int size_k, int output_buffer_kind=0, int[]? group=None, int workspace_mode=0) -> (Tensor out)");
     m.def("marlin_nvfp4_persistent_workspace_snapshot(Tensor like) -> Tensor");
 }
 

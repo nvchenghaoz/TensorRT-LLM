@@ -56,10 +56,20 @@ def build(n, k, seed):
     return _pack_nvfp4_weight_for_marlin(w_fp4, w_sf, (1.0 / gs).float(), n, k, 16)
 
 
-def marlin(x, wt, n, k):
+def marlin(x, wt, n, k, mode=0):
     return torch.ops.trtllm.marlin_nvfp4_gemm(x, wt[0], scale_a=None, scale_b=wt[1], alpha=None,
                                               weight_global_scale=wt[2], bias=None,
-                                              out_dtype=torch.bfloat16, size_n=n, size_k=k)
+                                              out_dtype=torch.bfloat16, size_n=n, size_k=k,
+                                              workspace_mode=mode)
+
+
+# Fork arms: A/W/B as above with workspace_mode 0; P = production candidate (both switches on,
+# workspace_mode=1 at rows >= 2 for the qkvz site, as linear.py's mark_marlin_fork_sites sets).
+FORK_ARMS = ARMS + [("P", "1", "1")]
+
+
+def fork_mode(arm, m):
+    return 1 if arm == "P" and m >= 2 else 0
 
 
 def norm(x, r, w):
@@ -93,14 +103,16 @@ wba = [(torch.randn(NBA, K, generator=g, device=dev) * 0.02).to(torch.bfloat16) 
 wn1 = (0.1 * torch.randn(K, generator=g, device=dev)).to(torch.bfloat16)
 wn2 = (0.1 * torch.randn(N, generator=g, device=dev)).to(torch.bfloat16)
 fork_res = {}
+fork_failures = []
 for m in (1, 2, 4):
     per = 2 * m * K + m * N
     st0 = torch.zeros(C * per, device=dev, dtype=torch.bfloat16)
     for i in range(C):
         st0[i * per: i * per + 2 * m * K] = (torch.randn(2 * m * K, generator=g, device=dev) * 0.5).to(torch.bfloat16)
     graphs, keep = {}, []
-    for a in ARMS:
+    for a in FORK_ARMS:
         set_arm(a)
+        mode = fork_mode(a[0], m)
         st = st0.clone()
         xs = [st[i * per: i * per + m * K].view(m, K) for i in range(C)]
         r1s = [st[i * per + m * K: i * per + 2 * m * K].view(m, K) for i in range(C)]
@@ -108,13 +120,13 @@ for m in (1, 2, 4):
         ev0 = [torch.cuda.Event() for _ in range(C)]
         ev1 = [torch.cuda.Event() for _ in range(C)]
 
-        def fn(st=st, xs=xs, r1s=r1s, r2s=r2s, ev0=ev0, ev1=ev1):
+        def fn(st=st, xs=xs, r1s=r1s, r2s=r2s, ev0=ev0, ev1=ev1, mode=mode):
             st.copy_(st0)
             outs = []
             for i in range(C):
                 norm(xs[i], r1s[i], wn1)
                 ev0[i].record()
-                y = marlin(xs[i], ws[i], N, K)
+                y = marlin(xs[i], ws[i], N, K, mode)
                 with torch.cuda.stream(AUX):
                     ev0[i].wait()
                     ba = in_proj_ba(xs[i], wba[i])
@@ -131,9 +143,18 @@ for m in (1, 2, 4):
         for _ in range(WARM):
             gr.replay()
     torch.cuda.synchronize()
-    evs = {a[0]: [] for a in ARMS}
+    # outputs of every arm bitwise equal to arm A (Marlin raw out lives in r2 after norm2's add)
+    ref_out = [(y.clone(), z.clone()) for y, z in keep[0][4]]
+    ref_st = keep[0][0].clone()
+    for idx, a in enumerate(FORK_ARMS):
+        st_a, out_a = keep[idx][0], keep[idx][4]
+        same = torch.equal(st_a, ref_st) and all(
+            torch.equal(y, ry) and torch.equal(z, rz) for (y, z), (ry, rz) in zip(out_a, ref_out))
+        if not same:
+            fork_failures.append(f"fork M={m} arm {a[0]} != A")
+    evs = {a[0]: [] for a in FORK_ARMS}
     for it in range(ITERS):
-        for a in ARMS:
+        for a in FORK_ARMS:
             e0 = torch.cuda.Event(enable_timing=True)
             e1 = torch.cuda.Event(enable_timing=True)
             e0.record()
@@ -142,15 +163,18 @@ for m in (1, 2, 4):
             evs[a[0]].append((e0, e1))
     torch.cuda.synchronize()
     r = {}
-    for a in ARMS:
+    for a in FORK_ARMS:
         t = sorted(e0.elapsed_time(e1) * 1e3 / C for e0, e1 in evs[a[0]])
         r[a[0]] = {"us_med": t[len(t) // 2], "us_p10": t[len(t) // 10], "us_p90": t[(9 * len(t)) // 10]}
     r["W_minus_A_us"] = r["W"]["us_med"] - r["A"]["us_med"]
     r["B_minus_A_us"] = r["B"]["us_med"] - r["A"]["us_med"]
     r["B_minus_W_us"] = r["B"]["us_med"] - r["W"]["us_med"]
+    r["P_minus_A_us"] = r["P"]["us_med"] - r["A"]["us_med"]
     fork_res[str(m)] = r
     log(f"fork M={m}: per-layer us A {r['A']['us_med']:.2f} W {r['W']['us_med']:.2f} B {r['B']['us_med']:.2f} "
-        f"(W-A {r['W_minus_A_us']:+.2f}, B-A {r['B_minus_A_us']:+.2f}, B-W {r['B_minus_W_us']:+.2f})")
+        f"P {r['P']['us_med']:.2f} (W-A {r['W_minus_A_us']:+.2f}, B-A {r['B_minus_A_us']:+.2f}, "
+        f"P-A {r['P_minus_A_us']:+.2f}; A p10-p90 {r['A']['us_p10']:.2f}-{r['A']['us_p90']:.2f}, "
+        f"P p10-p90 {r['P']['us_p10']:.2f}-{r['P']['us_p90']:.2f})")
     del graphs, keep
     torch.cuda.synchronize()
 del ws, wba
@@ -221,6 +245,7 @@ ws_zero = bool((snap == 0).all().item()) and snap.numel() > 0
 log("workspace bound slots", snap.numel() // sms, "all zero", ws_zero)
 if not ws_zero:
     failures.append("workspace not all zero")
+failures = fork_failures + failures
 print(json.dumps({"passed": not failures, "failures": failures[:20], "n_failures": len(failures),
                   "lmhead_graph_replays_checked": replays, "bound_slots": snap.numel() // sms,
                   "workspace_all_zero": ws_zero, "fork_timing_us_per_layer": fork_res,
