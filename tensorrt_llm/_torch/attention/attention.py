@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 import weakref
 from typing import List, Optional, Tuple, Union
 
@@ -31,6 +32,15 @@ from .backends.interface import (AttentionMask, CustomAttentionMask,
 from .backends.sparse.hooks import get_sparse_attention_hooks
 from .backends.utils import create_attention, get_attention_backend
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
+
+
+def _attn_nvfp4_decode_requested(env: str) -> bool:
+    """Whether to request a decode-only NVFP4 W4A16 copy (``env`` "0" = off).
+
+    Only a request: linear._fp8_nvfp4_decode_copy_enabled still requires SM12x,
+    an FP8 per-tensor weight with a static input scale, BF16 and no bias.
+    """
+    return os.environ.get(env, "1") != "0"
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -656,6 +666,13 @@ class Attention(nn.Module):
             use_custom_cublas_mm=use_custom_cublas_mm,
             fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+        if self.attn_output_gate:
+            # Gated attention feeds qkv_proj BF16: decode (<= 16 rows) runs on
+            # a load-time NVFP4 W4A16 Marlin copy of the FP8 weight (see
+            # FP8QDQLinearMethod.apply). Disable with
+            # TRTLLM_ATTN_QKV_NVFP4_DECODE=0 (or TRTLLM_GDN_INPROJ_NVFP4_DECODE=0).
+            self.qkv_proj._nvfp4_decode_copy = _attn_nvfp4_decode_requested(
+                "TRTLLM_ATTN_QKV_NVFP4_DECODE")
 
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
@@ -690,6 +707,13 @@ class Attention(nn.Module):
             use_custom_cublas_mm=use_custom_cublas_mm,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
             use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
+        if self.attn_output_gate:
+            # With the output gate, o_proj never gets fused FP8 attention output
+            # (see has_quant_scale use below), so its input is BF16: decode
+            # (<= 16 rows) runs on a load-time NVFP4 W4A16 Marlin copy. Disable
+            # with TRTLLM_ATTN_O_NVFP4_DECODE=0 (or TRTLLM_GDN_INPROJ_NVFP4_DECODE=0).
+            self.o_proj._nvfp4_decode_copy = _attn_nvfp4_decode_requested(
+                "TRTLLM_ATTN_O_NVFP4_DECODE")
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
