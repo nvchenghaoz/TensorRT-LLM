@@ -789,13 +789,11 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride) : (stages * s_sh_stage);
     int4* sh_s = sh_zp + (stages * zp_sh_stage);
     int4* sh_a = sh_s + sh_s_size;
-    // full_k only: every warp's partial sums of every stripe, [stripe][16 accumulators][threads]
-    // fp32, written once the pipeline has drained into the (then unused) B stage buffers.
-    float* sh_fk = reinterpret_cast<float*>(sh_b);
-    static_assert(!full_k || kMarlinNvfp4FullKMaxStripes * 16 * threads * 4 <= sh_b_size * 16,
-        "full_k stripe stash must fit in the B pipeline buffers");
-    // full_k only: this thread's partial sums of the stripes finished so far (registers).
-    float fk_park[kMarlinNvfp4FullKMaxStripes - 1][16];
+    // full_k only: every warp's partial sums of every stripe, [stripe][16 accumulators][threads] fp32.
+    float* sh_fk = reinterpret_cast<float*>(sh_a + stages * a_sh_stage);
+    // full_k only: the replayed result, [16 accumulators][32 lanes] fp32, in the drained B buffers.
+    float* sh_fk_out = reinterpret_cast<float*>(sh_b);
+    static_assert(!full_k || 16 * 32 * 4 <= sh_b_size * 16, "full_k result must fit in the B pipeline buffers");
 
     // Register storage for double buffer of shared memory reads.
     FragA frag_a[2][thread_m_blocks];
@@ -1467,20 +1465,6 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     {
         if constexpr (full_k)
         {
-            // Every warp is past its last shared-memory read of the pipeline.
-            __syncthreads();
-#pragma unroll
-            for (int s = 0; s < kMarlinNvfp4FullKMaxStripes - 1; s++)
-            {
-                if (s < fk_stripe)
-                {
-#pragma unroll
-                    for (int f = 0; f < 16; f++)
-                    {
-                        sh_fk[(s * 16 + f) * threads + threadIdx.x] = fk_park[s][f];
-                    }
-                }
-            }
 #pragma unroll
             for (int j = 0; j < 4; j++)
             {
@@ -1490,31 +1474,41 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                     sh_fk[((fk_stripe * 4 + j) * 4 + g) * threads + threadIdx.x] = frag_c[0][j][0][g];
                 }
             }
+            // Also: every warp is past its last shared-memory read of the pipeline.
+            __syncthreads();
+            // Warp q replays accumulators 4q .. 4q+3 of every lane (the chains are independent).
+            int const fk_lane = threadIdx.x % 32;
+            int const fk_f0 = 4 * (threadIdx.x / 32);
+            float acc[4] = {};
+            for (int s = fk_stripe; s >= 0; s--)
+            {
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+                {
+                    float const* p = &sh_fk[(s * 16 + fk_f0 + i) * threads + fk_lane];
+                    float r = p[0] + (p[32] + (p[96] + p[64]));
+                    if (s != fk_stripe)
+                    {
+                        r += acc[i];
+                    }
+                    acc[i] = s != 0 ? MarlinType<scalar_t>::num2float(MarlinType<scalar_t>::float2num(r)) : r;
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                sh_fk_out[(fk_f0 + i) * 32 + fk_lane] = acc[i];
+            }
             __syncthreads();
             if (threadIdx.x < 32)
             {
-                float acc[16] = {};
-                for (int s = fk_stripe; s >= 0; s--)
-                {
-#pragma unroll
-                    for (int f = 0; f < 16; f++)
-                    {
-                        float const* p = &sh_fk[(s * 16 + f) * threads + threadIdx.x];
-                        float r = p[0] + (p[32] + (p[96] + p[64]));
-                        if (s != fk_stripe)
-                        {
-                            r += acc[f];
-                        }
-                        acc[f] = s != 0 ? MarlinType<scalar_t>::num2float(MarlinType<scalar_t>::float2num(r)) : r;
-                    }
-                }
 #pragma unroll
                 for (int j = 0; j < 4; j++)
                 {
 #pragma unroll
                     for (int g = 0; g < 4; g++)
                     {
-                        frag_c[0][j][0][g] = acc[j * 4 + g];
+                        frag_c[0][j][0][g] = sh_fk_out[(j * 4 + g) * 32 + threadIdx.x];
                     }
                 }
             }
@@ -1931,19 +1925,12 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                 if (--fk_left == 0 && slice_iters != 0)
                 {
 #pragma unroll
-                    for (int s = 0; s < kMarlinNvfp4FullKMaxStripes - 1; s++)
+                    for (int j = 0; j < 4; j++)
                     {
-                        if (s == fk_stripe)
+#pragma unroll
+                        for (int g = 0; g < 4; g++)
                         {
-#pragma unroll
-                            for (int j = 0; j < 4; j++)
-                            {
-#pragma unroll
-                                for (int g = 0; g < 4; g++)
-                                {
-                                    fk_park[s][j * 4 + g] = frag_c[0][j][0][g];
-                                }
-                            }
+                            sh_fk[((fk_stripe * 4 + j) * 4 + g) * threads + threadIdx.x] = frag_c[0][j][0][g];
                         }
                     }
                     fk_stripe++;

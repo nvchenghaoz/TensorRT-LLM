@@ -130,9 +130,8 @@ bool marlin_full_k_enabled()
 }
 
 // Dynamic shared memory the full_k kernel addresses: the kernel's own layout for
-// BF16 A, 8-row m block, no act_order / zero points (the stripe stash reuses the
-// drained B stage buffers).
-int full_k_smem_bytes(int thread_n_blocks, int thread_k_blocks, int group_blocks, int stages)
+// BF16 A, 8-row m block, no act_order / zero points, plus the stripe stash.
+int full_k_smem_bytes(int threads, int thread_n_blocks, int thread_k_blocks, int group_blocks, int stages)
 {
     int const b_sh_stage = ((thread_n_blocks * 16) * 16 / 8 / 4) * thread_k_blocks;
     int const sh_red = (2 * thread_n_blocks + 1) * 16;
@@ -142,26 +141,8 @@ int full_k_smem_bytes(int thread_n_blocks, int thread_k_blocks, int group_blocks
     int const s_tb_groups = group_blocks < thread_k_blocks ? thread_k_blocks / group_blocks : 1;
     int const s_sh_stage = s_tb_groups * thread_n_blocks;
     int const a_sh_stage = (16 * thread_k_blocks / 8) * 8;
-    return (red_b + stages * s_sh_stage + stages * a_sh_stage) * 16;
-}
-
-// Pipeline depth of the full_k kernel; TRTLLM_MARLIN_FULLK_STAGES (8/10/12/14) is a sweep knob.
-int full_k_stages()
-{
-    char const* v = std::getenv("TRTLLM_MARLIN_FULLK_STAGES");
-    int s = v != nullptr ? std::atoi(v) : 12;
-    return (s == 8 || s == 10 || s == 12 || s == 14) ? s : 12;
-}
-
-MarlinFuncPtr full_k_kernel(int stages)
-{
-    switch (stages)
-    {
-    case 8: return Marlin<nv_bfloat16, 128, 1, 4, 8, true, 8, 1, true>;
-    case 10: return Marlin<nv_bfloat16, 128, 1, 4, 8, true, 10, 1, true>;
-    case 14: return Marlin<nv_bfloat16, 128, 1, 4, 8, true, 14, 1, true>;
-    default: return Marlin<nv_bfloat16, 128, 1, 4, 8, true, 12, 1, true>;
-    }
+    int const int4s = red_b + stages * s_sh_stage + stages * a_sh_stage;
+    return int4s * 16 + kMarlinNvfp4FullKMaxStripes * 16 * threads * static_cast<int>(sizeof(float));
 }
 
 // Largest number of split-K stripes the default `grid`-CTA launch gives one column.
@@ -267,16 +248,16 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
         // output is bitwise equal to it.
         int grid = blocks;
         int full_k_flags = 0;
-        int const fk_stages = full_k_stages();
         if (m_block_size_8 && thread_m_blocks == 1 && num_threads == 128 && thread_n == 64 && thread_k == 128
             && group_blocks == 1 && prob_n == 5120 && prob_k == 6144 && exec_cfg.blocks_per_sm == 1
             && !use_fp32_reduce && blocks <= kMarlinNvfp4FullKGridMask && prob_n / thread_n <= blocks
             && max_shared_mem_new < (1 << kMarlinNvfp4FullKGridShift)
             && full_k_max_stripes(prob_k / thread_k, prob_n / thread_n, blocks) <= kMarlinNvfp4FullKMaxStripes
-            && full_k_smem_bytes(thread_n_blocks, thread_k_blocks, group_blocks, fk_stages) <= max_shared_mem_new - 512
+            && full_k_smem_bytes(num_threads, thread_n_blocks, thread_k_blocks, group_blocks, 8)
+                <= max_shared_mem_new - 512
             && marlin_full_k_enabled())
         {
-            kernel = full_k_kernel(fk_stages);
+            kernel = Marlin<nv_bfloat16, 128, 1, 4, 8, true, 8, 1, true>;
             grid = prob_n / thread_n;
             full_k_flags = blocks << kMarlinNvfp4FullKGridShift;
         }
@@ -330,9 +311,6 @@ template __global__ void Marlin<nv_bfloat16, 256, 4, 16, 4, false, 4, 1>( MARLIN
 template __global__ void Marlin<nv_bfloat16, 128, 4, 8, 4, false, 4, 1>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 128, 4, 4, 8, false, 4, 1>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, true,  8, 1, true>( MARLIN_KERNEL_PARAMS );
-template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, true, 10, 1, true>( MARLIN_KERNEL_PARAMS );
-template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, true, 12, 1, true>( MARLIN_KERNEL_PARAMS );
-template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, true, 14, 1, true>( MARLIN_KERNEL_PARAMS );
 
 // clang-format on
 
