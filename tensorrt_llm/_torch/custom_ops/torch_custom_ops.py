@@ -1028,22 +1028,19 @@ class CudaCoreNVFP4Runner(TunableRunner):
     ) -> torch.Tensor:
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
-        # Unswizzle the activation scale factors
-        # act_sf is swizzled, need to reverse it for cuda_core_nvfp4_gemm
-        m = act_fp4.shape[0]
-        act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            act_sf.view((m + 128 - 1) // 128 * 128, -1))
-
+        # act_sf is in the 128x4 swizzled layout; the kernel reads it in place
+        # (no per-call block_scale_interleave_reverse launch).
         result = torch.ops.trtllm.cuda_core_nvfp4_gemm(
             act_fp4,
             weight,
-            scale_a=act_sf_unswizzled,
+            scale_a=act_sf,
             scale_b=weight_scale,
             alpha=alpha,
             bias=bias,
             out_dtype=self.output_dtype,
             output_buffer_kind=self.output_buffer_kind,
             group=self.group,
+            act_sf_swizzled=True,
         )
         return result
 
