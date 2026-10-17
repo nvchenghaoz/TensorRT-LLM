@@ -19,6 +19,11 @@ import torch
 import triton
 import triton.language as tl
 
+# V-tile height for both state I/O kernels. On SM120, 4 CTAs per (V, K) plane
+# (BLOCK_V=32 for V=128) is 11-31% faster at 1-4 seqs x 48 heads (fact 1045).
+# Read at call time; the kernels mask V % BLOCK_V != 0.
+_STATE_IO_BLOCK_V = 32
+
 
 @triton.jit
 def _gather_cast_vk_to_fp32_vk_kernel(
@@ -100,9 +105,9 @@ def gather_cast_vk_to_fp32_vk(
         num_seqs = n_pool
         has_indices = False
 
-    # K and V are typically 128 in GDN; one (BLOCK_K, BLOCK_V) tile covers the full K and V dimensions.
-    # entire (K, V) plane per (seq, head). Larger tiles save grid overhead;
-    # smaller tiles improve occupancy at small num_seqs * H.
+    # K and V are typically 128 in GDN. BLOCK_K covers the full K row; V is split
+    # into _STATE_IO_BLOCK_V-row tiles, so each (seq, head) plane gets several
+    # CTAs. Smaller tiles improve occupancy at small num_seqs * H.
     if out_dtype is None:
         out_dtype = torch.float32
     if output is None:
@@ -110,7 +115,7 @@ def gather_cast_vk_to_fp32_vk(
     else:
         assert output.shape == (num_seqs, h, v, k)
         assert output.dtype == out_dtype and output.device == initial_state.device
-    block_v = min(v, 128)
+    block_v = min(v, _STATE_IO_BLOCK_V)
     block_k = min(k, 128)
     num_v_blocks = triton.cdiv(v, block_v)
     num_k_blocks = triton.cdiv(k, block_k)
@@ -215,7 +220,7 @@ def cast_scatter_fp32_vk_to_vk(
         )
 
     has_indices = scatter_indices is not None
-    block_v = min(v, 128)
+    block_v = min(v, _STATE_IO_BLOCK_V)
     block_k = min(k, 128)
     num_v_blocks = triton.cdiv(v, block_v)
     num_k_blocks = triton.cdiv(k, block_k)
