@@ -15,7 +15,9 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/marlin/marlin_nvfp4.h"
+#include "tensorrt_llm/kernels/marlin/nvfp4_w4a16_gemv.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -82,6 +84,42 @@ Tensor gptq_marlin_repack(
     return out;
 }
 
+// Cuda-core W4A16 NVFP4 GEMV for decode rows (see kernels/marlin/nvfp4_w4a16_gemv.h).
+//
+// mat_a:        [M, K] BF16 activations, 1 <= M <= 4
+// weight:       [N, K/2] uint8 packed E2M1 (fp4_quantize layout)
+// weight_sf:    [N, K/16] uint8 (E4M3 bits) linear block scales
+// global_scale: FP32 global scale g; out = bf16((mat_a @ dequant(weight)^T) * g)
+// Supported (N, K): N even, K in {5120, 6144}, SM120/121.
+Tensor nvfp4_w4a16_gemv(Tensor const& mat_a, Tensor const& weight, Tensor const& weight_sf, double global_scale)
+{
+    CHECK_TH_CUDA(mat_a);
+    CHECK_TH_CUDA(weight);
+    CHECK_TH_CUDA(weight_sf);
+    TORCH_CHECK(mat_a.dim() == 2 && mat_a.scalar_type() == at::ScalarType::BFloat16 && mat_a.is_contiguous(),
+        "mat_a must be a contiguous 2D BF16 tensor");
+    TORCH_CHECK(weight.dim() == 2 && weight.scalar_type() == at::ScalarType::Byte && weight.is_contiguous(),
+        "weight must be a contiguous 2D uint8 tensor");
+    TORCH_CHECK(weight_sf.dim() == 2 && weight_sf.scalar_type() == at::ScalarType::Byte && weight_sf.is_contiguous(),
+        "weight_sf must be a contiguous 2D uint8 tensor");
+    int const m = static_cast<int>(mat_a.size(0));
+    int const k = static_cast<int>(mat_a.size(1));
+    int const n = static_cast<int>(weight.size(0));
+    TORCH_CHECK(weight.size(1) * 2 == k && weight_sf.size(0) == n && weight_sf.size(1) * 16 == k,
+        "nvfp4_w4a16_gemv shape mismatch: mat_a ", mat_a.sizes(), ", weight ", weight.sizes(), ", weight_sf ",
+        weight_sf.sizes());
+    TORCH_CHECK(m >= 1 && m <= ::marlin_nvfp4::kNvfp4W4a16GemvMaxRows, "nvfp4_w4a16_gemv supports 1..",
+        ::marlin_nvfp4::kNvfp4W4a16GemvMaxRows, " rows, got ", m);
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(mat_a));
+    Tensor out = at::empty({m, n}, mat_a.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
+    bool const launched = ::marlin_nvfp4::nvfp4W4a16Gemv(mat_a.data_ptr(), weight.data_ptr(), weight_sf.data_ptr(),
+        out.data_ptr(), static_cast<float>(global_scale), m, n, k, tensorrt_llm::common::getEnvEnablePDL(), stream);
+    TORCH_CHECK(launched, "nvfp4_w4a16_gemv: unsupported shape N=", n, " K=", k, " or device");
+    return out;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -91,9 +129,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "gptq_marlin_repack(Tensor b_q_weight, Tensor perm, int size_k, int size_n,"
         " int num_bits, bool is_a_8bit=False) -> (Tensor out)");
+    m.def("nvfp4_w4a16_gemv(Tensor mat_a, Tensor weight, Tensor weight_sf, float global_scale) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("gptq_marlin_repack", &tensorrt_llm::torch_ext::gptq_marlin_repack);
+    m.impl("nvfp4_w4a16_gemv", &tensorrt_llm::torch_ext::nvfp4_w4a16_gemv);
 }

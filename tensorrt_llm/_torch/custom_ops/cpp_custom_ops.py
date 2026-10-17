@@ -1485,6 +1485,14 @@ def _register_fake():
         m = mat_a.shape[0]
         return mat_a.new_empty((m, size_n), dtype=out_dtype)
 
+    if hasattr(torch.ops.trtllm, "nvfp4_w4a16_gemv"):
+
+        @torch.library.register_fake("trtllm::nvfp4_w4a16_gemv")
+        def _(mat_a: torch.Tensor, weight: torch.Tensor,
+              weight_sf: torch.Tensor, global_scale: float):
+            # weight: [N, K/2] packed E2M1 -> output [M, N] BF16
+            return mat_a.new_empty((mat_a.shape[0], weight.shape[0]))
+
     @torch.library.register_fake("trtllm::marlin_nvfp4_moe_gemm")
     def _(a: torch.Tensor,
           b_q_weight: torch.Tensor,
