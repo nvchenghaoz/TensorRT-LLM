@@ -51,6 +51,10 @@ from .mamba2_metadata import Mamba2Metadata
 from .mamba2_mixer import _cached_arange
 from .recurrent_state_cache import reset_recurrent_state_rows
 
+# Skip the prefill state reset when every prefill has initial state (a no-op
+# launch). Read once at import; "0" restores the unconditional launch.
+_SKIP_NOOP_RESET = os.environ.get("TRTLLM_GDN_SKIP_NOOP_STATE_RESET", "1") != "0"
+
 
 # FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
 # to force the vendored Triton chunk_gated_delta_rule everywhere. FlashInfer
@@ -1211,7 +1215,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ssm_states = layer_cache.temporal
 
         state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
-        if num_prefills > 0:
+        if num_prefills > 0 and not (
+            _SKIP_NOOP_RESET and getattr(mamba_metadata, "all_initial_states", False)
+        ):
+            # Skipped when every prefill has initial state: each store is masked.
             # PyExecutor guarantees prefill requests are placed before decode requests
             has_initial_states_p = has_initial_states[:num_prefills]
             reset_recurrent_state_rows(
