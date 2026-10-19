@@ -21,6 +21,8 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "87bcb21958a58c5bf22327e50aa0fdfee0
 CASES = os.environ.get("FMHA_CHECK_CASES", "c1,c4,ragged,empty").split(",")
 WARMUP = int(os.environ.get("FMHA_CHECK_WARMUP", "10"))
 ITERS = int(os.environ.get("FMHA_CHECK_ITERS", "50"))
+# FMHA_CHECK_SPLIT=-1 runs both arms with the TRT-LLM dispatch of the last q-tile split (bench --split -1); default 0.
+SPLIT = os.environ.get("FMHA_CHECK_SPLIT", "0")
 W = "/tmp/fmha_ctx_check"
 HERE = os.path.dirname(os.path.abspath(__file__))
 TREE = os.getcwd()
@@ -120,11 +122,12 @@ def main():
         d = f"{W}/dump_{arm}"
         os.makedirs(d, exist_ok=True)
         r = subprocess.run([f"{W}/bench_{arm}", "--cases", ",".join(CASES), "--warmup", str(WARMUP), "--iters",
-                            str(ITERS), "--dump", d], capture_output=True, text=True)
+                            str(ITERS), "--dump", d, "--split", SPLIT], capture_output=True, text=True)
         print(f"===== {arm} (rc {r.returncode}) =====\n{r.stdout}{r.stderr}", flush=True)
         runs[arm] = (r.returncode,) + parse(r.stdout)
 
-    summary = {"base_commit": BASE, "kernel": {a: runs[a][3] for a in runs}, "cases": {}}
+    summary = {"base_commit": BASE, "split": SPLIT, "warmup": WARMUP, "iters": ITERS,
+               "kernel": {a: runs[a][3] for a in runs}, "cases": {}}
     passed = runs["base"][0] == 0 and runs["cand"][0] == 0
     for case in CASES:
         rb, rc = runs["base"][1][case], runs["cand"][1][case]
