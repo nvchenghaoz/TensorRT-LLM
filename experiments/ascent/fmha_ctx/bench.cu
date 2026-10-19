@@ -360,6 +360,11 @@ static bool make_case(std::string const& name, Problem& p)
         p.q_lens = {2048, 2048, 2048, 2048};
         p.past_lens = {P, P, P, P};
     }
+    else if (name == "c3")
+    {
+        p.q_lens = {2048, 2048, 2048}; // c4 serving's trio prefill: 3 x 32 x 24 = 2304 CTAs
+        p.past_lens = {P, P, P};
+    }
     else if (name == "c1_1984")
     {
         p.q_lens = {1984}; // 31 x 24 = 744 CTAs (tail-wave probe)
@@ -399,6 +404,7 @@ int main(int argc, char** argv)
     std::string dump;
     int warmup = 10, iters = 50;
     int split = 0;
+    std::string arms_arg;
     uint64_t seed = 1234;
     for (int i = 1; i + 1 < argc; i += 2)
     {
@@ -415,6 +421,28 @@ int main(int argc, char** argv)
             seed = strtoull(argv[i + 1], nullptr, 10);
         else if (a == "--split")
             split = atoi(argv[i + 1]);
+        else if (a == "--arms")
+            arms_arg = argv[i + 1];
+    }
+    // --arms name:max_batch,...: per case, every round runs each arm once (order rotated by one arm per round), each
+    // arm with the dispatch's piece count at its own max batch (--split -1). RESULT lines then end with the arm name.
+    std::vector<std::string> arm_names;
+    std::vector<int> arm_max_batch;
+    for (size_t q = 0; q < arms_arg.size();)
+    {
+        size_t c = arms_arg.find(',', q);
+        if (c == std::string::npos)
+            c = arms_arg.size();
+        std::string t = arms_arg.substr(q, c - q);
+        size_t colon = t.find(':');
+        if (colon == std::string::npos)
+        {
+            fprintf(stderr, "bad --arms item %s (want name:max_batch)\n", t.c_str());
+            return 4;
+        }
+        arm_names.push_back(t.substr(0, colon));
+        arm_max_batch.push_back(atoi(t.substr(colon + 1).c_str()));
+        q = c + 1;
     }
 
     cudaDeviceProp prop;
@@ -439,8 +467,13 @@ int main(int argc, char** argv)
     namespace lts = fused_multihead_attention::last_tile_split;
     using Ws = lts::Workspace<Kt_causal>;
     static_assert(Kt_causal::BYTES_PER_SMEM == Kt_launch::BYTES_PER_SMEM, "");
-    // The constants of the TRT-LLM dispatch (last_tile_split_sm120/fmha_v2_e4m3_last_tile_split_sm120.cu).
-    constexpr int kMaxPiecesTotal = 384, kMaxPieces = 16, kMaxBatch = 2;
+    // The constants of the TRT-LLM dispatch (last_tile_split_sm120/fmha_v2_e4m3_last_tile_split_sm120.cu). kMaxBatch
+    // mirrors that file's constant: build with -DBENCH_MAX_BATCH=<its value> (check_split.py reads it per tree).
+#ifndef BENCH_MAX_BATCH
+#define BENCH_MAX_BATCH 2
+#endif
+    constexpr int kMaxPiecesTotal = 384, kMaxPieces = 16, kMaxBatch = BENCH_MAX_BATCH;
+    printf("[split] bench kMaxBatch %d\n", kMaxBatch);
     float4* ws_acc = nullptr;
     float4* ws_stats = nullptr;
     int slots = 0;
