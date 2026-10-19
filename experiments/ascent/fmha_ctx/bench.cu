@@ -404,6 +404,7 @@ int main(int argc, char** argv)
     std::string dump;
     int warmup = 10, iters = 50;
     int split = 0;
+    std::string arms_arg;
     uint64_t seed = 1234;
     for (int i = 1; i + 1 < argc; i += 2)
     {
@@ -420,6 +421,28 @@ int main(int argc, char** argv)
             seed = strtoull(argv[i + 1], nullptr, 10);
         else if (a == "--split")
             split = atoi(argv[i + 1]);
+        else if (a == "--arms")
+            arms_arg = argv[i + 1];
+    }
+    // --arms name:max_batch,...: per case, every round runs each arm once (order rotated by one arm per round), each
+    // arm with the dispatch's piece count at its own max batch (--split -1). RESULT lines then end with the arm name.
+    std::vector<std::string> arm_names;
+    std::vector<int> arm_max_batch;
+    for (size_t q = 0; q < arms_arg.size();)
+    {
+        size_t c = arms_arg.find(',', q);
+        if (c == std::string::npos)
+            c = arms_arg.size();
+        std::string t = arms_arg.substr(q, c - q);
+        size_t colon = t.find(':');
+        if (colon == std::string::npos)
+        {
+            fprintf(stderr, "bad --arms item %s (want name:max_batch)\n", t.c_str());
+            return 4;
+        }
+        arm_names.push_back(t.substr(0, colon));
+        arm_max_batch.push_back(atoi(t.substr(colon + 1).c_str()));
+        q = c + 1;
     }
 
     cudaDeviceProp prop;
@@ -444,8 +467,13 @@ int main(int argc, char** argv)
     namespace lts = fused_multihead_attention::last_tile_split;
     using Ws = lts::Workspace<Kt_causal>;
     static_assert(Kt_causal::BYTES_PER_SMEM == Kt_launch::BYTES_PER_SMEM, "");
-    // The constants of the TRT-LLM dispatch (last_tile_split_sm120/fmha_v2_e4m3_last_tile_split_sm120.cu).
-    constexpr int kMaxPiecesTotal = 384, kMaxPieces = 16, kMaxBatch = 2;
+    // The constants of the TRT-LLM dispatch (last_tile_split_sm120/fmha_v2_e4m3_last_tile_split_sm120.cu). kMaxBatch
+    // mirrors that file's constant: build with -DBENCH_MAX_BATCH=<its value> (check_split.py reads it per tree).
+#ifndef BENCH_MAX_BATCH
+#define BENCH_MAX_BATCH 2
+#endif
+    constexpr int kMaxPiecesTotal = 384, kMaxPieces = 16, kMaxBatch = BENCH_MAX_BATCH;
+    printf("[split] bench kMaxBatch %d\n", kMaxBatch);
     float4* ws_acc = nullptr;
     float4* ws_stats = nullptr;
     int slots = 0;
@@ -505,37 +533,57 @@ int main(int argc, char** argv)
         }
         build(p, seed);
         dim3 g = grid_of(p);
-        // The split: launch A = the generated kernel on s - 64 (q-tiles 0 .. Q-2), then B (pieces) and C (merge).
-        int pieces = 0;
-        bert::Fused_multihead_attention_params_v2 params_a = p.params;
-        dim3 g_a = g;
         int const q_loop_last = (p.params.s + 64 - 1) / 64 - 1;
-#if HAVE_LAST_TILE_SPLIT
-        if (split != 0)
+        // One arm without --arms; with --arms, one per item (same inputs, rotated order per round).
+        struct Arm
         {
-            // Auto: as the TRT-LLM dispatch (last_tile_split_sm120: at most 2 sequences). A fixed k: any batch.
-            int const auto_k
-                = lts::choose_num_pieces(p.b, p.h, p.params.s, 64, slots, kMaxPiecesTotal, kMaxPieces, kMaxBatch);
-            int const any_k
-                = lts::choose_num_pieces(p.b, p.h, p.params.s, 64, slots, kMaxPiecesTotal, kMaxPieces, INT_MAX);
-            pieces = split < 0 ? auto_k : (any_k > 0 ? std::min(split, kMaxPiecesTotal / (p.b * p.h)) : 0);
-            if (pieces > 0)
+            std::string name;
+            int max_batch = 0;
+            // The split: launch A = the generated kernel on s - 64 (q-tiles 0 .. Q-2), then B (pieces) and C (merge).
+            int pieces = 0;
+            bert::Fused_multihead_attention_params_v2 params_a{};
+            dim3 g_a;
+            std::vector<float> times;
+            unsigned long long out_hash1 = 0, nonfinite = 0;
+            int mismatches = 0;
+        };
+        std::vector<Arm> arms(arm_names.empty() ? 1 : arm_names.size());
+        for (size_t ai = 0; ai < arms.size(); ++ai)
+        {
+            Arm& A = arms[ai];
+            A.name = arm_names.empty() ? std::string() : arm_names[ai];
+            A.params_a = p.params;
+            A.g_a = g;
+#if HAVE_LAST_TILE_SPLIT
+            A.max_batch = arm_names.empty() ? kMaxBatch : arm_max_batch[ai];
+            if (split != 0)
             {
-                params_a.s -= 64;
-                g_a = grid_of(params_a);
+                // Auto: as the TRT-LLM dispatch (last_tile_split_sm120: at most max_batch sequences). A fixed k: any
+                // batch.
+                int const auto_k = lts::choose_num_pieces(
+                    p.b, p.h, p.params.s, 64, slots, kMaxPiecesTotal, kMaxPieces, A.max_batch);
+                int const any_k
+                    = lts::choose_num_pieces(p.b, p.h, p.params.s, 64, slots, kMaxPiecesTotal, kMaxPieces, INT_MAX);
+                A.pieces = split < 0 ? auto_k : (any_k > 0 ? std::min(split, kMaxPiecesTotal / (p.b * p.h)) : 0);
+                if (A.pieces > 0)
+                {
+                    A.params_a.s -= 64;
+                    A.g_a = grid_of(A.params_a);
+                }
+                printf("SPLIT %s pieces %d q_loop_last %d ctas_a %u ctas_b %d%s%s\n", cname.c_str(), A.pieces,
+                    q_loop_last, A.g_a.x * A.g_a.y * A.g_a.z, A.pieces * p.b * p.h, A.name.empty() ? "" : " ",
+                    A.name.c_str());
+                fflush(stdout);
             }
-            printf("SPLIT %s pieces %d q_loop_last %d ctas_a %u ctas_b %d\n", cname.c_str(), pieces, q_loop_last,
-                g_a.x * g_a.y * g_a.z, pieces * p.b * p.h);
-            fflush(stdout);
-        }
 #endif
-        auto launch = [&]()
+        }
+        auto launch = [&](Arm const& A)
         {
-            if (pieces > 0)
+            if (A.pieces > 0)
             {
 #if HAVE_LAST_TILE_SPLIT
-                KERNEL<<<g_a, Kt_launch::THREADS, smem, st>>>(params_a);
-                CK(lts::launch_last_tile_split<Kt_causal>(p.params, q_loop_last, pieces, ws_acc, ws_stats, st));
+                KERNEL<<<A.g_a, Kt_launch::THREADS, smem, st>>>(A.params_a);
+                CK(lts::launch_last_tile_split<Kt_causal>(p.params, q_loop_last, A.pieces, ws_acc, ws_stats, st));
 #endif
             }
             else
@@ -545,57 +593,71 @@ int main(int argc, char** argv)
         };
         unsigned long long q_hash0 = run_reduce(0, p.q, p.q_bytes, d_tmp, st);
         unsigned long long kv_hash0 = run_reduce(0, p.pool, p.pool_bytes, d_tmp, st);
-        std::vector<float> times;
-        unsigned long long out_hash1 = 0, nonfinite = 0;
-        int mismatches = 0;
         int const total = warmup + iters;
+        int const n_arms = (int) arms.size();
         for (int it = 0; it < total; ++it)
         {
-            // Reset point: NaN-poison O, then read-flush L2 (both untimed).
-            CK(cudaMemsetAsync(p.o, 0xFF, p.o_bytes, st));
+            for (int j = 0; j < n_arms; ++j)
+            {
+                // Round it runs the arms starting at arm (it % n): every arm takes every position equally often.
+                Arm& A = arms[(it + j) % n_arms];
+                // Reset point: NaN-poison O, then read-flush L2 (both untimed).
+                CK(cudaMemsetAsync(p.o, 0xFF, p.o_bytes, st));
 #if HAVE_LAST_TILE_SPLIT
-            if (pieces > 0)
-            {
-                // The split's workspace too (every piece must write what the merge reads).
-                CK(cudaMemsetAsync(ws_acc, 0xFF, sizeof(float4) * Ws::ACC_FLOAT4S_PER_PIECE * kMaxPiecesTotal, st));
-                CK(cudaMemsetAsync(ws_stats, 0xFF, sizeof(float4) * Ws::STATS_FLOAT4S_PER_PIECE * kMaxPiecesTotal, st));
-            }
+                if (A.pieces > 0)
+                {
+                    // The split's workspace too (every piece must write what the merge reads).
+                    CK(cudaMemsetAsync(
+                        ws_acc, 0xFF, sizeof(float4) * Ws::ACC_FLOAT4S_PER_PIECE * kMaxPiecesTotal, st));
+                    CK(cudaMemsetAsync(
+                        ws_stats, 0xFF, sizeof(float4) * Ws::STATS_FLOAT4S_PER_PIECE * kMaxPiecesTotal, st));
+                }
 #endif
-            flush_read<<<prop.multiProcessorCount * 4, 512, 0, st>>>(
-                reinterpret_cast<uint4 const*>(flush_buf), flush_bytes / 16, d_sink);
-            CK(cudaEventRecord(ev0, st));
-            launch();
-            CK(cudaEventRecord(ev1, st));
-            CK(cudaGetLastError());
-            CK(cudaEventSynchronize(ev1));
-            float ms = 0.f;
-            CK(cudaEventElapsedTime(&ms, ev0, ev1));
-            if (it >= warmup)
-            {
-                times.push_back(ms);
-            }
-            unsigned long long hsh = run_reduce(0, p.o, p.o_bytes, d_tmp, st);
-            nonfinite = std::max(nonfinite, run_reduce(1, p.o, p.o_bytes, d_tmp, st));
-            if (it == 0)
-            {
-                out_hash1 = hsh;
-            }
-            mismatches += hsh != out_hash1;
-            if (it == 0 || it == warmup || it == total - 1)
-            {
-                printf("[%s] call %d/%d %.4f ms out_hash %016llx\n", cname.c_str(), it + 1, total, ms, hsh);
-                fflush(stdout);
+                flush_read<<<prop.multiProcessorCount * 4, 512, 0, st>>>(
+                    reinterpret_cast<uint4 const*>(flush_buf), flush_bytes / 16, d_sink);
+                CK(cudaEventRecord(ev0, st));
+                launch(A);
+                CK(cudaEventRecord(ev1, st));
+                CK(cudaGetLastError());
+                CK(cudaEventSynchronize(ev1));
+                float ms = 0.f;
+                CK(cudaEventElapsedTime(&ms, ev0, ev1));
+                if (it >= warmup)
+                {
+                    A.times.push_back(ms);
+                }
+                unsigned long long hsh = run_reduce(0, p.o, p.o_bytes, d_tmp, st);
+                A.nonfinite = std::max(A.nonfinite, run_reduce(1, p.o, p.o_bytes, d_tmp, st));
+                if (it == 0)
+                {
+                    A.out_hash1 = hsh;
+                }
+                A.mismatches += hsh != A.out_hash1;
+                if (it == 0 || it == warmup || it == total - 1)
+                {
+                    printf("[%s%s%s] call %d/%d %.4f ms out_hash %016llx\n", cname.c_str(), A.name.empty() ? "" : " ",
+                        A.name.c_str(), it + 1, total, ms, hsh);
+                    fflush(stdout);
+                }
             }
         }
         bool inputs_ok = q_hash0 == run_reduce(0, p.q, p.q_bytes, d_tmp, st)
             && kv_hash0 == run_reduce(0, p.pool, p.pool_bytes, d_tmp, st);
-        all_ok = all_ok && mismatches == 0 && inputs_ok && nonfinite == 0;
-        double med = pct(times, 0.5), p10 = pct(times, 0.1), p90 = pct(times, 0.9);
-        double mn = *std::min_element(times.begin(), times.end());
-        printf("RESULT %s %d %u %.5f %.5f %.5f %.5f %.5f %d %d %llu %d %016llx\n", cname.c_str(), p.b, g.x * g.y * g.z,
-            med, p10, p90, mn, (p90 - p10) / med, mismatches, total, nonfinite, (int) inputs_ok, out_hash1);
+        for (Arm const& A : arms)
+        {
+            all_ok = all_ok && A.mismatches == 0 && inputs_ok && A.nonfinite == 0;
+            double med = pct(A.times, 0.5), p10 = pct(A.times, 0.1), p90 = pct(A.times, 0.9);
+            double mn = *std::min_element(A.times.begin(), A.times.end());
+            printf("RESULT %s %d %u %.5f %.5f %.5f %.5f %.5f %d %d %llu %d %016llx%s%s\n", cname.c_str(), p.b,
+                g.x * g.y * g.z, med, p10, p90, mn, (p90 - p10) / med, A.mismatches, total, A.nonfinite,
+                (int) inputs_ok, A.out_hash1, A.name.empty() ? "" : " ", A.name.c_str());
+        }
         fflush(stdout);
-        if (!dump.empty())
+        if (!dump.empty() && n_arms > 1)
+        {
+            printf("[dump] skipped: --dump needs a single arm\n");
+        }
+        else if (!dump.empty())
         {
             write_file(dump + "/" + cname + "_o.bin", p.o, p.o_bytes);
             write_file(dump + "/" + cname + "_q.bin", p.q, p.q_bytes);

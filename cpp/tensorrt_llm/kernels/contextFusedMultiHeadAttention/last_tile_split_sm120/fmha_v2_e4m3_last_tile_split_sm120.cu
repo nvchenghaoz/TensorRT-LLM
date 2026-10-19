@@ -25,9 +25,10 @@
 //   B) runs the last q-tile of every (head, sequence) as `pieces` CTAs over contiguous KV ranges (one wave);
 //   C) merges the pieces in a fixed order and stores O with the unchanged epilogue.
 // The device code lives in cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_noloop_tiled_last_tile_split.h.
-// It is only used when dropping the last q-tile from the generated grid saves a whole wave, and for batches of 1 or 2
-// sequences (measured: -14.5% per call at 1 x 2048 over 32768 cached tokens, -5% at 2 x 2048; -1% at 4 x 2048,
-// where it is not used).
+// It is only used when dropping the last q-tile from the generated grid saves a whole wave, and for batches of 1 to 3
+// sequences (measured: -14.5% per call at 1 x 2048 over 32768 cached tokens, -5% at 2 x 2048, -3% at 3 x 2048
+// (job 702: 2304 CTAs = 6.13 waves -> A 2232 CTAs = 5.94 waves + 360 pieces, k = 5); -1% at 4 x 2048, where it is
+// not used).
 
 #include <fmha/kernel_traits.h>
 #include <fused_multihead_attention.h>
@@ -49,8 +50,8 @@ constexpr int kStepQ = 64;
 // At most this many pieces per (head, sequence), and in total (the workspace).
 constexpr int kMaxPieces = 16;
 constexpr int kMaxPiecesTotal = 384;
-// The largest batch the split is used for.
-constexpr int kMaxBatch = 2;
+// The largest batch the split is used for (3: the c4 serving trio prefill, 3 x 24 x 5 = 360 pieces <= 384).
+constexpr int kMaxBatch = 3;
 
 static_assert(Kt_causal::STORE_O_FROM_REGS, "");
 static_assert(Kt_causal::Cta_tile_p::M == kStepQ, "");

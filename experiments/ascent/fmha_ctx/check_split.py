@@ -12,21 +12,33 @@ with --split -1 (the TRT-LLM dispatch), dumps the last output and compares:
     max-abs and mean-abs error <= 1.25 x main's + 1 BF16 ulp of the output magnitude, no NaN/Inf; plus the same
     tolerance on whole sequences for heads 0/11/23 (first and last sequence).
 Last stdout line: {"passed": ..., ...}.
+
+Branch 99 (idea 165, kMaxBatch 2 -> 3): BASE is main's explicit sha (66c3ff64, which carries the split at b <= 2).
+Each arm's bench is built from its own tree with -DBENCH_MAX_BATCH = that tree's TRT-LLM dispatch constant
+(last_tile_split_sm120/fmha_v2_e4m3_last_tile_split_sm120.cu kMaxBatch; override with FMHA_BASE_NVCC /
+FMHA_CAND_NVCC), so the bench dispatch mirrors each tree. Cases where both arms dispatch the same pieces (c1/c2 split
+in both, c4 / one unsplit in both) must be bitwise equal to main as a whole; a case only the candidate splits (c3)
+keeps rows of q-tiles 0..Q-2 bitwise and the last q-tile within the reordered tolerance. FMHA_CHECK_SPLIT (default -1,
+the dispatch), FMHA_CHECK_CASES, FMHA_CHECK_WARMUP, FMHA_CHECK_ITERS override the run.
 """
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 
 import numpy as np
 import torch
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "ffca2830a0339bc8f3d29a5b1fbf603b5de872c1"
-CASES = ["c1", "c2", "c3", "c4", "ragged", "empty", "one", "c1_2000"]
+BASE = sys.argv[1] if len(sys.argv) > 1 else "66c3ff64b97af2aafa395ed53e3d74ca40446262"
+CASES = os.environ.get("FMHA_CHECK_CASES", "c1,c2,c3,c4,ragged,empty,one,c1_2000").split(",")
 # Overridable (defaults unchanged): FMHA_CHECK_WARMUP=10 FMHA_CHECK_ITERS=50
 WARMUP = int(os.environ.get("FMHA_CHECK_WARMUP", "10"))
 ITERS = int(os.environ.get("FMHA_CHECK_ITERS", "50"))
+SPLIT = os.environ.get("FMHA_CHECK_SPLIT", "-1")
+DISPATCH_CU = ("cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/last_tile_split_sm120/"
+               "fmha_v2_e4m3_last_tile_split_sm120.cu")
 W = "/tmp/fmha_ctx_check_split"
 HERE = os.path.dirname(os.path.abspath(__file__))
 TREE = os.getcwd()
@@ -55,6 +67,14 @@ def parse(stdout):
         elif t[0] == "SPLIT":
             split[t[1]] = dict(pieces=int(t[3]), q_loop_last=int(t[5]))
     return res, meta, split
+
+
+def max_batch_of(cu_path):
+    """The TRT-LLM dispatch's kMaxBatch in a tree (None if the split file is absent)."""
+    if not os.path.exists(cu_path):
+        return None
+    m = re.search(r"constexpr int kMaxBatch = (\d+);", open(cu_path).read())
+    return int(m.group(1)) if m else None
 
 
 def load_o(d, case):
@@ -110,25 +130,35 @@ def within(err_c, err_m):
 
 def main():
     os.makedirs(f"{W}/base", exist_ok=True)
+    sh(f"rm -rf {W}/base/cpp")
     sh(f"git archive {BASE} cpp/kernels/fmha_v2/src | tar -x -C {W}/base")
-    sh(f"bash {HERE}/build.sh {W}/base/cpp/kernels/fmha_v2/src {W}/bench_base")
-    sh(f"bash {HERE}/build.sh {TREE}/cpp/kernels/fmha_v2/src {W}/bench_cand")
+    sh(f"git archive {BASE} {DISPATCH_CU} | tar -x -C {W}/base || true")
+    mb_base = max_batch_of(f"{W}/base/{DISPATCH_CU}")
+    mb_cand = max_batch_of(f"{TREE}/{DISPATCH_CU}")
+    nv_base = os.environ.get("FMHA_BASE_NVCC", f"-DBENCH_MAX_BATCH={mb_base}" if mb_base else "")
+    nv_cand = os.environ.get("FMHA_CAND_NVCC", f"-DBENCH_MAX_BATCH={mb_cand}" if mb_cand else "")
+    print(f"[check] base {BASE} kMaxBatch {mb_base} nvcc '{nv_base}'; cand {TREE} kMaxBatch {mb_cand} "
+          f"nvcc '{nv_cand}'", flush=True)
+    sh(f"bash {HERE}/build.sh {W}/base/cpp/kernels/fmha_v2/src {W}/bench_base {nv_base}")
+    sh(f"bash {HERE}/build.sh {TREE}/cpp/kernels/fmha_v2/src {W}/bench_cand {nv_cand}")
     runs = {}
     for arm in ("base", "cand"):
         d = f"{W}/dump_{arm}"
         os.makedirs(d, exist_ok=True)
         r = subprocess.run([f"{W}/bench_{arm}", "--cases", ",".join(CASES), "--warmup", str(WARMUP), "--iters",
-                            str(ITERS), "--dump", d, "--split", "-1"], capture_output=True, text=True)
+                            str(ITERS), "--dump", d, "--split", SPLIT], capture_output=True, text=True)
         print(f"===== {arm} (rc {r.returncode}) =====\n{r.stdout}{r.stderr}", flush=True)
         runs[arm] = (r.returncode,) + parse(r.stdout)
 
-    summary = {"base_commit": BASE, "warmup": WARMUP, "iters": ITERS, "cases": {}}
+    summary = {"base_commit": BASE, "base_max_batch": mb_base, "cand_max_batch": mb_cand, "base_nvcc": nv_base,
+               "cand_nvcc": nv_cand, "split_mode": SPLIT, "warmup": WARMUP, "iters": ITERS, "cases": {}}
     passed = runs["base"][0] == 0 and runs["cand"][0] == 0
     db, dc = f"{W}/dump_base", f"{W}/dump_cand"
     for case in CASES:
         rb, rc = runs["base"][1][case], runs["cand"][1][case]
         m = runs["cand"][2][case]
         sp = runs["cand"][3].get(case, dict(pieces=0, q_loop_last=-1))
+        sp_base = runs["base"][3].get(case, dict(pieces=0, q_loop_last=-1))
         same_inputs = all(
             np.array_equal(np.fromfile(f"{db}/{case}_{n}.bin", dtype=np.uint8),
                            np.fromfile(f"{dc}/{case}_{n}.bin", dtype=np.uint8)) for n in ("q", "pool", "offs"))
@@ -137,6 +167,7 @@ def main():
         raw_c = np.fromfile(f"{dc}/{case}_o.bin", dtype=np.uint16).reshape(-1, H, DIM)
         cu = np.concatenate([[0], np.cumsum(m["q_lens"])])
         entry = {"q_lens": m["q_lens"], "past_lens": m["past_lens"], "pieces": sp["pieces"],
+                 "pieces_cand": sp["pieces"], "pieces_base": sp_base["pieces"],
                  "same_inputs": same_inputs, "calls": rc["calls"],
                  "cand_repeat_mismatches_vs_call1": rc["repeat_mismatches"],
                  "main_repeat_mismatches_vs_call1": rb["repeat_mismatches"], "cand_nonfinite": rc["nonfinite"],
@@ -144,7 +175,8 @@ def main():
                  "out_hash_cand": rc["out_hash"]}
         ok = (same_inputs and rc["repeat_mismatches"] == 0 and rb["repeat_mismatches"] == 0 and rc["nonfinite"] == 0
               and rc["inputs_unchanged"])
-        if sp["pieces"] == 0:
+        if sp["pieces"] == sp_base["pieces"]:
+            # Same dispatch in both arms (unsplit in both, or the same piece count): the whole output bitwise.
             diff = int((raw_b != raw_c).sum())
             entry["bitwise_equal_to_main"] = diff == 0
             entry["diff_elems"] = diff
@@ -208,6 +240,17 @@ def main():
             entry["whole_fp32_ref_cand_h0_11_23"] = werr_c
             entry["whole_tolerance_ok"] = wok
             ok = ok and wok
+        # The dispatch each arm's bench mirrors, as each tree's TRT-LLM constant: b <= base / cand kMaxBatch split.
+        if SPLIT == "-1" and mb_base and mb_cand:
+            exp_base = m["b"] <= mb_base
+            exp_cand = m["b"] <= mb_cand
+            entry["dispatch_matches_tree_constant"] = ((sp_base["pieces"] > 0) <= exp_base
+                                                       and (sp["pieces"] > 0) <= exp_cand)
+            ok = ok and entry["dispatch_matches_tree_constant"]
+        # Idea 165's gate: c3 (3 x 2048 over 32768) unsplit on main (kMaxBatch 2), 5 pieces with kMaxBatch 3.
+        if case == "c3" and SPLIT == "-1" and mb_base == 2 and mb_cand == 3:
+            entry["c3_pieces_gate"] = sp["pieces"] == 5 and sp_base["pieces"] == 0
+            ok = ok and entry["c3_pieces_gate"]
         entry["ok"] = bool(ok)
         passed = passed and ok
         summary["cases"][case] = entry
