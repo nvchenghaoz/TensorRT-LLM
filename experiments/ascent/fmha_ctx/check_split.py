@@ -24,7 +24,9 @@ import torch
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "ffca2830a0339bc8f3d29a5b1fbf603b5de872c1"
 CASES = ["c1", "c2", "c3", "c4", "ragged", "empty", "one", "c1_2000"]
-WARMUP, ITERS = 10, 50
+# Overridable (defaults unchanged): FMHA_CHECK_WARMUP=10 FMHA_CHECK_ITERS=50
+WARMUP = int(os.environ.get("FMHA_CHECK_WARMUP", "10"))
+ITERS = int(os.environ.get("FMHA_CHECK_ITERS", "50"))
 W = "/tmp/fmha_ctx_check_split"
 HERE = os.path.dirname(os.path.abspath(__file__))
 TREE = os.getcwd()
@@ -120,7 +122,7 @@ def main():
         print(f"===== {arm} (rc {r.returncode}) =====\n{r.stdout}{r.stderr}", flush=True)
         runs[arm] = (r.returncode,) + parse(r.stdout)
 
-    summary = {"base_commit": BASE, "cases": {}}
+    summary = {"base_commit": BASE, "warmup": WARMUP, "iters": ITERS, "cases": {}}
     passed = runs["base"][0] == 0 and runs["cand"][0] == 0
     db, dc = f"{W}/dump_base", f"{W}/dump_cand"
     for case in CASES:
