@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "ffca2830a0339bc8f3d29a5b1fbf603b5de872c1"
-CASES = ["c1", "c2", "c4", "ragged", "empty", "one", "c1_2000"]
+CASES = ["c1", "c2", "c3", "c4", "ragged", "empty", "one", "c1_2000"]
 WARMUP, ITERS = 10, 50
 W = "/tmp/fmha_ctx_check_split"
 HERE = os.path.dirname(os.path.abspath(__file__))

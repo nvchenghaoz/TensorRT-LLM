@@ -360,6 +360,11 @@ static bool make_case(std::string const& name, Problem& p)
         p.q_lens = {2048, 2048, 2048, 2048};
         p.past_lens = {P, P, P, P};
     }
+    else if (name == "c3")
+    {
+        p.q_lens = {2048, 2048, 2048}; // c4 serving's trio prefill: 3 x 32 x 24 = 2304 CTAs
+        p.past_lens = {P, P, P};
+    }
     else if (name == "c1_1984")
     {
         p.q_lens = {1984}; // 31 x 24 = 744 CTAs (tail-wave probe)
