@@ -33,7 +33,7 @@ L = int(os.environ.get("S0_LAYERS", "12"))
 WARMUP = 10
 ITERS = int(os.environ.get("S0_ITERS", "100"))
 ROUNDS = int(os.environ.get("S0_ROUNDS", "3"))
-MS = [int(x) for x in os.environ.get("S0_MS", "1").split(",")]
+MS = [int(x) for x in os.environ.get("S0_MS", "1,2").split(",")]
 FP8_MAX, E2M1_MAX = 448.0, 6.0
 FLUSH_BYTES = 512 << 20
 
@@ -447,6 +447,7 @@ def main():
             nf = sum(int(not torch.isfinite(o.float()).all()) for o in eager_main)
             ts = {a: [] for a in ARMS}
             mism = {a: 0 for a in ARMS if a not in ("prod",)}
+            prod_mism = [0]
             for rnd in range(ROUNDS):
                 graphs, outs = {}, {}
                 for arm in ARMS:
@@ -470,11 +471,10 @@ def main():
                 # bitwise vs eager main after all replays
                 for arm in mism:
                     mism[arm] += sum(int(not torch.equal(outs[arm][i], eager_main[i])) for i in range(L))
-                pm = sum(int(not torch.equal(outs["prod"][i], pre[i][0])) for i in range(L))
-                mism.setdefault("prod_vs_eager_fp4", 0)
-                mism["prod_vs_eager_fp4"] += pm
+                prod_mism[0] += sum(int(not torch.equal(outs["prod"][i], pre[i][0])) for i in range(L))
                 log(f"[s0] M={m} chain {cname} round {rnd}: " + json.dumps(
-                    {a: round(q(ts[a][-ITERS:], 0.5), 3) for a in ARMS}) + f" mism={mism} ({time.time() - t0:.0f}s)")
+                    {a: round(q(ts[a][-ITERS:], 0.5), 3) for a in ARMS}) +
+                    f" mism={mism} prod_mism={prod_mism[0]} ({time.time() - t0:.0f}s)")
                 del graphs, outs
                 torch.cuda.synchronize()
             rec = {a: summ(ts[a]) for a in ARMS}
@@ -490,7 +490,8 @@ def main():
             d_mp = [x - y for x, y in zip(ts["main"], ts["plain"])]
             pair["main_minus_plain"] = summ(d_mp)
             rec["paired"] = pair
-            rec["bitwise_mismatch"] = {"graph": mism, "eager_variants": eager_mm, "main_nonfinite": nf}
+            rec["bitwise_mismatch"] = {"graph": mism, "eager_variants": eager_mm, "prod_vs_eager_fp4": prod_mism[0],
+                                       "main_nonfinite": nf}
             results[f"M{m}/{cname}"] = rec
             log(f"[s0] RESULT M={m} {cname}: " + json.dumps(rec))
             del layers, pre, eager_main
