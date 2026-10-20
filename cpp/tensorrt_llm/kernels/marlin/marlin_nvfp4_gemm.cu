@@ -146,18 +146,11 @@ int full_k_smem_bytes(int threads, int thread_n_blocks, int thread_k_blocks, int
 }
 
 // Full-K launch of the in_proj decode shapes (n = 16384 / 14336, k = 5120):
-// TRTLLM_MARLIN_INPROJ_FULLK, read per call. "0" restores the split-K launch;
-// unset (or anything else) selects 128 threads, {64k, 128n}, 6 stages. Sweep-only
-// value "w": the default 256-thread {128k, 128n} 4-stage tile on the same
-// one-CTA-per-column grid. Returns the pipeline stages, or 0 for off.
-int marlin_inproj_full_k_stages()
+// TRTLLM_MARLIN_INPROJ_FULLK, read per call; "0" restores the split-K launch.
+bool marlin_inproj_full_k_enabled()
 {
     char const* v = std::getenv("TRTLLM_MARLIN_INPROJ_FULLK");
-    if (v != nullptr && v[0] == '0' && v[1] == '\0')
-        return 0;
-    if (v != nullptr && v[0] == 'w' && v[1] == '\0')
-        return 4;
-    return 6;
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
 }
 
 // Largest number of split-K stripes the default `grid`-CTA launch gives one column.
@@ -278,34 +271,21 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
         }
 
         // GDN in_proj_qkvz (n=16384) / attention qkv_proj (n=14336), k=5120, at decode
-        // rows <= 8: one CTA per 128-wide column streaming the whole K (iters == k_tiles,
-        // slice_count 1, no lock use) instead of `blocks` split-K CTAs whose partial sums
-        // chain through the BF16 output. Reordered: each column's fp32 sum is rounded once.
+        // rows <= 8: one CTA per 128-wide column (128 threads, {64k, 128n}, 6 stages)
+        // streaming the whole K (iters == k_tiles, slice_count 1, no lock use) instead
+        // of `blocks` split-K CTAs whose partial sums chain through the BF16 output.
+        // Reordered: each column's fp32 sum is rounded to BF16 once.
+        thread_config_t const in_proj_cfg = {64, 128, 128};
         if (full_k_flags == 0 && prob_m <= 8 && m_block_size_8 && thread_m_blocks == 1 && group_blocks == 1
             && exec_cfg.blocks_per_sm == 1 && !use_fp32_reduce && prob_k == 5120
-            && (prob_n == 16384 || prob_n == 14336))
+            && (prob_n == 16384 || prob_n == 14336) && prob_n / in_proj_cfg.thread_n <= blocks
+            && is_valid_config(
+                in_proj_cfg, thread_m_blocks, prob_n, prob_k, num_bits, group_size, 6, max_shared_mem_new - 512)
+            && marlin_inproj_full_k_enabled())
         {
-            int const fk_stages = marlin_inproj_full_k_stages();
-            thread_config_t fk_cfg = {64, 128, 128};
-            if (fk_stages == 4)
-            {
-                fk_cfg = {128, 128, 256};
-            }
-            if (fk_stages != 0 && prob_n / fk_cfg.thread_n <= blocks
-                && is_valid_config(fk_cfg, thread_m_blocks, prob_n, prob_k, num_bits, group_size, fk_stages,
-                    max_shared_mem_new - 512))
-            {
-                if (fk_stages == 4)
-                {
-                    kernel = Marlin<nv_bfloat16, 256, 1, 8, 8, true, 4, 1>;
-                }
-                else
-                {
-                    kernel = Marlin<nv_bfloat16, 128, 1, 8, 4, true, 6, 1>;
-                }
-                num_threads = fk_cfg.num_threads;
-                grid = prob_n / fk_cfg.thread_n;
-            }
+            kernel = Marlin<nv_bfloat16, 128, 1, 8, 4, true, 6, 1>;
+            num_threads = in_proj_cfg.num_threads;
+            grid = prob_n / in_proj_cfg.thread_n;
         }
 
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new);

@@ -3,8 +3,10 @@
 # Arms in ONE process (env TRTLLM_MARLIN_INPROJ_FULLK read per call, at capture):
 #   A  = "0"  : main's 188-CTA split-K launch (kill switch)
 #   F6 = unset: 128 threads, {64k,128n}, 6 stages, grid N/128 (the branch default)
-#   W  = "w"  : main's 256-thread {128k,128n} 4-stage tile on the N/128 grid
+#   W  = "w"  : job 926 (commit a3e9b20a) only: main's 256-thread {128k,128n} 4-stage tile on
+#               the N/128 grid; the option was removed afterwards, so on later commits W == F6
 #   AA = "0"  : a second graph of arm A (A/A bias floor)
+# On a tree without the switch (main), every arm runs main's launch.
 # Cold L2: each graph chains C distinct weight copies (C x bytes >= 600 MB) and a 512 MiB
 # READ flush (sum) runs before every replay outside the timed events. Arm order cycles
 # through all 24 permutations. 10 warmup + 100 timed replays, PDL on.
@@ -207,5 +209,7 @@ batch = dict()
 for m in MS:
     d = results["qkvz"][str(m)]["F6"]
     batch[str(m)] = dict(kernel_ms=d["med"] / 1e3, noise_floor=(d["p90"] - d["p10"]) / d["med"])
-print(json.dumps(dict(batch=batch, output=dict(cls="reordered"), gate=gate, results=results,
+output = dict()
+output["class"] = "reordered"
+print(json.dumps(dict(batch=batch, output=output, gate=gate, results=results,
                       warm=WARM, iters=ITERS)))
