@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemmNVFP4.h"
+#include <cstdlib>
 #include <cub/cub.cuh>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -55,14 +56,16 @@ __device__ __forceinline__ int4 loadWeightNoL1(void const* ptr)
 // ACT_SF_SWIZZLED: scale_a is in the 128x4 swizzled layout written by fp4_quantize
 // (isSfSwizzledLayout=True) instead of the linear [m, k / 16] layout. Both read the same bytes,
 // so the output is identical.
+// PRE_PDL_WEIGHT_LOADS: issue the first K step's weight and weight-SF loads (constant data, never
+// written by a preceding kernel) before the PDL wait, with that step peeled. Same FMAs in the same
+// order either way, so the output is bitwise identical; see cudaCoreGemmKernel for the choice.
 template <typename InputType, typename OutputType, typename ScaleType, SizeType32 TILE_M, SizeType32 TILE_N,
-    SizeType32 BLOCK_SIZE, bool ACT_SF_SWIZZLED>
+    SizeType32 BLOCK_SIZE, bool ACT_SF_SWIZZLED, bool PRE_PDL_WEIGHT_LOADS>
 __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType const* __restrict__ weight,
     ScaleType const* __restrict__ scale_a, ScaleType const* __restrict__ scale_w, float const alpha,
     OutputType* __restrict__ output, OutputType const* __restrict__ bias, SizeType32 m, SizeType32 n, SizeType32 k)
 {
     using VecType = int4;
-    static constexpr bool PRE_PDL_WEIGHT_LOADS = TILE_M > 1;
 
     using ScaleVecType = __nv_fp8x2_e4m3;
     using CvtInputType = typename tensorrt_llm::kernels::cutlass_kernels::TllmToCutlassTypeAdapter<InputType>::type;
@@ -178,14 +181,11 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
     };
 
     SizeType32 const first_idx_k = tid * step_k;
-    // K-loop structure, chosen per TILE_M from cold-L2 CUDA-graph measurements on SM120
-    // (gate_up 34816x5120 and down 5120x17408). Both orders run the same FMAs in the same order,
-    // so the output is bitwise identical.
-    // - TILE_M == 1: plain loop after the PDL wait. Peeling the first step raises the register
-    //   count (40 -> 48), lowers occupancy and measured ~2% slower.
-    // - TILE_M >= 2: the first K step's weight and weight-SF loads (constant data) are issued
-    //   before the PDL wait so they overlap the producer's tail, and that step is peeled so the
-    //   remaining loop has no branch (M=2 gate_up ~5% faster than the plain loop).
+    // K-loop structure (PRE_PDL_WEIGHT_LOADS, chosen in cudaCoreGemmKernel). Both orders run the
+    // same FMAs in the same order, so the output is bitwise identical.
+    // - false: plain loop after the PDL wait.
+    // - true: the first K step's weight and weight-SF loads are issued before the PDL wait so they
+    //   overlap the producer, and that step is peeled so the remaining loop has no branch.
     if constexpr (!PRE_PDL_WEIGHT_LOADS)
     {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -264,16 +264,35 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
 }
 
 template <typename InputType, typename OutputType, typename ScaleType, SizeType32 TILE_M, SizeType32 TILE_N,
-    SizeType32 BLOCK_SIZE, bool ACT_SF_SWIZZLED>
+    SizeType32 BLOCK_SIZE, bool ACT_SF_SWIZZLED, bool PRE_PDL_WEIGHT_LOADS>
 __global__ void cudaCoreGemmFp4(InputType const* __restrict__ act, InputType const* __restrict__ weight,
     ScaleType const* __restrict__ scale_a, ScaleType const* __restrict__ scale_w, float const* alpha_ptr,
     OutputType* __restrict__ output, OutputType const* __restrict__ bias, SizeType32 m, SizeType32 n, SizeType32 k)
 {
     float alpha = alpha_ptr[0];
-    cudaCoreGemmImpl<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, ACT_SF_SWIZZLED>(
-        reinterpret_cast<InputType const*>(act), reinterpret_cast<InputType const*>(weight),
+    cudaCoreGemmImpl<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, ACT_SF_SWIZZLED,
+        PRE_PDL_WEIGHT_LOADS>(reinterpret_cast<InputType const*>(act), reinterpret_cast<InputType const*>(weight),
         reinterpret_cast<ScaleType const*>(scale_a), reinterpret_cast<ScaleType const*>(scale_w), alpha,
         reinterpret_cast<OutputType*>(output), reinterpret_cast<OutputType const*>(bias), m, n, k);
+}
+
+// Whether the first K step's weight loads go before the PDL wait (cold-L2 CUDA-graph chains on SM120).
+// - TILE_M >= 2: always (M=2 gate_up ~5% faster than the plain loop).
+// - TILE_M == 1: only when every thread runs >= 4 K steps (k >= 4 * tile_k, e.g. down 5120x17408).
+//   Behind fused_silu_mul_nvfp4, which triggers its dependents at its start, down's loads then stream
+//   while the producer runs: ~2.4 us/call faster. With 1-2 K steps per thread (gate_up 34816x5120) the
+//   peel's extra registers (40 -> 46-48) cost ~0.6 us/call and nothing is gained even behind an
+//   early-trigger producer, so short K keeps the plain loop.
+//   TRTLLM_CUDA_CORE_NVFP4_M1_PREWAIT=0 restores the plain loop for every K (kill switch). It is read per
+//   launch, so it takes effect at CUDA-graph capture.
+inline bool cudaCoreGemmM1PreWaitLoads(SizeType32 k, SizeType32 tile_k)
+{
+    char const* env = std::getenv("TRTLLM_CUDA_CORE_NVFP4_M1_PREWAIT");
+    if (env != nullptr && env[0] == '0' && env[1] == '\0')
+    {
+        return false;
+    }
+    return k >= 4 * tile_k;
 }
 
 template <typename InputType, typename OutputType, typename ScaleType, SizeType32 TILE_M, SizeType32 TILE_N,
@@ -288,9 +307,22 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
 
     using KernelFn = void (*)(InputType const*, InputType const*, ScaleType const*, ScaleType const*, float const*,
         OutputType*, OutputType const*, SizeType32, SizeType32, SizeType32);
-    KernelFn const cudaCoreGemmFp4Kernel = params.act_sf_swizzled
-        ? &cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, true>
-        : &cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, false>;
+    KernelFn cudaCoreGemmFp4Kernel = params.act_sf_swizzled
+        ? &cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, true, true>
+        : &cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, false, true>;
+    if constexpr (TILE_M == 1)
+    {
+        using CvtInputType =
+            typename tensorrt_llm::kernels::cutlass_kernels::TllmToCutlassTypeAdapter<InputType>::type;
+        constexpr SizeType32 tile_k
+            = static_cast<SizeType32>(128 / cutlass::sizeof_bits<CvtInputType>::value) * BLOCK_SIZE;
+        if (!cudaCoreGemmM1PreWaitLoads(params.k, tile_k))
+        {
+            cudaCoreGemmFp4Kernel = params.act_sf_swizzled
+                ? &cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, true, false>
+                : &cudaCoreGemmFp4<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE, false, false>;
+        }
+    }
 
     if (tensorrt_llm::common::getEnvEnablePDL())
     {
