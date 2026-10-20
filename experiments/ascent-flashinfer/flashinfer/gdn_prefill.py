@@ -137,6 +137,7 @@ def chunk_gated_delta_rule(
     checkpoint_every_n_tokens: int = 0,
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
+    num_long_seqs: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -234,6 +235,13 @@ def chunk_gated_delta_rule(
         into a packed buffer and scattering the result back. The pool may be
         non-compact (padded first-dimension stride). ``None`` (default) keeps
         the packed, sequence-ordered layout.
+
+    num_long_seqs : int, optional
+        Host-side hint (SM120 non-CP path only): an upper bound on the number
+        of sequences longer than one token, e.g. the caller's context-request
+        count in a mixed step where decodes ride along as 1-token sequences.
+        It only steers the V-split x2 kernel selection (bitwise-identical
+        results either way); ``None`` counts every sequence.
 
         The ids **must be unique**: as with any indexed scatter, two sequences
         sharing a slot id would concurrently write the same pool row across
@@ -558,6 +566,7 @@ def chunk_gated_delta_rule(
             if checkpoint_cu_starts is not None
             else None,
             checkpoint_every_n_tokens,
+            num_long_seqs=num_long_seqs,
         )
     elif _arch_major == 9:
         # SM90 Hopper path (CuTe DSL kernel)
