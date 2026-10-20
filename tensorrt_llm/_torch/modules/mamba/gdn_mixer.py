@@ -37,6 +37,7 @@ from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is
 from ..fp8_prefill_nvfp4 import get_prefill_nvfp4_copy
 from ..linear import _FP8_NVFP4_DECODE_MAX_ROWS, FP8QDQLinearMethod, Linear, TensorParallelMode
 from ..multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
+from . import PAD_SLOT_ID
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
 from .fuse_elementwise_ops import (
@@ -225,6 +226,15 @@ def _verify_intermediate_state_indices(
 # _compute_tokenwise_inputs path. 0 disables the fork at every row count.
 # Read at call time.
 _PREFILL_BA_FORK_MIN_ROWS = int(os.environ.get("TRTLLM_GDN_PREFILL_BA_FORK_MIN_ROWS", "4096"))
+
+# Pure-decode steps whose in_proj_qkvz runs on the cuda-core NVFP4 W4A16 GEMV (rows <= 3) fold
+# causal_conv1d_update into the GEMV epilogue (trtllm::nvfp4_w4a16_gemv_conv): each GEMV CTA owns
+# its output columns for every row, so it convolves its conv channels and shifts their conv state;
+# one launch per layer fewer, bitwise equal to the GEMV followed by causal_conv1d_update. Mixed or
+# prefill steps, speculative verification, rows >= 4 (Marlin) and the breakable-CUDA-graph /
+# torch.compile paths keep the separate conv. TRTLLM_GDN_GEMV_CONV=0 disables it (read at import).
+_GDN_GEMV_CONV = os.environ.get("TRTLLM_GDN_GEMV_CONV", "1") != "0"
+_GDN_GEMV_CONV_MAX_ROWS = 3
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
@@ -415,8 +425,100 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def post_load_weights(self) -> None:
         self.cache_derived_state()
 
-    def _compute_tokenwise_inputs(self, hidden_states: torch.Tensor):
+    def _gemv_conv_operands(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        mamba_metadata: Mamba2Metadata,
+        spec_metadata: Optional[SpecMetadata],
+    ):
+        """Operands for the fused in_proj_qkvz GEMV + conv1d update, or None for main's path.
+
+        Returns ``(weight, weight_sf, global_scale, conv_states, conv_weight, state_indices)``
+        only when the step is pure decode without speculative verification and in_proj_qkvz
+        would run trtllm::nvfp4_w4a16_gemv on these exact rows (FP8QDQLinearMethod.apply).
+        """
+        if not _GDN_GEMV_CONV:
+            return None
+        rows = hidden_states.shape[0]
+        if rows < 1 or rows > _GDN_GEMV_CONV_MAX_ROWS or attn_metadata.num_contexts != 0:
+            return None
+        if is_torch_compiling() or is_in_breakable_cuda_graph():
+            return None
+        if not hasattr(torch.ops.trtllm, "nvfp4_w4a16_gemv_conv"):
+            return None
+        lin = self.in_proj_qkvz
+        gemv = lin.__dict__.get("_nvfp4_decode_gemv")
+        if gemv is None or rows > lin.__dict__.get("_nvfp4_decode_gemv_max_rows", 0):
+            return None
+        if (
+            not isinstance(lin.quant_method, FP8QDQLinearMethod)
+            or lin.bias is not None
+            or lin.lora is not None
+            or lin._locality_domain_weight_shards is not None
+            or lin.tp_mode != TensorParallelMode.COLUMN
+            or lin.gather_output
+        ):
+            return None
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or hidden_states.dim() != 2
+            or not hidden_states.is_contiguous()
+            or hidden_states.data_ptr() % 16 != 0
+        ):
+            return None
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        if spec_metadata is not None and kv_cache_manager.is_speculative():
+            return None
+        if self.activation not in ("silu", "swish") or self.conv1d.bias is not None:
+            return None
+        conv_weight = self.conv1d.weight
+        conv_dim = self.conv_dim_per_tp
+        if (
+            conv_weight.dtype != torch.bfloat16
+            or tuple(conv_weight.shape) != (conv_dim, 4)
+            or not conv_weight.is_contiguous()
+        ):
+            return None
+        layer_cache = kv_cache_manager.mamba_layer_cache(self.layer_idx)
+        if layer_cache is None:
+            return None
+        conv_states = layer_cache.conv
+        if (
+            conv_states.dtype != torch.bfloat16
+            or conv_states.dim() != 3
+            or conv_states.shape[1] != conv_dim
+            or conv_states.shape[2] != 3
+            or conv_states.stride(1) != 3
+            or conv_states.stride(2) != 1
+        ):
+            return None
+        num_decodes = attn_metadata.seq_lens.shape[0]
+        state_indices = mamba_metadata.state_indices[:num_decodes]
+        if (
+            num_decodes != rows
+            or state_indices.dtype != torch.int32
+            or not state_indices.is_contiguous()
+        ):
+            return None
+        return gemv[0], gemv[1], gemv[2], conv_states, conv_weight, state_indices
+
+    def _compute_tokenwise_inputs(self, hidden_states: torch.Tensor, gemv_conv=None):
         def _compute_projected_states_qkvz():
+            if gemv_conv is not None:
+                # in_proj_qkvz's GEMV with causal_conv1d_update fused for columns [0, conv_dim).
+                weight, weight_sf, global_scale, conv_states, conv_weight, state_indices = gemv_conv
+                return torch.ops.trtllm.nvfp4_w4a16_gemv_conv(
+                    hidden_states,
+                    weight,
+                    weight_sf,
+                    global_scale,
+                    conv_states,
+                    conv_weight,
+                    state_indices,
+                    self.conv_dim_per_tp,
+                    PAD_SLOT_ID,
+                )
             return self.in_proj_qkvz(hidden_states)
 
         def _compute_projected_states_ba():
@@ -773,14 +875,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 self.head_v_dim,
             )
 
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            self.conv1d.weight,
-            self.conv1d.bias,
-            self.activation,
-            conv_state_indices=cache_indices,
-        )
+        if not kwargs.get("conv_fused", False):
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=cache_indices,
+            )
 
         # Keep q/k/v as views over mixed_qkv so the fused decode kernel can
         # consume their native strides without forcing packed copies.
@@ -1166,7 +1269,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         spec_metadata: Optional[SpecMetadata] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
-        mixed_qkv, z, a, b = self._compute_tokenwise_inputs_routed(hidden_states)
+        gemv_conv = self._gemv_conv_operands(
+            hidden_states, attn_metadata, mamba_metadata, spec_metadata
+        )
+        if gemv_conv is not None:
+            # Pure decode: mixed_qkv comes out of in_proj_qkvz already convolved (conv state shifted).
+            mixed_qkv, z, a, b = self._compute_tokenwise_inputs(hidden_states, gemv_conv)
+        else:
+            mixed_qkv, z, a, b = self._compute_tokenwise_inputs_routed(hidden_states)
 
         use_breakable_cuda_graph = not is_torch_compiling() and is_in_breakable_cuda_graph()
         if self.register_to_config and (is_torch_compiling() or use_breakable_cuda_graph):
@@ -1182,6 +1292,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 attn_metadata,
                 mamba_metadata,
                 spec_metadata=spec_metadata,
+                conv_fused=gemv_conv is not None,
             )
 
         return self._postprocess_gdn_output(attn_out, z, all_reduce_params)
@@ -1195,6 +1306,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         mamba_metadata: Mamba2Metadata,
         spec_metadata: Optional[SpecMetadata] = None,
         output: Optional[torch.Tensor] = None,
+        conv_fused: bool = False,
     ):
         ### sglang linear attn
         # has_initial_states = None
@@ -1289,6 +1401,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             else None,
             "use_cached_replay_all_layer_commit": use_cached_replay_all_layer_commit,
         }
+        # mixed_qkv was convolved by in_proj_qkvz's fused GEMV epilogue (pure decode only).
+        assert not conv_fused or (num_prefills == 0 and not is_target_verify)
+        kwargs["conv_fused"] = conv_fused
         if num_prefills > 0:
             attn_out = self.forward_extend(
                 conv_states,

@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cuda_runtime.h>
 
 namespace marlin_nvfp4
@@ -39,5 +40,30 @@ bool nvfp4W4a16GemvSupported(int n, int k);
 
 bool nvfp4W4a16Gemv(void const* x, void const* w, void const* sf, void* out, float g, int m, int n, int k,
     bool enable_pdl, cudaStream_t stream);
+
+// The same GEMV with a fused GDN decode causal_conv1d_update epilogue (width 4, no bias, SiLU) on the
+// output columns [0, conv_dim), for 1 <= m <= kNvfp4W4a16GemvConvMaxRows:
+//   for row r with slot s = conv_state_indices[r] != pad_slot_id and column c < conv_dim:
+//     xv = bf16(GEMV output); out[r, c] = bf16(silu(sum_i w[c, i] * [state[s, c, 0..2], xv][i]))
+//     state[s, c, 0..2] = [state[s, c, 1], state[s, c, 2], xv]
+//   PAD rows keep the raw GEMV output and leave the state untouched; columns >= conv_dim are the plain
+//   GEMV output. Bitwise equal to nvfp4W4a16Gemv followed by causal_conv1d_update_kernel_sl1.
+// conv_state:  [slots, conv_dim, 3] BF16 with strides (conv_state_batch_stride, 3, 1)
+// conv_weight: [conv_dim, 4] BF16, contiguous, 8-byte aligned
+// conv_dim must be even (a CTA's two columns are either both conv channels or both not).
+struct Nvfp4GemvConvParams
+{
+    void* conv_state;
+    void const* conv_weight;
+    int const* conv_state_indices;
+    int64_t conv_state_batch_stride;
+    int conv_dim;
+    int pad_slot_id;
+};
+
+constexpr int kNvfp4W4a16GemvConvMaxRows = 3;
+
+bool nvfp4W4a16GemvConv(void const* x, void const* w, void const* sf, void* out, float g, int m, int n, int k,
+    Nvfp4GemvConvParams const& conv, bool enable_pdl, cudaStream_t stream);
 
 } // namespace marlin_nvfp4
