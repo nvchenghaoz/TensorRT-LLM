@@ -145,6 +145,14 @@ int full_k_smem_bytes(int threads, int thread_n_blocks, int thread_k_blocks, int
     return int4s * 16 + kMarlinNvfp4FullKMaxStripes * 16 * threads * static_cast<int>(sizeof(float));
 }
 
+// Full-K launch of the in_proj decode shapes (n = 16384 / 14336, k = 5120):
+// TRTLLM_MARLIN_INPROJ_FULLK, read per call; "0" restores the split-K launch.
+bool marlin_inproj_full_k_enabled()
+{
+    char const* v = std::getenv("TRTLLM_MARLIN_INPROJ_FULLK");
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+}
+
 // Largest number of split-K stripes the default `grid`-CTA launch gives one column.
 int full_k_max_stripes(int k_tiles, int n_tiles, int grid)
 {
@@ -262,6 +270,24 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
             full_k_flags = blocks << kMarlinNvfp4FullKGridShift;
         }
 
+        // GDN in_proj_qkvz (n=16384) / attention qkv_proj (n=14336), k=5120, at decode
+        // rows <= 8: one CTA per 128-wide column (128 threads, {64k, 128n}, 6 stages)
+        // streaming the whole K (iters == k_tiles, slice_count 1, no lock use) instead
+        // of `blocks` split-K CTAs whose partial sums chain through the BF16 output.
+        // Reordered: each column's fp32 sum is rounded to BF16 once.
+        thread_config_t const in_proj_cfg = {64, 128, 128};
+        if (full_k_flags == 0 && prob_m <= 8 && m_block_size_8 && thread_m_blocks == 1 && group_blocks == 1
+            && exec_cfg.blocks_per_sm == 1 && !use_fp32_reduce && prob_k == 5120
+            && (prob_n == 16384 || prob_n == 14336) && prob_n / in_proj_cfg.thread_n <= blocks
+            && is_valid_config(
+                in_proj_cfg, thread_m_blocks, prob_n, prob_k, num_bits, group_size, 6, max_shared_mem_new - 512)
+            && marlin_inproj_full_k_enabled())
+        {
+            kernel = Marlin<nv_bfloat16, 128, 1, 8, 4, true, 6, 1>;
+            num_threads = in_proj_cfg.num_threads;
+            grid = prob_n / in_proj_cfg.thread_n;
+        }
+
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new);
 
         // The kernel starts with griddepcontrol.wait, so a PDL launch orders all of
@@ -311,6 +337,7 @@ template __global__ void Marlin<nv_bfloat16, 256, 4, 16, 4, false, 4, 1>( MARLIN
 template __global__ void Marlin<nv_bfloat16, 128, 4, 8, 4, false, 4, 1>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 128, 4, 4, 8, false, 4, 1>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, true,  8, 1, true>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<nv_bfloat16, 128, 1, 8, 4, true,  6, 1>( MARLIN_KERNEL_PARAMS );
 
 // clang-format on
 
