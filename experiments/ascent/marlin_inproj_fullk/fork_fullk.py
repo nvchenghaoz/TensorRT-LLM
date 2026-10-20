@@ -243,24 +243,41 @@ def fork_profile(gr, st, st0, tag):
         ks.append((float(e["ts"]), float(e.get("dur", 0.0)), e.get("name", ""),
                    e.get("args", dict()).get("grid")))
     ks.sort()
+    # qkvz = Marlin / nvfp4 W4A16 GEMV; consumer = the elementwise add; norm and the flush
+    # reduce are skipped; anything else after the first qkvz is in_proj_ba (small_n_gemv, or
+    # the cuBLAS fallback at M > 6).
     q, ba, cons = [], [], []
     qgrid = set()
+    ba_names = set()
     started = False
     for ts, dur, name, grid in ks:
-        if "Marlin" in name or "Gemv" in name or "gemv_kernel" in name and "small_n" not in name:
+        if "Marlin" in name or "nvfp4W4a16Gemv" in name:
             q.append((ts, ts + dur))
             qgrid.add(str(grid))
             started = True
-        elif "small_n_gemv" in name:
-            ba.append((ts, ts + dur))
-        elif "Norm" in name or "norm" in name:
+        elif "Norm" in name or "norm" in name or "reduce" in name:
             continue
-        elif started and ("reduce" not in name):
-            cons.append((ts, ts + dur))
-    res = dict(n_q=len(q), n_ba=len(ba), n_cons=len(cons), qkvz_grids=sorted(qgrid))
+        elif "elementwise" in name:
+            if started:
+                cons.append((ts, ts + dur))
+        elif started:
+            ba.append((ts, ts + dur))
+            ba_names.add(name.split("(")[0][-50:])
+    res = dict(n_q=len(q), n_ba=len(ba), n_cons=len(cons), qkvz_grids=sorted(qgrid), ba_kernels=sorted(ba_names))
     nw = NGDN * PROF_REPLAYS
     if len(q) == nw and len(ba) == nw and len(cons) >= nw:
-        cons = cons[:nw]
+        # per window: in_proj_ba = first aux kernel starting after this qkvz starts, consumer =
+        # first elementwise kernel starting after this qkvz starts
+        bsel, csel = [], []
+        jb, jc = 0, 0
+        for a in q:
+            while jb < len(ba) - 1 and ba[jb][0] < a[0] - 5.0:
+                jb += 1
+            while jc < len(cons) - 1 and cons[jc][0] < a[0]:
+                jc += 1
+            bsel.append(ba[jb])
+            csel.append(cons[jc])
+        ba, cons = bsel, csel
         d_ba_q = [b[1] - a[1] for a, b in zip(q, ba)]
         join = [c[0] - max(a[1], b[1]) for a, b, c in zip(q, ba, cons)]
         win = [c[1] - a[0] for a, c in zip(q, cons)]
