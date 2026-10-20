@@ -120,6 +120,70 @@ Tensor nvfp4_w4a16_gemv(Tensor const& mat_a, Tensor const& weight, Tensor const&
     return out;
 }
 
+// nvfp4_w4a16_gemv with the GDN decode causal_conv1d_update (width 4, no bias, SiLU) fused into its
+// epilogue for output columns [0, conv_dim) (see kernels/marlin/nvfp4_w4a16_gemv.h). Bitwise equal to
+// nvfp4_w4a16_gemv followed by causal_conv1d_update(out[:, :conv_dim], conv_state, conv_weight, None,
+// silu, conv_state_indices=conv_state_indices, pad_slot_id=pad_slot_id). Updates conv_state in place.
+// mat_a:              [M, K] BF16, contiguous, 1 <= M <= 3
+// conv_state:         [slots, conv_dim, 3] BF16, strides (any, 3, 1)
+// conv_weight:        [conv_dim, 4] BF16, contiguous
+// conv_state_indices: [M] int32, contiguous
+Tensor nvfp4_w4a16_gemv_conv(Tensor const& mat_a, Tensor const& weight, Tensor const& weight_sf, double global_scale,
+    Tensor& conv_state, Tensor const& conv_weight, Tensor const& conv_state_indices, int64_t conv_dim,
+    int64_t pad_slot_id)
+{
+    CHECK_TH_CUDA(mat_a);
+    CHECK_TH_CUDA(weight);
+    CHECK_TH_CUDA(weight_sf);
+    CHECK_TH_CUDA(conv_state);
+    CHECK_TH_CUDA(conv_weight);
+    CHECK_TH_CUDA(conv_state_indices);
+    TORCH_CHECK(mat_a.dim() == 2 && mat_a.scalar_type() == at::ScalarType::BFloat16 && mat_a.is_contiguous(),
+        "mat_a must be a contiguous 2D BF16 tensor");
+    TORCH_CHECK(weight.dim() == 2 && weight.scalar_type() == at::ScalarType::Byte && weight.is_contiguous(),
+        "weight must be a contiguous 2D uint8 tensor");
+    TORCH_CHECK(weight_sf.dim() == 2 && weight_sf.scalar_type() == at::ScalarType::Byte && weight_sf.is_contiguous(),
+        "weight_sf must be a contiguous 2D uint8 tensor");
+    int const m = static_cast<int>(mat_a.size(0));
+    int const k = static_cast<int>(mat_a.size(1));
+    int const n = static_cast<int>(weight.size(0));
+    TORCH_CHECK(weight.size(1) * 2 == k && weight_sf.size(0) == n && weight_sf.size(1) * 16 == k,
+        "nvfp4_w4a16_gemv_conv shape mismatch: mat_a ", mat_a.sizes(), ", weight ", weight.sizes(), ", weight_sf ",
+        weight_sf.sizes());
+    TORCH_CHECK(m >= 1 && m <= ::marlin_nvfp4::kNvfp4W4a16GemvConvMaxRows, "nvfp4_w4a16_gemv_conv supports 1..",
+        ::marlin_nvfp4::kNvfp4W4a16GemvConvMaxRows, " rows, got ", m);
+    TORCH_CHECK(conv_dim > 0 && conv_dim % 2 == 0 && conv_dim <= n, "conv_dim must be even and in (0, N], got ",
+        conv_dim);
+    TORCH_CHECK(conv_state.dim() == 3 && conv_state.scalar_type() == at::ScalarType::BFloat16
+            && conv_state.size(1) == conv_dim && conv_state.size(2) == 3 && conv_state.stride(1) == 3
+            && conv_state.stride(2) == 1,
+        "conv_state must be a [slots, conv_dim, 3] BF16 tensor with strides (any, 3, 1); got sizes ",
+        conv_state.sizes(), " strides ", conv_state.strides());
+    TORCH_CHECK(conv_weight.dim() == 2 && conv_weight.scalar_type() == at::ScalarType::BFloat16
+            && conv_weight.size(0) == conv_dim && conv_weight.size(1) == 4 && conv_weight.is_contiguous()
+            && reinterpret_cast<uintptr_t>(conv_weight.data_ptr()) % 8 == 0,
+        "conv_weight must be a contiguous, 8-byte aligned [conv_dim, 4] BF16 tensor");
+    TORCH_CHECK(conv_state_indices.dim() == 1 && conv_state_indices.scalar_type() == at::ScalarType::Int
+            && conv_state_indices.is_contiguous() && conv_state_indices.size(0) == m,
+        "conv_state_indices must be a contiguous [M] int32 tensor");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(mat_a));
+    Tensor out = at::empty({m, n}, mat_a.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
+    ::marlin_nvfp4::Nvfp4GemvConvParams conv{};
+    conv.conv_state = conv_state.data_ptr();
+    conv.conv_weight = conv_weight.data_ptr();
+    conv.conv_state_indices = conv_state_indices.data_ptr<int32_t>();
+    conv.conv_state_batch_stride = conv_state.stride(0);
+    conv.conv_dim = static_cast<int>(conv_dim);
+    conv.pad_slot_id = static_cast<int>(pad_slot_id);
+    bool const launched = ::marlin_nvfp4::nvfp4W4a16GemvConv(mat_a.data_ptr(), weight.data_ptr(),
+        weight_sf.data_ptr(), out.data_ptr(), static_cast<float>(global_scale), m, n, k, conv,
+        tensorrt_llm::common::getEnvEnablePDL(), stream);
+    TORCH_CHECK(launched, "nvfp4_w4a16_gemv_conv: unsupported shape N=", n, " K=", k, " or device");
+    return out;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -130,10 +194,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "gptq_marlin_repack(Tensor b_q_weight, Tensor perm, int size_k, int size_n,"
         " int num_bits, bool is_a_8bit=False) -> (Tensor out)");
     m.def("nvfp4_w4a16_gemv(Tensor mat_a, Tensor weight, Tensor weight_sf, float global_scale) -> Tensor");
+    m.def(
+        "nvfp4_w4a16_gemv_conv(Tensor mat_a, Tensor weight, Tensor weight_sf, float global_scale,"
+        " Tensor(a!) conv_state, Tensor conv_weight, Tensor conv_state_indices, int conv_dim,"
+        " int pad_slot_id) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("gptq_marlin_repack", &tensorrt_llm::torch_ext::gptq_marlin_repack);
     m.impl("nvfp4_w4a16_gemv", &tensorrt_llm::torch_ext::nvfp4_w4a16_gemv);
+    m.impl("nvfp4_w4a16_gemv_conv", &tensorrt_llm::torch_ext::nvfp4_w4a16_gemv_conv);
 }
