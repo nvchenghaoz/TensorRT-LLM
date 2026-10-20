@@ -806,6 +806,20 @@ __device__ __host__ inline void assertClose(half a, half b, float threshold = 0.
     assertClose(__half2float(a), __half2float(b), threshold);
 }
 
+// Paired e4m3x2 -> bf16x2 hardware conversion (cvt.rn.bf16x2.e4m3x2) for a BF16 input with an FP8 e4m3 cache. It is the
+// same F2FP.BF16.E4M3 op the generic per-element path uses, two elements per instruction, so every value is identical
+// (e4m3 -> bf16 is exact). ptxas rejects it on plain .target sm_120 and accepts the family/arch-specific targets
+// (sm_120f, the XQA JIT target, and sm_120a), so it is enabled only there. Build with -DXQA_BF16_E4M3_PAIRED_CVT=0 to
+// get the generic per-element path everywhere.
+#ifndef XQA_BF16_E4M3_PAIRED_CVT
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200) && (__CUDA_ARCH__ < 1300)                                       \
+    && (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) || defined(__CUDA_ARCH_SPECIFIC__))
+#define XQA_BF16_E4M3_PAIRED_CVT 1
+#else
+#define XQA_BF16_E4M3_PAIRED_CVT 0
+#endif
+#endif
+
 template <typename InputElem, typename CacheElem>
 __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data)
 {
@@ -820,6 +834,20 @@ __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data)
         asm("{\n"
             "cvt.rn.f16x2.e4m3x2 %0, %2;\n"
             "cvt.rn.f16x2.e4m3x2 %1, %3;\n"
+            "}"
+            : "=r"(dst[0]), "=r"(dst[1])
+            : "h"(src[0]), "h"(src[1]));
+        return ret;
+    }
+#endif
+#if XQA_BF16_E4M3_PAIRED_CVT
+    if constexpr (mha::is_same_v<InputElem, __nv_bfloat16> && mha::is_same_v<CacheElem, __nv_fp8_e4m3>)
+    {
+        uint16_t(&src)[2] = reinterpret_cast<uint16_t(&)[2]>(i8data);
+        uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(ret);
+        asm("{\n"
+            "cvt.rn.bf16x2.e4m3x2 %0, %2;\n"
+            "cvt.rn.bf16x2.e4m3x2 %1, %3;\n"
             "}"
             : "=r"(dst[0]), "=r"(dst[1])
             : "h"(src[0]), "h"(src[1]));
@@ -856,6 +884,26 @@ __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data)
             "mov.b32 {src0, src1}, src;\n"
             "cvt.rn.f16x2.e4m3x2 %0, src0;\n"
             "cvt.rn.f16x2.e4m3x2 %1, src1;\n"
+            "}"
+            : "=r"(dst[0]), "=r"(dst[1])
+            : "r"(i8data));
+        return ret;
+    }
+#endif
+#if XQA_BF16_E4M3_PAIRED_CVT
+    if constexpr (mha::is_same_v<InputElem, __nv_bfloat16> && mha::is_same_v<CacheElem, __nv_fp8_e4m3>)
+    {
+        uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(ret);
+        asm("{\n"
+            ".reg .b32 dst0;\n"
+            ".reg .b32 dst1;\n"
+            ".reg .b32 src;\n"
+            ".reg .b16 src0;\n"
+            ".reg .b16 src1;\n"
+            "prmt.b32 src, %2, 0x0, 0x3120;\n"
+            "mov.b32 {src0, src1}, src;\n"
+            "cvt.rn.bf16x2.e4m3x2 %0, src0;\n"
+            "cvt.rn.bf16x2.e4m3x2 %1, src1;\n"
             "}"
             : "=r"(dst[0]), "=r"(dst[1])
             : "r"(i8data));
