@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-# Branch 121 / idea 214: paired kernel bench for the XQA kernel_mha BF16-Q + FP8 e4m3 KV paired conversion
-# (cpp/kernels/xqa/utils.cuh, macro XQA_BF16_E4M3_PAIRED_CVT). Brace-free so it can run inline in run_gpu_pair's
-# base arm (which has no branch files).
-# Usage: python bf16cvt_pair.py <order 0|1> <out.json>         one timing process
-#        python bf16cvt_pair.py combine <r0.json> <r1.json>    pools both processes, prints the evidence JSON last
-# Each timing process NVRTC-compiles <cwd>/cpp/kernels/xqa/mha.cu exactly like the JIT (-arch=sm_120f, the JIT
-# macros, fp8 e4m3 KV, kv scale 0.5, 24 Q / 4 KV heads, head 256, 34944 tokens, 32768-token prefix aliased across
-# requests) and the same tree at BASE_SHA (git archive; falls back to cwd). It loads the cwd cubin twice (own and
-# own_aa = the A/A arm) and the base cubin once (ref), and times the three rotated per round at 1x47, 2x23, 3x15,
-# 4x11 (order 1 reverses config order and rotation order). Before every call the output is NaN-poisoned and the L2
-# is flushed by a 384 MiB read sweep (never zero_/fill_ of inputs); CUDA-graph replay timed with CUDA events;
-# ROUNDS x (WARMUP + ITERS) calls per arm per config; kernel_ms = 10-90% trimmed mean.
-# Process 0 also runs the arch-macro probe, an exhaustive e4m3x2 -> bf16x2 equality test (paired cvt vs the
-# generic per-element conversion), and the SASS census (total / F2FP / LOP3 / PRMT) of every build.
+# Branch 121 / idea 214: paired kernel bench for XQA kernel_mha, BF16 Q + FP8 e4m3 KV paired conversion
+# (cpp/kernels/xqa/utils.cuh, macro XQA_BF16_E4M3_PAIRED_CVT). Free of braces, backslashes and double quotes so it
+# can run inline (bash heredoc) in run_gpu_pair's base arm, which has no branch files.
+# Usage: python bf16cvt_pair.py <order 0|1> <out.json>        one timing process
+#        python bf16cvt_pair.py combine <r0.json> <r1.json>   pools both processes; prints the evidence JSON last
+# A timing process NVRTC-compiles <cwd>/cpp/kernels/xqa/mha.cu like the JIT (-arch=sm_120f, the JIT macros, fp8 e4m3
+# KV, kv scale 0.5, 24 Q / 4 KV heads, head 256, 34944 tokens, 32768-token prefix aliased across requests) and the
+# same files at BASE_SHA (git archive). It loads the cwd cubin twice (own, own_aa = the A/A arm) and the base cubin
+# once (ref), and times the three rotated per round at 1x47, 2x23, 3x15, 4x11 (order 1 reverses the config order and
+# the rotation). Before every call: output NaN-poisoned and a 384 MiB L2 read flush (inputs are never written).
+# CUDA-graph replay timed with CUDA events; ROUNDS x (WARMUP + ITERS) calls per arm per config; kernel_ms = 10-90%
+# trimmed mean. Process 0 also runs the arch-macro probe, an exhaustive e4m3x2 -> bf16x2 test (paired cvt vs the
+# generic per-element conversion), and the SASS census (total / F2FP / LOP3 / PRMT) of each build.
 import ctypes
 import hashlib
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +28,7 @@ import torch
 from cuda.bindings import driver as cu
 from cuda.bindings import nvrtc
 
-LB, RB = chr(123), chr(125)
+LB, RB, NL, DQ = chr(123), chr(125), chr(10), chr(34)
 BASE_SHA = '07a287408d9a3a2313ae5f3ec22730f94f932b51'
 CONFIGS = [(1, 47), (2, 23), (3, 15), (4, 11)]
 PRIMARY = [(1, 47), (2, 23), (4, 11)]
@@ -54,7 +52,7 @@ MACROS = dict(INPUT_FP16='0', DTYPE='__nv_bfloat16', GENERATE_CUBIN='1', NDEBUG=
               USE_INPUT_KV='0', ROPE_STYLE='0', ROPE_ELEMS='64', IS_SPEC_DEC_TREE='0', SKIP_SOFTMAX_ATTN='0',
               __FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__='1', __FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__='1')
 CUOBJDUMP = shutil.which('cuobjdump') or '/usr/local/cuda/bin/cuobjdump'
-INST = re.compile(r'^\s*/\*([0-9a-f]+)\*/\s+(.*?)\s*;')
+HEXCH = set('0123456789abcdef')
 
 
 def log(*a):
@@ -72,20 +70,16 @@ def sha(b):
     return hashlib.sha256(b).hexdigest()
 
 
-def git(args):
+def run_text(cmd):
     try:
-        return subprocess.run(['git'] + args, capture_output=True, text=True, timeout=60).stdout.strip()
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout.strip()
     except Exception as e:  # noqa: BLE001
         return 'unavailable: %s' % e
 
 
 def gpu_state():
-    try:
-        return subprocess.run(['nvidia-smi', '--query-gpu=clocks.sm,clocks.mem,temperature.gpu,'
-                               'clocks_event_reasons.active,power.draw', '--format=csv,noheader'],
-                              capture_output=True, text=True, timeout=30).stdout.strip()
-    except Exception as e:  # noqa: BLE001
-        return 'unavailable: %s' % e
+    return run_text(['nvidia-smi', '--query-gpu=clocks.sm,clocks.mem,temperature.gpu,clocks_event_reasons.active,'
+                     'power.draw', '--format=csv,noheader'])
 
 
 def extract_base_tree(commit):
@@ -121,9 +115,7 @@ def nvrtc_compile(src, name, headers, contents, opts):
 
 
 def cuda_headers():
-    names = [h.encode() for h in CHDRS]
-    cont = [open(os.path.join(CUDA_INC, h), 'rb').read() for h in CHDRS]
-    return names, cont
+    return [h.encode() for h in CHDRS], [open(os.path.join(CUDA_INC, h), 'rb').read() for h in CHDRS]
 
 
 def compile_mha(src_dir, arch='sm_120f', extra=()):
@@ -137,10 +129,28 @@ def compile_mha(src_dir, arch='sm_120f', extra=()):
     opts += [e.encode() for e in extra]
     cubin, err = nvrtc_compile(src, b'default_program', names, cont, opts)
     if cubin is None:
-        raise RuntimeError('NVRTC compile failed (%s %s %s):\n%s' % (src_dir, arch, ' '.join(extra), err[-6000:]))
+        raise RuntimeError('NVRTC compile failed (%s %s %s): %s' % (src_dir, arch, ' '.join(extra), err[-3000:]))
     log('compiled %s arch %s extra [%s] in %.1fs, cubin %d B, sha256 %s' %
         (src_dir, arch, ' '.join(extra), time.time() - t0, len(cubin), sha(cubin)[:16]))
     return cubin
+
+
+def sass_insts(text):
+    ins = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith('/*'):
+            continue
+        j = s.find('*/')
+        addr = s[2:j]
+        if j < 3 or not set(addr) <= HEXCH:
+            continue
+        rest = s[j + 2:]
+        k = rest.find(';')
+        if k < 0:
+            continue
+        ins.append(rest[:k].strip())
+    return ins
 
 
 def census(cubin, tag):
@@ -148,8 +158,7 @@ def census(cubin, tag):
     p = os.path.join(d, tag + '.cubin')
     with open(p, 'wb') as f:
         f.write(cubin)
-    sass = subprocess.run([CUOBJDUMP, '-sass', p], capture_output=True, text=True).stdout
-    ins = [m.group(2) for m in (INST.match(line) for line in sass.splitlines()) if m]
+    ins = sass_insts(subprocess.run([CUOBJDUMP, '-sass', p], capture_output=True, text=True).stdout)
     ops = []
     for s in ins:
         toks = s.split()
@@ -159,12 +168,12 @@ def census(cubin, tag):
                F2FP_F16_E4M3=sum(1 for o in ops if o.startswith('F2FP.F16') and 'E4M3' in o),
                LOP3=sum(1 for o in ops if o.startswith('LOP3')), PRMT=sum(1 for o in ops if o.startswith('PRMT')),
                SHF=sum(1 for o in ops if o.startswith('SHF')), cubin_bytes=len(cubin), cubin_sha256=sha(cubin),
-               sass_sha256=sha('\n'.join(ins).encode()))
+               sass_sha256=sha(NL.join(ins).encode()))
     log('census %s: %s' % (tag, json.dumps(res)))
     return res
 
 
-PROBE_SRC = '\n'.join([
+PROBE_SRC = NL.join([
     '#include <cuda_fp16.h>',
     '#include <cuda_bf16.h>',
     '#include <cuda_fp8.h>',
@@ -180,21 +189,21 @@ PROBE_SRC = '\n'.join([
     '#endif',
     '__device__ int probe_arch = __CUDA_ARCH__;',
     '#if PROBE_CVT',
-    'extern "C" __global__ void probe_exh(unsigned int* out)',
+    'extern ' + DQ + 'C' + DQ + ' __global__ void probe_exh(unsigned int* out)',
     LB,
     '    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;',
     '    unsigned short s = (unsigned short) i;',
     '    unsigned int d;',
-    '    asm volatile("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(d) : "h"(s));',
+    '    asm volatile(' + DQ + 'cvt.rn.bf16x2.e4m3x2 %0, %1;' + DQ + ' : ' + DQ + '=r' + DQ + '(d) : ' + DQ + 'h' + DQ +
+    '(s));',
     '    __nv_fp8_e4m3 lo;',
     '    __nv_fp8_e4m3 hi;',
     '    lo.__x = (__nv_fp8_storage_t) (s & 0xFF);',
     '    hi.__x = (__nv_fp8_storage_t) (s >> 8);',
     '    __nv_bfloat16 blo = __nv_bfloat16(lo);',
     '    __nv_bfloat16 bhi = __nv_bfloat16(hi);',
-    '    unsigned int g = (unsigned int) __bfloat16_as_ushort(blo) | ((unsigned int) __bfloat16_as_ushort(bhi) << 16);',
     '    out[2 * i] = d;',
-    '    out[2 * i + 1] = g;',
+    '    out[2 * i + 1] = (unsigned int) __bfloat16_as_ushort(blo) | ((unsigned int) __bfloat16_as_ushort(bhi) << 16);',
     RB,
     '#endif',
     ''])
@@ -205,22 +214,22 @@ def probe():
     res = dict()
     for arch in ('sm_120f', 'sm_120a', 'sm_120'):
         r = dict()
-        base_opts = [b'-default-device', b'--use_fast_math', ('-arch=' + arch).encode(),
-                     b'-D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__=1',
-                     b'-D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__=1']
-        cubin, err = nvrtc_compile(PROBE_SRC, b'probe.cu', cn, cc, base_opts + [b'-DPROBE_CVT=0'])
+        opts = [b'-default-device', ('-arch=' + arch).encode(), b'-D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__=1',
+                b'-D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__=1']
+        cubin, err = nvrtc_compile(PROBE_SRC, b'probe.cu', cn, cc, opts + [b'-DPROBE_CVT=0'])
         if cubin is None:
             r['macro_probe_error'] = err[-2000:]
         else:
             img = np.frombuffer(cubin, dtype=np.uint8).copy()
             mod = ck(cu.cuModuleLoadData(img.ctypes.data))
-            for nm in ('probe_fam', 'probe_spec', 'probe_arch'):
+            for nm, key in (('probe_fam', '__CUDA_ARCH_FAMILY_SPECIFIC__'), ('probe_spec', '__CUDA_ARCH_SPECIFIC__'),
+                            ('probe_arch', '__CUDA_ARCH__')):
                 dptr, _ = ck(cu.cuModuleGetGlobal(mod, nm.encode()))
                 v = ctypes.c_int32(0)
                 ck(cu.cuMemcpyDtoH(ctypes.addressof(v), dptr, 4))
-                r[nm.replace('probe_', '__CUDA_ARCH_') if nm != 'probe_arch' else '__CUDA_ARCH__'] = int(v.value)
+                r[key] = int(v.value)
             r['note'] = '-1 = macro not defined'
-        cubin, err = nvrtc_compile(PROBE_SRC, b'probe.cu', cn, cc, base_opts + [b'-DPROBE_CVT=1'])
+        cubin, err = nvrtc_compile(PROBE_SRC, b'probe.cu', cn, cc, opts + [b'-DPROBE_CVT=1'])
         r['cvt_rn_bf16x2_e4m3x2_compiles'] = cubin is not None
         if cubin is None:
             r['cvt_error_tail'] = err[-600:]
@@ -235,10 +244,9 @@ def probe():
             ck(cu.cuLaunchKernel(fn, 256, 1, 1, 256, 1, 1, 0, stream, ctypes.addressof(arr), 0))
             torch.cuda.synchronize()
             t = out.view(65536, 2).cpu()
-            mism = (t[:, 0] != t[:, 1])
+            mism = t[:, 0] != t[:, 1]
             idx = torch.arange(65536)
-            lo, hi = idx & 0xFF, idx >> 8
-            nan_in = ((lo & 0x7F) == 0x7F) | ((hi & 0x7F) == 0x7F)
+            nan_in = ((idx & 0x7F) == 0x7F) | (((idx >> 8) & 0x7F) == 0x7F)
             r['exhaustive_e4m3x2_inputs'] = 65536
             r['exhaustive_mismatches_paired_vs_generic'] = int(mism.sum().item())
             r['exhaustive_mismatches_non_nan_inputs'] = int((mism & ~nan_in).sum().item())
@@ -373,8 +381,8 @@ def run_process(order, outp):
     torch.cuda.init()
     torch.zeros(1, device='cuda')
     ck(cu.cuInit(0))
-    res = dict(order=order, git_head=git(['rev-parse', 'HEAD']),
-               git_status_xqa=git(['status', '--porcelain', 'cpp/kernels/xqa']), cwd=os.getcwd(),
+    res = dict(order=order, git_head=run_text(['git', 'rev-parse', 'HEAD']),
+               git_status_xqa=run_text(['git', 'status', '--porcelain', 'cpp/kernels/xqa']), cwd=os.getcwd(),
                device=torch.cuda.get_device_name(), gpu_state_start=gpu_state(), base_sha=BASE_SHA,
                protocol='%d rounds x (%d warmup + %d timed) per arm per config; arms own/own_aa/ref rotated; '
                'NaN-poison + %d MiB L2 read flush before every call; CUDA graph replay + CUDA events' %
@@ -455,11 +463,12 @@ def run_process(order, outp):
             cen['own_sm_120f_macro0']['resources'] = dict(regs=k0.regs, smem=k0.smem, local=k0.lmem)
             for arch in ('sm_120a', 'sm_120', 'sm_89'):
                 for tag, dd in (('own', own_dir), ('ref', ref_dir)):
+                    key = '%s_%s' % (tag, arch)
                     try:
-                        cen['%s_%s' % (tag, arch)] = census(compile_mha(dd, arch), '%s_%s' % (tag, arch))
+                        cen[key] = census(compile_mha(dd, arch), key)
                     except Exception as e:  # noqa: BLE001
-                        cen['%s_%s' % (tag, arch)] = dict(error=str(e)[-1500:])
-                        log('compile %s %s failed: %s' % (tag, arch, str(e)[-1500:]))
+                        cen[key] = dict(error=str(e)[-1500:])
+                        log('compile %s failed: %s' % (key, str(e)[-1500:]))
 
             def same(a, b):
                 if 'sass_sha256' not in cen.get(a, dict()) or 'sass_sha256' not in cen.get(b, dict()):
@@ -511,8 +520,8 @@ def combine(paths):
         e['semaphores_zero'] = all(r['configs'][key]['semaphores_zero'] for r in rs)
         e['finite'] = all(r['configs'][key]['finite'] for r in rs)
         e['output_sha256'] = rs[0]['configs'][key]['output_sha256']
-        allpass = allpass and e['own_equals_ref_bitwise'] and e['repeat_bitwise'] and e['semaphores_zero'] and \
-            e['finite']
+        allpass = (allpass and e['own_equals_ref_bitwise'] and e['repeat_bitwise'] and e['semaphores_zero'] and
+                   e['finite'])
         if (b, m) in PRIMARY:
             out['batch'][str(b)] = e
         else:
