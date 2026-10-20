@@ -24,6 +24,13 @@ pre-tokenizer regex has no lookbehind (GPT-2, Llama-3, Qwen), every pre-token
 match ends before such a space, so the tail tokenizes exactly as it does inside
 the whole prompt.
 
+The same kind of cut makes the tokenization of a long tail (and of a missed
+prompt) parallel: for a tokenizer of that proven shape, the text is cut at such
+spaces into pieces that go to the tokenizer's backend in one ``encode_batch``
+call, which runs them in parallel with the GIL released, and the pieces' ids and
+shifted offsets are concatenated. ``TLLM_PREFIX_TOKEN_CACHE_PARALLEL=0`` turns
+this off.
+
 Off by default; enable with the ``enable_tokenization_cache`` LLM argument.
 Each ``DefaultInputProcessor`` owns its own cache, so cached ids are never
 shared across tokenizers. Sizing knobs, eligibility rules, and measured effect
@@ -80,6 +87,34 @@ MAX_SHARED_PREFIX_SIBLINGS = 32
 # text has that probe at the same position. The probe must be longer than any
 # suffix the chat template appends after the last message.
 PROBE_CHARS = 256
+# A long tail (or a missed prompt) is cut, at spaces that follow a non-space,
+# into pieces tokenized by one backend encode_batch call, which a fast
+# tokenizer runs in parallel without the GIL. The cut is a pre-token boundary
+# (see the module docstring and _space_cut_is_exact), so the ids and offsets are
+# the ones a single call returns. Read once at import;
+# TLLM_PREFIX_TOKEN_CACHE_PARALLEL=0 tokenizes every text in one call.
+# Benchmarks flip the attribute.
+PARALLEL_TAIL = os.environ.get("TLLM_PREFIX_TOKEN_CACHE_PARALLEL", "1") != "0"
+# Pieces are at least this many characters. A text gets at most
+# PARALLEL_MAX_PIECES // (texts being tokenized at once) pieces, so concurrent
+# requests share the cores instead of oversubscribing them.
+PARALLEL_PIECE_CHARS = 1024
+PARALLEL_MAX_PIECES = 8
+# Characters searched past a piece's nominal start for a cut.
+PARALLEL_CUT_SEARCH = 256
+# Pre-tokenizer Split patterns, as stored in tokenizer.json, for which a space
+# that follows a non-space is a pre-token boundary: no lookbehind, and a space
+# only starts a match or sits in an all-whitespace match.
+_CUT_SAFE_SPLIT_PATTERNS = frozenset(
+    {
+        # Qwen3 family.
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
+        r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        # Qwen2 / GPT-4 (cl100k) style.
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
+        r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    }
+)
 
 
 class OffsetTokenizer(Protocol):
@@ -182,6 +217,142 @@ def _is_space_split(text: str, char: int) -> bool:
     return 0 < char < len(text) and text[char] == " " and not text[char - 1].isspace()
 
 
+def _is_cut(text: str, char: int) -> bool:
+    """A stricter ``_is_space_split``: ``text[char]`` is U+0020 and the character
+    before it is a letter, mark, number, punctuation or symbol.
+
+    Those categories are never whitespace in any Unicode version or regex
+    engine, so no whitespace run of the pre-tokenizer reaches across the cut.
+    """
+    if not 0 < char < len(text) or text[char] != " ":
+        return False
+    prev = text[char - 1]
+    return prev != " " and prev.isprintable()
+
+
+def _space_cuts(text: str, pieces: int) -> list[int]:
+    """Start characters of up to ``pieces`` pieces of ``text``, the first 0.
+
+    Every other start is an ``_is_cut`` point within ``PARALLEL_CUT_SEARCH``
+    characters after an equal-length cut; a cut with no such point nearby is
+    skipped.
+    """
+    n = len(text)
+    cuts = [0]
+    for j in range(1, pieces):
+        start = max(j * n // pieces, cuts[-1] + 1)
+        end = min(start + PARALLEL_CUT_SEARCH, n)
+        char = text.find(" ", start, end)
+        while char != -1 and not _is_cut(text, char):
+            char = text.find(" ", char + 1, end)
+        if char != -1:
+            cuts.append(char)
+    return cuts
+
+
+def _backend_of(tokenizer: object) -> object | None:
+    """The ``tokenizers.Tokenizer`` behind a HF fast tokenizer or TRT-LLM's wrapper."""
+    for candidate in (tokenizer, getattr(tokenizer, "tokenizer", None)):
+        backend = getattr(candidate, "backend_tokenizer", None)
+        if backend is not None:
+            return backend
+    return None
+
+
+def _space_cut_is_exact(tokenizer: object) -> bool:
+    """Whether tokenizing pieces of a text cut by ``_space_cuts`` gives the
+    ids, and the offsets shifted by each piece's start, of the whole text.
+
+    True for a byte-level BPE fast tokenizer of a known shape: no normalizer or
+    NFC (a space is a starter that never composes), a Split pre-tokenizer with
+    a pattern from ``_CUT_SAFE_SPLIT_PATTERNS`` followed by ByteLevel without a
+    prefix space or its own regex, no post-processor or a ByteLevel one that
+    keeps offsets, BPE without dropout, and added tokens that hold no
+    whitespace and strip none (they are split out before pre-tokenization).
+    """
+    import json
+
+    backend = _backend_of(tokenizer)
+    if backend is None:
+        return False
+
+    def state(component: object) -> dict | None:
+        return None if component is None else json.loads(component.__getstate__())
+
+    normalizer = state(backend.normalizer)
+    if normalizer is not None and normalizer.get("type") != "NFC":
+        return False
+    pre = state(backend.pre_tokenizer) or {}
+    steps = pre.get("pretokenizers") if pre.get("type") == "Sequence" else None
+    if not steps or len(steps) != 2:
+        return False
+    split, byte_level = steps
+    if (
+        split.get("type") != "Split"
+        or split.get("behavior") != "Isolated"
+        or split.get("invert")
+        or (split.get("pattern") or {}).get("Regex") not in _CUT_SAFE_SPLIT_PATTERNS
+        or byte_level.get("type") != "ByteLevel"
+        or byte_level.get("add_prefix_space")
+        or byte_level.get("use_regex")
+    ):
+        return False
+    post = state(backend.post_processor)
+    if post is not None and (post.get("type") != "ByteLevel" or post.get("trim_offsets")):
+        return False
+    if type(backend.model).__name__ != "BPE" or getattr(backend.model, "dropout", None):
+        return False
+    for added in backend.get_added_tokens_decoder().values():
+        if (
+            added.lstrip
+            or added.rstrip
+            or added.single_word
+            or any(ch.isspace() for ch in added.content)
+        ):
+            return False
+    return True
+
+
+class _PieceOffsets:
+    """Offsets of a text tokenized in pieces, as one call on the text returns
+    them: each piece's offsets shifted by the piece's start character.
+
+    Read lazily from the pieces' encodings, because the cache reads only a few
+    of them (the resync span, every GRID_STRIDE-th start, the next split), and
+    building every tuple in Python would hold the GIL for longer than the
+    parallel tokenization saves when several requests arrive together.
+    """
+
+    __slots__ = ("_encodings", "_starts", "_cuts", "_len")
+
+    def __init__(self, encodings: list, starts: list[int], cuts: list[int], length: int):
+        self._encodings = encodings
+        self._starts = starts  # first token index of each piece
+        self._cuts = cuts  # first character of each piece
+        self._len = length
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __iter__(self):
+        return (self._at(i) for i in range(self._len))
+
+    def _at(self, index: int) -> tuple[int, int]:
+        piece = bisect_right(self._starts, index) - 1
+        start, end = self._encodings[piece].token_to_chars(index - self._starts[piece])
+        shift = self._cuts[piece]
+        return start + shift, end + shift
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self._at(i) for i in range(*index.indices(self._len))]
+        if index < 0:
+            index += self._len
+        if not 0 <= index < self._len:
+            raise IndexError(index)
+        return self._at(index)
+
+
 class PrefixTokenCache:
     """Splice a cached prefix's token ids with a freshly tokenized tail.
 
@@ -216,6 +387,16 @@ class PrefixTokenCache:
         self.resync_failures = 0
         self.shared_prefix_hits = 0
         self.shared_prefix_fallbacks = 0
+        # Texts tokenized in parallel pieces, and parallel attempts that raised
+        # and were tokenized in one call instead.
+        self.parallel_tokenizations = 0
+        self.parallel_errors = 0
+        # (tokenizer, its backend if _space_cut_is_exact holds for it, else
+        # None), set on first use.
+        self._cut_backend: tuple[object, object | None] | None = None
+        # Texts being tokenized by _tokenize_long right now. Concurrent requests
+        # split into fewer pieces each, so they do not oversubscribe the cores.
+        self._inflight = 0
 
     def encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
         """Return the token ids of ``text`` without special tokens."""
@@ -256,7 +437,7 @@ class PrefixTokenCache:
             if split is not None:
                 attempted = True
                 split_token, split_char = split
-                tail_ids, tail_offsets = self._tokenize(tokenizer, text[split_char:])
+                tail_ids, tail_offsets = self._tokenize_long(tokenizer, text[split_char:])
                 # A shared-prefix splice only compares ids inside the common
                 # prefix, and needs a full resync span there.
                 limit, required = (
@@ -267,7 +448,7 @@ class PrefixTokenCache:
                     ids.extend(tail_ids)
                     base_token, base_char = split_token, split_char
         if ids is None:
-            tail_ids, tail_offsets = self._tokenize(tokenizer, text)
+            tail_ids, tail_offsets = self._tokenize_long(tokenizer, text)
             ids, base_token, base_char = array("i", tail_ids), 0, 0
 
         # Where a prompt extending this one will be re-tokenized from.
@@ -323,6 +504,105 @@ class PrefixTokenCache:
     ) -> tuple[list[int], Sequence[tuple[int, int]]]:
         enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
         return enc["input_ids"], enc["offset_mapping"]
+
+    def parallel_backend(self, tokenizer: OffsetTokenizer) -> object | None:
+        """The backend of ``tokenizer`` if ``_space_cut_is_exact`` holds for it (cached)."""
+        known = self._cut_backend
+        if known is not None and known[0] is tokenizer:
+            return known[1]
+        try:
+            backend = _backend_of(tokenizer) if _space_cut_is_exact(tokenizer) else None
+        except Exception as e:  # noqa: BLE001 - unknown shape means "not known exact"
+            logger.debug(f"Prefix token cache: cannot inspect the tokenizer: {e!r}")
+            backend = None
+        self._cut_backend = (tokenizer, backend)
+        state = "on" if backend is not None else "off (tokenizer shape not known exact)"
+        logger.info(
+            f"Prefix token cache: parallel tail tokenization {state} "
+            f"(PARALLEL_TAIL={PARALLEL_TAIL}, "
+            f"TOKENIZERS_PARALLELISM={os.environ.get('TOKENIZERS_PARALLELISM')})"
+        )
+        return backend
+
+    def _tokenize_long(
+        self, tokenizer: OffsetTokenizer, text: str
+    ) -> tuple[list[int], Sequence[tuple[int, int]]]:
+        """``_tokenize``, run on parallel pieces of ``text`` when that is exact.
+
+        The pieces are cut at pre-token boundaries (``_space_cuts``) and go to
+        the tokenizer's backend in one ``encode_batch`` call, which runs them in
+        parallel with the GIL released; their ids are concatenated and their
+        offsets shifted by each piece's start, which is what one call on the
+        whole text returns. Falls back to one call when the tokenizer is not of
+        a shape the cut is proven for, the text is short or has no cut point,
+        enough other texts are being tokenized that it would get one piece, or
+        the batched call fails or does not cover every piece.
+        """
+        backend = None
+        if PARALLEL_TAIL and len(text) >= 2 * PARALLEL_PIECE_CHARS:
+            backend = self.parallel_backend(tokenizer)
+        if backend is not None:
+            with self._lock:
+                self._inflight += 1
+                pieces = min(
+                    PARALLEL_MAX_PIECES // self._inflight, len(text) // PARALLEL_PIECE_CHARS
+                )
+            out = None
+            try:
+                if pieces > 1:
+                    out = self._tokenize_pieces(backend, text, pieces)
+            except Exception as e:  # noqa: BLE001 - never fail a request on this path
+                with self._lock:
+                    self.parallel_errors += 1
+                logger.debug(f"Prefix token cache: parallel tokenization failed: {e!r}")
+                out = None
+            finally:
+                with self._lock:
+                    self._inflight -= 1
+            if out is not None:
+                with self._lock:
+                    self.parallel_tokenizations += 1
+                return out
+        return self._tokenize(tokenizer, text)
+
+    @staticmethod
+    def _tokenize_pieces(
+        backend: object, text: str, pieces: int
+    ) -> tuple[list[int], _PieceOffsets] | None:
+        # A truncation, padding or special-token splitting left on the backend
+        # by another caller would change the ids; the HF call resets them,
+        # encode_batch does not.
+        if (
+            backend.truncation is not None
+            or backend.padding is not None
+            or getattr(backend, "encode_special_tokens", False)
+        ):
+            return None
+        cuts = _space_cuts(text, pieces)
+        if len(cuts) < 2:
+            return None
+        ends = cuts[1:]
+        ends.append(len(text))
+        encodings = backend.encode_batch(
+            [text[start:end] for start, end in zip(cuts, ends)], add_special_tokens=False
+        )
+        if len(encodings) != len(cuts):
+            return None
+        ids: list[int] = []
+        starts = []
+        for start, end, encoding in zip(cuts, ends, encodings):
+            piece_ids = encoding.ids
+            # Byte-level BPE gives every character to a token, so a piece's
+            # last token ends at the piece's end; anything else is not the
+            # tokenization of the whole piece.
+            if not piece_ids:
+                return None
+            last = encoding.token_to_chars(len(piece_ids) - 1)
+            if last is None or last[1] != end - start:
+                return None
+            starts.append(len(ids))
+            ids.extend(piece_ids)
+        return ids, _PieceOffsets(encodings, starts, cuts, len(ids))
 
     def _split(
         self, entry: _Entry, text: str, common: int, extends: bool
