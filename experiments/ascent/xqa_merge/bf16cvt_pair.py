@@ -154,6 +154,14 @@ def sass_insts(text):
 
 
 def census(cubin, tag):
+    try:
+        return census_impl(cubin, tag)
+    except Exception as e:  # noqa: BLE001
+        log('census %s failed: %s' % (tag, e))
+        return dict(error=str(e)[-1500:], cubin_bytes=len(cubin), cubin_sha256=sha(cubin))
+
+
+def census_impl(cubin, tag):
     d = tempfile.mkdtemp(prefix='bf16cvt_')
     p = os.path.join(d, tag + '.cubin')
     with open(p, 'wb') as f:
@@ -451,8 +459,14 @@ def run_process(order, outp):
         del runners
     res['readonly_inputs_unchanged'] = readonly_hash(inp) == h0
     res['gpu_state_end'] = gpu_state()
+    with open(outp, 'w') as f:
+        json.dump(res, f)
     if order == 0:
-        res['probe'] = probe()
+        try:
+            res['probe'] = probe()
+        except Exception as e:  # noqa: BLE001
+            res['probe'] = dict(error=str(e)[-1500:])
+            log('probe failed: %s' % str(e)[-1500:])
         cen = dict()
         cen['own_sm_120f'] = census(cub_own, 'own_sm_120f')
         cen['ref_sm_120f'] = census(cub_ref, 'ref_sm_120f')
