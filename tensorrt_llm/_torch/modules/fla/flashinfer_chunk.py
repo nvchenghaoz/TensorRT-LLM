@@ -28,6 +28,8 @@ This module is only imported when ``TLLM_USE_FLASHINFER_GDN_PREFILL=1`` is set
 at process start; do not import it lazily inside hot paths.
 """
 
+import functools
+import inspect
 from typing import Optional, Tuple
 
 import torch
@@ -38,6 +40,18 @@ from tensorrt_llm._torch.modules.fla.fused_state_io import (
 )
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 from tensorrt_llm._utils import is_sm_100f
+
+
+@functools.lru_cache(maxsize=1)
+def _flashinfer_accepts_long_seq_hint() -> bool:
+    """Whether flashinfer.chunk_gated_delta_rule takes the ``num_long_seqs`` hint."""
+    import flashinfer
+
+    try:
+        params = inspect.signature(flashinfer.chunk_gated_delta_rule).parameters
+    except (TypeError, ValueError):
+        return False
+    return "num_long_seqs" in params
 
 
 # Mirror the @torch.compiler.disable on the legacy Triton wrapper
@@ -61,6 +75,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
     state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    num_long_seqs: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Adapter for FlashInfer's ``chunk_gated_delta_rule``.
 
@@ -71,6 +86,9 @@ def chunk_gated_delta_rule(
     ``state_workspace`` optionally supplies an (input, output) tensor pair,
     each shaped ``[capacity, H, V, K]`` in the state I/O dtype.
     Returned states never alias this scratch.
+    ``num_long_seqs`` is an optional host-side upper bound on the number of
+    sequences longer than one token; FlashInfer's SM120 kernel uses it only to
+    pick its launch shape (bitwise-identical results).
     """
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
     # build does not error until the function is actually called.
@@ -152,6 +170,11 @@ def chunk_gated_delta_rule(
     num_o_heads = max(q3.shape[1], v3.shape[1])
     head_size = q3.shape[2]
     need_state = inplace_indexed_state_update or output_final_state
+    hint_kwargs = (
+        {"num_long_seqs": num_long_seqs}
+        if num_long_seqs is not None and _flashinfer_accepts_long_seq_hint()
+        else {}
+    )
     output_buf = (
         output.squeeze(0)
         if output is not None
@@ -180,6 +203,7 @@ def chunk_gated_delta_rule(
             use_qk_l2norm_in_kernel=False,  # dead param in FlashInfer; we already normalized
             output=output_buf,
             output_state=state_buf,
+            **hint_kwargs,
         )
     else:
         # FI returns a single tensor (not a tuple) when output_final_state=False.
@@ -195,6 +219,7 @@ def chunk_gated_delta_rule(
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=False,
             output=output_buf,
+            **hint_kwargs,
         )
         out_state = None
 

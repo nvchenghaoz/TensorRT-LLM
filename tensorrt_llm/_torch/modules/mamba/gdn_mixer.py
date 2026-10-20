@@ -87,11 +87,17 @@ def _resolve_chunk_gated_delta_rule():
 
 @torch.compiler.disable
 def chunk_gated_delta_rule(
-    *args, state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None, **kwargs
+    *args,
+    state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    num_long_seqs: Optional[int] = None,
+    **kwargs,
 ):
     """Dispatch prefill, omitting unused FlashInfer-only workspace arguments."""
     if state_workspace is not None:
         kwargs["state_workspace"] = state_workspace
+    if num_long_seqs is not None and _use_flashinfer_gdn_prefill():
+        # Host-only hint for FlashInfer's SM120 kernel selection (V-split x2).
+        kwargs["num_long_seqs"] = num_long_seqs
     return _resolve_chunk_gated_delta_rule()(*args, **kwargs)
 
 
@@ -1131,6 +1137,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=False,
             output=output,
             state_workspace=kwargs.get("state_workspace"),
+            # Decodes in a mixed step ride along as 1-token sequences; only the
+            # context requests can be long (host ints, no D2H read).
+            num_long_seqs=num_prefill,
         )
 
         return core_attn_out
