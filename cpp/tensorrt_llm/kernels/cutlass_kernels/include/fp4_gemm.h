@@ -17,6 +17,8 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include <cstddef>
+#include <cstdint>
 #include <cuda_runtime_api.h>
 #include <vector>
 
@@ -98,6 +100,15 @@ private:
     int mSm;
     int mMultiProcessorCount;
 };
+
+// SM120 NVFP4 W4A4 gate_up GEMM + SwiGLU + NVFP4 quantize epilogue (see
+// fp4_gemm/nvfp4_swiglu_gemm_sm120.h for the weight-row layout it expects).
+// Writes fp4Out [m, n/4] bytes and sfOut (128x4-swizzled, padding rows zeroed).
+// tile 0: 256x128x128, tile 1: 128x128x256. Returns the workspace size when A,
+// B and fp4Out are all null.
+size_t nvfp4SwigluGemmSm120(void const* A, void const* B, void const* inputSf, void const* weightSf,
+    float const* alpha, float const* outScale, uint8_t* fp4Out, uint8_t* sfOut, int m, int n, int k, int tile,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, bool enablePdl);
 
 } // namespace cutlass_kernels
 } // namespace kernels

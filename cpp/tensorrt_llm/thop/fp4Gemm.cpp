@@ -16,6 +16,7 @@
 
 #include "cutlass_extensions/gemm_configs.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -29,6 +30,7 @@
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/native/cuda/Resize.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cuda_fp16.h>
 
@@ -245,6 +247,54 @@ at::Tensor fp4_bmm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor co
         static_cast<int>(torch_ext::BufferKind::Default));
 }
 
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+// gate_up NVFP4 W4A4 GEMM (rows pre-permuted, see nvfp4_swiglu_gemm_sm120.h)
+// + SwiGLU + NVFP4 quantize with down_proj's global input scale `outScale`.
+// Returns (fp4 [m, n/4] uint8, swizzled SF [ceil128(m) * ceil4(n/32)] uint8),
+// bitwise equal to nvfp4_gemm (BF16) + fused_silu_mul_nvfp4 on the unpermuted
+// weights.
+std::vector<at::Tensor> nvfp4_gate_up_swiglu_nvfp4(at::Tensor const& mat1, at::Tensor const& mat2,
+    at::Tensor const& mat1Scale, at::Tensor const& mat2Scale, at::Tensor const& alpha, at::Tensor const& outScale,
+    int64_t tile)
+{
+    CHECK_INPUT(mat1, FLOAT4_E2M1X2);
+    CHECK_INPUT(mat2, FLOAT4_E2M1X2);
+    CHECK_INPUT(mat1Scale, SF_DTYPE);
+    CHECK_INPUT(mat2Scale, SF_DTYPE);
+    CHECK_INPUT(alpha, at::ScalarType::Float);
+    CHECK_INPUT(outScale, at::ScalarType::Float);
+    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "mat1 and mat2 must be matrices");
+    TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1], "K mismatch");
+    TORCH_CHECK(tensorrt_llm::common::getSMVersion() / 10 == 12, "nvfp4_gate_up_swiglu_nvfp4 requires SM12x");
+    int64_t const m = mat1.sizes()[0];
+    int64_t const n = mat2.sizes()[0];
+    int64_t const k = mat2.sizes()[1] * 2;
+    TORCH_CHECK(n % 128 == 0 && k % 128 == 0, "n and k must be multiples of 128");
+    int64_t const d = n / 2;
+    int64_t const mPad = (m + 127) / 128 * 128;
+    int64_t const numKTiles = (d / 16 + 3) / 4;
+    at::Tensor fp4 = at::detail::empty_cuda({m, d / 2}, at::ScalarType::Byte, mat1.device(), std::nullopt);
+    at::Tensor sf = at::detail::empty_cuda({mPad * numKTiles * 4}, at::ScalarType::Byte, mat1.device(), std::nullopt);
+    if (m == 0)
+    {
+        return {fp4, sf};
+    }
+    auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
+    int const tileId = static_cast<int>(tile);
+    size_t const wsBytes = tensorrt_llm::kernels::cutlass_kernels::nvfp4SwigluGemmSm120(nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+        tileId, nullptr, 0, stream, false);
+    at::Tensor workspace = at::detail::empty_cuda(
+        {static_cast<int64_t>(std::max<size_t>(wsBytes, 16))}, at::ScalarType::Char, mat1.device(), std::nullopt);
+    tensorrt_llm::kernels::cutlass_kernels::nvfp4SwigluGemmSm120(mat1.const_data_ptr(), mat2.const_data_ptr(),
+        mat1Scale.const_data_ptr(), mat2Scale.const_data_ptr(), alpha.data_ptr<float>(), outScale.data_ptr<float>(),
+        fp4.data_ptr<uint8_t>(), sf.data_ptr<uint8_t>(), static_cast<int>(m), static_cast<int>(n),
+        static_cast<int>(k), tileId, reinterpret_cast<char*>(workspace.data_ptr()), workspace.numel(), stream,
+        tensorrt_llm::common::getEnvEnablePDL());
+    return {fp4, sf};
+}
+#endif
+
 class FP4GemmRunner : public torch::CustomClassHolder
 {
 public:
@@ -342,10 +392,18 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fp4_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor globalScale, int fp4GemmType, "
         "ScalarType? out_dtype=None) -> Tensor");
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+    m.def(
+        "nvfp4_gate_up_swiglu_nvfp4(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor alpha, "
+        "Tensor outScale, int tile=0) -> Tensor[]");
+#endif
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_bmm", &tensorrt_llm::torch_ext::fp4_bmm);
     m.impl("fp4_gemm", &tensorrt_llm::torch_ext::fp4_bmm);
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+    m.impl("nvfp4_gate_up_swiglu_nvfp4", &tensorrt_llm::torch_ext::nvfp4_gate_up_swiglu_nvfp4);
+#endif
 }

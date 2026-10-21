@@ -16,6 +16,10 @@
 
 #include "fp4_gemm_template.h"
 #include "tensorrt_llm/common/config.h"
+#ifndef PLACEHOLDER_KERNELS
+#include "nvfp4_swiglu_gemm_sm120.h"
+#endif
+#include <stdexcept>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -83,6 +87,23 @@ template class CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A8_MXFP4_MXFP8
 template class CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W8A8_MXFP8_MXFP8>;
 
 #endif
+
+size_t nvfp4SwigluGemmSm120(void const* A, void const* B, void const* inputSf, void const* weightSf,
+    float const* alpha, float const* outScale, uint8_t* fp4Out, uint8_t* sfOut, int m, int n, int k, int tile,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, bool enablePdl)
+{
+#ifdef PLACEHOLDER_KERNELS
+    throw std::runtime_error("[TensorRT LLM Error][SwiGLU NVFP4 GEMM] not compiled for this architecture.");
+#else
+    if (tile == 0)
+    {
+        return swiglu_nvfp4_sm120::runSwigluNvfp4GemmSm120<256, 128, 128>(A, B, inputSf, weightSf, alpha, outScale,
+            fp4Out, sfOut, m, n, k, workspace, workspaceBytes, stream, enablePdl);
+    }
+    return swiglu_nvfp4_sm120::runSwigluNvfp4GemmSm120<128, 128, 256>(A, B, inputSf, weightSf, alpha, outScale,
+        fp4Out, sfOut, m, n, k, workspace, workspaceBytes, stream, enablePdl);
+#endif
+}
 
 } // namespace cutlass_kernels
 } // namespace kernels
