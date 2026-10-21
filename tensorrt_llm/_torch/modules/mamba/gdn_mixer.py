@@ -226,13 +226,14 @@ def _verify_intermediate_state_indices(
     return indices[:num_decodes]
 
 
-# Eager prefill steps with at least this many rows run GDN in_proj_ba (BF16,
+# Eager prefill steps with at least this many rows (default 2048, so the
+# 2048-row chunked-prefill steps fork too) run GDN in_proj_ba (BF16,
 # N=96) on aux_stream beside the W4A4 in_proj_qkvz instead of after it; same
 # kernels and inputs, so outputs are bitwise unchanged. Decode, smaller
 # prefill, CUDA-graph capture and torch.compile keep the serial
 # _compute_tokenwise_inputs path. 0 disables the fork at every row count.
 # Read at call time.
-_PREFILL_BA_FORK_MIN_ROWS = int(os.environ.get("TRTLLM_GDN_PREFILL_BA_FORK_MIN_ROWS", "4096"))
+_PREFILL_BA_FORK_MIN_ROWS = int(os.environ.get("TRTLLM_GDN_PREFILL_BA_FORK_MIN_ROWS", "2048"))
 
 # Pure-decode steps whose in_proj_qkvz runs on the cuda-core NVFP4 W4A16 GEMV (rows <= 3) fold
 # causal_conv1d_update into the GEMV epilogue (trtllm::nvfp4_w4a16_gemv_conv): each GEMV CTA owns
