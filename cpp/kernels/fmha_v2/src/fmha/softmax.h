@@ -20,9 +20,103 @@
 #include "fmha/fragment.h"
 #include "fmha/utils.h"
 #include <cfloat>
+#include <type_traits>
+
+// FMHA_SM120_EXP2 (idea 230 arm E / idea 244; default 1, -DFMHA_SM120_EXP2=0 is the kill switch): the SM120 e4m3 tiled no-loop context kernels (the ones
+// with the register-direct O epilogue, Kernel_traits::STORE_O_FROM_REGS) take the softmax in base 2: the QK^T
+// accumulators stay raw, the row max is taken in raw units, P = ex2.approx(acc * s2 - (max * s2 - log2(256))) with
+// s2 = scale_bmm1 * log2(e), and the O / sum rescale is ex2.approx((prev - curr) * s2). The piece and merge kernels of
+// the last q-tile split use the same domain. Every other kernel is unchanged. Precision class (ex2.approx).
+#ifndef FMHA_SM120_EXP2
+#define FMHA_SM120_EXP2 1
+#endif
+#if FMHA_SM120_EXP2 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+#define FMHA_SM120_EXP2_ACTIVE 1
+#else
+#define FMHA_SM120_EXP2_ACTIVE 0
+#endif
 
 namespace fmha
 {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Whether a kernel traits type has the register-direct O epilogue (the SM120 e4m3 head-256 tiled no-loop kernels).
+template <typename T, typename = void>
+struct Kernel_traits_store_o_from_regs
+{
+    static constexpr bool VALUE = false;
+};
+
+template <typename T>
+struct Kernel_traits_store_o_from_regs<T, std::void_t<decltype(T::STORE_O_FROM_REGS)>>
+{
+    static constexpr bool VALUE = T::STORE_O_FROM_REGS;
+};
+
+// Whether a Softmax type runs the base-2 path (USE_EXP2 is defined only by the e4m3 FP32 QMMA softmax).
+template <typename T, typename = void>
+struct Softmax_uses_exp2
+{
+    static constexpr bool VALUE = false;
+};
+
+template <typename T>
+struct Softmax_uses_exp2<T, std::void_t<decltype(T::USE_EXP2)>>
+{
+    static constexpr bool VALUE = T::USE_EXP2;
+};
+
+static inline __device__ float ex2_approx_ftz(float x)
+{
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+// The base-2 forms of Tile_o_normalizer_fp32::update / Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits>::update_sum, for
+// row max values in raw accumulator units (s2 = scale_bmm1 * log2(e)).
+template <typename Fragment_accu, int M, int N, int ROWS>
+inline __device__ void exp2_update_o(Fragment_accu (&acc_o)[M][N], float (&curr_max)[ROWS],
+    float const (&prev_max)[ROWS], float (&sum)[ROWS], float const s2)
+{
+    static_assert(ROWS == 2 * M, "");
+#pragma unroll
+    for (int mi = 0; mi < M; ++mi)
+    {
+        float alpha[2];
+#pragma unroll
+        for (int ii = 0; ii < 2; ++ii)
+        {
+            int jj = 2 * mi + ii;
+            curr_max[jj] = fmax(prev_max[jj], curr_max[jj]);
+            alpha[ii] = ex2_approx_ftz((prev_max[jj] - curr_max[jj]) * s2);
+            sum[jj] *= alpha[ii];
+        }
+#pragma unroll
+        for (int ni = 0; ni < N; ++ni)
+        {
+#pragma unroll
+            for (int ii = 0; ii < Fragment_accu::NUM_ELTS; ++ii)
+            {
+                acc_o[mi][ni].elt(ii) = alpha[(ii & 2) / 2] * acc_o[mi][ni].elt(ii);
+            }
+        }
+    }
+}
+
+// The attention-sink term (once per CTA): the row max is converted back to scaled units (scale = scale_bmm1) and the
+// term is the expf of Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits>::update_sum.
+template <int ROWS>
+inline __device__ void exp2_update_sum(
+    float const sink, float const (&max)[ROWS], float (&sum)[ROWS], float const scale, float const quant_scale)
+{
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i)
+    {
+        sum[i] += expf(sink - max[i] * scale) * quant_scale;
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1391,14 +1485,83 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
     // The accumulators.
     using Accumulator = fmha::Fragment_accumulator<Traits>;
 
+#if FMHA_SM120_EXP2
+    // The base-2 softmax (see FMHA_SM120_EXP2 at the top of this file): elt_ holds the raw accumulators, and the
+    // row max / O rescale are in raw units. s2_ = scale_bmm1 * log2(e). The softmax scale (scale_softmax, which the
+    // expf path multiplies into P before the e4m3 cast) is folded into the exponent too:
+    //   P_e4m3 = e4m3(2^(raw * s2 - (max * s2 - 8 - log2(scale_softmax)))),
+    // so the row sums carry the factor scale_softmax; sum_to_base_units() (1 / scale_softmax) takes them back to the
+    // units of the expf path before the attention-sink term and the final normalization.
+    static constexpr bool USE_EXP2 = FMHA_SM120_EXP2_ACTIVE && Kernel_traits_store_o_from_regs<Kernel_traits>::VALUE;
+    static_assert(Traits::SOFTMAX_FP_QUANT_SCALE == 256.f, "log2(SOFTMAX_FP_QUANT_SCALE) = 8");
+    static constexpr float LOG2_SOFTMAX_FP_QUANT_SCALE = 8.f;
+#endif
+
     // Ctor.
     template <typename Params>
     inline __device__ Softmax_qmma(Params const& params, void* smem, int bidb, int tidx)
         : Base(params, smem, bidb, tidx)
         , params_scale_bmm1_(params.scale_bmm1_d ? *params.scale_bmm1_d : params.scale_bmm1)
         , params_scale_softmax_(params.scale_softmax)
+#if FMHA_SM120_EXP2
+        , s2_(reinterpret_cast<float const&>(params_scale_bmm1_) * 1.4426950408889634f)
+        , exp_bias_(LOG2_SOFTMAX_FP_QUANT_SCALE + log2f(reinterpret_cast<float const&>(params_scale_softmax_)))
+#endif
     {
     }
+
+#if FMHA_SM120_EXP2
+    // The factor that takes the base-2 path's row sums to the units of the expf path.
+    inline __device__ float sum_to_base_units() const
+    {
+        return 1.f / reinterpret_cast<float const&>(params_scale_softmax_);
+    }
+#endif
+
+#if FMHA_SM120_EXP2
+    // ALiBi on raw units: (raw * scale) * scale_after_alibi + m * col, divided by scale (the base-2 path only).
+    template <typename Mask, typename AlibiParams>
+    inline __device__ void apply_mask_alibi(Mask const& mask, int head_id, AlibiParams const& alibi_params)
+    {
+        if constexpr (USE_EXP2 && Kernel_traits::CAUSAL_MASK)
+        {
+            float const inv_scale = 1.f / reinterpret_cast<float const&>(params_scale_bmm1_);
+            float m = get_alibi_head_scaling_factor<AlibiParams>(head_id, alibi_params) * inv_scale;
+#pragma unroll
+            for (int mi = 0; mi < MMAS_M; ++mi)
+            {
+#pragma unroll
+                for (int ii = 0; ii < 2; ++ii)
+                {
+#pragma unroll
+                    for (int ni = 0; ni < MMAS_N; ++ni)
+                    {
+#pragma unroll
+                        for (int jj = 0; jj < 4; ++jj)
+                        {
+                            int row, col;
+                            mask.get_row_col(row, col, mi, ni, ii, jj);
+                            if (mask.is_valid(row, col))
+                            {
+                                this->elt_[2 * mi + ii][4 * ni + jj]
+                                    = this->elt_[2 * mi + ii][4 * ni + jj] * alibi_params.scale_after_alibi
+                                    + m * (col + alibi_params.sequence_pos_offset);
+                            }
+                            else
+                            {
+                                this->elt_[2 * mi + ii][4 * ni + jj] = -FLT_MAX;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            Base::apply_mask_alibi(mask, head_id, alibi_params);
+        }
+    }
+#endif
 
     // Store the tile after softmax.
     template <typename Gmem_tile>
@@ -1434,7 +1597,12 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
     // Convert from accumulators to floats.
     inline __device__ void unpack(Accumulator const (&acc)[MMAS_M][MMAS_N])
     {
+#if FMHA_SM120_EXP2
+        // The base-2 path keeps the raw accumulators (the scale is folded into the exponent).
+        float const scale = USE_EXP2 ? 1.f : reinterpret_cast<float const&>(params_scale_bmm1_);
+#else
         float const scale = reinterpret_cast<float const&>(params_scale_bmm1_);
+#endif
 #pragma unroll
         for (int mi = 0; mi < MMAS_M; ++mi)
         {
@@ -1458,6 +1626,24 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
     template <bool APPLY_MASK = false>
     inline __device__ void apply_exp_with_mask(float const (&max)[MMAS_M * 2])
     {
+#if FMHA_SM120_EXP2
+        if constexpr (USE_EXP2)
+        {
+            // P * 256 * scale_softmax = 2^(raw * s2 - (max * s2 - 8 - log2(scale_softmax))); a fully masked row
+            // (max == -FLT_MAX) gives 0 as before.
+#pragma unroll
+            for (int mi = 0; mi < MMAS_M * 2; ++mi)
+            {
+                float const offset = APPLY_MASK && max[mi] == -FLT_MAX ? 0.f : fmaf(max[mi], s2_, -exp_bias_);
+#pragma unroll
+                for (int ni = 0; ni < MMAS_N * 4; ++ni)
+                {
+                    this->elt_[mi][ni] = ex2_approx_ftz(fmaf(this->elt_[mi][ni], s2_, -offset));
+                }
+            }
+            return;
+        }
+#endif
 #pragma unroll
         for (int mi = 0; mi < MMAS_M * 2; ++mi)
         {
@@ -1474,7 +1660,12 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
     template <typename Fragment_a, int K, int M>
     inline __device__ void pack(Fragment_a (&dst)[K][M]) const
     {
+#if FMHA_SM120_EXP2
+        // The base-2 path has scale_softmax in the exponent already.
+        float const scale = USE_EXP2 ? 1.f : reinterpret_cast<float const&>(this->params_scale_softmax_);
+#else
         float const scale = reinterpret_cast<float const&>(this->params_scale_softmax_);
+#endif
 
 // The canonical layout in K should be R0: [0,1,2,3] R2: [16,17,18,19]
 // Note below that this is not possible with the register layout of the accumulator.
@@ -1515,6 +1706,10 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
 
     // The scaling factors.
     uint32_t const params_scale_bmm1_, params_scale_softmax_;
+#if FMHA_SM120_EXP2
+    // scale_bmm1 * log2(e), and log2(SOFTMAX_FP_QUANT_SCALE * scale_softmax).
+    float const s2_, exp_bias_;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

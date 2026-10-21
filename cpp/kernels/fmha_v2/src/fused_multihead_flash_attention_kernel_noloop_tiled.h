@@ -237,6 +237,9 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
     static_assert(!Softmax::USE_SHARED_MEMORY, "");
 
+    // The base-2 softmax of the SM120 e4m3 kernels (FMHA_SM120_EXP2 in fmha/softmax.h): row max in raw units.
+    static constexpr bool USE_EXP2 = fmha::Softmax_uses_exp2<Softmax>::VALUE;
+
     // Prefetch next kv buffer to share memory
     static constexpr int PREFETCH_K_BUFFER_TO_SMEM = !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY;
 
@@ -446,7 +449,14 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
                 }
 
                 // Update last step's acc_o.
-                acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+                if constexpr (USE_EXP2)
+                {
+                    fmha::exp2_update_o(acc_o, global_max, tmp, global_sum, softmax.s2_);
+                }
+                else
+                {
+                    acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+                }
                 // Apply expf of softmax.
                 // It is possible that all elts are -FLT_MAX with sliding_window_causal or custom_mask.
                 softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
@@ -743,7 +753,14 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
             }
 
             // Update last step's acc_o.
-            acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+            if constexpr (USE_EXP2)
+            {
+                fmha::exp2_update_o(acc_o, global_max, tmp, global_sum, softmax.s2_);
+            }
+            else
+            {
+                acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+            }
             // Apply expf of softmax.
             // It is possible that all elts are -FLT_MAX with sliding_window_causal or custom_mask.
             softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
@@ -872,7 +889,22 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     }     // Inner loop over the key/value sequence length.
 
     // Update the sum if attention sinks are used.
-    acc_o_normalizer.update_sum(global_max, global_sum);
+    if constexpr (USE_EXP2)
+    {
+        // The base-2 row sums carry scale_softmax (folded into the exponent): back to the expf path's units.
+        float const to_base = softmax.sum_to_base_units();
+#pragma unroll
+        for (int i = 0; i < Softmax::ROWS_PER_THREAD; ++i)
+        {
+            global_sum[i] *= to_base;
+        }
+        fmha::exp2_update_sum(acc_o_normalizer.attention_sink_value_, global_max, global_sum,
+            reinterpret_cast<float const&>(softmax.params_scale_bmm1_), Traits_p::SOFTMAX_FP_QUANT_SCALE);
+    }
+    else
+    {
+        acc_o_normalizer.update_sum(global_max, global_sum);
+    }
     // Update acc_o of flash attention
     acc_o_normalizer.final_update(acc_o, global_sum);
 
@@ -922,6 +954,15 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     {
         using Mma_tile = typename Traits_p::template Mma_tile<Cta_tile_o>;
         fmha::Softmax_saver<Cta_tile_o, Mma_tile> saver(params, binfo);
+        if constexpr (USE_EXP2)
+        {
+            // Save the row max in the scaled units of the expf path.
+#pragma unroll
+            for (int i = 0; i < Softmax::ROWS_PER_THREAD; ++i)
+            {
+                global_max[i] *= reinterpret_cast<float const&>(softmax.params_scale_bmm1_);
+            }
+        }
         saver.store(q_loop, global_sum, global_max);
     }
 } // device_flash_attention_1xN
