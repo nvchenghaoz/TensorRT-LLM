@@ -427,6 +427,13 @@ class GatedMLP(nn.Module):
         m = t.shape[0]
         if m < max(1, GatedMLP._SWIGLU_EPI_MIN_ROWS):
             return None
+        # During AutoTuner warmup run main's gate_up nvfp4_gemm instead: its
+        # dynamic-bucket tuning at the warmup's prefill shape is what tunes the
+        # decode buckets (2/4/8/16) that the unfused path uses later. The fused
+        # op has no tactics of its own.
+        from ..autotuner import AutoTuner
+        if AutoTuner.get().is_tuning_mode:
+            return None
         gate_up = self.gate_up_proj
         act_fp4, act_sf, alpha = gate_up.quant_method._input_prepare(gate_up, x)
         tile = 0 if m >= 1024 else 1
