@@ -1,6 +1,12 @@
 import os, sys, time, json, threading
 os.environ['TLLM_WORKER_USE_SINGLE_PROCESS'] = '1'
 import torch
+# Idea 225 Stage A in-process pair + correctness (brace-free so the base arm can run it inline with python -c).
+# argv: checkpoint, shared out dir (same slot for both arms), timed c1 iterations.
+# Base arm (main): runs the scenario sets S and S2 and the timing, saves base.pt.
+# Candidate arm: S with the change on, S2 with the kill switch (TRTLLM_LAST_LAYER_SKIP_FMHA_A=0 path), compares both
+# with base.pt from the BASE tree: layer-63 KV pages of the new tokens, read-row logits and final hidden state
+# (lm_head input), greedy ids and logprobs, for cases whose scheduler batching matches base.
 CK = sys.argv[1]
 OUT = sys.argv[2] if len(sys.argv) > 2 else '/tmp/ll127'
 NT1 = int(sys.argv[3]) if len(sys.argv) > 3 else 50
@@ -9,8 +15,8 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig, CudaGraphConfig
 import tensorrt_llm._torch.models.modeling_qwen3_next as mq
 CAND = hasattr(mq, '_LAST_LAYER_SKIP_FMHA_A')
-print('TREE_COMMIT arm', 'cand' if CAND else 'base', flush=True)
 ARM = 'cand' if CAND else 'base'
+print('TREE_COMMIT arm', ARM, 'BASE_MAIN 66cff73e', flush=True)
 AT = os.path.join(OUT, 'autotuner_cache.json')
 if not CAND and os.path.exists(AT):
     os.remove(AT)
@@ -26,7 +32,7 @@ threading.Thread(target=hb, daemon=True).start()
 def set_mode(on):
     if CAND:
         mq._LAST_LAYER_SKIP_FMHA_A = bool(on)
-def lto_count():
+def skip_count():
     if hasattr(torch.ops.trtllm, 'fmha_set_last_tile_split_skip_a'):
         return int(torch.ops.trtllm.fmha_set_last_tile_split_skip_a(False))
     return -1
@@ -47,7 +53,7 @@ for name, m in model.named_modules():
         lm_head = m
 LID = last.layer_idx
 log('last full-attention layer', LID, 'lm_head', type(lm_head).__name__)
-CAP = dict(on=False, kv=[], logits=[], hid=[], pend=False)
+CAP = dict(on=False, kv=[], logits=[], hid=[], pend=False, last=skip_count())
 def attn_hook(mod, args, kwargs, out):
     if not CAP['on'] or torch.cuda.is_current_stream_capturing():
         return
@@ -70,8 +76,13 @@ def attn_hook(mod, args, kwargs, out):
         b1 = (cached[i] + seq[i] - 1) // tpb
         pids = torch.tensor(idx[i][b0:b1 + 1], device=buf.device, dtype=torch.long)
         pages.append(bu8.index_select(0, pids).cpu())
-    gkv = [int(x) for x in md.kv_lens[nc:nc + int(md.num_generations)].tolist()]
-    CAP['kv'].append(dict(seq=seq, cached=cached, ng=int(md.num_generations), gkv=gkv, lto=lto_count(), pages=pages))
+    ng = int(md.num_generations)
+    gkv = [int(x) for x in md.kv_lens[nc:nc + ng].tolist()]
+    c = skip_count()
+    skipped = c - CAP['last']
+    CAP['last'] = c
+    qt = sorted(set([(s + 63) // 64 for s in seq]))
+    CAP['kv'].append(dict(seq=seq, cached=cached, ng=ng, gkv=gkv, skipped=skipped, qtiles=qt, pages=pages))
     CAP['pend'] = True
 def lm_hook(mod, args, out):
     if not CAP['pend']:
@@ -86,42 +97,40 @@ PREFIX = torch.randint(1000, 200000, (32768,), generator=g).tolist()
 def P(i, n=2048):
     gg = torch.Generator().manual_seed(100000 + i)
     return PREFIX + torch.randint(1000, 200000, (n,), generator=gg).tolist()
+def outres(o):
+    c = o.outputs[0]
+    lps = []
+    for tid, d in zip(c.token_ids, c.logprobs or []):
+        v = d.get(tid) if isinstance(d, dict) else None
+        lps.append(float(v.logprob) if v is not None else None)
+    return dict(ids=list(c.token_ids), lp=lps, cached=getattr(o, 'cached_tokens', None))
 def gen(prompts, mt, lp=True):
     sp = SamplingParams(max_tokens=mt, temperature=0.0, top_k=1, ignore_eos=True,
                         logprobs=1 if lp else None)
     t = time.time()
     outs = llm.generate(prompts, sp, use_tqdm=False)
     dt = time.time() - t
-    res = []
-    for o in outs:
-        c = o.outputs[0]
-        lps = []
-        if lp and c.logprobs:
-            for tid, d in zip(c.token_ids, c.logprobs):
-                v = d.get(tid) if isinstance(d, dict) else None
-                lps.append(float(v.logprob) if v is not None else None)
-        res.append(dict(ids=list(c.token_ids), lp=lps, cached=getattr(o, 'cached_tokens', None)))
-    return res, dt
-def scen(prompts, mt):
+    return [outres(o) for o in outs], dt
+def cap_start():
     CAP['kv'] = []
     CAP['logits'] = []
     CAP['hid'] = []
     CAP['pend'] = False
     CAP['on'] = True
-    res, dt = gen(prompts, mt)
+def cap_end(res):
     torch.cuda.synchronize()
     CAP['on'] = False
     return dict(res=res, kv=CAP['kv'], logits=CAP['logits'], hid=CAP['hid'])
+def scen(prompts, mt):
+    cap_start()
+    res, dt = gen(prompts, mt)
+    return cap_end(res)
 def mixed(seed_a, seed_b):
+    # B joins while A decodes (submitted once A has streamed 16 tokens), so B's context step is a mixed
+    # [ctx B + gen A] step; the gen position is recorded and must match base's for the comparison to count.
     sa = SamplingParams(max_tokens=96, temperature=0.0, top_k=1, ignore_eos=True, logprobs=1)
     sb = SamplingParams(max_tokens=8, temperature=0.0, top_k=1, ignore_eos=True, logprobs=1)
-    CAP['kv'] = []
-    CAP['logits'] = []
-    CAP['hid'] = []
-    CAP['pend'] = False
-    CAP['on'] = True
-    # B joins while A decodes: submit B once A has streamed 16 tokens, so B's context step is a mixed [ctx B + gen A]
-    # step at about the same A position in both arms (the A position is recorded and compared).
+    cap_start()
     fa = llm.generate_async(P(seed_a), sa, streaming=True)
     fb = None
     for part in fa:
@@ -131,17 +140,81 @@ def mixed(seed_a, seed_b):
         fb = llm.generate_async(P(seed_b), sb)
     ra = fa.result()
     rb = fb.result()
-    torch.cuda.synchronize()
-    CAP['on'] = False
-    res = []
-    for o in (ra, rb):
-        c = o.outputs[0]
-        lps = []
-        for tid, d in zip(c.token_ids, c.logprobs or []):
-            v = d.get(tid) if isinstance(d, dict) else None
-            lps.append(float(v.logprob) if v is not None else None)
-        res.append(dict(ids=list(c.token_ids), lp=lps, cached=getattr(o, 'cached_tokens', None)))
-    return dict(res=res, kv=CAP['kv'], logits=CAP['logits'], hid=CAP['hid'])
+    return cap_end([outres(ra), outres(rb)])
+def cmp(a, b):
+    o = dict()
+    o['ids_eq'] = len(a['res']) == len(b['res']) and all(x['ids'] == y['ids'] for x, y in zip(a['res'], b['res']))
+    lpd = 0.0
+    for x, y in zip(a['res'], b['res']):
+        for u, v in zip(x['lp'], y['lp']):
+            if u is not None and v is not None:
+                lpd = max(lpd, abs(u - v))
+    o['lp_maxdiff'] = lpd
+    o['ctx_steps'] = [len(a['kv']), len(b['kv'])]
+    o['gen_positions'] = [[x['gkv'] for x in a['kv']], [x['gkv'] for x in b['kv']]]
+    o['step_seqs'] = [[x['seq'] for x in a['kv']], [x['seq'] for x in b['kv']]]
+    o['aligned'] = o['gen_positions'][0] == o['gen_positions'][1] and o['step_seqs'][0] == o['step_seqs'][1]
+    kv_eq = len(a['kv']) == len(b['kv'])
+    npg = 0
+    for x, y in zip(a['kv'], b['kv']):
+        for p, q in zip(x['pages'], y['pages']):
+            npg += p.shape[0]
+            kv_eq = kv_eq and p.shape == q.shape and torch.equal(p, q)
+    o['kv_bitwise'] = kv_eq
+    o['kv_pages'] = npg
+    lg_eq = len(a['logits']) == len(b['logits'])
+    hd_eq = lg_eq
+    lg_max = 0.0
+    hd_max = 0.0
+    rows = 0
+    for x, y in zip(a['logits'], b['logits']):
+        if x.shape != y.shape:
+            lg_eq = False
+            continue
+        rows += x.shape[0]
+        lg_eq = lg_eq and torch.equal(x, y)
+        lg_max = max(lg_max, float((x - y).abs().max()))
+    for x, y in zip(a['hid'], b['hid']):
+        if x.shape != y.shape:
+            hd_eq = False
+            continue
+        hd_eq = hd_eq and torch.equal(x, y)
+        hd_max = max(hd_max, float((x - y).abs().max()))
+    o['logit_rows'] = rows
+    o['logits_bitwise'] = lg_eq
+    o['logits_maxabs'] = lg_max
+    o['final_hidden_bitwise'] = hd_eq
+    o['final_hidden_maxabs'] = hd_max
+    return o
+def ok(c):
+    return (c['kv_bitwise'] and c['logits_bitwise'] and c['final_hidden_bitwise'] and c['ids_eq']
+            and c['lp_maxdiff'] == 0.0 and c['ctx_steps'][0] == c['ctx_steps'][1])
+CASES = ('c1a', 'c1b', 'b2', 'b4', 'long', 'mixed', 'ragged')
+def run_set(off):
+    d = dict()
+    d['c1a'] = scen([P(off + 10)], 8)
+    d['c1b'] = scen([P(off + 11)], 8)
+    d['b2'] = scen([P(off + 12), P(off + 13)], 8)
+    d['b4'] = scen([P(off + 14), P(off + 15), P(off + 16), P(off + 17)], 8)
+    # Untimed repeated sequence with the timed loop's warmup (10) and iteration count (50): the same prompt every
+    # time (prefix reused, its 2048 new tokens recomputed and their KV pages rewritten); every iteration must equal
+    # iteration 1 (greedy ids, logprobs, read-row logits, final hidden state, layer-63 KV pages, step count).
+    first = None
+    eq = []
+    for k in range(60):
+        x = scen([P(off + 21)], 8)
+        if first is None:
+            first = x
+        else:
+            eq.append(ok(cmp(first, x)))
+    d['rep_first'] = first
+    d['rep_eq'] = eq
+    d['long'] = scen([P(off + 20)], 64)
+    d['mixed'] = mixed(off + 30, off + 31)
+    # Guard fallback: 2048 + 2048 + 1900 new tokens; a context step holding a 1900 (30 q-tiles) and a 2048 (32)
+    # must keep launch A (skipped == 0).
+    d['ragged'] = scen([P(off + 32), P(off + 33), P(off + 34, 1900)], 8)
+    return d
 log('prime')
 r, dt = gen([P(0)], 1, False)
 log('prime done %.2fs cached=%s' % (dt, r[0]['cached']))
@@ -153,31 +226,13 @@ for mode in modes:
     gen([P(4), P(5), P(6), P(7)], 2, False)
 log('warm done')
 SC = dict()
-def run_set(off):
-    d = dict()
-    d['c1a'] = scen([P(off + 10)], 8)
-    d['c1b'] = scen([P(off + 11)], 8)
-    d['b2'] = scen([P(off + 12), P(off + 13)], 8)
-    d['b4'] = scen([P(off + 14), P(off + 15), P(off + 16), P(off + 17)], 8)
-    d['rep'] = [scen([P(off + 10)], 8) for k in range(4)]
-    d['long'] = scen([P(off + 20)], 64)
-    d['mixed'] = mixed(off + 30, off + 31)
-    # Guard fallback: 2048 and 1900 new tokens are in different q-tiles (32 and 30 of 64 rows), so the host guard
-    # keeps launch A (the whole kernel's rows).
-    d['ragged'] = scen([P(off + 32), P(off + 33, 1900)], 8)
-    return d
-def show(tag, d):
-    log(tag, 'cached c1a/rep', d['c1a']['res'][0]['cached'], [x['res'][0]['cached'] for x in d['rep']],
-        'lto per ctx step c1a', [x['lto'] for x in d['c1a']['kv']],
-        'ng per ctx step mixed', [x['ng'] for x in d['mixed']['kv']])
-# The same prompt sequence in both arms: set S (seeds 10..) then set S2 (seeds 50..). Base runs both on main's
-# code; the candidate runs S with the change on and S2 with the kill switch (TRTLLM_LAST_LAYER_SKIP_FMHA_A=0 path).
 set_mode(True)
 SC['S'] = run_set(0)
-show('S', SC['S'])
 set_mode(False)
 SC['S2'] = run_set(40)
-show('S2', SC['S2'])
+for t in ('S', 'S2'):
+    log(t, 'cached c1a', SC[t]['c1a']['res'][0]['cached'], 'repeat all equal', all(SC[t]['rep_eq']),
+        'steps', json.dumps([[k, [[x['seq'], x['ng'], x['skipped']] for x in SC[t][k]['kv']]] for k in CASES]))
 TIM = dict()
 for mode in modes:
     TIM['m' + str(mode)] = dict(b1=[], b2=[], b4=[])
@@ -206,95 +261,45 @@ for k in TIM:
         TS[k][b] = stats(TIM[k][b])
 log('timing ms', json.dumps(TS))
 torch.save(dict(SC=SC, TIM=TIM), os.path.join(OUT, ARM + '.pt'))
-ART = os.environ.get('AUTO_DEV_ARTIFACTS')
-if ART:
-    os.makedirs(ART, exist_ok=True)
-    torch.save(dict(SC=SC, TIM=TIM), os.path.join(ART, ARM + '.pt'))
 log('saved', os.path.join(OUT, ARM + '.pt'), 'host', os.uname()[1], 'gpu', os.environ.get('CUDA_VISIBLE_DEVICES'))
-def cmp(a, b):
-    o = dict()
-    o['ids_eq'] = all(x['ids'] == y['ids'] for x, y in zip(a['res'], b['res']))
-    lpd = 0.0
-    for x, y in zip(a['res'], b['res']):
-        for u, v in zip(x['lp'], y['lp']):
-            if u is not None and v is not None:
-                lpd = max(lpd, abs(u - v))
-    o['lp_maxdiff'] = lpd
-    o['ctx_steps'] = [len(a['kv']), len(b['kv'])]
-    o['gen_positions'] = [[x['gkv'] for x in a['kv']], [x['gkv'] for x in b['kv']]]
-    o['aligned'] = o['gen_positions'][0] == o['gen_positions'][1]
-    kv_eq = len(a['kv']) == len(b['kv'])
-    npg = 0
-    for x, y in zip(a['kv'], b['kv']):
-        for p, q in zip(x['pages'], y['pages']):
-            npg += p.shape[0]
-            kv_eq = kv_eq and p.shape == q.shape and torch.equal(p, q)
-    o['kv_bitwise'] = kv_eq
-    o['kv_pages'] = npg
-    lg_eq = len(a['logits']) == len(b['logits'])
-    lg_max = 0.0
-    hd_eq = lg_eq
-    hd_max = 0.0
-    am_eq = lg_eq
-    rows = 0
-    for x, y in zip(a['logits'], b['logits']):
-        if x.shape != y.shape:
-            lg_eq = False
-            am_eq = False
-            continue
-        rows += x.shape[0]
-        lg_eq = lg_eq and torch.equal(x, y)
-        lg_max = max(lg_max, float((x - y).abs().max()))
-        am_eq = am_eq and torch.equal(x.argmax(-1), y.argmax(-1))
-    for x, y in zip(a['hid'], b['hid']):
-        if x.shape != y.shape:
-            hd_eq = False
-            continue
-        hd_eq = hd_eq and torch.equal(x, y)
-        hd_max = max(hd_max, float((x - y).abs().max()))
-    o['logit_rows'] = rows
-    o['logits_bitwise'] = lg_eq
-    o['logits_maxabs'] = lg_max
-    o['argmax_eq'] = am_eq
-    o['final_hidden_bitwise'] = hd_eq
-    o['final_hidden_maxabs'] = hd_max
-    return o
-def cmp_all(A, B):
-    o = dict()
-    for k in ('c1a', 'c1b', 'b2', 'b4', 'long', 'mixed', 'ragged'):
-        o[k] = cmp(A[k], B[k])
-    return o
 REP = dict()
-for tag in ('S', 'S2'):
-    # Repeats of one prompt see one cache state (its own blocks reused): each equals repeat 1.
-    REP['repeat_' + tag] = [cmp(SC[tag]['rep'][0], x) for x in SC[tag]['rep'][1:]]
-REP['lto'] = [[x['lto'] for x in SC['S'][k]['kv']] for k in ('c1a', 'b2', 'b4', 'mixed')]
-REP['cached'] = [[x['cached'] for x in SC['S'][k]['res']] for k in ('c1a', 'b2', 'b4', 'mixed')]
-REP['mixed_ng'] = [[x['ng'] for x in SC[t]['mixed']['kv']] for t in ('S', 'S2')]
+for t in ('S', 'S2'):
+    REP['repeat_' + t] = dict(n=len(SC[t]['rep_eq']), all_equal_iter1=all(SC[t]['rep_eq']))
 PASS = None
 if CAND:
     bp = os.path.join(OUT, 'base.pt')
     if os.path.exists(bp):
         B = torch.load(bp, weights_only=False)
-        REP['base_vs_cand_on'] = cmp_all(B['SC']['S'], SC['S'])
-        REP['base_vs_cand_killswitch'] = cmp_all(B['SC']['S2'], SC['S2'])
+        on = dict()
+        ks = dict()
+        for k in CASES + ('rep_first',):
+            on[k] = cmp(B['SC']['S'][k], SC['S'][k])
+            ks[k] = cmp(B['SC']['S2'][k], SC['S2'][k])
+        REP['base_vs_cand_on'] = on
+        REP['base_vs_cand_killswitch'] = ks
+        REP['base_repeat'] = [all(B['SC'][t]['rep_eq']) for t in ('S', 'S2')]
         REP['base_timing'] = dict()
         for b in B['TIM']['mNone']:
             REP['base_timing'][b] = stats(B['TIM']['mNone'][b])
-        on = REP['base_vs_cand_on']
-        ks = REP['base_vs_cand_killswitch']
+        al_on = [k for k in on if on[k]['aligned']]
+        al_ks = [k for k in ks if ks[k]['aligned']]
+        REP['aligned_on'] = al_on
+        REP['aligned_killswitch'] = al_ks
         PASS = dict()
-        PASS['kv_bitwise_on'] = all(on[k]['kv_bitwise'] for k in on)
-        PASS['killswitch_all_bitwise'] = all(ks[k]['kv_bitwise'] and ks[k]['logits_bitwise'] and ks[k]['ids_eq'] for k in ks)
-        PASS['greedy_ids_on'] = all(on[k]['ids_eq'] for k in on)
-        PASS['repeat_on'] = all(x['logits_bitwise'] and x['ids_eq'] and x['kv_bitwise'] for x in REP['repeat_S'])
-        PASS['skip_a_used'] = REP['lto'][0][0] > 0 if REP['lto'][0] else False
-        PASS['ragged_fallback_keeps_a'] = SC['S']['ragged']['kv'][0]['lto'] == SC['S']['mixed']['kv'][-1]['lto']
-        PASS['mixed_has_gen_rows'] = any(x['ng'] > 0 for x in SC['S']['mixed']['kv'])
-        PASS['mixed_aligned'] = on['mixed']['aligned']
-        PASS['logits_bitwise_on'] = all(on[k]['logits_bitwise'] and on[k]['final_hidden_bitwise'] for k in on)
+        PASS['on_aligned_bitwise'] = all(ok(on[k]) for k in al_on)
+        PASS['on_core_aligned'] = all(k in al_on for k in ('c1a', 'c1b', 'long', 'mixed', 'rep_first'))
+        PASS['killswitch_aligned_bitwise'] = all(ok(ks[k]) for k in al_ks)
+        PASS['killswitch_core_aligned'] = all(k in al_ks for k in ('c1a', 'c1b', 'long', 'mixed', 'rep_first'))
+        PASS['repeat_on_59_equal_iter1'] = REP['repeat_S']['all_equal_iter1'] and REP['repeat_S']['n'] == 59
+        PASS['repeat_killswitch_equal_iter1'] = REP['repeat_S2']['all_equal_iter1']
+        PASS['skip_a_used_c1'] = all(x['skipped'] == 1 for x in SC['S']['c1a']['kv'])
+        PASS['killswitch_never_skips'] = all(x['skipped'] == 0 for k in CASES for x in SC['S2'][k]['kv'])
+        rg = [x for x in SC['S']['ragged']['kv'] if len(x['qtiles']) > 1]
+        PASS['ragged_step_seen'] = len(rg) > 0
+        PASS['ragged_fallback_keeps_a'] = len(rg) > 0 and all(x['skipped'] == 0 for x in rg)
+        PASS['mixed_gen_rows_present'] = any(x['ng'] > 0 for x in SC['S']['mixed']['kv'])
     else:
-        REP['base_vs_cand_on'] = 'base.pt not found at ' + bp
+        REP['error'] = 'base.pt not found at ' + bp
 log('report', json.dumps(REP, default=str))
 log('pass', json.dumps(PASS))
 key = 'mTrue' if CAND else 'mNone'
