@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cuda_runtime_api.h>
@@ -278,7 +279,26 @@ void run_skip_softmax_bf16_d128_causal_sm120(
 bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(Fused_multihead_attention_params_v2& params,
     Launch_params const& launch_params,
     void (*launcher)(Fused_multihead_attention_params_v2&, Launch_params const&, cudaStream_t), cudaStream_t stream);
+// The last q-tile of every (head, sequence) only (same TU); returns false when nothing was launched.
+bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_only_sm120(
+    Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
+#endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
 
+namespace
+{
+// Host flag set around a decoder layer whose context rows are read only at each sequence's last token (see
+// setFmhaLastTileOnly); the count is the number of context FMHA calls that took the last-tile-only path.
+std::atomic<bool> gFmhaLastTileOnly{false};
+std::atomic<int64_t> gFmhaLastTileOnlyCount{0};
+} // namespace
+
+int64_t setFmhaLastTileOnly(bool enable)
+{
+    gFmhaLastTileOnly.store(enable, std::memory_order_relaxed);
+    return gFmhaLastTileOnlyCount.load(std::memory_order_relaxed);
+}
+
+#if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
 namespace
 {
 // The generated kernel the split replicates (its traits are instantiated in the split TU).
@@ -395,11 +415,20 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
             && params.softmax_stats_ptr == nullptr && params.attention_sinks_ptr == nullptr
             && launch_params.sage_block_size_q == 0 && launch_params.sage_block_size_k == 0
             && launch_params.sage_block_size_v == 0 && !launch_params.enableSkipSoftmax
-            && isE4m3D256CausalPagedKvTiledSm120Kernel(kernelMeta.mFuncName)
-            && run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(
-                params, launch_params, kernelMeta.launcher, stream))
+            && isE4m3D256CausalPagedKvTiledSm120Kernel(kernelMeta.mFuncName))
         {
-            return;
+            // Only each sequence's last row is read (setFmhaLastTileOnly): run its last q-tile alone.
+            if (gFmhaLastTileOnly.load(std::memory_order_relaxed)
+                && run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_only_sm120(params, launch_params, stream))
+            {
+                gFmhaLastTileOnlyCount.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(
+                    params, launch_params, kernelMeta.launcher, stream))
+            {
+                return;
+            }
         }
 #endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
         kernelMeta.launcher(params, launch_params, stream);

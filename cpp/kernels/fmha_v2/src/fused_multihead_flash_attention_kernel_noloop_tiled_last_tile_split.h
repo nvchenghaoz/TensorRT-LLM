@@ -95,7 +95,7 @@ inline __device__ int active_pieces(int num_kv_tiles, int num_pieces)
 // kv loop limited to the piece's range.
 template <typename Kernel_traits, typename Params>
 inline __device__ void device_flash_attention_nl_tiled_last_tile_piece(
-    Params const& params, int const q_loop, int const num_pieces, float4* ws_acc, float4* ws_stats)
+    Params const& params, int const q_loop_arg, int const num_pieces, float4* ws_acc, float4* ws_stats)
 {
 
     // The instruction traits.
@@ -165,6 +165,9 @@ inline __device__ void device_flash_attention_nl_tiled_last_tile_piece(
 
     // The block info.
     Single_cta<Kernel_traits::VERSION> const binfo(params, bidb, bidh, 0, tidx);
+    // The q-tile: q_loop_arg, or (q_loop_arg < 0) the last q-tile of this sequence.
+    int const q_loop
+        = q_loop_arg >= 0 ? q_loop_arg : max(0, (binfo.actual_q_seqlen - 1) / int(Gmem_tile_q::ROWS));
     // The local sequence offset of Q.
     int q_sequence_start = q_loop * Gmem_tile_q::ROWS;
     // Consider the past sequence length.
@@ -539,7 +542,7 @@ inline __device__ void device_flash_attention_nl_tiled_last_tile_piece(
 // C) The merge of the pieces of the last q-tile. Grid (h, b), Kernel_traits::THREADS threads, no shared memory.
 template <typename Kernel_traits, typename Params>
 inline __device__ void device_flash_attention_nl_tiled_last_tile_merge(
-    Params const& params, int const q_loop, int const num_pieces, float4 const* ws_acc, float4 const* ws_stats)
+    Params const& params, int const q_loop_arg, int const num_pieces, float4 const* ws_acc, float4 const* ws_stats)
 {
     using Traits_o = typename Kernel_traits::Traits_o;
     using Cta_tile_p = typename Kernel_traits::Cta_tile_p;
@@ -560,6 +563,9 @@ inline __device__ void device_flash_attention_nl_tiled_last_tile_merge(
 
     // The block info.
     Single_cta<Kernel_traits::VERSION> const binfo(params, bidb, bidh, 0, tidx);
+    // The same q-tile as the piece kernel.
+    int const q_loop
+        = q_loop_arg >= 0 ? q_loop_arg : max(0, (binfo.actual_q_seqlen - 1) / int(Gmem_tile_q::ROWS));
     int q_sequence_start = q_loop * Gmem_tile_q::ROWS;
     q_sequence_start += binfo.actual_kv_seqlen - binfo.actual_q_seqlen;
     if (binfo.stop_early(q_loop * Gmem_tile_q::ROWS))

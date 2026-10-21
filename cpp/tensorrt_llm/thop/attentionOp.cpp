@@ -1791,9 +1791,24 @@ void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_schedul
     get_mla_metadata_func(params, stream);
 }
 
+namespace kernels
+{
+// Defined in kernels/contextFusedMultiHeadAttention/fused_multihead_attention_v2.cpp.
+int64_t setFmhaLastTileOnly(bool enable);
+} // namespace kernels
+
 TRTLLM_NAMESPACE_END
+
+namespace
+{
+int64_t fmhaSetLastTileOnly(bool enable)
+{
+    return tensorrt_llm::kernels::setFmhaLastTileOnly(enable);
+}
+} // namespace
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("attention_supports_nvfp4_output", &tensorrt_llm::torch_ext::attention_supports_nvfp4_output);
+    m.def("fmha_set_last_tile_only", &fmhaSetLastTileOnly);
 }

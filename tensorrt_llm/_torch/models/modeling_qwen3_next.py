@@ -118,6 +118,12 @@ def _precompute_fused_norm_weights(module: nn.Module) -> None:
             norm._fused_norm_weight = (w.float() + 1.0).to(w.dtype)
 
 
+# Final decoder layer at prefill: compute only the rows LogitsProcessor reads
+# (Qwen3NextForCausalLM._final_layer_read_rows). 0 restores the all-rows path.
+_LAST_LAYER_READ_ROWS = os.environ.get("TRTLLM_LAST_LAYER_READ_ROWS",
+                                       "1") != "0"
+
+
 def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
     return (os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
             and not enable_attention_dp)
@@ -817,6 +823,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[dict] = None,
+        read_rows: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -827,16 +834,31 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                 self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
 
-        # Self Attention
-        hidden_states = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not self.disable_attn_allreduce),
-            lora_params=lora_params,
-            **kwargs,
-        )
+        # Self Attention. With read_rows (the final layer at prefill, see
+        # Qwen3NextForCausalLM.forward) QKV, RoPE and the KV-cache append run
+        # on every row, and the attention output keeps only read_rows.
+        if read_rows is not None:
+            self.self_attn._read_rows = read_rows
+        try:
+            hidden_states = self.self_attn(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not self.disable_attn_allreduce),
+                lora_params=lora_params,
+                **kwargs,
+            )
+        finally:
+            if read_rows is not None:
+                self.self_attn._read_rows = None
+        if read_rows is not None:
+            residual = residual.index_select(0, read_rows)
+            if (isinstance(hidden_states, torch.Tensor)
+                    and hidden_states.shape[0] != read_rows.shape[0]):
+                # The attention module kept every row (e.g. the in-place
+                # custom-op path): slice its o_proj output instead.
+                hidden_states = hidden_states.index_select(0, read_rows)
 
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
@@ -1179,7 +1201,23 @@ class Qwen3NextModel(DecoderModel):
 
         hidden_states = inputs_embeds
         residual = None
-        for decoder_layer in self.layers[:self.num_hidden_layers]:
+        # Rows of the final layer that are read (set by
+        # Qwen3NextForCausalLM.forward), else None.
+        read_rows = self.__dict__.get("_read_rows")
+        last_idx = self.num_hidden_layers - 1
+        for idx, decoder_layer in enumerate(
+                self.layers[:self.num_hidden_layers]):
+            if read_rows is not None and idx == last_idx:
+                hidden_states, residual = decoder_layer(
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    residual=residual,
+                    spec_metadata=spec_metadata,
+                    mamba_metadata=mamba_metadata,
+                    lora_params=lora_params,
+                    read_rows=read_rows)
+                continue
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -1221,6 +1259,91 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                 and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
 
             self.model.layers.extend(self.draft_model.mtp_layers)
+
+    def _final_layer_read_rows(self, attn_metadata, return_context_logits,
+                               spec_metadata, kwargs) -> Optional[torch.Tensor]:
+        """Rows of the final decoder layer whose output is read, or None.
+
+        Without context logits, LogitsProcessor reads the final hidden state
+        only at each sequence's last token (cumsum(seq_lens) - 1). On a step
+        with context requests the final (full-attention) layer can then run
+        its attention output, o_proj, MLP and final norm on those rows only;
+        QKV, RoPE and the KV-cache append still run on every row. Kill switch:
+        TRTLLM_LAST_LAYER_READ_ROWS=0.
+        """
+        if not _LAST_LAYER_READ_ROWS:
+            return None
+        if (return_context_logits or spec_metadata is not None
+                or getattr(self, "spec_worker", None) is not None
+                or getattr(self, "draft_model", None) is not None):
+            return None
+        # Pure context steps only: on a mixed [ctx + gen] step the gen rows
+        # would run o_proj / MLP at another row count (other GEMM kernels),
+        # so they keep main's all-rows path bit for bit.
+        if (attn_metadata is None or attn_metadata.num_contexts <= 0
+                or attn_metadata.num_generations != 0
+                or attn_metadata.padded_num_tokens is not None
+                or getattr(attn_metadata, "csa2_remote_tail_mode",
+                           None) is not None
+                or attn_metadata.seq_lens_cuda is None
+                or attn_metadata.num_tokens <= attn_metadata.num_seqs):
+            return None
+        if kwargs.get("lora_params"):
+            return None
+        mapping = self.model_config.mapping
+        if (mapping.tp_size != 1 or mapping.pp_size != 1
+                or mapping.cp_size != 1 or mapping.enable_attention_dp):
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        layers = self.model.layers[:self.model.num_hidden_layers]
+        if not layers or not isinstance(layers[-1],
+                                        Qwen3NextFullAttentionDecoderLayer):
+            return None
+        return torch.cumsum(attn_metadata.seq_lens_cuda, dim=0,
+                            dtype=torch.long) - 1
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        read_rows = self._final_layer_read_rows(attn_metadata,
+                                                return_context_logits,
+                                                spec_metadata, kwargs)
+        if read_rows is None:
+            return super().forward(
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                return_context_logits=return_context_logits,
+                spec_metadata=spec_metadata,
+                resource_manager=resource_manager,
+                **kwargs,
+            )
+        self.model._read_rows = read_rows
+        try:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
+        finally:
+            self.model._read_rows = None
+        # hidden_states holds exactly the rows LogitsProcessor would gather,
+        # in the same order: its gather is the identity here.
+        logits = self.lm_head(hidden_states)
+        return logits.float()
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:

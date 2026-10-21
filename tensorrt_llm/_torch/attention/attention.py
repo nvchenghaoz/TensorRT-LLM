@@ -1112,23 +1112,44 @@ class Attention(nn.Module):
                 output_sf,
             )
         else:
-            output, output_sf = self._attn_impl(
-                q,
-                k,
-                v,
-                attn_metadata,
-                attention_mask,
-                mrope_rotary_cos_sin,
-                mrope_position_deltas,
-                attention_window_size,
-                attention_mask_data,
-                attention_sinks=attention_sinks,
-                relative_attention_bias=relative_attention_bias,
-                relative_attention_max_distance=relative_attention_max_distance,
-                has_lora=has_lora,
-            )
+            last_tile_only = (self.__dict__.get("_read_rows") is not None
+                              and hasattr(torch.ops.trtllm,
+                                          "fmha_set_last_tile_only"))
+            if last_tile_only:
+                # Only the read rows (each context sequence's last row) of
+                # the context FMHA output are used: let the SM120 e4m3 FMHA
+                # compute its last q-tile only. KV-cache writes are unchanged.
+                torch.ops.trtllm.fmha_set_last_tile_only(True)
+            try:
+                output, output_sf = self._attn_impl(
+                    q,
+                    k,
+                    v,
+                    attn_metadata,
+                    attention_mask,
+                    mrope_rotary_cos_sin,
+                    mrope_position_deltas,
+                    attention_window_size,
+                    attention_mask_data,
+                    attention_sinks=attention_sinks,
+                    relative_attention_bias=relative_attention_bias,
+                    relative_attention_max_distance=
+                    relative_attention_max_distance,
+                    has_lora=has_lora,
+                )
+            finally:
+                if last_tile_only:
+                    torch.ops.trtllm.fmha_set_last_tile_only(False)
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
+        read_rows = self.__dict__.get("_read_rows")
+        if read_rows is not None and isinstance(output, torch.Tensor):
+            # Only these rows of this layer's output are read (the final
+            # layer at prefill, see Qwen3NextModel.forward): keep them here,
+            # before the output gate and o_proj.
+            output = output.index_select(0, read_rows)
+            if output_gate is not None:
+                output_gate = output_gate.index_select(0, read_rows)
         if output_gate is not None:
             output = self.apply_output_gate(output, output_gate)
 
@@ -1230,6 +1251,19 @@ class Attention(nn.Module):
             )
             if sparse_output is not None:
                 return sparse_output
+
+        if self.__dict__.get("_read_rows") is not None:
+            # The read rows of a prefill step keep o_proj's prefill path (the
+            # NVFP4 W4A4 copy main runs on every row of a > 16-row step), not
+            # the <= 16-row decode copy their row count would select.
+            prefill_copy = self.o_proj.__dict__.get("_fp8_prefill_nvfp4")
+            if (prefill_copy is not None and not lora_params
+                    and isinstance(attn_output, torch.Tensor)
+                    and attn_output.dim() == 2
+                    and attn_output.dtype == torch.bfloat16
+                    and getattr(self.o_proj, "tp_size", 1) == 1):
+                return prefill_copy(self.o_proj, attn_output,
+                                    attn_output.shape, self.o_proj.bias)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

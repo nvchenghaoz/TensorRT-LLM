@@ -157,6 +157,11 @@ using FusedMHAKernelFactoryV2 = TFusedMHAKernelFactory<FusedMultiHeadAttentionXM
 
 FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType, Data_type outputType, unsigned int sm);
 
+// Host flag: while set, the sm_120 e4m3 head-256 causal paged-KV tiled context FMHA computes only the last q-tile of
+// each (head, sequence); the other output rows are left unwritten. For a layer whose context rows are read only at the
+// last token. Returns the number of FMHA calls that have taken that path so far.
+int64_t setFmhaLastTileOnly(bool enable);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
