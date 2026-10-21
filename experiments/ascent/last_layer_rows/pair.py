@@ -16,7 +16,15 @@ from tensorrt_llm.llmapi import KvCacheConfig, CudaGraphConfig
 import tensorrt_llm._torch.models.modeling_qwen3_next as mq
 CAND = hasattr(mq, '_LAST_LAYER_SKIP_FMHA_A')
 ARM = 'cand' if CAND else 'base'
-print('TREE_COMMIT arm', ARM, 'BASE_MAIN 66cff73e', flush=True)
+import subprocess
+def _git_head():
+    try:
+        return subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=20).stdout.strip()
+    except Exception as e:
+        return 'unknown:' + repr(e)
+LOAD0 = os.getloadavg()
+print('TREE_COMMIT', _git_head(), 'cwd', os.getcwd(), 'arm', ARM, 'BASE_MAIN 66cff73e', flush=True)
+print('LOADAVG_START', ARM, LOAD0, flush=True)
 AT = os.path.join(OUT, 'autotuner_cache.json')
 if not CAND and os.path.exists(AT):
     os.remove(AT)
@@ -238,7 +246,9 @@ TIM = dict()
 for mode in modes:
     TIM['m' + str(mode)] = dict(b1=[], b2=[], b4=[])
 seed = 1000
-for nb, iters, wu in ((1, NT1, 10), (2, 30, 5), (4, 20, 5)):
+LOADT = os.getloadavg()
+log('LOADAVG_TIMING_START', LOADT)
+for nb, iters, wu in ((1, 50, 10), (2, 50, 10), (4, 50, 10)):
     for it in range(iters + wu):
         for mode in modes:
             set_mode(mode)
@@ -314,6 +324,10 @@ if PASS is not None:
     res['checks'] = PASS
 if CAND:
     res['kill_switch_arm'] = TS['mFalse']
+LOAD1 = os.getloadavg()
+log('LOADAVG_END', LOAD1)
+res['loadavg_1min'] = dict(start=LOAD0[0], timing_start=LOADT[0], end=LOAD1[0])
+res['tree_commit'] = _git_head()
 llm.shutdown()
 print(json.dumps(res, default=str), flush=True)
 os._exit(0)
