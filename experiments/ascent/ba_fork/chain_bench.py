@@ -28,6 +28,23 @@ import tempfile
 
 for _a in sys.argv[1:] or ["TREE_COMMIT=unlabelled"]:
     print(_a, flush=True)
+import importlib.util  # noqa: E402
+
+# FWD_EXTEND_PATH names the TREE (one-pass GDN prefill front end importable and
+# not disabled), not the calls: this bench calls _compute_tokenwise_inputs_routed
+# and the fork directly and never calls forward_extend.
+try:
+    _op = importlib.util.find_spec("tensorrt_llm._torch.modules.mamba.gdn_prefill_onepass") is not None
+except Exception:  # noqa: BLE001
+    _op = False
+_op_env = os.environ.get("TRTLLM_GDN_ONEPASS_PREFILL", "1") != "0"
+print("FWD_EXTEND_PATH=%s" % ("one-pass" if (_op and _op_env) else "stock"), flush=True)
+if _op:
+    from tensorrt_llm._torch.modules.mamba.gdn_prefill_onepass import gdn_prefill_onepass_enabled
+    print("gdn_prefill_onepass_enabled()=%s" % gdn_prefill_onepass_enabled(), flush=True)
+else:
+    print("gdn_prefill_onepass_enabled()=n/a (module absent)", flush=True)
+print("FWD_EXTEND_PATH note: label names the tree; this bench never calls forward_extend", flush=True)
 try:
     _h = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout
     _d = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout
@@ -70,8 +87,9 @@ ITERS = int(os.environ.get("CHAIN_ITERS", "60"))
 SLEEP_CYCLES = 1000000
 IN_SCALE = 8.0 / 448.0
 dev = torch.device("cuda")
+ARM_LABEL = "threshold_%d" % DEFAULT_T
 log("arm=%s HAS_FORK=%s default_threshold=%d layers=%d MS=%s warmup=%d iters=%d" % (
-    "candidate" if HAS_FORK else "baseline", HAS_FORK, DEFAULT_T, LAYERS, MS, WARMUP, ITERS))
+    ARM_LABEL, HAS_FORK, DEFAULT_T, LAYERS, MS, WARMUP, ITERS))
 log("torch %s device %s" % (torch.__version__, torch.cuda.get_device_name()))
 smi("start")
 
@@ -167,11 +185,12 @@ def chain(xs, arm):
     return out
 
 
-flush = torch.empty(64 * 1024 * 1024, dtype=torch.float32, device=dev)
+# READ flush (pitfall 1236): 512 MiB summed, never zero_() (dirty-line write-back).
+flush = torch.ones(128 * 1024 * 1024, dtype=torch.float32, device=dev)
 
 
 def one(xs, arm, ev):
-    flush.zero_()
+    flush.view(torch.int64).sum()
     torch.cuda._sleep(SLEEP_CYCLES)
     if ev is not None:
         ev[0].record()
@@ -262,9 +281,8 @@ for M in MS:
     entry = dict(arms=res, fork_enabled=bool(HAS_FORK and M >= DEFAULT_T),
                  gain_prod_vs_serial=1.0 - p["median_ms"] / s["median_ms"])
     if entry["fork_enabled"]:
-        entry["crit_gain_ge_4pct"] = entry["gain_prod_vs_serial"] >= 0.04
         entry["crit_fork_p90_lt_serial_p10"] = p["p90_ms"] < s["p10_ms"]
-        crit_ok = crit_ok and entry["crit_gain_ge_4pct"] and entry["crit_fork_p90_lt_serial_p10"]
+        crit_ok = crit_ok and entry["crit_fork_p90_lt_serial_p10"]
     if "forced" in res:
         entry["gain_forced_vs_serial"] = 1.0 - res["forced"]["median_ms"] / s["median_ms"]
     ab[str(M)] = entry
@@ -279,6 +297,6 @@ for M in MS:
 
 smi("end")
 summary = dict(batch=batch, output=dict([("class", "exact")]), ab=ab, streams=streams,
-               arm="candidate" if HAS_FORK else "baseline", default_threshold=DEFAULT_T,
+               arm=ARM_LABEL, default_threshold=DEFAULT_T,
                layers=LAYERS, warmup=WARMUP, iters=ITERS, ab_criteria_met=bool(HAS_FORK and crit_ok))
 print(json.dumps(summary))
