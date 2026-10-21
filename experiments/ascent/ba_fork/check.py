@@ -28,6 +28,25 @@ import tempfile
 
 for _a in sys.argv[1:] or ["TREE_COMMIT=unlabelled"]:
     print(_a, flush=True)
+import importlib.util  # noqa: E402
+
+# FWD_EXTEND_PATH names the TREE (one-pass GDN prefill front end importable and
+# not disabled), not the calls: this check calls _compute_tokenwise_inputs_routed
+# and the fork directly and never calls forward_extend.
+try:
+    _op = importlib.util.find_spec("tensorrt_llm._torch.modules.mamba.gdn_prefill_onepass") is not None
+except Exception:  # noqa: BLE001
+    _op = False
+_op_env = os.environ.get("TRTLLM_GDN_ONEPASS_PREFILL", "1") != "0"
+FWD_EXTEND_PATH = "one-pass" if (_op and _op_env) else "stock"
+print("FWD_EXTEND_PATH=%s" % FWD_EXTEND_PATH, flush=True)
+if _op:
+    from tensorrt_llm._torch.modules.mamba.gdn_prefill_onepass import gdn_prefill_onepass_enabled
+    print("gdn_prefill_onepass_enabled()=%s" % gdn_prefill_onepass_enabled(), flush=True)
+else:
+    print("gdn_prefill_onepass_enabled()=n/a (module absent)", flush=True)
+print("FWD_EXTEND_PATH note: label names the tree; this check never calls forward_extend", flush=True)
+EXPECTED_DEFAULT_T = 2048
 try:
     _h = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout
     _d = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout
@@ -164,7 +183,10 @@ def maxabs(outs, ref):
     return max(float((o.float() - r.float()).abs().max()) for o, r in zip(outs, ref))
 
 
-flush = torch.empty(64 * 1024 * 1024, dtype=torch.float32, device=dev)
+# READ flush (pitfall 1236), as in chain_bench.py; never zero_().
+flush = torch.ones(128 * 1024 * 1024, dtype=torch.float32, device=dev)
+if DEFAULT_T != EXPECTED_DEFAULT_T:
+    failures.append("default threshold %d != %d" % (DEFAULT_T, EXPECTED_DEFAULT_T))
 
 
 def stream_summary(xs, arm, tag):
@@ -250,7 +272,7 @@ for M in MS:
         bad_iters = []
         it1_eq_ref = None
         for it in range(WARMUP + ITERS):
-            flush.zero_()
+            flush.view(torch.int64).sum()
             torch.cuda._sleep(SLEEP_CYCLES)
             tot = None
             for li in range(LAYERS):
@@ -308,9 +330,10 @@ for rows in [1, 2, 3, 4, 8, 16]:
     cases.append(("decode rows=%d threshold 1" % rows, rows, 1, 0))
 cases.append(("rows=17 threshold 1", 17, 1, 1))
 cases.append(("rows=17 threshold 0", 17, 0, 0))
-cases.append(("rows=2048 default", 2048, DEFAULT_T, 0))
-cases.append(("rows=2049 default", 2049, DEFAULT_T, 0))
-cases.append(("rows=4095 default", 4095, DEFAULT_T, 0))
+cases.append(("rows=2047 default", 2047, DEFAULT_T, 0))
+cases.append(("rows=2048 default", 2048, DEFAULT_T, 1))
+cases.append(("rows=2049 default", 2049, DEFAULT_T, 1))
+cases.append(("rows=4095 default", 4095, DEFAULT_T, 1))
 cases.append(("rows=4096 default", 4096, DEFAULT_T, 1))
 cases.append(("rows=6145 default", 6145, DEFAULT_T, 1))
 cases.append(("rows=6145 threshold 0", 6145, 0, 0))
@@ -365,7 +388,7 @@ for val in [None, "0"]:
     out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
     lines = [ln for ln in out.stdout.splitlines() if ln.startswith("THRESHOLD=")]
     got = lines[-1] if lines else "missing rc=%d %s" % (out.returncode, out.stderr[-300:])
-    want = "THRESHOLD=%s" % ("4096" if val is None else val)
+    want = "THRESHOLD=%s" % (str(EXPECTED_DEFAULT_T) if val is None else val)
     disp["env %s" % ("unset" if val is None else "=" + val)] = got
     if got != want:
         failures.append("env %s: %s" % (val, got))
@@ -377,4 +400,5 @@ for fl in failures:
 print(json.dumps(dict(passed=not failures, failures=failures, compared_against=(
     "main's serial _compute_tokenwise_inputs output (threshold 0) on the same inputs, bitwise as int16"),
     per_m=report, dispatch=disp, default_threshold=DEFAULT_T, layers=LAYERS,
+    fwd_extend_path=FWD_EXTEND_PATH,
     warmup=WARMUP, iters=ITERS)))
