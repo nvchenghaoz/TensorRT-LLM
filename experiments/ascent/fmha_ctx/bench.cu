@@ -100,6 +100,22 @@ __global__ void fill_e4m3(__nv_fp8_e4m3* p, size_t n, uint64_t seed)
     }
 }
 
+// Outlier inputs (cases with suffix _out, idea 230): Q of every 4th head x4 (peaky softmax rows, logits std ~4) and
+// every 509th token row of the KV pool x8 (spike keys / values), saturated to the e4m3 range.
+__global__ void outlier_e4m3(__nv_fp8_e4m3* p, size_t n, int row_elems, int period, int stride, float mult)
+{
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+    {
+        size_t const row = i / row_elems;
+        if ((row / stride) % period == 0)
+        {
+            float v = float(p[i]) * mult;
+            v = fminf(fmaxf(v, -448.f), 448.f);
+            p[i] = __nv_fp8_e4m3(v);
+        }
+    }
+}
+
 // Order-independent hash of a buffer of 8-byte words.
 __global__ void hash_buf(uint64_t const* p, size_t n_words, unsigned long long* out)
 {
@@ -157,6 +173,7 @@ struct Problem
     int b = 1, h = 24, h_kv = 4, d = 256, tpb = 32;
     std::vector<int> q_lens, past_lens;
     bool alias = true;
+    bool outlier = false;
     int s_max = 0, max_blocks = 0, shared_blocks = 0, total_blocks = 0, total_q = 0;
     size_t q_bytes = 0, o_bytes = 0, pool_bytes = 0, bytes_per_block = 0;
     void* q = nullptr;
@@ -235,6 +252,11 @@ static void build(Problem& p, uint64_t seed)
     CK(cudaMemcpy(p.scales, h_scales, sizeof(h_scales), cudaMemcpyHostToDevice));
     fill_e4m3<<<1024, 256>>>(reinterpret_cast<__nv_fp8_e4m3*>(p.q), p.q_bytes, seed * 3 + 1);
     fill_e4m3<<<4096, 256>>>(reinterpret_cast<__nv_fp8_e4m3*>(p.pool), p.pool_bytes, seed * 3 + 2);
+    if (p.outlier)
+    {
+        outlier_e4m3<<<1024, 256>>>(reinterpret_cast<__nv_fp8_e4m3*>(p.q), p.q_bytes, p.d, 4, 1, 4.f);
+        outlier_e4m3<<<4096, 256>>>(reinterpret_cast<__nv_fp8_e4m3*>(p.pool), p.pool_bytes, p.d, 509, 1, 8.f);
+    }
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
 
@@ -341,9 +363,15 @@ static void write_file(std::string const& path, void const* dev, size_t bytes)
     fclose(f);
 }
 
-static bool make_case(std::string const& name, Problem& p)
+static bool make_case(std::string const& name_in, Problem& p)
 {
-    p.name = name;
+    p.name = name_in;
+    std::string name = name_in;
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, "_out") == 0)
+    {
+        p.outlier = true;
+        name = name.substr(0, name.size() - 4);
+    }
     int const P = 32768;
     if (name == "c1")
     {

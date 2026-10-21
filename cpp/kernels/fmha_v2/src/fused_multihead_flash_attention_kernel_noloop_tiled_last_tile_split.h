@@ -236,6 +236,10 @@ inline __device__ void device_flash_attention_nl_tiled_last_tile_piece(
     static_assert(!Softmax::USE_SHARED_MEMORY, "");
     static_assert(Softmax::ROWS_PER_THREAD == 2, "");
 
+    // The base-2 softmax (FMHA_SM120_EXP2 in fmha/softmax.h): the stats below hold the row max in raw units, which
+    // the merge kernel reads in the same units.
+    static constexpr bool USE_EXP2 = fmha::Softmax_uses_exp2<Softmax>::VALUE;
+
     // Load the mask for that iteration.
     mask.load(q_sequence_start);
 
@@ -397,7 +401,14 @@ inline __device__ void device_flash_attention_nl_tiled_last_tile_piece(
             softmax.template reduce<fmha::Max_>(global_max);
 
             // Update last step's acc_o.
-            acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+            if constexpr (USE_EXP2)
+            {
+                fmha::exp2_update_o(acc_o, global_max, tmp, global_sum, softmax.s2_);
+            }
+            else
+            {
+                acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+            }
             // Apply expf of softmax.
             softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
 
@@ -512,6 +523,14 @@ inline __device__ void device_flash_attention_nl_tiled_last_tile_piece(
     // Make sure there is no data in-flight.
     fmha::depbar_<USE_LDGSTS, 0>();
 
+    if constexpr (USE_EXP2)
+    {
+        // The base-2 row sums carry scale_softmax (folded into the exponent): back to the expf path's units.
+        float const to_base = softmax.sum_to_base_units();
+        global_sum[0] *= to_base;
+        global_sum[1] *= to_base;
+    }
+
     // Write the unnormalized accumulators and the row max / sum of the piece.
     size_t const piece_idx = (size_t(bidb) * params.h + bidh) * num_pieces + piece;
     float4* acc_ptr = ws_acc + piece_idx * Ws::ACC_FLOAT4S_PER_PIECE + tidx;
@@ -583,6 +602,13 @@ inline __device__ void device_flash_attention_nl_tiled_last_tile_merge(
         global_max[1] = fmax(global_max[1], s.y);
     }
 
+    // The units of the piece stats: raw accumulator units on the base-2 path (FMHA_SM120_EXP2 in fmha/softmax.h).
+    using Softmax = fmha::Softmax<typename Kernel_traits::Traits_p, Cta_tile_p, Kernel_traits>;
+    static constexpr bool USE_EXP2 = fmha::Softmax_uses_exp2<Softmax>::VALUE;
+    uint32_t const scale_bmm1_u = params.scale_bmm1_d ? *params.scale_bmm1_d : params.scale_bmm1;
+    float const scale_bmm1 = reinterpret_cast<float const&>(scale_bmm1_u);
+    float const s2 = scale_bmm1 * 1.4426950408889634f;
+
     // The weighted sums, in the fixed order j = 0 .. active - 1.
     fmha::Fragment_accumulator<Traits_o> acc_o[Ws::MMAS_M][Ws::MMAS_N];
     using Acc_type_o = typename Traits_o::Accumulator_type;
@@ -592,8 +618,16 @@ inline __device__ void device_flash_attention_nl_tiled_last_tile_merge(
     {
         float4 const s = ws_stats[(piece0 + j) * Ws::STATS_FLOAT4S_PER_PIECE + tidx];
         float alpha[2];
-        alpha[0] = expf(s.x - global_max[0]);
-        alpha[1] = expf(s.y - global_max[1]);
+        if constexpr (USE_EXP2)
+        {
+            alpha[0] = fmha::ex2_approx_ftz((s.x - global_max[0]) * s2);
+            alpha[1] = fmha::ex2_approx_ftz((s.y - global_max[1]) * s2);
+        }
+        else
+        {
+            alpha[0] = expf(s.x - global_max[0]);
+            alpha[1] = expf(s.y - global_max[1]);
+        }
         global_sum[0] += alpha[0] * s.z;
         global_sum[1] += alpha[1] * s.w;
         float4 const* acc_ptr = ws_acc + (piece0 + j) * Ws::ACC_FLOAT4S_PER_PIECE + tidx;
@@ -621,7 +655,15 @@ inline __device__ void device_flash_attention_nl_tiled_last_tile_merge(
     // The unchanged epilogue of device_flash_attention_nl_tiled.
     fmha::Tile_o_normalizer<Traits_o, Cta_tile_o> acc_o_normalizer(params, binfo);
     // Update the sum if attention sinks are used.
-    acc_o_normalizer.update_sum(global_max, global_sum);
+    if constexpr (USE_EXP2)
+    {
+        fmha::exp2_update_sum(acc_o_normalizer.attention_sink_value_, global_max, global_sum, scale_bmm1,
+            Kernel_traits::Traits_p::SOFTMAX_FP_QUANT_SCALE);
+    }
+    else
+    {
+        acc_o_normalizer.update_sum(global_max, global_sum);
+    }
     // Update acc_o of flash attention
     acc_o_normalizer.final_update(acc_o, global_sum);
 
