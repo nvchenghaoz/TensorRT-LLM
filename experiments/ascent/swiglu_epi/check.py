@@ -273,10 +273,22 @@ def main():
             del g
     res["repeated"] = rep
     ok &= rep_ok
+    log("FULL_RESULT", json.dumps(res))
+    summary = {
+        "cases_eq_base": sum(all(v["eq_base"].values()) for v in res["cases"].values()),
+        "cases_total": len(res["cases"]),
+        "kill_switch_ok": all(v for k, v in res["kill_switch"].items() if k != "permuted")
+        and not res["kill_switch"]["permuted"],
+        "per_tactic_bad": {k: v["bad"] for k, v in res["per_tactic_vs_base"].items()},
+        "invariance_bad": {k: v["bad"] for k, v in res["layout_invariance"].items()},
+        "repeated": {k: [v["neq_run1"], v["neq_base"]] for k, v in res["repeated"].items()},
+        "tactic_lists": res["tactic_lists"],
+        "head": res["tree"]["head"], "tree": res["tree"]["tree"],
+    }
     print(json.dumps({"passed": bool(ok),
                       "compared": "GatedMLP down_proj input FP4+SF bytes and MLP output vs BASE-tree (66cff73e) "
                                   "saved files; kill switch; per-tactic layout invariance; 10+50 repeats",
-                      "result": res}))
+                      "summary": summary}))
 
 
 if __name__ == "__main__":
