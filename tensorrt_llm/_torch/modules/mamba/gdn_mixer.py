@@ -46,6 +46,7 @@ from .fuse_elementwise_ops import (
     pack_gdn_decode_qkv,
 )
 from .gdn_prefill_conv import gdn_fused_transpose_conv_enabled, gdn_prefill_transpose_conv
+from .gdn_prefill_onepass import gdn_prefill_onepass, gdn_prefill_onepass_enabled
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import Mamba2Metadata
@@ -993,7 +994,48 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         conv_states_to_use = conv_states
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
-        if num_decode_tokens > 0:
+        if not is_target_verify and gdn_prefill_onepass_enabled():
+            # One pass: conv + SiLU + q/k/v split + q/k L2 norm + gates (bitwise
+            # equal to the transpose/conv/fused_gdn_post_conv chain below).
+            mixed_qkv_d = None
+            if num_decode_tokens > 0:
+                mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv, seqlen_split_size, dim=0)
+                mixed_qkv_d = causal_conv1d_update(
+                    mixed_qkv_d,
+                    conv_states_to_use,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    activation=self.activation,
+                    conv_state_indices=state_indices_d,
+                )
+                prefill_qsl = query_start_loc[: num_prefill + 1]
+                prefill_has_init = has_initial_states[:num_prefill]
+                prefill_slots = state_indices_p
+            else:
+                mixed_qkv_p = mixed_qkv
+                prefill_qsl = query_start_loc
+                prefill_has_init = has_initial_states
+                prefill_slots = cache_indices
+            query, key, value, g, beta = gdn_prefill_onepass(
+                mixed_qkv_p,
+                mixed_qkv_d,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_states_to_use,
+                prefill_qsl,
+                prefill_slots,
+                prefill_has_init,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+                activation=self.activation,
+            )
+        elif num_decode_tokens > 0:
             mixed_qkv_p, mixed_qkv_d = torch.split(mixed_qkv, seqlen_split_size, dim=0)
             query_start_loc_p = query_start_loc[: num_prefill + 1]
             has_initial_states_p = has_initial_states[:num_prefill]
