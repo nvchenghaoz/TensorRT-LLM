@@ -30,6 +30,8 @@
 // (job 702: 2304 CTAs = 6.13 waves -> A 2232 CTAs = 5.94 waves + 360 pieces, k = 5); -1% at 4 x 2048, where it is
 // not used).
 
+#include <atomic>
+#include <cstdint>
 #include <fmha/kernel_traits.h>
 #include <fused_multihead_attention.h>
 #include <fused_multihead_attention_kernel.h>
@@ -59,6 +61,10 @@ static_assert(Kt_causal::Cta_tile_p::M == kStepQ, "");
 // The workspace (25 MB): FP32 accumulators and row max / sum of every piece. Static, so a call needs no allocation.
 __device__ float4 g_ws_acc[Ws::ACC_FLOAT4S_PER_PIECE * kMaxPiecesTotal];
 __device__ float4 g_ws_stats[Ws::STATS_FLOAT4S_PER_PIECE * kMaxPiecesTotal];
+
+// Host flag (setFmhaLastTileSplitSkipA) and the number of split calls that skipped launch A.
+std::atomic<bool> g_skip_launch_a{false};
+std::atomic<int64_t> g_skip_launch_a_count{0};
 
 struct Device_state
 {
@@ -132,10 +138,19 @@ bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(Fused_multihead
         return false;
     }
 
-    // A) The generated kernel on q-tiles 0 .. Q-2.
-    Fused_multihead_attention_params_v2 params_a = params;
-    params_a.s -= ns::kStepQ;
-    launcher(params_a, launch_params, stream);
+    // A) The generated kernel on q-tiles 0 .. Q-2, unless the caller reads only each sequence's last row and has
+    // checked that every sequence's last row lies in q-tile Q-1 (setFmhaLastTileSplitSkipA): then those rows are left
+    // unwritten and B + C below write the last q-tile exactly as they always do.
+    if (ns::g_skip_launch_a.load(std::memory_order_relaxed))
+    {
+        ns::g_skip_launch_a_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        Fused_multihead_attention_params_v2 params_a = params;
+        params_a.s -= ns::kStepQ;
+        launcher(params_a, launch_params, stream);
+    }
 
     // B) + C) The last q-tile.
     auto const& bert_params = reinterpret_cast<bert::Fused_multihead_attention_params_v2 const&>(params);
@@ -145,6 +160,17 @@ bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(Fused_multihead
     TLLM_CHECK_WITH_INFO(err == cudaSuccess, "fmha_v2 e4m3 sm120 last q-tile KV split launch failed: %s",
         cudaGetErrorString(err));
     return true;
+}
+
+// While set, a split call skips launch A (q-tiles 0 .. Q-2 stay unwritten). For a layer whose context rows are read
+// only at each sequence's last token, with every context length in (64 * (Q - 1), 64 * Q] (checked by the caller).
+// Calls that do not take the split (b > 3, no wave saving) run the whole kernel as before. Returns the number of
+// split calls that skipped launch A so far.
+int64_t setFmhaLastTileSplitSkipASm120(bool enable)
+{
+    namespace ns = fmha_last_tile_split_sm120;
+    ns::g_skip_launch_a.store(enable, std::memory_order_relaxed);
+    return ns::g_skip_launch_a_count.load(std::memory_order_relaxed);
 }
 
 } // namespace kernels

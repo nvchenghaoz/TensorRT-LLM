@@ -157,6 +157,12 @@ using FusedMHAKernelFactoryV2 = TFusedMHAKernelFactory<FusedMultiHeadAttentionXM
 
 FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType, Data_type outputType, unsigned int sm);
 
+// Host flag: while set, the sm_120 e4m3 head-256 causal paged-KV last q-tile KV split skips its launch A (q-tiles
+// 0 .. Q-2), leaving those output rows unwritten; the last q-tile is computed as always. For a layer whose context
+// rows are read only at each sequence's last token, with every context length in (64 * (Q - 1), 64 * Q]. Returns the
+// number of split calls that skipped launch A so far (-1 without the sm_120 kernels).
+int64_t setFmhaLastTileSplitSkipA(bool enable);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

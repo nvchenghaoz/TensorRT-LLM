@@ -118,6 +118,15 @@ def _precompute_fused_norm_weights(module: nn.Module) -> None:
             norm._fused_norm_weight = (w.float() + 1.0).to(w.dtype)
 
 
+# Final decoder layer at prefill: the SM120 e4m3 context FMHA skips the q-tiles
+# whose rows are not read (Qwen3NextForCausalLM._final_layer_skip_fmha_a).
+# 0 restores main's path.
+_LAST_LAYER_SKIP_FMHA_A = os.environ.get("TRTLLM_LAST_LAYER_SKIP_FMHA_A",
+                                         "1") != "0"
+# The q-tile height of that FMHA (fmha_v2 e4m3 64x128 tiled, kStepQ).
+_FMHA_LAST_TILE_STEP_Q = 64
+
+
 def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
     return (os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
             and not enable_attention_dp)
@@ -1179,15 +1188,27 @@ class Qwen3NextModel(DecoderModel):
 
         hidden_states = inputs_embeds
         residual = None
-        for decoder_layer in self.layers[:self.num_hidden_layers]:
-            hidden_states, residual = decoder_layer(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                residual=residual,
-                spec_metadata=spec_metadata,
-                mamba_metadata=mamba_metadata,
-                lora_params=lora_params)
+        # Set by Qwen3NextForCausalLM.forward when only each sequence's last
+        # row of the final layer is read (see _final_layer_skip_fmha_a).
+        skip_last_a = self.__dict__.get("_skip_last_fmha_a", False)
+        last_idx = self.num_hidden_layers - 1
+        for idx, decoder_layer in enumerate(
+                self.layers[:self.num_hidden_layers]):
+            skip_a = skip_last_a and idx == last_idx
+            if skip_a:
+                torch.ops.trtllm.fmha_set_last_tile_split_skip_a(True)
+            try:
+                hidden_states, residual = decoder_layer(
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    residual=residual,
+                    spec_metadata=spec_metadata,
+                    mamba_metadata=mamba_metadata,
+                    lora_params=lora_params)
+            finally:
+                if skip_a:
+                    torch.ops.trtllm.fmha_set_last_tile_split_skip_a(False)
         return hidden_states
 
 
@@ -1221,6 +1242,82 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                 and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
 
             self.model.layers.extend(self.draft_model.mtp_layers)
+
+    def _final_layer_skip_fmha_a(self, attn_metadata, return_context_logits,
+                                 spec_metadata, kwargs) -> bool:
+        """Whether the final layer's context FMHA may skip q-tiles 0 .. Q-2.
+
+        Without context logits, LogitsProcessor reads the final hidden state
+        only at each sequence's last token, and every op after attention is
+        row-local (static-scale quantizes), so the final layer's context
+        attention rows other than each context sequence's last are never read.
+        The SM120 e4m3 last-q-tile KV split computes q-tile Q-1 (Q = the
+        q-tile count of the longest context) in its own launches B + C; when
+        every context length lies in (64 * (Q - 1), 64 * Q] each context's
+        last row is in that q-tile, so launch A (q-tiles 0 .. Q-2) is skipped.
+        The KV-cache append, the last q-tile and generation rows are
+        unchanged. Host metadata only. Kill switch:
+        TRTLLM_LAST_LAYER_SKIP_FMHA_A=0.
+        """
+        if not _LAST_LAYER_SKIP_FMHA_A:
+            return False
+        if (return_context_logits or spec_metadata is not None
+                or getattr(self, "spec_worker", None) is not None
+                or getattr(self, "draft_model", None) is not None
+                or kwargs.get("lora_params")):
+            return False
+        if (attn_metadata is None or attn_metadata.num_contexts <= 0
+                or attn_metadata.seq_lens is None
+                or getattr(attn_metadata, "csa2_remote_tail_mode",
+                           None) is not None):
+            return False
+        if not hasattr(torch.ops.trtllm, "fmha_set_last_tile_split_skip_a"):
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        mapping = self.model_config.mapping
+        if mapping.cp_size != 1 or mapping.pp_size != 1:
+            return False
+        layers = self.model.layers[:self.model.num_hidden_layers]
+        if not layers or not isinstance(layers[-1],
+                                        Qwen3NextFullAttentionDecoderLayer):
+            return False
+        ctx_lens = attn_metadata.seq_lens[:attn_metadata.num_contexts].tolist()
+        step = _FMHA_LAST_TILE_STEP_Q
+        max_len, min_len = max(ctx_lens), min(ctx_lens)
+        num_q_tiles = (max_len + step - 1) // step
+        return num_q_tiles >= 2 and min_len > step * (num_q_tiles - 1)
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        skip_a = self._final_layer_skip_fmha_a(attn_metadata,
+                                               return_context_logits,
+                                               spec_metadata, kwargs)
+        if skip_a:
+            self.model._skip_last_fmha_a = True
+        try:
+            return super().forward(
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                return_context_logits=return_context_logits,
+                spec_metadata=spec_metadata,
+                resource_manager=resource_manager,
+                **kwargs,
+            )
+        finally:
+            if skip_a:
+                self.model._skip_last_fmha_a = False
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:

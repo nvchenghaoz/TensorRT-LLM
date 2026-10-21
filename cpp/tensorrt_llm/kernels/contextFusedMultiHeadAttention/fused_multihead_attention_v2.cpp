@@ -278,7 +278,21 @@ void run_skip_softmax_bf16_d128_causal_sm120(
 bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(Fused_multihead_attention_params_v2& params,
     Launch_params const& launch_params,
     void (*launcher)(Fused_multihead_attention_params_v2&, Launch_params const&, cudaStream_t), cudaStream_t stream);
+// The split's launch-A skip flag (same TU).
+int64_t setFmhaLastTileSplitSkipASm120(bool enable);
+#endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
 
+int64_t setFmhaLastTileSplitSkipA(bool enable)
+{
+#if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
+    return setFmhaLastTileSplitSkipASm120(enable);
+#else
+    (void) enable;
+    return -1;
+#endif
+}
+
+#if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
 namespace
 {
 // The generated kernel the split replicates (its traits are instantiated in the split TU).
