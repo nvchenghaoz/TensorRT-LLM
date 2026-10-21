@@ -28,7 +28,7 @@
 // s2 = scale_bmm1 * log2(e), and the O / sum rescale is ex2.approx((prev - curr) * s2). The piece and merge kernels of
 // the last q-tile split use the same domain. Every other kernel is unchanged. Precision class (ex2.approx).
 #ifndef FMHA_SM120_EXP2
-#define FMHA_SM120_EXP2 1 // STEP 1 of idea 230 only (arm H measurement); the parked branch restores 0
+#define FMHA_SM120_EXP2 0
 #endif
 #if FMHA_SM120_EXP2 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
 #define FMHA_SM120_EXP2_ACTIVE 1
@@ -42,7 +42,7 @@
 // row sums (an f16x2 tree, finished in FP32 per thread) and the conversion to e4m3 run in FP16x2. The MMAs, the
 // running max / sum and the O rescale stay FP32. Precision class.
 #ifndef FMHA_SM120_FP16_SOFTMAX
-#define FMHA_SM120_FP16_SOFTMAX 1 // STEP 1 of idea 230 only (arm H measurement); the parked branch restores 0
+#define FMHA_SM120_FP16_SOFTMAX 0
 #endif
 #if FMHA_SM120_FP16_SOFTMAX && !FMHA_SM120_EXP2
 #error "FMHA_SM120_FP16_SOFTMAX needs FMHA_SM120_EXP2"
