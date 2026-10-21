@@ -1794,21 +1794,21 @@ void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_schedul
 namespace kernels
 {
 // Defined in kernels/contextFusedMultiHeadAttention/fused_multihead_attention_v2.cpp.
-int64_t setFmhaLastTileOnly(bool enable);
+int64_t setFmhaLastTileSplitSkipA(bool enable);
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
 
 namespace
 {
-int64_t fmhaSetLastTileOnly(bool enable)
+int64_t fmhaSetLastTileSplitSkipA(bool enable)
 {
-    return tensorrt_llm::kernels::setFmhaLastTileOnly(enable);
+    return tensorrt_llm::kernels::setFmhaLastTileSplitSkipA(enable);
 }
 } // namespace
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("attention_supports_nvfp4_output", &tensorrt_llm::torch_ext::attention_supports_nvfp4_output);
-    m.def("fmha_set_last_tile_only", &fmhaSetLastTileOnly);
+    m.def("fmha_set_last_tile_split_skip_a", &fmhaSetLastTileSplitSkipA);
 }

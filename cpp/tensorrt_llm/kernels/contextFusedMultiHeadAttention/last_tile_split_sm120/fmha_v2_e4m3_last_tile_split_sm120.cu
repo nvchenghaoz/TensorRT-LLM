@@ -30,6 +30,8 @@
 // (job 702: 2304 CTAs = 6.13 waves -> A 2232 CTAs = 5.94 waves + 360 pieces, k = 5); -1% at 4 x 2048, where it is
 // not used).
 
+#include <atomic>
+#include <cstdint>
 #include <fmha/kernel_traits.h>
 #include <fused_multihead_attention.h>
 #include <fused_multihead_attention_kernel.h>
@@ -60,6 +62,10 @@ static_assert(Kt_causal::Cta_tile_p::M == kStepQ, "");
 __device__ float4 g_ws_acc[Ws::ACC_FLOAT4S_PER_PIECE * kMaxPiecesTotal];
 __device__ float4 g_ws_stats[Ws::STATS_FLOAT4S_PER_PIECE * kMaxPiecesTotal];
 
+// Host flag (setFmhaLastTileSplitSkipA) and the number of split calls that skipped launch A.
+std::atomic<bool> g_skip_launch_a{false};
+std::atomic<int64_t> g_skip_launch_a_count{0};
+
 struct Device_state
 {
     bool init = false;
@@ -81,21 +87,27 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-namespace
-{
-// Per-device state: the workspace addresses and the CTAs/SM of the piece kernel (the generated kernel's body with
-// the same traits and shared memory, so the same occupancy as launch A). nullptr if the device index is out of range.
-fmha_last_tile_split_sm120::Device_state* get_last_tile_split_state()
+bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(Fused_multihead_attention_params_v2& params,
+    Launch_params const& launch_params,
+    void (*launcher)(Fused_multihead_attention_params_v2&, Launch_params const&, cudaStream_t), cudaStream_t stream)
 {
     namespace lts = fused_multihead_attention::last_tile_split;
     namespace ns = fmha_last_tile_split_sm120;
     using Kt = ns::Kt_causal;
+
+    if (launcher == nullptr || params.b < 1 || params.b > ns::kMaxBatch || params.is_s_padded)
+    {
+        return false;
+    }
+
+    // Per-device state: the workspace addresses and the CTAs/SM of the piece kernel (the generated kernel's body with
+    // the same traits and shared memory, so the same occupancy as launch A).
     static ns::Device_state s_state[64];
     int device = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
     if (device < 0 || device >= 64)
     {
-        return nullptr;
+        return false;
     }
     ns::Device_state& state = s_state[device];
     if (!state.init)
@@ -117,28 +129,6 @@ fmha_last_tile_split_sm120::Device_state* get_last_tile_split_state()
         TLLM_LOG_INFO("fmha_v2 e4m3 sm120 last q-tile KV split: %d CTAs/SM, workspace %zu bytes", state.occupancy,
             sizeof(ns::g_ws_acc) + sizeof(ns::g_ws_stats));
     }
-    return &state;
-}
-} // namespace
-
-bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(Fused_multihead_attention_params_v2& params,
-    Launch_params const& launch_params,
-    void (*launcher)(Fused_multihead_attention_params_v2&, Launch_params const&, cudaStream_t), cudaStream_t stream)
-{
-    namespace lts = fused_multihead_attention::last_tile_split;
-    namespace ns = fmha_last_tile_split_sm120;
-    using Kt = ns::Kt_causal;
-
-    if (launcher == nullptr || params.b < 1 || params.b > ns::kMaxBatch || params.is_s_padded)
-    {
-        return false;
-    }
-    ns::Device_state* const state_ptr = get_last_tile_split_state();
-    if (state_ptr == nullptr)
-    {
-        return false;
-    }
-    ns::Device_state& state = *state_ptr;
 
     int const slots = launch_params.multi_processor_count * state.occupancy;
     int const pieces = lts::choose_num_pieces(
@@ -148,10 +138,19 @@ bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(Fused_multihead
         return false;
     }
 
-    // A) The generated kernel on q-tiles 0 .. Q-2.
-    Fused_multihead_attention_params_v2 params_a = params;
-    params_a.s -= ns::kStepQ;
-    launcher(params_a, launch_params, stream);
+    // A) The generated kernel on q-tiles 0 .. Q-2, unless the caller reads only each sequence's last row and has
+    // checked that every sequence's last row lies in q-tile Q-1 (setFmhaLastTileSplitSkipA): then those rows are left
+    // unwritten and B + C below write the last q-tile exactly as they always do.
+    if (ns::g_skip_launch_a.load(std::memory_order_relaxed))
+    {
+        ns::g_skip_launch_a_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        Fused_multihead_attention_params_v2 params_a = params;
+        params_a.s -= ns::kStepQ;
+        launcher(params_a, launch_params, stream);
+    }
 
     // B) + C) The last q-tile.
     auto const& bert_params = reinterpret_cast<bert::Fused_multihead_attention_params_v2 const&>(params);
@@ -163,45 +162,15 @@ bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_split_sm120(Fused_multihead
     return true;
 }
 
-// Only the last q-tile of every (head, sequence), as the split's pieces + merge (B + C above, no launch A): the rows
-// of the other q-tiles are not written. Used when the caller reads only each sequence's last row (the final decoder
-// layer at prefill). The piece count is choose_num_pieces' k for the same (b, h), so when the split above runs (b <= 3
-// on a whole-wave saving) the last q-tile rows are bitwise those of the split. Returns false (nothing launched) when
-// the workspace cannot hold one piece per (head, sequence).
-bool run_fmha_v2_e4m3_d256_causal_paged_kv_last_tile_only_sm120(
-    Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream)
+// While set, a split call skips launch A (q-tiles 0 .. Q-2 stay unwritten). For a layer whose context rows are read
+// only at each sequence's last token, with every context length in (64 * (Q - 1), 64 * Q] (checked by the caller).
+// Calls that do not take the split (b > 3, no wave saving) run the whole kernel as before. Returns the number of
+// split calls that skipped launch A so far.
+int64_t setFmhaLastTileSplitSkipASm120(bool enable)
 {
-    namespace lts = fused_multihead_attention::last_tile_split;
     namespace ns = fmha_last_tile_split_sm120;
-    using Kt = ns::Kt_causal;
-
-    if (params.b < 1 || params.h < 1 || params.s < 1 || params.is_s_padded)
-    {
-        return false;
-    }
-    long long const hb = static_cast<long long>(params.h) * params.b;
-    if (hb > ns::kMaxPiecesTotal)
-    {
-        return false;
-    }
-    ns::Device_state* const state_ptr = get_last_tile_split_state();
-    if (state_ptr == nullptr)
-    {
-        return false;
-    }
-    ns::Device_state& state = *state_ptr;
-    long long const slots = static_cast<long long>(launch_params.multi_processor_count) * state.occupancy;
-    long long k = std::min<long long>(slots / hb, ns::kMaxPieces);
-    k = std::min<long long>(k, ns::kMaxPiecesTotal / hb);
-    k = std::max<long long>(k, 1);
-
-    auto const& bert_params = reinterpret_cast<bert::Fused_multihead_attention_params_v2 const&>(params);
-    // q_loop -1: each sequence's own last q-tile.
-    cudaError_t const err
-        = lts::launch_last_tile_split<Kt>(bert_params, -1, static_cast<int>(k), state.acc, state.stats, stream);
-    TLLM_CHECK_WITH_INFO(err == cudaSuccess, "fmha_v2 e4m3 sm120 last q-tile only launch failed: %s",
-        cudaGetErrorString(err));
-    return true;
+    ns::g_skip_launch_a.store(enable, std::memory_order_relaxed);
+    return ns::g_skip_launch_a_count.load(std::memory_order_relaxed);
 }
 
 } // namespace kernels
