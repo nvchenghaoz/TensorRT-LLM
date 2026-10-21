@@ -145,21 +145,28 @@ for mode in modes:
     gen([P(4), P(5), P(6), P(7)], 2, False)
 log('warm done')
 SC = dict()
-for mode in modes:
-    set_mode(mode)
-    tag = 'm' + str(mode)
+def run_set(off):
     d = dict()
-    d['c1a'] = scen([P(10)], 8)
-    d['c1b'] = scen([P(11)], 8)
-    d['b2'] = scen([P(12), P(13)], 8)
-    d['b4'] = scen([P(14), P(15), P(16), P(17)], 8)
-    d['rep'] = [scen([P(10)], 8) for k in range(3)]
-    d['long'] = scen([P(20)], 64)
-    d['mixed'] = mixed(30, 31)
-    SC[tag] = d
-    log(tag, 'scenarios done; cached c1a', d['c1a']['res'][0]['cached'],
+    d['c1a'] = scen([P(off + 10)], 8)
+    d['c1b'] = scen([P(off + 11)], 8)
+    d['b2'] = scen([P(off + 12), P(off + 13)], 8)
+    d['b4'] = scen([P(off + 14), P(off + 15), P(off + 16), P(off + 17)], 8)
+    d['rep'] = [scen([P(off + 10)], 8) for k in range(3)]
+    d['long'] = scen([P(off + 20)], 64)
+    d['mixed'] = mixed(off + 30, off + 31)
+    return d
+def show(tag, d):
+    log(tag, 'cached c1a/rep', d['c1a']['res'][0]['cached'], [x['res'][0]['cached'] for x in d['rep']],
         'lto per ctx step c1a', [x['lto'] for x in d['c1a']['kv']],
         'ng per ctx step mixed', [x['ng'] for x in d['mixed']['kv']])
+# The same prompt sequence in both arms: set S (seeds 10..) then set S2 (seeds 50..). Base runs both on main's
+# code; the candidate runs S with the change on and S2 with the kill switch (TRTLLM_LAST_LAYER_READ_ROWS=0 path).
+set_mode(True)
+SC['S'] = run_set(0)
+show('S', SC['S'])
+set_mode(False)
+SC['S2'] = run_set(40)
+show('S2', SC['S2'])
 TIM = dict()
 for mode in modes:
     TIM['m' + str(mode)] = dict(b1=[], b2=[], b4=[])
@@ -240,31 +247,42 @@ def cmp_all(A, B):
         o[k] = cmp(A[k], B[k])
     return o
 REP = dict()
+for tag in ('S', 'S2'):
+    REP['repeat_' + tag] = [cmp(SC[tag]['c1a'], x) for x in SC[tag]['rep']]
+REP['lto'] = [[x['lto'] for x in SC['S'][k]['kv']] for k in ('c1a', 'b2', 'b4', 'mixed')]
+REP['cached'] = [[x['cached'] for x in SC['S'][k]['res']] for k in ('c1a', 'b2', 'b4', 'mixed')]
+REP['mixed_ng'] = [[x['ng'] for x in SC[t]['mixed']['kv']] for t in ('S', 'S2')]
+PASS = None
 if CAND:
-    REP['cand_off_vs_on'] = cmp_all(SC['mFalse'], SC['mTrue'])
-    for tag in ('mFalse', 'mTrue'):
-        REP['repeat_' + tag] = [cmp(SC[tag]['c1a'], x) for x in SC[tag]['rep']]
-    REP['lto_on'] = [[x['lto'] for x in SC['mTrue'][k]['kv']] for k in ('c1a', 'b2', 'b4', 'mixed')]
     bp = os.path.join(OUT, 'base.pt')
     if os.path.exists(bp):
         B = torch.load(bp, weights_only=False)
-        BS = B['SC']['mNone']
-        REP['base_vs_cand_on'] = cmp_all(BS, SC['mTrue'])
-        REP['base_vs_cand_off'] = cmp_all(BS, SC['mFalse'])
+        REP['base_vs_cand_on'] = cmp_all(B['SC']['S'], SC['S'])
+        REP['base_vs_cand_killswitch'] = cmp_all(B['SC']['S2'], SC['S2'])
         REP['base_timing'] = dict()
         for b in B['TIM']['mNone']:
             REP['base_timing'][b] = stats(B['TIM']['mNone'][b])
+        on = REP['base_vs_cand_on']
+        ks = REP['base_vs_cand_killswitch']
+        PASS = dict()
+        PASS['kv_bitwise_on'] = all(on[k]['kv_bitwise'] for k in on)
+        PASS['killswitch_all_bitwise'] = all(ks[k]['kv_bitwise'] and ks[k]['logits_bitwise'] and ks[k]['ids_eq'] for k in ks)
+        PASS['greedy_ids_on'] = all(on[k]['ids_eq'] for k in on)
+        PASS['repeat_on'] = all(x['logits_bitwise'] and x['ids_eq'] and x['kv_bitwise'] for x in REP['repeat_S'])
+        PASS['lto_used'] = REP['lto'][0][0] > 0 if REP['lto'][0] else False
     else:
         REP['base_vs_cand_on'] = 'base.pt not found at ' + bp
-else:
-    REP['repeat_base'] = [cmp(SC['mNone']['c1a'], x) for x in SC['mNone']['rep']]
 log('report', json.dumps(REP, default=str))
+log('pass', json.dumps(PASS))
 key = 'mTrue' if CAND else 'mNone'
 batch = dict()
 for b in ('b1', 'b2', 'b4'):
     s = TS[key][b]
     batch[b[1:]] = dict(step_ms=s['median'], noise_floor=s['noise'], p10=s['p10'], p90=s['p90'])
 res = dict(batch=batch, output=dict(**dict(zip(['class'], ['reordered']))), arm=ARM)
+if PASS is not None:
+    res['passed'] = all(PASS.values())
+    res['checks'] = PASS
 if CAND:
     res['kill_switch_arm'] = TS['mFalse']
 llm.shutdown()
