@@ -29,7 +29,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mlp_common import (DownInputTap, H, I, build_mlp, dev, make_input,  # noqa: E402
                         sha, tree_info)
 
-from tensorrt_llm._torch.autotuner import autotune  # noqa: E402
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import NVFP4GemmUnifiedRunner  # noqa: E402
 
 MODE = os.environ.get("MODE", "compare")
@@ -99,7 +98,6 @@ def main():
     # No autotune: both trees run the AutoTuner's deterministic fallback
     # tactic, so base and candidate GEMM picks are identical. Every valid
     # tactic is covered by the layout-invariance section below.
-    del autotune
     res["tactic_lists"] = tactic_lists(mlp)
     log("TACTICS", json.dumps(res["tactic_lists"]))
     outs = {}
