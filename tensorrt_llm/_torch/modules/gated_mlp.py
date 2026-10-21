@@ -363,17 +363,19 @@ class GatedMLP(nn.Module):
         column is the same dot product, in permuted order) and read them back
         through fused_silu_mul_nvfp4's PERMUTED gather. Both paths are bitwise
         equal to main. TRTLLM_GATEUP_SWIGLU_EPI=0 restores main exactly."""
+        gate_up = getattr(self, "gate_up_proj", None)
         if getattr(self, "_swiglu_epi_permuted", False):
-            return
+            return  # post_load_weights runs once per load; never permute twice
         self._swiglu_epi_permuted = False
         if os.environ.get("TRTLLM_GATEUP_SWIGLU_EPI", "1") == "0":
             return
-        gate_up = getattr(self, "gate_up_proj", None)
         if (gate_up is None or self.split_gate_up
                 or get_sm_version() // 10 != 12
                 or not hasattr(torch.ops.trtllm, "nvfp4_gate_up_swiglu_nvfp4")
                 or not self._can_fuse_swiglu_nvfp4_quant()
-                or gate_up.lora is not None):
+                or gate_up.lora is not None
+                or gate_up.can_use_cute_dsl_nvfp4_swiglu_blackwell()
+                or getattr(gate_up, "_nvfp4_decode_weight", None) is not None):
             return
         n, k = gate_up.out_features, gate_up.in_features
         w, ws = gate_up.weight, gate_up.weight_scale
@@ -394,15 +396,25 @@ class GatedMLP(nn.Module):
             gate_up.weight_scale.data.copy_(
                 torch.ops.trtllm.block_scale_interleave(
                     sf2d[perm].contiguous()).view_as(gate_up.weight_scale))
-        self._swiglu_epi_inv_perm = torch.argsort(perm)
+        del perm
+        self._swiglu_epi_inv_perm = None  # built lazily (fallback paths only)
         self._swiglu_epi_permuted = True
+        logger.debug(f"GatedMLP layer {self.layer_idx}: gate_up rows permuted "
+                     "for the SM120 SwiGLU+NVFP4 GEMM epilogue")
 
     # Rows from which gate_up runs the SwiGLU-epilogue GEMM (prefill).
     _SWIGLU_EPI_MIN_ROWS = int(
         os.environ.get("TRTLLM_GATEUP_SWIGLU_EPI_MIN_ROWS", "17"))
 
     def _unpermute_gate_up_output(self, h1):
+        """[gate | up] column order for consumers that are not index-aware."""
         if getattr(self, "_swiglu_epi_permuted", False):
+            if self._swiglu_epi_inv_perm is None:
+                from .fused_silu_mul_nvfp4 import \
+                    gate_up_swiglu_row_permutation
+                self._swiglu_epi_inv_perm = torch.argsort(
+                    gate_up_swiglu_row_permutation(h1.shape[-1]).to(
+                        h1.device))
             return h1.index_select(-1, self._swiglu_epi_inv_perm)
         return h1
 

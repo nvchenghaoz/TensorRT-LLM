@@ -313,3 +313,20 @@ def _(x: torch.Tensor, global_scale: torch.Tensor):
     num_k_tiles = (d // _SF_VEC + 3) // 4
     return (x.new_empty((m, d // 2), dtype=torch.uint8),
             x.new_empty((m_pad * num_k_tiles * 4, ), dtype=torch.uint8))
+
+
+try:
+    if hasattr(torch.ops.trtllm, "nvfp4_gate_up_swiglu_nvfp4"):
+
+        @torch.library.register_fake("trtllm::nvfp4_gate_up_swiglu_nvfp4")
+        def _(mat1, mat2, mat1Scale, mat2Scale, alpha, outScale, tile=0):
+            m, n = mat1.shape[0], mat2.shape[0]
+            d = n // 2
+            m_pad = (m + 127) // 128 * 128
+            num_k_tiles = (d // _SF_VEC + 3) // 4
+            return [
+                mat1.new_empty((m, d // 2), dtype=torch.uint8),
+                mat1.new_empty((m_pad * num_k_tiles * 4, ), dtype=torch.uint8)
+            ]
+except Exception:  # noqa: BLE001 - fake registration is optional
+    pass

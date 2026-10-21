@@ -117,6 +117,53 @@ def main():
                 ok &= all(entry["eq_base"].values())
             res["cases"][key] = entry
             log("CASE", key, json.dumps(entry))
+    # ---- C3: every gate_up tactic at decode M vs BASE-tree files -----------
+    from tensorrt_llm._torch.modules import fused_silu_mul_nvfp4 as fsm
+    runner = NVFP4GemmUnifiedRunner(0, torch.bfloat16, ["cutlass", "cublaslt", "cuda_core"])
+    gsd = mlp.down_proj.input_scale
+    per_tac = {}
+    pt_ok = True
+    for m in (1, 2, 3, 4, 8, 16):
+        x = case_input(m, "random")
+        a, asf = torch.ops.trtllm.fp4_quantize(x, mlp.gate_up_proj.input_scale, 16, False)
+        ins = [a, mlp.gate_up_proj.weight, asf, mlp.gate_up_proj.weight_scale, mlp.gate_up_proj.alpha]
+        tacs = runner.get_valid_tactics(ins, None)
+        got = {}
+        for t in tacs:
+            h = runner(ins, tactic=t)
+            if permuted:
+                q, s = torch.ops.trtllm.fused_silu_mul_nvfp4_permuted(h, gsd)
+            else:
+                q, s = torch.ops.trtllm.fused_silu_mul_nvfp4(h, gsd)
+            o = torch.ops.trtllm.nvfp4_gemm(q, mlp.down_proj.weight, s, mlp.down_proj.weight_scale,
+                                            mlp.down_proj.alpha, torch.bfloat16)
+            torch.cuda.synchronize()
+            got[str(t)] = {"fp4": q.cpu(), "sf": s.cpu(), "out": o.view(torch.int16).cpu()}
+        path = os.path.join(REF_DIR, f"tactics_{m}.pt")
+        if MODE == "save":
+            torch.save(got, path)
+            per_tac[str(m)] = {"tactics": list(got.keys())}
+        else:
+            ref = torch.load(path)
+            bad = [k for k in ref if k not in got or not all(eq(got[k][f], ref[k][f]) for f in ("fp4", "sf", "out"))]
+            extra = [k for k in got if k not in ref]
+            per_tac[str(m)] = {"tactics": len(got), "base_tactics": len(ref), "bad": bad, "extra": extra}
+            pt_ok &= not bad and not extra and len(ref) > 0
+        log("PER_TACTIC", m, json.dumps(per_tac[str(m)]))
+    del fsm
+    res["per_tactic_vs_base"] = per_tac
+    ok &= pt_ok
+    # A2: derived tensors of gate_up after load.
+    gu = mlp.gate_up_proj
+    res["gate_up_derived"] = {
+        "weight_shape": list(gu.weight.shape), "weight_scale_numel": gu.weight_scale.numel(),
+        "sf_padding_rows": (gu.weight_scale.numel() // (H // 16)) - gu.out_features,
+        "uses_marlin_nvfp4": bool(gu.uses_marlin_nvfp4),
+        "nvfp4_decode_copy": getattr(gu, "_nvfp4_decode_weight", None) is not None,
+        "w4a16_scale_linear": hasattr(gu, "_w4a16_weight_scale_linear"),
+        "cute_dsl_swiglu": bool(gu.can_use_cute_dsl_nvfp4_swiglu_blackwell()),
+    }
+    log("DERIVED", json.dumps(res["gate_up_derived"]))
     if MODE == "save":
         print(json.dumps({"passed": True, "saved": REF_DIR, "result": res}))
         return
