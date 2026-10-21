@@ -335,6 +335,7 @@ class GatedMLP(nn.Module):
         of loading incorrectly.
         """
         self._maybe_share_gate_up_quantize = False
+        self._maybe_permute_gate_up_for_swiglu_epilogue()
         # Sharing hands both GEMMs a tensor quantized with the stored scale, so
         # a dynamic scale computed per call has no way to reach them.
         if not (self.split_gate_up and self.gate_proj.has_fp8_qdq
@@ -353,6 +354,74 @@ class GatedMLP(nn.Module):
                 "instead of sharing one quantized activation.")
             return
         self._maybe_share_gate_up_quantize = True
+
+    def _maybe_permute_gate_up_for_swiglu_epilogue(self) -> None:
+        """SM12x: permute the gate_up NVFP4 weight rows (in place, one copy)
+        for the CUTLASS gate_up GEMM with the SwiGLU + NVFP4 epilogue
+        (trtllm::nvfp4_gate_up_swiglu_nvfp4), used at rows >= _SWIGLU_EPI_MIN_ROWS.
+        Smaller calls keep main's GEMMs on the permuted rows (each output
+        column is the same dot product, in permuted order) and read them back
+        through fused_silu_mul_nvfp4's PERMUTED gather. Both paths are bitwise
+        equal to main. TRTLLM_GATEUP_SWIGLU_EPI=0 restores main exactly."""
+        if getattr(self, "_swiglu_epi_permuted", False):
+            return
+        self._swiglu_epi_permuted = False
+        if os.environ.get("TRTLLM_GATEUP_SWIGLU_EPI", "1") == "0":
+            return
+        gate_up = getattr(self, "gate_up_proj", None)
+        if (gate_up is None or self.split_gate_up
+                or get_sm_version() // 10 != 12
+                or not hasattr(torch.ops.trtllm, "nvfp4_gate_up_swiglu_nvfp4")
+                or not self._can_fuse_swiglu_nvfp4_quant()
+                or gate_up.lora is not None):
+            return
+        n, k = gate_up.out_features, gate_up.in_features
+        w, ws = gate_up.weight, gate_up.weight_scale
+        if (n % 128 != 0 or k % 128 != 0 or w.dtype != torch.uint8
+                or tuple(w.shape) != (n, k // 2)
+                or ws.numel() != n * (k // 16)):
+            return
+        # Settle padding (a no-op at these shapes) before permuting.
+        gate_up.transform_weights()
+        if tuple(gate_up.weight.shape) != (n, k // 2):
+            return
+        from .fused_silu_mul_nvfp4 import gate_up_swiglu_row_permutation
+        perm = gate_up_swiglu_row_permutation(n).to(w.device)
+        with torch.no_grad():
+            gate_up.weight.data.copy_(gate_up.weight.data[perm])
+            sf2d = torch.ops.trtllm.block_scale_interleave_reverse(
+                gate_up.weight_scale.data.view(1, n, k // 16)).view(n, k // 16)
+            gate_up.weight_scale.data.copy_(
+                torch.ops.trtllm.block_scale_interleave(
+                    sf2d[perm].contiguous()).view_as(gate_up.weight_scale))
+        self._swiglu_epi_inv_perm = torch.argsort(perm)
+        self._swiglu_epi_permuted = True
+
+    # Rows from which gate_up runs the SwiGLU-epilogue GEMM (prefill).
+    _SWIGLU_EPI_MIN_ROWS = int(
+        os.environ.get("TRTLLM_GATEUP_SWIGLU_EPI_MIN_ROWS", "17"))
+
+    def _unpermute_gate_up_output(self, h1):
+        if getattr(self, "_swiglu_epi_permuted", False):
+            return h1.index_select(-1, self._swiglu_epi_inv_perm)
+        return h1
+
+    def _swiglu_epi_forward(self, x):
+        """Returns down_proj's NVFP4 input, or None to take the unfused path."""
+        t = x.fp4_tensor if isinstance(x, Fp4QuantizedTensor) else (
+            x[0] if isinstance(x, tuple) else x)
+        if torch.compiler.is_compiling() or t.dim() != 2:
+            return None
+        m = t.shape[0]
+        if m < max(1, GatedMLP._SWIGLU_EPI_MIN_ROWS):
+            return None
+        gate_up = self.gate_up_proj
+        act_fp4, act_sf, alpha = gate_up.quant_method._input_prepare(gate_up, x)
+        tile = 0 if m >= 1024 else 1
+        fp4, sf = torch.ops.trtllm.nvfp4_gate_up_swiglu_nvfp4(
+            act_fp4, gate_up.weight, act_sf, gate_up.weight_scale, alpha,
+            self.down_proj.input_scale, tile)
+        return Fp4QuantizedTensor(fp4, sf)
 
     def _can_fuse_gate_up_swiglu(self) -> bool:
         """Check if fused GEMM + SwiGLU path is available.
@@ -541,6 +610,23 @@ class GatedMLP(nn.Module):
             h2 = self._fused_gate_up_swiglu(x, fp4_out=fp4_out)
         elif self._can_fuse_gate_up_swiglu():
             h2 = self._fused_gate_up_swiglu(x)
+        elif getattr(self, "_swiglu_epi_permuted", False):
+            h2 = self._swiglu_epi_forward(x)
+            if h2 is None:
+                h1 = self.gate_up_proj(x)
+                if (h1.dtype == torch.bfloat16 and h1.stride(-1) == 1
+                        and (h1.dim() == 2 or h1.is_contiguous())):
+                    lead_shape = h1.shape[:-1]
+                    h1_2d = h1.reshape(-1,
+                                       h1.shape[-1]) if h1.dim() > 2 else h1
+                    fp4, sf = torch.ops.trtllm.fused_silu_mul_nvfp4_permuted(
+                        h1_2d, self.down_proj.input_scale)
+                    if h1.dim() > 2:
+                        fp4 = fp4.reshape(*lead_shape, fp4.shape[-1])
+                    h2 = Fp4QuantizedTensor(fp4, sf)
+                else:
+                    h2 = self._apply_activation(
+                        self._unpermute_gate_up_output(h1))
         else:
             h1 = self.gate_up_proj(x)
             if self._can_fuse_swiglu_fp8_quant():
@@ -579,7 +665,7 @@ class GatedMLP(nn.Module):
                 "(intermediate_size not divisible by tp_size).")
 
         h1 = LoraLayer.forward_with_base(
-            lambda: self.gate_up_proj(x),
+            lambda: self._unpermute_gate_up_output(self.gate_up_proj(x)),
             (self.splitted_gate_up_lora, self.fused_gate_up_lora),
             x,
             lora_params,

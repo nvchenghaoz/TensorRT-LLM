@@ -1,0 +1,438 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// SM120 NVFP4 W4A4 gate_up GEMM with SwiGLU + NVFP4 (group-16, E4M3 SF,
+// 128x4-swizzled) quantize in the epilogue: it writes down_proj's FP4 input
+// and SF directly instead of the [M, 2I] BF16 gate_up output.
+//
+// Mainloop: identical to nvfp4_nvfp4_gemm_template_sm120.h (Sm120
+// OpClassBlockScaledTensorOp, cooperative, StaticPersistentScheduler,
+// swizzle 1, raster heuristic). Epilogue: register-only operator epilogue.
+//
+// Weight layout (GatedMLP permutes gate_up rows at load): inside every
+// 128-row tile t, row c = 32a + 16nw + 8b + 2lq + p holds gate (p = 0) or up
+// (p = 1) of output j = 64t + 32nw + 16(a/2) + 4lq + 2(a%2) + b. With the SM120
+// tiled MMA (warps 4x2, N permutation (8,2,2):(1,16,8)) each thread's
+// accumulator pair is (gate_j, up_j) and a lane quad owns two whole 16-wide
+// SF blocks per row.
+//
+// Per-element math is a bitwise copy of main's unfused path:
+//   LinCombPerColBias (null bias): bf16_rn(alpha * acc + 0)
+//   fused_silu_mul_nvfp4.py: h = bf16_rn((u + 0) * (sigmoid(g) * g)) with
+//   tl.sigmoid lowered to div.full(1, ex2.approx(g * -log2e) + 1)
+//   quant tail (cvt_warp_fp16_to_fp4 as built, landing 13): rcp.approx.ftz,
+//   mul.rn, cvt.rn.satfinite.e4m3x2, cvt.rn.satfinite.e2m1x2.
+
+#pragma once
+
+#ifndef _WIN32
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif // #ifndef _WIN32
+
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+
+#include "cute/tensor.hpp"
+#include "cutlass/arch/arch.h"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/detail.hpp"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/gemm.h"
+#include "cutlass/util/packed_stride.hpp"
+
+#ifndef _WIN32
+#pragma GCC diagnostic pop
+#endif // #ifndef _WIN32
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/archCondition.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
+{
+namespace cutlass_kernels
+{
+namespace swiglu_nvfp4_sm120
+{
+using namespace cute;
+
+__device__ __forceinline__ float rcpApproxFtz(float x)
+{
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ float mulRn(float a, float b)
+{
+    float y;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
+    return y;
+}
+
+__device__ __forceinline__ float addRn(float a, float b)
+{
+    float y;
+    asm("add.rn.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
+    return y;
+}
+
+__device__ __forceinline__ float ex2Approx(float a)
+{
+    float y;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(a));
+    return y;
+}
+
+__device__ __forceinline__ float divFull(float a, float b)
+{
+    float y;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
+    return y;
+}
+
+__device__ __forceinline__ float bf16Round(float x)
+{
+    return __bfloat162float(__float2bfloat16_rn(x));
+}
+
+__device__ __forceinline__ uint32_t cvtE4m3(float x)
+{
+    uint32_t r;
+    asm("{\n.reg .b16 t;\ncvt.rn.satfinite.e4m3x2.f32 t, %2, %1;\ncvt.u32.u16 %0, t;\n}"
+        : "=r"(r)
+        : "f"(x), "f"(0.0f));
+    return r & 0xff;
+}
+
+__device__ __forceinline__ float e4m3ToF32(uint32_t b)
+{
+    uint32_t h2;
+    uint16_t v = static_cast<uint16_t>(b);
+    asm("{\ncvt.rn.f16x2.e4m3x2 %0, %1;\n}" : "=r"(h2) : "h"(v));
+    return __half2float(__ushort_as_half(static_cast<unsigned short>(h2 & 0xffff)));
+}
+
+__device__ __forceinline__ uint32_t cvtE2m1x4(float e0, float e1, float e2, float e3)
+{
+    uint32_t r;
+    asm("{\n.reg .b8 b0;\n.reg .b8 b1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n"
+        "mov.b32 %0, {b0, b1, b0, b1};\n}"
+        : "=r"(r)
+        : "f"(e0), "f"(e1), "f"(e2), "f"(e3));
+    return r & 0xffff;
+}
+
+__device__ __forceinline__ float swigluElem(float alpha, float accGate, float accUp)
+{
+    // gate_up GEMM epilogue (LinCombPerColBias, null bias, beta 0) -> BF16.
+    float const g = bf16Round(__fmaf_rn(alpha, accGate, 0.0f));
+    float const u = bf16Round(__fmaf_rn(alpha, accUp, 0.0f));
+    // tl.sigmoid as Triton lowers it for fused_silu_mul_nvfp4_kernel.
+    float const sig = divFull(1.0f, addRn(ex2Approx(mulRn(g, -1.44269502162933349609375f)), 1.0f));
+    return bf16Round(mulRn(addRn(u, 0.0f), mulRn(sig, g)));
+}
+
+template <class StrideC_, class StrideD_>
+class SwigluNvfp4Epilogue
+{
+public:
+    using EpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized;
+    using DispatchPolicy = EpilogueSchedule;
+    using ThreadEpilogueOp = cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, 1, float, float>;
+    using ElementOutput = cutlass::bfloat16_t;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    using ElementScalar = float;
+    using ElementC = void;
+    using StrideC = StrideC_;
+    using ElementD = cutlass::bfloat16_t;
+    using StrideD = StrideD_;
+    using GmemElementC = ElementD;
+    using GmemTiledCopyC = void;
+    using GmemTiledCopyD = void;
+
+    struct SharedStorage
+    {
+    };
+
+    using TensorStorage = SharedStorage;
+
+    struct Arguments
+    {
+        float const* alpha_ptr = nullptr;
+        float const* out_scale_ptr = nullptr;
+        uint8_t* fp4_ptr = nullptr;
+        uint8_t* sf_ptr = nullptr;
+        int num_k_tiles = 0;
+    };
+
+    using Params = Arguments;
+
+    template <class ProblemShape>
+    static constexpr Params to_underlying_arguments(ProblemShape const&, Arguments const& args, void*)
+    {
+        return args;
+    }
+
+    template <class ProblemShape>
+    static size_t get_workspace_size(ProblemShape const&, Arguments const&)
+    {
+        return 0;
+    }
+
+    template <class ProblemShape>
+    static cutlass::Status initialize_workspace(
+        ProblemShape const&, Arguments const&, void*, cudaStream_t, cutlass::CudaHostAdapter* = nullptr)
+    {
+        return cutlass::Status::kSuccess;
+    }
+
+    template <class ProblemShape>
+    static bool can_implement(ProblemShape const&, Arguments const&)
+    {
+        return true;
+    }
+
+    CUTLASS_HOST_DEVICE
+    SwigluNvfp4Epilogue(Params const& params_, SharedStorage const& = SharedStorage())
+        : params(params_)
+    {
+    }
+
+    CUTLASS_DEVICE bool is_source_needed()
+    {
+        return false;
+    }
+
+    template <class ProblemShapeMNKL, class BlockShapeMNK, class BlockCoordMNKL, class FrgEngine, class FrgLayout,
+        class TiledMma, class ResidueMNK>
+    CUTLASS_DEVICE void operator()(ProblemShapeMNKL problem_shape_mnkl, BlockShapeMNK, BlockCoordMNKL blk_coord_mnkl,
+        cute::Tensor<FrgEngine, FrgLayout> const& accumulators, TiledMma tiled_mma, ResidueMNK, int thread_idx, char*)
+    {
+        constexpr int BLK_M = size<0>(BlockShapeMNK{});
+        constexpr int BLK_N = size<1>(BlockShapeMNK{});
+        static_assert(BLK_N == 128, "tile N must be 128");
+        int const M = get<0>(problem_shape_mnkl);
+        int const N = get<1>(problem_shape_mnkl);
+        auto m_coord = get<0>(blk_coord_mnkl);
+        auto n_coord = get<1>(blk_coord_mnkl);
+
+        auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+        Tensor cD = make_identity_tensor(make_shape(Int<BLK_M>{}, Int<BLK_N>{}));
+        Tensor tCcD = thr_mma.partition_C(cD);
+        static_assert(size<0>(FrgLayout{}) == 4, "accumulator fragment must be (2,2)");
+        constexpr int MMA_M = size<1>(FrgLayout{});
+        constexpr int MMA_N = size<2>(FrgLayout{});
+        static_assert(MMA_N == 8, "MMA_N must be 8");
+
+        float const alpha = *params.alpha_ptr;
+        float const s = *params.out_scale_ptr;
+        float const r6 = rcpApproxFtz(6.0f);
+        float const rs = rcpApproxFtz(s);
+
+        int const n0 = get<1>(tCcD(0, 0, 0));
+        int const nw = n0 / 16;
+        int const lq = (n0 % 16) / 2;
+        int const d = N / 2;
+        int const m_pad = (M + 127) / 128 * 128;
+        int const j_base = int(n_coord) * (BLK_N / 2) + 32 * nw + 4 * lq;
+        int const m_base = int(m_coord) * BLK_M;
+        int const nkt = params.num_k_tiles;
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int im = 0; im < MMA_M; ++im)
+        {
+            CUTLASS_PRAGMA_UNROLL
+            for (int r2 = 0; r2 < 2; ++r2)
+            {
+                int const row = m_base + get<0>(tCcD(2 * r2, im, 0));
+                // MMA_N index k covers tile col offset 32a + 8b (static) ->
+                // output j_base + 16(a/2) + 2(a%2) + b.
+                float hv[2][4];
+                CUTLASS_PRAGMA_UNROLL
+                for (int k = 0; k < MMA_N; ++k)
+                {
+                    int const ck = get<1>(tCcD(0, im, k)) - get<1>(tCcD(0, im, 0));
+                    int const a_ = ck / 32;
+                    int const b_ = (ck % 32) / 8;
+                    hv[a_ / 2][2 * (a_ % 2) + b_]
+                        = swigluElem(alpha, accumulators(2 * r2, im, k), accumulators(2 * r2 + 1, im, k));
+                }
+                CUTLASS_PRAGMA_UNROLL
+                for (int sb = 0; sb < 2; ++sb)
+                {
+                    float vmax = 0.0f;
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        vmax = fmaxf(vmax, fabsf(hv[sb][e]));
+                    }
+                    vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffff, vmax, 1));
+                    vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffff, vmax, 2));
+                    float const sfv = mulRn(s, mulRn(vmax, r6));
+                    uint32_t const sfb = cvtE4m3(sfv);
+                    float const sff = e4m3ToF32(sfb);
+                    float const osc = (vmax != 0.0f) ? rcpApproxFtz(mulRn(sff, rs)) : 0.0f;
+                    uint32_t const packed = cvtE2m1x4(mulRn(hv[sb][0], osc), mulRn(hv[sb][1], osc),
+                        mulRn(hv[sb][2], osc), mulRn(hv[sb][3], osc));
+                    int const j = j_base + 16 * sb;
+                    if (row < M)
+                    {
+                        *reinterpret_cast<uint16_t*>(params.fp4_ptr + size_t(row) * (d / 2) + j / 2)
+                            = static_cast<uint16_t>(packed);
+                    }
+                    if (lq == 0 && row < m_pad)
+                    {
+                        // get_sf_out_offset_128x4, batch 0; SF padding rows zeroed.
+                        int const c = j / 16;
+                        size_t const off = (size_t(row / 128) * nkt + c / 4) * 512 + (row % 32) * 16
+                            + ((row % 128) / 32) * 4 + c % 4;
+                        params.sf_ptr[off] = row < M ? static_cast<uint8_t>(sfb) : uint8_t(0);
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    Params params;
+};
+
+template <int TM, int TN, int TK>
+struct SwigluNvfp4GemmSm120
+{
+    using CTAShape = Shape<Int<TM>, Int<TN>, Int<TK>>;
+    using ClusterShape = Shape<_1, _1, _1>;
+    using Arch = cutlass::arch::Sm120;
+    using ElementA = cutlass::float_e2m1_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    static constexpr int AlignmentA = 32;
+    using ElementB = cutlass::float_e2m1_t;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    static constexpr int AlignmentB = 32;
+    using ElementPairA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using ElementPairB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using StrideCD = cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>;
+    using EpiOp = SwigluNvfp4Epilogue<StrideCD, StrideCD>;
+    using CollectiveEpilogue = cutlass::epilogue::collective::detail::Sm90TmaWarpSpecializedAdapter<EpiOp>;
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<Arch,
+        cutlass::arch::OpClassBlockScaledTensorOp, ElementPairA, LayoutA, AlignmentA, ElementPairB, LayoutB,
+        AlignmentB, float, CTAShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+            sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+    using BaseKernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,
+        CollectiveEpilogue, cutlass::gemm::StaticPersistentScheduler>;
+
+    struct GemmKernel : BaseKernel
+    {
+        using typename BaseKernel::Params;
+
+        CUTLASS_DEVICE
+        void operator()(Params const& params, char* smem_buf)
+        {
+            if constexpr (tensorrt_llm::kernels::arch::is_major_v<12>)
+            {
+                this->BaseKernel::operator()(params, smem_buf);
+            }
+            else
+            {
+                if (cute::thread0())
+                {
+                    printf("%s : This kernel shall only run on SM12x devices.\n", __PRETTY_FUNCTION__);
+                    __trap();
+                }
+            }
+        }
+    };
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+// Returns the workspace size when A, B and fp4 are all null.
+template <int TM, int TN, int TK>
+size_t runSwigluNvfp4GemmSm120(void const* A, void const* B, void const* input_sf, void const* weight_sf,
+    float const* alpha, float const* out_scale, uint8_t* fp4, uint8_t* sf, int m, int n, int k, char* workspace,
+    size_t workspaceBytes, cudaStream_t stream, bool enablePdl)
+{
+    using G = SwigluNvfp4GemmSm120<TM, TN, TK>;
+    using Gemm = typename G::Gemm;
+    using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+    int const d = n / 2;
+    typename Gemm::Arguments args;
+    args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+    args.problem_shape = cute::make_shape(m, n, k, 1);
+    args.mainloop.ptr_A = static_cast<typename G::ElementA const*>(A);
+    args.mainloop.ptr_B = static_cast<typename G::ElementB const*>(B);
+    args.mainloop.ptr_SFA = static_cast<cutlass::float_ue4m3_t const*>(input_sf);
+    args.mainloop.ptr_SFB = static_cast<cutlass::float_ue4m3_t const*>(weight_sf);
+    args.mainloop.dA = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, 0);
+    args.mainloop.dB = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
+    args.mainloop.layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(args.problem_shape);
+    args.mainloop.layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(args.problem_shape);
+    args.epilogue.alpha_ptr = alpha;
+    args.epilogue.out_scale_ptr = out_scale;
+    args.epilogue.fp4_ptr = fp4;
+    args.epilogue.sf_ptr = sf;
+    args.epilogue.num_k_tiles = (d / 16 + 3) / 4;
+    if constexpr (!std::is_const_v<decltype(args.scheduler.max_swizzle_size)>)
+    {
+        args.scheduler.max_swizzle_size = 1;
+    }
+    if constexpr (!std::is_const_v<decltype(args.scheduler.raster_order)>)
+    {
+        using Enum_t = decltype(args.scheduler.raster_order);
+        args.scheduler.raster_order = Enum_t::Heuristic;
+    }
+    args.hw_info.cluster_shape = dim3(1, 1, 1);
+    args.hw_info.cluster_shape_fallback = dim3(1, 1, 1);
+
+    Gemm gemm;
+    if (!A && !B && !fp4)
+    {
+        return gemm.get_workspace_size(args);
+    }
+    int smem_size = int(sizeof(typename Gemm::GemmKernel::SharedStorage));
+    static int const maxSmem = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
+    TLLM_CHECK_WITH_INFO(smem_size <= maxSmem, "[SwiGLU NVFP4 GEMM] SMEM %d exceeds %d", smem_size, maxSmem);
+    TLLM_CHECK_WITH_INFO(gemm.can_implement(args) == cutlass::Status::kSuccess,
+        "[SwiGLU NVFP4 GEMM] cannot implement m=%d n=%d k=%d", m, n, k);
+    size_t const ws = gemm.get_workspace_size(args);
+    TLLM_CHECK_WITH_INFO(ws <= workspaceBytes, "[SwiGLU NVFP4 GEMM] workspace %zu > %zu", ws, workspaceBytes);
+    auto st = gemm.initialize(args, workspace, stream);
+    TLLM_CHECK_WITH_INFO(st == cutlass::Status::kSuccess, "[SwiGLU NVFP4 GEMM] initialize failed: %s",
+        cutlass::cutlassGetStatusString(st));
+    st = gemm.run(args, workspace, stream, nullptr, enablePdl);
+    TLLM_CHECK_WITH_INFO(
+        st == cutlass::Status::kSuccess, "[SwiGLU NVFP4 GEMM] run failed: %s", cutlass::cutlassGetStatusString(st));
+    return ws;
+}
+
+} // namespace swiglu_nvfp4_sm120
+} // namespace cutlass_kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

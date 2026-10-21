@@ -109,7 +109,8 @@ def fused_silu_mul_nvfp4_kernel(fp4_ptr, sf_ptr, x_ptr, x_stride, scale_ptr, M,
                                 swiglu_beta: tl.constexpr,
                                 BLOCK_SIZE: tl.constexpr,
                                 NUM_K_TILES: tl.constexpr,
-                                USE_PDL: tl.constexpr = False) -> None:
+                                USE_PDL: tl.constexpr = False,
+                                PERMUTED: tl.constexpr = False) -> None:
     if USE_PDL:
         # Let the consumer GEMM launch (and prefetch its weights) now; every
         # access of this kernel stays behind the wait.
@@ -126,9 +127,23 @@ def fused_silu_mul_nvfp4_kernel(fp4_ptr, sf_ptr, x_ptr, x_stride, scale_ptr, M,
         offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < d
 
-        a = tl.load(x_row_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        b = tl.load(x_row_ptr + offsets + d, mask=mask,
-                    other=0.0).to(tl.float32)
+        if PERMUTED:
+            # gate_up rows permuted for the SwiGLU GEMM epilogue
+            # (gate_up_swiglu_row_permutation): output j's gate/up sit at
+            # adjacent columns of its 128-column tile. Only the load
+            # addresses change; the arithmetic below is unchanged.
+            jl = offsets % 64
+            col = ((offsets // 64) * 128 + 32 * (2 * ((jl % 32) // 16) +
+                                                 (jl % 4) // 2) +
+                   16 * (jl // 32) + 8 * (jl % 2) + 2 * ((jl % 16) // 4))
+            a = tl.load(x_row_ptr + col, mask=mask, other=0.0).to(tl.float32)
+            b = tl.load(x_row_ptr + col + 1, mask=mask,
+                        other=0.0).to(tl.float32)
+        else:
+            a = tl.load(x_row_ptr + offsets, mask=mask,
+                        other=0.0).to(tl.float32)
+            b = tl.load(x_row_ptr + offsets + d, mask=mask,
+                        other=0.0).to(tl.float32)
         # Exactly silu_and_mul_kernel's expression (plain SwiGLU).
         result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
         # The unfused path stores BF16 and the quantizer reloads it.
@@ -177,7 +192,9 @@ def fused_silu_mul_nvfp4_kernel(fp4_ptr, sf_ptr, x_ptr, x_stride, scale_ptr, M,
         tl.store(sf_ptr + off, tl.zeros([128, NSF], tl.uint8), mask=pmask)
 
 
-def _fused_silu_mul_nvfp4_impl(x: torch.Tensor, global_scale: torch.Tensor):
+def _fused_silu_mul_nvfp4_impl(x: torch.Tensor,
+                               global_scale: torch.Tensor,
+                               permuted: bool = False):
     assert x.dim() == 2 and x.stride(1) == 1
     m, n = x.shape
     assert n % 2 == 0
@@ -189,12 +206,34 @@ def _fused_silu_mul_nvfp4_impl(x: torch.Tensor, global_scale: torch.Tensor):
     sf = torch.empty((m_pad * num_k_tiles * 4, ),
                      dtype=torch.uint8,
                      device=x.device)
-    _launch(x, global_scale, fp4, sf)
+    _launch(x, global_scale, fp4, sf, permuted=permuted)
     return fp4, sf
 
 
-def _launch(x: torch.Tensor, global_scale: torch.Tensor, fp4: torch.Tensor,
-            sf: torch.Tensor) -> None:
+def gate_up_swiglu_row_permutation(n: int) -> torch.Tensor:
+    """Row order of the gate_up weight for the SM120 SwiGLU GEMM epilogue.
+
+    Permuted row r holds source row perm[r] of the [gate | up] weight. Inside
+    every 128-row tile t, row c = 32a + 16nw + 8b + 2lq + p is gate (p = 0) or
+    up (p = 1) of output j = 64t + 32nw + 16(a // 2) + 4lq + 2(a % 2) + b
+    (see nvfp4_swiglu_gemm_sm120.h). The PERMUTED mode of
+    fused_silu_mul_nvfp4_kernel inverts this map.
+    """
+    assert n % 128 == 0
+    d = n // 2
+    c = torch.arange(128)
+    a, nw = c // 32, (c % 32) // 16
+    b, lq, p = (c % 16) // 8, (c % 8) // 2, c % 2
+    jl = 32 * nw + 4 * lq + 16 * (a // 2) + 2 * (a % 2) + b
+    j = 64 * torch.arange(n // 128)[:, None] + jl[None, :]
+    return torch.where(p[None, :] == 0, j, d + j).reshape(-1)
+
+
+def _launch(x: torch.Tensor,
+            global_scale: torch.Tensor,
+            fp4: torch.Tensor,
+            sf: torch.Tensor,
+            permuted: bool = False) -> None:
     """Write FP4 [m, d/2] and swizzled SF [ceil128(m) * ceil4(d/16)]."""
     m, n = x.shape
     d = n // 2
@@ -219,6 +258,7 @@ def _launch(x: torch.Tensor, global_scale: torch.Tensor, fp4: torch.Tensor,
             BLOCK_SIZE=block,
             NUM_K_TILES=num_k_tiles,
             USE_PDL=use_pdl,
+            PERMUTED=permuted,
             num_warps=4,
             launch_pdl=use_pdl,
         )
@@ -246,6 +286,26 @@ def fused_silu_mul_nvfp4(
 
 
 @fused_silu_mul_nvfp4.register_fake
+def _(x: torch.Tensor, global_scale: torch.Tensor):
+    m, n = x.shape
+    d = n // 2
+    m_pad = (m + 127) // 128 * 128
+    num_k_tiles = (d // _SF_VEC + 3) // 4
+    return (x.new_empty((m, d // 2), dtype=torch.uint8),
+            x.new_empty((m_pad * num_k_tiles * 4, ), dtype=torch.uint8))
+
+
+@torch.library.custom_op("trtllm::fused_silu_mul_nvfp4_permuted",
+                         mutates_args=())
+def fused_silu_mul_nvfp4_permuted(
+        x: torch.Tensor,
+        global_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """fused_silu_mul_nvfp4 for a gate_up output whose columns are in
+    gate_up_swiglu_row_permutation order; same bytes as the unpermuted op."""
+    return _fused_silu_mul_nvfp4_impl(x, global_scale, permuted=True)
+
+
+@fused_silu_mul_nvfp4_permuted.register_fake
 def _(x: torch.Tensor, global_scale: torch.Tensor):
     m, n = x.shape
     d = n // 2
