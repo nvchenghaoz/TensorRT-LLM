@@ -3,6 +3,7 @@
 
   lib_sass_cmp.py save     (baseline arm: the main sha's build)  -> /tmp/fmha244_sass/base/
   lib_sass_cmp.py compare  (candidate arm)                       -> prints the diff
+  lib_sass_cmp.py compare <base_libs_dir>  (base libs copied there by the baseline arm)
 
 Every .so under the tensorrt_llm package's libs/ is unpacked with cuobjdump -xelf all. Each cubin's bytes are hashed;
 the base and candidate multisets of hashes are matched. Byte-identical cubins have identical SASS. For each cubin
@@ -35,13 +36,14 @@ def lib_dir():
     return os.path.join(pkg, "libs")
 
 
-def unpack(dst):
+def unpack(dst, src=None):
+    src = src or lib_dir()
     shutil.rmtree(dst, ignore_errors=True)
     os.makedirs(dst)
-    libs = sorted(f for f in os.listdir(lib_dir()) if f.endswith(".so") or ".so." in f)
+    libs = sorted(f for f in os.listdir(src) if f.endswith(".so") or ".so." in f)
     entries = []
     for lib in libs:
-        path = os.path.join(lib_dir(), lib)
+        path = os.path.join(src, lib)
         if os.path.islink(path):
             continue
         d = os.path.join(dst, lib)
@@ -93,7 +95,11 @@ def main():
         json.dump(entries, open(f"{ROOT}/base_index.json", "w"))
         log(json.dumps({"saved": len(entries), "kept": sum(e["keep"] for e in entries)}))
         return
-    base = json.load(open(f"{ROOT}/base_index.json"))
+    if len(sys.argv) > 2:
+        # compare <dir>: the base libs were copied there by the baseline arm (main has no copy of this script).
+        base = unpack(f"{ROOT}/base", sys.argv[2])
+    else:
+        base = json.load(open(f"{ROOT}/base_index.json"))
     cand = unpack(f"{ROOT}/cand")
     pool = {}
     for e in base:
