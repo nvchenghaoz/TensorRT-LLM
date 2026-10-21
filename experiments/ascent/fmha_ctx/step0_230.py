@@ -195,7 +195,8 @@ def sass_text(binary):
 
 
 def gpu_state():
-    r = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,clocks.mem,temperature.gpu,power.draw,"
+    dev = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+    r = subprocess.run(["nvidia-smi", "-i", dev, "--query-gpu=clocks.sm,clocks.mem,temperature.gpu,power.draw,"
                         "clocks_throttle_reasons.active", "--format=csv,noheader"], capture_output=True, text=True)
     return r.stdout.strip()
 
@@ -324,7 +325,13 @@ def main():
         log(f"[sass_same] {tag}: {res}")
     summary["sass_other_kernels_vs_base"] = other
 
-    # 3. timing palindrome
+    # 3. timing palindrome (S0_PREWARM=n: n discarded base runs first, so position 0 does not start on an idle GPU)
+    for wi in range(int(os.environ.get("S0_PREWARM", "0"))):
+        st0 = gpu_state()
+        rc, out = run_bench(f"{W}/bench_base", TIME_CASES)
+        res, _ = parse_bench(out)
+        log(f"[prewarm] {wi} base (discarded) " + " ".join(f"{c}={r['median']:.4f}" for c, r in res.items())
+            + f" | {st0} -> {gpu_state()}")
     pos_res = []
     for pi, arm in enumerate(POSITIONS):
         st0 = gpu_state()
