@@ -3,7 +3,7 @@ os.environ['TLLM_WORKER_USE_SINGLE_PROCESS'] = '1'
 import torch
 CK = sys.argv[1]
 OUT = sys.argv[2] if len(sys.argv) > 2 else '/tmp/ll127'
-NT1 = int(sys.argv[3]) if len(sys.argv) > 3 else 15
+NT1 = int(sys.argv[3]) if len(sys.argv) > 3 else 50
 os.makedirs(OUT, exist_ok=True)
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig, CudaGraphConfig
@@ -151,7 +151,7 @@ def run_set(off):
     d['c1b'] = scen([P(off + 11)], 8)
     d['b2'] = scen([P(off + 12), P(off + 13)], 8)
     d['b4'] = scen([P(off + 14), P(off + 15), P(off + 16), P(off + 17)], 8)
-    d['rep'] = [scen([P(off + 10)], 8) for k in range(3)]
+    d['rep'] = [scen([P(off + 10)], 8) for k in range(4)]
     d['long'] = scen([P(off + 20)], 64)
     d['mixed'] = mixed(off + 30, off + 31)
     return d
@@ -171,7 +171,7 @@ TIM = dict()
 for mode in modes:
     TIM['m' + str(mode)] = dict(b1=[], b2=[], b4=[])
 seed = 1000
-for nb, iters, wu in ((1, NT1, 3), (2, 8, 2), (4, 6, 2)):
+for nb, iters, wu in ((1, NT1, 10), (2, 30, 5), (4, 20, 5)):
     for it in range(iters + wu):
         for mode in modes:
             set_mode(mode)
@@ -248,7 +248,8 @@ def cmp_all(A, B):
     return o
 REP = dict()
 for tag in ('S', 'S2'):
-    REP['repeat_' + tag] = [cmp(SC[tag]['c1a'], x) for x in SC[tag]['rep']]
+    # Repeats of one prompt see one cache state (its own blocks reused): each equals repeat 1.
+    REP['repeat_' + tag] = [cmp(SC[tag]['rep'][0], x) for x in SC[tag]['rep'][1:]]
 REP['lto'] = [[x['lto'] for x in SC['S'][k]['kv']] for k in ('c1a', 'b2', 'b4', 'mixed')]
 REP['cached'] = [[x['cached'] for x in SC['S'][k]['res']] for k in ('c1a', 'b2', 'b4', 'mixed')]
 REP['mixed_ng'] = [[x['ng'] for x in SC[t]['mixed']['kv']] for t in ('S', 'S2')]
