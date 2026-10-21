@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""STEP 0 of idea 230 (branch 132): base / arm E (FMHA_SM120_EXP2) / arm H (+FMHA_SM120_FP16_SOFTMAX) of the SM120
+"""Idea 244 (landing of idea 230 arm E): base (kill switch -DFMHA_SM120_EXP2=0) / arm E (the default build) of the SM120
 e4m3 tiled context FMHA (fmha_v2_flash_attention_e4m3_fp32_64_128_S_q_paged_kv_256_causal_output_bf16_sm120_kernel_nl_tiled
 plus the last-q-tile split piece / merge kernels), all three built from THIS tree with -DBENCH_MAX_BATCH=3 (base = the
 macros at their default 0), timed with experiments/ascent/fmha_ctx/bench.cu --split -1.
@@ -40,10 +40,13 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "66cff73e70c6452eaa12f3261f8cddf0e9
 W = "/tmp/fmha_230"
 HERE = os.path.dirname(os.path.abspath(__file__))
 TREE = os.getcwd()
-ARMS = {"base": [], "E": ["-DFMHA_SM120_EXP2=1"], "H": ["-DFMHA_SM120_EXP2=1", "-DFMHA_SM120_FP16_SOFTMAX=1"]}
+# Idea 244 (landing of arm E): FMHA_SM120_EXP2 defaults to 1 in the tree; "base" is the kill switch build (=0), which
+# must be SASS-identical to the BASE tree's stock kernels; "E" is the shipped default build (no flags). Arm H is gone.
+ARMS = {"base": ["-DFMHA_SM120_EXP2=0"], "E": []}
+CAND = [a for a in ARMS if a != "base"]
 TIME_CASES = os.environ.get("S0_TIME_CASES", "c1,c2,c3,c4")
 ERR_CASES = os.environ.get("S0_ERR_CASES", "c1,c3,ragged,one,c1_out,c3_out").split(",")
-POSITIONS = ["base", "E", "H", "H", "E", "base"] * int(os.environ.get("S0_ROUNDS", "2"))
+POSITIONS = ["base", "E", "E", "base"] * int(os.environ.get("S0_ROUNDS", "3"))
 WARMUP, ITERS = 10, 100
 H_, H_KV, DIM, TPB = 24, 4, 256, 32
 ART = os.environ.get("AUTO_DEV_ARTIFACTS", W)
@@ -309,7 +312,7 @@ def main():
               "-DUSE_DEMO_BERT_PARAMS=1", "-DGENERATE_CUBIN=1", "-cubin", "-arch=sm_120a"])
     subprocess.run(flags + [f"-I{W}/stock/cpp/kernels/fmha_v2/src", f"{HERE}/sass_same.cu", "-o", f"{W}/ss_base.cubin"],
                    check=True)
-    for tag, fl in (("macros0", []), ("E", ARMS["E"]), ("H", ARMS["H"])):
+    for tag, fl in (("macros0", ARMS["base"]), ("E", ARMS["E"])):
         subprocess.run(flags + fl + [f"-I{TREE}/cpp/kernels/fmha_v2/src", f"{HERE}/sass_same.cu", "-o",
                                      f"{W}/ss_{tag}.cubin"], check=True)
         res = {}
@@ -355,13 +358,13 @@ def main():
         bm = tc["base"]["position_medians"]
         floor = (max(bm) - min(bm)) / statistics.median(bm)
         tc["aa_floor"] = floor
-        for arm in ("E", "H"):
+        for arm in CAND:
             tc[arm]["gain_vs_base"] = 1.0 - tc[arm]["median"] / tc["base"]["median"]
             tc[arm]["beats_2x_floor"] = tc[arm]["gain_vs_base"] > 2 * floor
         timing[case] = tc
         log(f"[timing] {case} floor {floor:.4f} " + " ".join(
             f"{a}: {tc[a]['median']:.4f} [{tc[a]['p10']:.4f},{tc[a]['p90']:.4f}]" for a in ARMS)
-            + f" gainE {tc['E']['gain_vs_base']:.4f} gainH {tc['H']['gain_vs_base']:.4f}")
+            + f" gainE {tc['E']['gain_vs_base']:.4f}")
     summary["timing"] = timing
 
     # 4./5. error + repeated-call runs
@@ -408,7 +411,7 @@ def main():
         for a in dumps:
             entry[a] = dict(max_abs=acc[a]["max_abs"], mean_abs=acc[a]["sum_abs"] / max(acc[a]["n"], 1),
                             n=acc[a]["n"], finite=acc[a]["finite"])
-        for a in ("E", "H"):
+        for a in CAND:
             entry[a]["max_ratio_vs_stock"] = entry[a]["max_abs"] / max(entry["stock"]["max_abs"], 1e-30)
             entry[a]["mean_ratio_vs_stock"] = entry[a]["mean_abs"] / max(entry["stock"]["mean_abs"], 1e-30)
             entry[a]["within_1p5x"] = (entry[a]["finite"] and entry[a]["max_ratio_vs_stock"] <= 1.5
@@ -424,17 +427,15 @@ def main():
 
     # STOP rule
     verdict = {}
-    for a in ("E", "H"):
+    for a in CAND:
         speed = all(timing[c][a]["beats_2x_floor"] for c in ("c1", "c3") if c in timing)
         err_ok = all(errs[c][a]["within_1p5x"] for c in errs)
         rep_ok = all(r["mismatches_vs_call1"] == 0 and r["nonfinite"] == 0 and r["inputs_unchanged"]
                      for r in rep[a].values())
-        ok = speed and err_ok and rep_ok
-        if a == "H":
-            ok = ok and timing["c1"]["H"]["gain_vs_base"] >= 0.03
+        ok = err_ok and rep_ok
         verdict[a] = dict(speed_gate_c1_c3=speed, error_bar=err_ok, repeated_ok=rep_ok,
-                          gain_c1=timing["c1"][a]["gain_vs_base"], gain_c3=timing.get("c3", {}).get(a, {}).get(
-                              "gain_vs_base"), passes_step0=bool(ok))
+                          gain_c1=timing.get("c1", {}).get(a, {}).get("gain_vs_base"),
+                          gain_c3=timing.get("c3", {}).get(a, {}).get("gain_vs_base"), checks_pass=bool(ok))
     summary["verdict"] = verdict
     with open(f"{ART}/step0_230.json", "w") as f:
         json.dump(summary, f, indent=1)
@@ -445,8 +446,13 @@ def main():
                         errs.items()},
              "ptxas": builds, "sass_base_vs_stock_identical": summary["sass_base_vs_stock_identical"],
              "sass_other_kernels_identical": {t: all(v["identical"] for v in r.values()) for t, r in other.items()},
-             "passed": all(rep[a][c]["mismatches_vs_call1"] == 0 and rep[a][c]["nonfinite"] == 0
-                           for a in rep for c in rep[a])}
+             "passed": bool(all(rep[a][c]["mismatches_vs_call1"] == 0 and rep[a][c]["nonfinite"] == 0
+                                and rep[a][c]["inputs_unchanged"] for a in rep for c in rep[a])
+                            and all(v["checks_pass"] for v in verdict.values())
+                            and all(summary["sass_base_vs_stock_identical"].values())
+                            and all(v["identical"] for r in other.values() for v in r.values())),
+             "compared": "FP32 torch reference (dequantized e4m3 Q/K/V, FP32 softmax) and the BASE tree's stock kernel "
+                         "outputs; bar max/mean-abs <= 1.5x stock; repeated calls vs call 1"}
     print(json.dumps(short))
 
 

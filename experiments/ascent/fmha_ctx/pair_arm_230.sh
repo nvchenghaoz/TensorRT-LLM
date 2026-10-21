@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One arm of the idea-230 kernel pair (SM120 e4m3 tiled context FMHA + last-q-tile split, --split -1, kMaxBatch 3).
 # The baseline arm runs this same text inline (main has no copy of this file). Extra nvcc flags come from $ARM_NVCC
-# (candidate: -DFMHA_SM120_EXP2=1 -DFMHA_SM120_FP16_SOFTMAX=1 for arm H). Builds bench.cu against the arm's own
+# (the tree default is FMHA_SM120_EXP2=1 since idea 244; -DFMHA_SM120_EXP2=0 is the kill switch). Builds bench.cu against the arm's own
 # cpp/kernels/fmha_v2/src, runs 2 discarded warm-up processes, then c1,c2,c3,c4 with 10 warmup + 100 timed calls
 # (each: NaN-poisoned O and split workspace, 384 MiB L2 flush, own event pair; output hash vs call 1).
 # Last stdout line: the evidence JSON (class from $ARM_CLASS, default exact).

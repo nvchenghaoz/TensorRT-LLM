@@ -22,30 +22,18 @@
 #include <cfloat>
 #include <type_traits>
 
-// FMHA_SM120_EXP2 (idea 230 arm E / idea 234; default 0): the SM120 e4m3 tiled no-loop context kernels (the ones
+// FMHA_SM120_EXP2 (idea 230 arm E / idea 244; default 1, -DFMHA_SM120_EXP2=0 is the kill switch): the SM120 e4m3 tiled no-loop context kernels (the ones
 // with the register-direct O epilogue, Kernel_traits::STORE_O_FROM_REGS) take the softmax in base 2: the QK^T
 // accumulators stay raw, the row max is taken in raw units, P = ex2.approx(acc * s2 - (max * s2 - log2(256))) with
 // s2 = scale_bmm1 * log2(e), and the O / sum rescale is ex2.approx((prev - curr) * s2). The piece and merge kernels of
 // the last q-tile split use the same domain. Every other kernel is unchanged. Precision class (ex2.approx).
 #ifndef FMHA_SM120_EXP2
-#define FMHA_SM120_EXP2 0
+#define FMHA_SM120_EXP2 1
 #endif
 #if FMHA_SM120_EXP2 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
 #define FMHA_SM120_EXP2_ACTIVE 1
 #else
 #define FMHA_SM120_EXP2_ACTIVE 0
-#endif
-
-// FMHA_SM120_FP16_SOFTMAX (idea 230 arm H, coach item 6; REPORT ONLY; default 0; needs FMHA_SM120_EXP2): on the
-// base-2 path, the exponent argument raw * s2 - offset is formed in FP32 (one FFMA: the row max and the subtraction
-// stay FP32, since raw QK^T accumulators can exceed the FP16 range), converted to f16x2, and the exp2, the per-thread
-// row sums (an f16x2 tree, finished in FP32 per thread) and the conversion to e4m3 run in FP16x2. The MMAs, the
-// running max / sum and the O rescale stay FP32. Precision class.
-#ifndef FMHA_SM120_FP16_SOFTMAX
-#define FMHA_SM120_FP16_SOFTMAX 0
-#endif
-#if FMHA_SM120_FP16_SOFTMAX && !FMHA_SM120_EXP2
-#error "FMHA_SM120_FP16_SOFTMAX needs FMHA_SM120_EXP2"
 #endif
 
 namespace fmha
@@ -85,34 +73,6 @@ static inline __device__ float ex2_approx_ftz(float x)
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
 }
-
-#if FMHA_SM120_FP16_SOFTMAX
-// 2^x for two FP32 arguments, computed in f16x2: (lo, hi) = (2^a, 2^b).
-static inline __device__ uint32_t ex2_f16x2_of_f32(float a, float b)
-{
-    uint32_t h, y;
-    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(h) : "f"(b), "f"(a));
-    asm("ex2.approx.f16x2 %0, %1;" : "=r"(y) : "r"(h));
-    return y;
-}
-
-static inline __device__ uint32_t hadd2_nv(uint32_t a, uint32_t b)
-{
-    uint32_t c;
-    asm("add.rn.f16x2 %0, %1, %2;" : "=r"(c) : "r"(a), "r"(b));
-    return c;
-}
-
-static inline __device__ float half2_sum_to_float(uint32_t x)
-{
-    uint16_t lo, hi;
-    asm("mov.b32 {%0, %1}, %2;" : "=h"(lo), "=h"(hi) : "r"(x));
-    float flo, fhi;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(flo) : "h"(lo));
-    asm("cvt.f32.f16 %0, %1;" : "=f"(fhi) : "h"(hi));
-    return flo + fhi;
-}
-#endif
 
 // The base-2 forms of Tile_o_normalizer_fp32::update / Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits>::update_sum, for
 // row max values in raw accumulator units (s2 = scale_bmm1 * log2(e)).
@@ -1536,55 +1496,6 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
     static_assert(Traits::SOFTMAX_FP_QUANT_SCALE == 256.f, "log2(SOFTMAX_FP_QUANT_SCALE) = 8");
     static constexpr float LOG2_SOFTMAX_FP_QUANT_SCALE = 8.f;
 #endif
-#if FMHA_SM120_FP16_SOFTMAX
-    // Arm H (FMHA_SM120_FP16_SOFTMAX at the top of this file): P in f16x2, p16_[row][k] = (P[2k], P[2k + 1]).
-    static constexpr bool USE_FP16_SOFTMAX = USE_EXP2;
-    uint32_t p16_[MMAS_M * 2][MMAS_N * 2];
-
-    // The row reductions: the max in FP32 (Base), the sum of P from the f16x2 values (per-thread f16x2 tree, then the
-    // quad in FP32).
-    template <typename Functor>
-    inline __device__ void reduce(float (&dst)[MMAS_M * 2])
-    {
-        if constexpr (USE_FP16_SOFTMAX && Functor::IS_SUM)
-        {
-            static_assert(Cta_tile::WARPS_N == 1, "");
-            static_assert((MMAS_N & (MMAS_N - 1)) == 0, "f16x2 tree over a power of two");
-            // Per thread and row: MMAS_N * 4 values of P * 256 <= 256 each, so the FP16 partial sums stay finite.
-            static_assert(MMAS_N * 4 * 256 <= 65504, "");
-#pragma unroll
-            for (int mi = 0; mi < MMAS_M * 2; ++mi)
-            {
-                uint32_t s[MMAS_N * 2];
-#pragma unroll
-                for (int k = 0; k < MMAS_N * 2; ++k)
-                {
-                    s[k] = p16_[mi][k];
-                }
-#pragma unroll
-                for (int w = MMAS_N; w >= 1; w /= 2)
-                {
-#pragma unroll
-                    for (int k = 0; k < w; ++k)
-                    {
-                        s[k] = hadd2_nv(s[k], s[k + w]);
-                    }
-                }
-                dst[mi] = half2_sum_to_float(s[0]);
-            }
-#pragma unroll
-            for (int mi = 0; mi < MMAS_M * 2; ++mi)
-            {
-                dst[mi] += __shfl_xor_sync(uint32_t(-1), dst[mi], 1);
-                dst[mi] += __shfl_xor_sync(uint32_t(-1), dst[mi], 2);
-            }
-        }
-        else
-        {
-            Base::template reduce<Functor>(dst);
-        }
-    }
-#endif
 
     // Ctor.
     template <typename Params>
@@ -1724,18 +1635,6 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
             for (int mi = 0; mi < MMAS_M * 2; ++mi)
             {
                 float const offset = APPLY_MASK && max[mi] == -FLT_MAX ? 0.f : fmaf(max[mi], s2_, -exp_bias_);
-#if FMHA_SM120_FP16_SOFTMAX
-                if constexpr (USE_FP16_SOFTMAX)
-                {
-#pragma unroll
-                    for (int k = 0; k < MMAS_N * 2; ++k)
-                    {
-                        p16_[mi][k] = ex2_f16x2_of_f32(fmaf(this->elt_[mi][2 * k + 0], s2_, -offset),
-                            fmaf(this->elt_[mi][2 * k + 1], s2_, -offset));
-                    }
-                    continue;
-                }
-#endif
 #pragma unroll
                 for (int ni = 0; ni < MMAS_N * 4; ++ni)
                 {
@@ -1766,30 +1665,6 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
         float const scale = USE_EXP2 ? 1.f : reinterpret_cast<float const&>(this->params_scale_softmax_);
 #else
         float const scale = reinterpret_cast<float const&>(this->params_scale_softmax_);
-#endif
-
-#if FMHA_SM120_FP16_SOFTMAX
-        if constexpr (USE_FP16_SOFTMAX)
-        {
-            // f16x2 -> e4m3x4, the same element order as below (pair k holds elements 2k, 2k + 1).
-#pragma unroll
-            for (int mi = 0; mi < M; ++mi)
-            {
-#pragma unroll
-                for (int ki = 0; ki < K; ++ki)
-                {
-                    dst[ki][mi].reg(0)
-                        = fmha::half4_to_fp8x4<Traits::A_type>(p16_[2 * mi + 0][4 * ki + 0], p16_[2 * mi + 0][4 * ki + 1]);
-                    dst[ki][mi].reg(1)
-                        = fmha::half4_to_fp8x4<Traits::A_type>(p16_[2 * mi + 1][4 * ki + 0], p16_[2 * mi + 1][4 * ki + 1]);
-                    dst[ki][mi].reg(2)
-                        = fmha::half4_to_fp8x4<Traits::A_type>(p16_[2 * mi + 0][4 * ki + 2], p16_[2 * mi + 0][4 * ki + 3]);
-                    dst[ki][mi].reg(3)
-                        = fmha::half4_to_fp8x4<Traits::A_type>(p16_[2 * mi + 1][4 * ki + 2], p16_[2 * mi + 1][4 * ki + 3]);
-                }
-            }
-            return;
-        }
 #endif
 
 // The canonical layout in K should be R0: [0,1,2,3] R2: [16,17,18,19]
