@@ -112,6 +112,7 @@ def gen(prompts, mt, lp=True):
     dt = time.time() - t
     return [outres(o) for o in outs], dt
 def cap_start():
+    CAP['last'] = skip_count()
     CAP['kv'] = []
     CAP['logits'] = []
     CAP['hid'] = []
