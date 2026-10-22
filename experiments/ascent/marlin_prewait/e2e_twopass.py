@@ -43,7 +43,6 @@ def corpus_ids(tok, n_tokens):
     files = sorted(glob.glob("docs/source/**/*.md", recursive=True))
     files += sorted(glob.glob("tensorrt_llm/_torch/**/*.md", recursive=True))
     files += sorted(glob.glob("examples/**/*.md", recursive=True))
-    files += sorted(glob.glob("tensorrt_llm/**/*.py", recursive=True))
     ids = []
     for f in files:
         try:
@@ -153,6 +152,7 @@ def main(ckpt):
                pass1_all_lp_sha=hashlib.sha256("".join(per[k]["p1_lp_sha"] for k in sorted(per)).encode()).hexdigest(),
                pass2_all_ids_sha=digest_ids([p2[k]["ids"] for k in sorted(p2)]),
                pass2_all_lp_sha=hashlib.sha256("".join(per[k]["p2_lp_sha"] for k in sorted(per)).encode()).hexdigest(),
+               prompt_ids_sha=digest_ids(prompts)[:16],
                engine_json=engine_json, batch_wait_timeout_ms=BATCH_WAIT_MS, osl=OSL,
                prompts="%d x (%d shared prefix + %d unique), %d greedy tokens, logprobs=1; c8@8, c16@16, c32@32" % (
                    n, PREFIX, SUFFIX, OSL), per_prompt=per,
