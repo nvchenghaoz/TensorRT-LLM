@@ -50,6 +50,8 @@ from ..locality_domain_utils import _copy_to_new_cuda_allocation
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, replace_parameter_and_save_metadata,
                      unswizzle_sf)
+from .fp8_prefill_nvfp4 import (prefill_nvfp4_apply_quantized,
+                                uses_prefill_nvfp4_copy)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 from .small_n_gemv import maybe_small_n_gemv
 
@@ -782,6 +784,17 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        if isinstance(input, Fp4QuantizedTensor):
+            # A producer (GDN gated norm, attention output gate, ...) already
+            # quantized this activation for the W4A4 prefill copy. Tested
+            # first: an Fp4QuantizedTensor has no .dtype/.dim() and must never
+            # reach the Marlin/GEMV decode branches below.
+            copy = uses_prefill_nvfp4_copy(module, input.shape[0])
+            assert copy is not None, (
+                "Fp4QuantizedTensor input needs this FP8 linear's W4A4 "
+                "prefill copy at these rows")
+            return prefill_nvfp4_apply_quantized(copy, module, input, bias)
+
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
@@ -829,8 +842,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
             if static_input_scale is not None:
-                nvfp4_prefill = module.__dict__.get("_fp8_prefill_nvfp4")
-                if nvfp4_prefill is not None and input.shape[0] > 16 and input.dtype == torch.bfloat16:
+                nvfp4_prefill = uses_prefill_nvfp4_copy(module, input.shape[0])
+                if nvfp4_prefill is not None and input.dtype == torch.bfloat16:
                     return nvfp4_prefill(module, input, original_shape, bias)
                 # Static quantization
                 qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(

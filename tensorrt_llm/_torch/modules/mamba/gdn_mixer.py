@@ -49,6 +49,9 @@ from .gdn_prefill_conv import gdn_fused_transpose_conv_enabled, gdn_prefill_tran
 from .gdn_prefill_onepass import gdn_prefill_onepass, gdn_prefill_onepass_enabled
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
+from .layernorm_gated import GDN_GATED_NORM_NVFP4_ENABLED, rms_norm_gated_token_major_nvfp4  # noqa: I001
+from ..fp8_prefill_nvfp4 import uses_prefill_nvfp4_copy  # noqa: I001
+from ...utils import Fp4QuantizedTensor  # noqa: I001
 from .mamba2_metadata import Mamba2Metadata
 from .mamba2_mixer import _cached_arange
 from .recurrent_state_cache import reset_recurrent_state_rows
@@ -626,6 +629,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ):
             # BF16 rows go to out_proj's NVFP4 W4A4 prefill copy.
             fp8_scale = None
+        nvfp4_copy = uses_prefill_nvfp4_copy(self.out_proj, z.shape[0])
+        if GDN_GATED_NORM_NVFP4_ENABLED and nvfp4_copy is not None and nvfp4_copy.split is None:
+            # out_proj takes its W4A4 copy at these rows: the gated norm
+            # quantizes for it in the same kernel (bitwise equal to the BF16
+            # norm + fp4_quantize). TRTLLM_GDN_GATED_NORM_NVFP4=0 disables.
+            fp4, sf = rms_norm_gated_token_major_nvfp4(
+                attn_out.reshape(-1, self.head_v_dim),
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                nvfp4_copy.act_global,
+            )
+            return self.out_proj(Fp4QuantizedTensor(fp4, sf), all_reduce_params=all_reduce_params)
         attn_out = rms_norm_gated_token_major(
             attn_out.reshape(-1, self.head_v_dim),
             z,

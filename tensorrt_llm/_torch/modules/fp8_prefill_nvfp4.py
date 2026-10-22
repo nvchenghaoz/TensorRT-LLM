@@ -137,16 +137,42 @@ def get_prefill_nvfp4_copy(module: torch.nn.Module):
     return module.__dict__.get(_ATTR)
 
 
+_decode_max_rows_fn = None
+
+
+def _decode_copy_max_rows(module: torch.nn.Module) -> int:
+    """Rows up to which this linear's W4A16 decode copy (Marlin) runs.
+
+    Read through linear.fp8_nvfp4_decode_max_rows (the per-(N,K) cap) where
+    the tree has it; otherwise the fixed MAX_DECODE_ROWS that
+    FP8QDQLinearMethod.apply's decode branch uses.
+    """
+    global _decode_max_rows_fn
+    if _decode_max_rows_fn is None:
+        from . import linear as _linear
+        _decode_max_rows_fn = getattr(_linear, "fp8_nvfp4_decode_max_rows",
+                                      lambda _module: MAX_DECODE_ROWS)
+    return _decode_max_rows_fn(module)
+
+
 def uses_prefill_nvfp4_copy(module: torch.nn.Module, rows: int):
-    """The W4A4 prefill copy this FP8 linear runs for an input of ``rows``
-    rows, or None when those rows take the FP8 / decode-copy path.
+    """The W4A4 prefill copy this FP8 linear runs for a BF16 input of
+    ``rows`` rows, or None when those rows take the FP8 / decode-copy path.
 
     The single routing decision shared by FP8QDQLinearMethod.apply and the
     producers that emit NVFP4 for it (GDN gated norm, attention output gate).
+    It mirrors apply's order: a module with a W4A16 decode copy keeps rows up
+    to its decode cap there; the W4A4 copy takes rows > MAX_DECODE_ROWS.
     """
     if rows <= MAX_DECODE_ROWS:
         return None
-    return module.__dict__.get(_ATTR)
+    copy = module.__dict__.get(_ATTR)
+    if copy is None:
+        return None
+    if (getattr(module, "_nvfp4_decode_weight", None) is not None
+            and rows <= _decode_copy_max_rows(module)):
+        return None
+    return copy
 
 
 def _main_decoder_layers(model: torch.nn.Module) -> list:
