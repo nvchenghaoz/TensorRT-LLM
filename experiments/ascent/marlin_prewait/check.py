@@ -68,8 +68,11 @@ def env(**kv):
 
 
 def arm_env(prewait, fullk):
+    # fullk=True: the served launches (full_k out_proj / in_proj at rows <= 8, kM16Table at rows 9-16).
+    # fullk=False: the default split-K launch at every row count.
     env(TRTLLM_MARLIN_PREWAIT_B="1" if prewait else "0", TRTLLM_MARLIN_FULLK="1" if fullk else "0",
-        TRTLLM_MARLIN_INPROJ_FULLK="1" if fullk else "0", TRTLLM_MARLIN_DEBUG_SKIP_WAIT=None)
+        TRTLLM_MARLIN_INPROJ_FULLK="1" if fullk else "0", TRTLLM_MARLIN_M16_TABLE="1" if fullk else "0",
+        TRTLLM_MARLIN_DEBUG_SKIP_WAIT=None, TRTLLM_MARLIN_M16_CFG=None)
 
 
 def build(n, k, seed):
@@ -217,7 +220,7 @@ def main():
                 torch.cuda.synchronize()
                 eq = all(torch.equal(a, b) for a, b in zip(outs[True], outs[False]))
                 det = all(torch.equal(o, outs[True][0]) for o in outs[True] + outs[False])
-                fam = "fullk" if fullk else "default"
+                fam = "served_fullk_or_m16table" if fullk else "default_splitk"
                 rec[fam] = {"prewait_eq_kill": eq, "deterministic": det, "hash": sha([outs[True][0]]),
                             "hash_kill": sha([outs[False][0]])}
                 report["hashes"][f"{key}_{fam}"] = sha([outs[True][0]])

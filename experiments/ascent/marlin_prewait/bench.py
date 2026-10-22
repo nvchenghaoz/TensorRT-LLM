@@ -145,6 +145,24 @@ for sname, n, k, c, calls in SHAPES:
             and dK["replay_eq_eager"], hashes[key + "_P"]))
         del graphs, outs, objs
         torch.cuda.synchronize()
+        # Cross-tree bitwise evidence: eager Marlin output hashes, served launches (full_k / kM16Table) and the
+        # default split-K launch, for both arms (P and K must match each other and the base tree's hashes).
+        xg = torch.Generator(device=dev).manual_seed(7 + m)
+        xin = (torch.randn(m, k, generator=xg, device=dev) * 0.5).to(torch.bfloat16)
+        for fam in ["served", "splitk"]:
+            for flag in ["TRTLLM_MARLIN_FULLK", "TRTLLM_MARLIN_INPROJ_FULLK", "TRTLLM_MARLIN_M16_TABLE"]:
+                os.environ[flag] = "1" if fam == "served" else "0"
+            for a in ARMS:
+                set_arm(a)
+                o1 = marlin(xin, ws[0], n, k).clone()
+                o2 = marlin(xin, ws[1], n, k).clone()
+                torch.cuda.synchronize()
+                bitwise_ok = bitwise_ok and bool(torch.equal(o1, o2))
+                hashes["eager_%s_M%d_%s_%s" % (sname, m, fam, a)] = h(o1)
+            same = hashes["eager_%s_M%d_%s_P" % (sname, m, fam)] == hashes["eager_%s_M%d_%s_K" % (sname, m, fam)]
+            bitwise_ok = bitwise_ok and same
+        for flag in ["TRTLLM_MARLIN_FULLK", "TRTLLM_MARLIN_INPROJ_FULLK", "TRTLLM_MARLIN_M16_TABLE"]:
+            os.environ.pop(flag, None)
     del ws
     torch.cuda.empty_cache()
 res = dict()

@@ -490,10 +490,11 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
 
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new);
 
-        // The kernel starts with griddepcontrol.wait, so a PDL launch orders all of
-        // its memory accesses (A, scales, locks, C) after the predecessor grid; that
-        // also serializes the launches of this loop, which share `locks`. Only a PDL
-        // launch (flag in the last argument) triggers dependents early.
+        // A PDL launch orders its A, lock and C accesses after the predecessor grid
+        // (griddepcontrol.wait); that also serializes the launches of this loop, which
+        // share `locks`. Only the constant weight / weight-scale copies of the first
+        // pipeline stages may be issued before the wait (kMarlinNvfp4PreWaitFlag).
+        // Only a PDL launch (flag in the last argument) triggers dependents early.
         int4 const* b_bias_null = nullptr;
         float const* a_scales_null = nullptr;
         int4 const* zp_null = nullptr;
