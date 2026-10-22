@@ -56,7 +56,7 @@ constexpr int kMarlinNvfp4PdlLaunchFlag = 1 << 30;
 
 // full_k kernels (template flag): the host launches one CTA per n-tile column
 // (gridDim.x == n_tiles, a single m block) and stores, in bits
-// [kMarlinNvfp4FullKGridShift, +13) of max_shared_mem, the grid size G of the
+// [kMarlinNvfp4FullKGridShift, +12) of max_shared_mem, the grid size G of the
 // default launch it replaces. The default launch splits every column's k tiles
 // at multiples of iters(G) over several CTAs and chains their partial sums
 // through the BF16 output (highest k stripe first, each step fp32 add of the
@@ -66,7 +66,17 @@ constexpr int kMarlinNvfp4PdlLaunchFlag = 1 << 30;
 // a new CTA), and replays the in-CTA warp reduction and the BF16 chain at the
 // end, so its output is bitwise equal to the default launch's.
 constexpr int kMarlinNvfp4FullKGridShift = 17;
-constexpr int kMarlinNvfp4FullKGridMask = (1 << 13) - 1;
+constexpr int kMarlinNvfp4FullKGridMask = (1 << 12) - 1;
+// Or-ed in (PDL launches only): the kernel issues the first `stages - 1` pipeline
+// stages' B (weight) and weight-scale cp.async copies before griddepcontrol.wait.
+// B, the weight scales and the weight global scale are constant model weights, never
+// written by the predecessor grid; A, the locks and C are only touched after the wait.
+// The copies land in the same shared-memory slots as before, so the output is
+// bitwise unchanged. Kill switch: TRTLLM_MARLIN_PREWAIT_B=0.
+constexpr int kMarlinNvfp4PreWaitFlag = 1 << 29;
+// Test-only negative control (TRTLLM_MARLIN_DEBUG_SKIP_WAIT=1): skip griddepcontrol.wait.
+// Never set in production; it exists so a PDL-live check can show it detects a missing wait.
+constexpr int kMarlinNvfp4DebugSkipWaitFlag = -2147483647 - 1; // bit 31
 constexpr int kMarlinNvfp4FullKMaxStripes = 4;
 
 // Empty kernel stub outside the architectures supported by dense Marlin.
@@ -280,20 +290,35 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     // kMarlinNvfp4PdlLaunchFlag or-ed in when the host launched it with PDL.
     int max_shared_mem)
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    // PDL: order every A / scale / lock read and every C write after the
-    // immediate predecessor grid (a no-op when launched without the
-    // programmatic-serialization attribute).
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    // Only a PDL launch triggers dependents early, so a non-PDL launch keeps the
-    // implicit trigger at grid completion. The grid is a single wave (one CTA per
-    // SM), so an early trigger cannot delay this kernel; dependents must issue
-    // their own griddepcontrol.wait before touching C or the lock workspace.
-    if (max_shared_mem & kMarlinNvfp4PdlLaunchFlag)
+    // PDL: order every A / lock read and every C write after the immediate
+    // predecessor grid (a no-op when launched without the programmatic-serialization
+    // attribute). Only a PDL launch triggers dependents early, so a non-PDL launch
+    // keeps the implicit trigger at grid completion. The grid is a single wave (one
+    // CTA per SM), so an early trigger cannot delay this kernel; dependents must
+    // issue their own griddepcontrol.wait before touching C or the lock workspace.
+    // With kMarlinNvfp4PreWaitFlag the wait moves below the first stages' B /
+    // weight-scale cp.async issue (see pdl_prewait); nothing else moves.
+    // (BF16 A, no zero-points in this kernel; act_order would read g_idx in the prologue.)
+    constexpr bool can_prewait_b = group_blocks != 0;
+    bool const pdl_prewait
+        = can_prewait_b && (max_shared_mem & kMarlinNvfp4PreWaitFlag) != 0 && !use_atomic_add;
+    auto pdl_wait_and_trigger = [&]()
     {
-        asm volatile("griddepcontrol.launch_dependents;");
-    }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        if (!(max_shared_mem & kMarlinNvfp4DebugSkipWaitFlag))
+        {
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+        }
+        if (max_shared_mem & kMarlinNvfp4PdlLaunchFlag)
+        {
+            asm volatile("griddepcontrol.launch_dependents;");
+        }
 #endif
+    };
+    if (!pdl_prewait)
+    {
+        pdl_wait_and_trigger();
+    }
     // Each threadblock processes one "stripe" of the B matrix with (roughly) the
     // same size, which might involve multiple column "slices" (of width 16 *
     // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -881,19 +906,12 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
             }
         }
     };
-    // Asynchronously fetch the next A, B and s tile from global to the next
-    // shared memory pipeline location.
-    auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true)
+    // Asynchronously fetch the B (weight) and s (weight scale) part of the next
+    // tile from global to the given shared memory pipeline location (no fence).
+    // It reads only constant weights, so it may run before griddepcontrol.wait.
+    auto fetch_b_s_to_shared = [&](int pipe, int a_off)
     {
-        if (pred)
         {
-            int4* sh_a_stage = sh_a + a_sh_stage * pipe;
-#pragma unroll
-            for (int i = 0; i < a_sh_wr_iters; i++)
-            {
-                cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]],
-                    &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off], a_sh_wr_pred[i]);
-            }
             int4* sh_b_stage = sh_b + b_sh_stage * pipe;
 #pragma unroll
             for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++)
@@ -955,6 +973,28 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                         zp_gl_rd += zp_gl_rd_delta * zp_tb_groups;
                     }
                 }
+            }
+        }
+    };
+
+    // Asynchronously fetch the next A, B and s tile from global to the next
+    // shared memory pipeline location.
+    // b_prefetched: this stage's B / weight-scale copies were already issued before
+    // griddepcontrol.wait (pdl_prewait), so only its A copies are issued here.
+    auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true, bool b_prefetched = false)
+    {
+        if (pred)
+        {
+            int4* sh_a_stage = sh_a + a_sh_stage * pipe;
+#pragma unroll
+            for (int i = 0; i < a_sh_wr_iters; i++)
+            {
+                cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]],
+                    &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off], a_sh_wr_pred[i]);
+            }
+            if (!b_prefetched)
+            {
+                fetch_b_s_to_shared(pipe, a_off);
             }
         }
         // Insert a fence even when we are winding down the pipeline to ensure that
@@ -1834,7 +1874,7 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     };
 
     // Start global fetch and register load pipelines.
-    auto start_pipes = [&]()
+    auto start_pipes = [&](bool b_prefetched = false)
     {
 
 #pragma unroll
@@ -1861,7 +1901,7 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                     }
                 }
             }
-            fetch_to_shared(i, i, i < slice_iters);
+            fetch_to_shared(i, i, i < slice_iters, b_prefetched);
         }
 
         zero_accums();
@@ -1876,9 +1916,34 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
             slice_k_start_shared_fetch += tb_k * (stages - 1);
         }
     };
+    // pdl_prewait: issue the first slice's first `stages - 1` B / weight-scale
+    // stages before griddepcontrol.wait, uncommitted. start_pipes then issues each
+    // stage's A copies and commits one group per stage, so the first group holds
+    // all prefetched B / scales plus stage 0's A, and every later wait_for_stage
+    // still finds its stage's B complete (it is in an older group).
+    bool b_prefetched = false;
+    if constexpr (can_prewait_b)
+    {
+        if (pdl_prewait && slice_iters)
+        {
+#pragma unroll
+            for (int i = 0; i < stages - 1; i++)
+            {
+                if (i < slice_iters)
+                {
+                    fetch_b_s_to_shared(i, i);
+                }
+            }
+            b_prefetched = true;
+        }
+    }
+    if (pdl_prewait)
+    {
+        pdl_wait_and_trigger();
+    }
     if (slice_iters)
     {
-        start_pipes();
+        start_pipes(b_prefetched);
     }
 
     // Main loop.

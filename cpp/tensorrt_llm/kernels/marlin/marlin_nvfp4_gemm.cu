@@ -299,6 +299,23 @@ bool marlin_inproj_full_k_enabled()
     return !(v != nullptr && v[0] == '0' && v[1] == '\0');
 }
 
+// PDL launches issue the first pipeline stages' B / weight-scale copies before
+// griddepcontrol.wait (kMarlinNvfp4PreWaitFlag): TRTLLM_MARLIN_PREWAIT_B, read per
+// call; "0" restores the wait-first prologue.
+bool marlin_prewait_b_enabled()
+{
+    char const* v = std::getenv("TRTLLM_MARLIN_PREWAIT_B");
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+}
+
+// Test-only negative control for PDL-live checks: TRTLLM_MARLIN_DEBUG_SKIP_WAIT=1
+// drops griddepcontrol.wait from PDL launches (the output then races its producer).
+bool marlin_debug_skip_wait()
+{
+    char const* v = std::getenv("TRTLLM_MARLIN_DEBUG_SKIP_WAIT");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
 // Largest number of split-K stripes the default `grid`-CTA launch gives one column.
 int full_k_max_stripes(int k_tiles, int n_tiles, int grid)
 {
@@ -337,6 +354,10 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
     if (prob_n <= 4096)
         max_par_val = 16 * 8;
     int max_shared_mem_new = max_shared_mem;
+    int const pdl_flags = enable_pdl ? (kMarlinNvfp4PdlLaunchFlag
+                                           | (marlin_prewait_b_enabled() ? kMarlinNvfp4PreWaitFlag : 0)
+                                           | (marlin_debug_skip_wait() ? kMarlinNvfp4DebugSkipWaitFlag : 0))
+                                     : 0;
     int rest_m = prob_m;
     int max_thread_m_blocks = 4;
     int lda = prob_k;
@@ -489,7 +510,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
             num_groups, prob_m_split, prob_n, prob_k, lda, locks,
             false,  // has_bias
             false,  // use_atomic_add
-            use_fp32_reduce, max_shared_mem_new | full_k_flags | (enable_pdl ? kMarlinNvfp4PdlLaunchFlag : 0));
+            use_fp32_reduce, max_shared_mem_new | full_k_flags | pdl_flags);
         // clang-format on
 
         A_ptr += prob_m_split * (lda / 8);
