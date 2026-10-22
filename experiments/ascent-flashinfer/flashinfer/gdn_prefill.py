@@ -36,6 +36,11 @@ from .gdn_kernels.delta_rule_dsl.varlen_helper import (
 )
 
 
+# Feature flag for callers: the SM120 path accepts ``state_indices`` with a
+# bf16/fp16/fp32 state pool updated in place (``output_state`` None or
+# ``initial_state``).
+SM120_SUPPORTS_STATE_INDICES = True
+
 _SM100_STATE_DTYPES: tuple[torch.dtype, ...] = (
     torch.float32,
     torch.bfloat16,
@@ -387,9 +392,45 @@ def chunk_gated_delta_rule(
             device_name=_device_name,
         )
     will_use_cp = use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
-    if state_indices is not None:
-        # Indexed state-pool I/O is only implemented in the SM100/SM103 non-CP
-        # CuTe-DSL kernel. Reject it on every other dispatch path (SM90, SM120,
+    if state_indices is not None and _arch_major == 12:
+        # SM120: in-place indexed pool I/O (bf16/fp16/fp32 pool). The non-CP
+        # kernel reads/writes pool[state_indices[i]] directly; the CP path keeps
+        # its fp32 packed state, so it gathers/casts here and scatters back with
+        # round-to-nearest-even (bitwise equal to the external gather/scatter).
+        if initial_state is None:
+            raise ValueError("SM120 state_indices requires initial_state (the pool)")
+        if output_state is not None and output_state is not initial_state:
+            raise ValueError(
+                "SM120 state_indices updates the pool in place: output_state must be "
+                "None or initial_state"
+            )
+        if checkpoint_every_n_tokens > 0:
+            raise ValueError("SM120 state_indices does not support checkpoints")
+        if will_use_cp:
+            _idx = state_indices.to(torch.long)
+            _packed_init = initial_state.index_select(0, _idx).to(torch.float32)
+            _res = chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=_packed_init,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                output=output,
+                use_cp=use_cp,
+                num_long_seqs=num_long_seqs,
+            )
+            _out, _final = _res
+            initial_state.index_copy_(0, _idx, _final.to(initial_state.dtype))
+            if output_final_state:
+                return _out, initial_state
+            return _out
+    elif state_indices is not None:
+        # Indexed state-pool I/O is otherwise only implemented in the SM100/SM103
+        # non-CP CuTe-DSL kernel. Reject it on every other dispatch path (SM90,
         # or CP) rather than silently ignoring it and reading/writing the state
         # in packed, sequence-ordered layout.
         if _arch_major != 10:
@@ -544,7 +585,13 @@ def chunk_gated_delta_rule(
         # SM120 Blackwell path (CuTe DSL kernel)
         if chunk_gated_delta_rule_sm120 is None:
             raise NotImplementedError("SM120 GDN prefill DSL kernel is unavailable")
-        if output_state is None:
+        sm120_pool_kwargs = {}
+        if state_indices is not None:
+            # In-place pool mode (validated above): the kernel writes the final
+            # states into initial_state's rows named by state_indices.
+            output_state = initial_state
+            sm120_pool_kwargs = {"state_indices": state_indices}
+        elif output_state is None:
             output_state = torch.empty(
                 (num_seqs, num_sab_heads, head_size, head_size),
                 dtype=torch.float32,
@@ -567,6 +614,7 @@ def chunk_gated_delta_rule(
             else None,
             checkpoint_every_n_tokens,
             num_long_seqs=num_long_seqs,
+            **sm120_pool_kwargs,
         )
     elif _arch_major == 9:
         # SM90 Hopper path (CuTe DSL kernel)

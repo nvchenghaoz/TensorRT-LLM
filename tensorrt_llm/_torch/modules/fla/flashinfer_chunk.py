@@ -39,7 +39,40 @@ from tensorrt_llm._torch.modules.fla.fused_state_io import (
     gather_cast_vk_to_fp32_vk,
 )
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
+
+_POOL_IO_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+@functools.lru_cache(maxsize=1)
+def sm120_indexed_state_io_supported() -> bool:
+    """Whether the SM120 FlashInfer GDN prefill updates an indexed state pool in place.
+
+    When true, the adapter passes the pool and slot ids straight to the kernel
+    instead of gathering an fp32 copy and scattering it back, so callers need no
+    fp32 state workspace.
+    """
+    if get_sm_version() // 10 != 12:
+        return False
+    try:
+        import flashinfer.gdn_prefill as fi_gdn_prefill
+    except ImportError:
+        return False
+    return bool(getattr(fi_gdn_prefill, "SM120_SUPPORTS_STATE_INDICES", False))
+
+
+def sm120_pool_io_eligible(initial_state: torch.Tensor) -> bool:
+    """Whether in-place indexed updates of this state pool skip the fp32 round trip."""
+    if initial_state.dtype not in _POOL_IO_DTYPES or initial_state.dim() != 4:
+        return False
+    _, h, v, k = initial_state.shape
+    return (
+        initial_state.stride()[1:] == (v * k, k, 1)
+        and h * v * k <= initial_state.stride(0) < 2**31
+        and initial_state.stride(0) % 2 == 0
+        and initial_state.data_ptr() % 4 == 0
+        and sm120_indexed_state_io_supported()
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -135,6 +168,52 @@ def chunk_gated_delta_rule(
         q3 = l2norm_fwd(q3)
         k3 = l2norm_fwd(k3)
 
+    total_seq_len = q3.shape[0]
+    num_o_heads = max(q3.shape[1], v3.shape[1])
+    head_size = q3.shape[2]
+    hint_kwargs = (
+        {"num_long_seqs": num_long_seqs}
+        if num_long_seqs is not None and _flashinfer_accepts_long_seq_hint()
+        else {}
+    )
+    output_buf = (
+        output.squeeze(0)
+        if output is not None
+        else q3.new_empty(total_seq_len, num_o_heads, head_size)
+    )
+
+    # --- Step 4a (SM120): in-place indexed pool I/O ----------------------
+    # The SM120 kernel reads pool[idx[i]] (bf16/fp16 -> fp32, exact) and writes
+    # the final state back in place (fp32 -> pool dtype, round-to-nearest-even),
+    # bitwise equal to the gather / fp32 kernel / scatter round trip below
+    # without the fp32 copies. state_workspace is not needed on this path.
+    if (
+        inplace_indexed_state_update
+        and initial_state_indices is not None
+        and not is_sm_100f()
+        and sm120_pool_io_eligible(initial_state)
+    ):
+        slot_ids = initial_state_indices
+        if slot_ids.dtype != torch.int32 or not slot_ids.is_contiguous():
+            slot_ids = slot_ids.to(torch.int32).contiguous()
+        out_packed, _ = flashinfer.chunk_gated_delta_rule(
+            q=q3,
+            k=k3,
+            v=v3,
+            g=g2,
+            beta=beta2,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,  # dead param in FlashInfer; we already normalized
+            output=output_buf,
+            output_state=initial_state,
+            state_indices=slot_ids,
+            **hint_kwargs,
+        )
+        return out_packed.unsqueeze(0), None
+
     # --- Step 4: gather initial state (+ cast dtype only when required) ---
     # TRT-LLM's GDN kernels and FlashInfer both use [N, H, V, K] state layout.
     # The SM100/SM103 kernel carries the recurrent state in fp32 in TMEM
@@ -166,20 +245,7 @@ def chunk_gated_delta_rule(
     # Only allocate / request final state when a caller actually consumes it
     # (either inplace scatter back to the SSM pool, or return to the caller);
     # otherwise FI skips the final-state aggregation entirely.
-    total_seq_len = q3.shape[0]
-    num_o_heads = max(q3.shape[1], v3.shape[1])
-    head_size = q3.shape[2]
     need_state = inplace_indexed_state_update or output_final_state
-    hint_kwargs = (
-        {"num_long_seqs": num_long_seqs}
-        if num_long_seqs is not None and _flashinfer_accepts_long_seq_hint()
-        else {}
-    )
-    output_buf = (
-        output.squeeze(0)
-        if output is not None
-        else q3.new_empty(total_seq_len, num_o_heads, head_size)
-    )
     if need_state:
         num_seqs = cu_seqlens.shape[0] - 1
         # Match the initial-state dtype (native bf16/fp16 on SM100/SM103, else
