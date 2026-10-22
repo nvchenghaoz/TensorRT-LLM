@@ -3086,14 +3086,15 @@ class DecoderRunner(ScheduledModelRunner):
         # Gather this step's input tokens from the previous iteration's device
         # sample buffer; the seq-slot indices in previous_batch_indices_cuda
         # are unchanged since the last full pass.
-        previous_slots = self.previous_batch_indices_cuda[:num_requests]
-        torch.index_select(
-            new_tensors_device.new_tokens[0, :, : self._config.max_beam_width],
+        # torch.gather with the int64 (N, 1) slot index cached when the fast
+        # path was recorded (max_beam_width == 1 there) is a pure copy that
+        # always launches the elementwise gather kernel; index_select picks
+        # the latency-bound indexSelectSmallIndex kernel for <= 16 indices.
+        torch.gather(
+            new_tensors_device.new_tokens[0, :, :1],
             0,
-            previous_slots,
-            out=self.input_ids_cuda[: num_requests * self._config.max_beam_width].view(
-                num_requests, self._config.max_beam_width
-            ),
+            cache["previous_slots_i64"],
+            out=self.input_ids_cuda[:num_requests].view(num_requests, 1),
         )
 
         if not attn_metadata.is_cuda_graph:
@@ -4431,6 +4432,12 @@ class DecoderRunner(ScheduledModelRunner):
                     "prompt_lens": prompt_lengths,
                     "seq_lens_ones": maybe_pin_memory(torch.ones(_n_gen, dtype=torch.int)),
                     "use_mrope": _use_mrope,
+                    # Seq-slot indices this pass wrote to
+                    # previous_batch_indices_cuda (stream-ordered), cast once
+                    # here so the fast path's gather adds no per-step cast.
+                    "previous_slots_i64": self.previous_batch_indices_cuda[:_n_gen]
+                    .to(torch.int64)
+                    .view(_n_gen, 1),
                 }
 
         gather_ids_device = self.gather_ids_cuda[: len(gather_ids)] if enable_spec_decode else None
