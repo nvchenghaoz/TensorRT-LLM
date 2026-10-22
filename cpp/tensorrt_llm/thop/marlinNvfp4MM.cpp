@@ -152,14 +152,16 @@ int* getPersistentMarlinWorkspace(Tensor const& like, int device, int sms, cudaS
 //                     TRTLLM_MARLIN_PERSISTENT_WORKSPACE / TRTLLM_MARLIN_PDL kill switches);
 //                     1 = per-call zeroed workspace and no PDL. Mode 1 is for a call that runs beside
 //                     an aux-stream fork branch: the zero-fill kernel in front of Marlin lets the
-//                     branch's kernel take SMs before Marlin's one-CTA-per-SM, full-smem grid does.
+//                     branch's kernel take SMs before Marlin's one-CTA-per-SM, full-smem grid does;
+//                     2 = as 0, plus split-K partials reduced in FP32 (per-call FP32 C_tmp) so each
+//                     output is rounded to BF16 once (used for FP8-origin decode copies at rows > 16).
 Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional<Tensor> const& scale_a,
     Tensor const& scale_b, std::optional<Tensor> const& alpha, Tensor const& weight_global_scale,
     std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t size_n, int64_t size_k,
     int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt,
     int64_t workspace_mode = 0)
 {
-    TORCH_CHECK(workspace_mode == 0 || workspace_mode == 1, "workspace_mode must be 0 or 1, got ", workspace_mode);
+    TORCH_CHECK(workspace_mode >= 0 && workspace_mode <= 2, "workspace_mode must be 0, 1 or 2, got ", workspace_mode);
     CHECK_TH_CUDA(mat_a);
     TORCH_CHECK(mat_a.scalar_type() == FLOAT4_E2M1X2 || mat_a.scalar_type() == at::ScalarType::BFloat16,
         "mat_a must be FP4 E2M1X2 or BFloat16, got ", mat_a.scalar_type());
@@ -212,6 +214,7 @@ Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional
 
     // Both switches are read per call (uncached) so A/B graphs can coexist in one process.
     bool const forkSafe = workspace_mode == 1;
+    bool const fp32Reduce = workspace_mode == 2;
     bool const persistentWorkspace = !forkSafe && marlinEnvSwitchOn("TRTLLM_MARLIN_PERSISTENT_WORKSPACE");
     bool const enablePdl
         = !forkSafe && tensorrt_llm::common::getEnvEnablePDL() && marlinEnvSwitchOn("TRTLLM_MARLIN_PDL");
@@ -231,13 +234,25 @@ Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional
     int num_groups = k / 16;
     int group_size = 16;
 
+    // workspace_mode 2: split-K partial sums reduce in an FP32 buffer (the template's
+    // global_reduce_fp32) instead of chaining through the BF16 output, so each output is
+    // rounded to BF16 once. One [tb_m x tb_n] FP32 tile per lock slot (locks_off < sms,
+    // blocks_per_sm == 1), tb_m <= 64 rows, tb_n <= 256 columns. Slice 0 writes its tile
+    // before any slice reads it, so the buffer needs no zero fill.
+    Tensor cTmp;
+    void* cTmpPtr = nullptr;
+    if (fp32Reduce)
+    {
+        int64_t const tileRows = std::min<int64_t>((static_cast<int64_t>(m) + 15) / 16 * 16, 64);
+        cTmp = at::empty({static_cast<int64_t>(sms) * tileRows * 256}, mat_a.options().dtype(at::kFloat));
+        cTmpPtr = cTmp.data_ptr();
+    }
+
     // Step 2: Run Marlin W4A16 GEMM
     // weight_global_scale is BF16, already Marlin-processed (includes 2^119 bias correction)
-    ::marlin_nvfp4::marlinNvfp4Gemm(act_bf16.data_ptr(), mat_b.data_ptr(), out.data_ptr(),
-        nullptr, // C_tmp
+    ::marlin_nvfp4::marlinNvfp4Gemm(act_bf16.data_ptr(), mat_b.data_ptr(), out.data_ptr(), cTmpPtr,
         scale_b.data_ptr(), weight_global_scale.data_ptr(), m, n, k, workspacePtr, num_groups, group_size,
-        false, // use_fp32_reduce
-        stream, enablePdl);
+        fp32Reduce, stream, enablePdl);
 
     return out;
 }
