@@ -33,13 +33,22 @@ EMPTY_MARK = "    uint32_t* const misc = reinterpret_cast<uint32_t*>(pfxSmem + m
 
 
 def variant_tree(src_dir, kind):
-    """Copy of src_dir with kernel_mha_prefix cut after step 1 ('step1') or at entry ('empty')."""
+    """Copy of src_dir with kernel_mha_prefix cut after step 1 ('step1') or at entry ('empty'); 'norot' turns the
+    candidate's per-CTA scan rotation off; kinds join with '+'."""
+    if "+" in kind:
+        for k in kind.split("+"):
+            src_dir = variant_tree(src_dir, k)
+        return src_dir
     d = tempfile.mkdtemp(prefix=f"pfx_{kind}_")
     dst = os.path.join(d, "xqa")
     shutil.copytree(src_dir, dst)
     p = os.path.join(dst, "mha.cu")
     s = open(p).read()
-    if kind == "step1":
+    if kind == "norot":
+        mark = "#define XQA_PFX_SCAN_ROTATE 1\n"
+        assert s.count(mark) == 1
+        s = s.replace(mark, "#define XQA_PFX_SCAN_ROTATE 0\n")
+    elif kind == "step1":
         assert s.count(STEP1_MARK) == 1
         s = s.replace(STEP1_MARK, "    publishInfo();\n    return;\n" + STEP1_MARK)
     elif kind == "empty":
@@ -99,11 +108,15 @@ def mode_bench(a):
     base_dir = cl.extract_tree(BASE_COMMIT)
     cand_dir = os.path.join(os.getcwd(), "cpp/kernels/xqa")
     kerns = {}
-    for arm, d in (("base", base_dir), ("cand", cand_dir)):
+    arms = [("base", base_dir), ("cand", cand_dir)]
+    if a.norot:
+        arms.append(("candnr", variant_tree(cand_dir, "norot")))
+    for arm, d in arms:
         kerns[arm] = cl.Kernels(d)
         if a.step0:
             kerns[arm + "_step1"] = cl.Kernels(variant_tree(d, "step1"))
-            kerns[arm + "_empty"] = cl.Kernels(variant_tree(d, "empty"))
+            if arm != "candnr":
+                kerns[arm + "_empty"] = cl.Kernels(variant_tree(d, "empty"))
     regs = {n: dict(prefix_regs=k.pregs, prefix_local_bytes=k.plmem, mha_regs=k.regs) for n, k in kerns.items()}
     log(f"regs: {regs}")
     batches = [int(x) for x in a.batches.split(",")]
@@ -115,16 +128,17 @@ def mode_bench(a):
         graphs = {}
         for n, k in kerns.items():
             graphs[n + ":prefix"] = prefix_graph(k, inp, b, m).graph
-        for arm in ("base", "cand"):
+        for arm, _ in arms:
             graphs[arm + ":total"] = cl.Call(kerns[arm], inp, b, m, cascade=True).capture().graph
         c, g = cl.cascade_grid(b, m)
         log(f"B={b} m={m} C={c} G={g}: timing {len(graphs)} configs interleaved")
         t = time_interleaved(graphs, inp, flush, a.rounds, a.warmup, a.iters)
         r = dict(nb_sub_seq=m, chunks=c, row_groups=g, times=t)
         if a.step0:
-            for arm in ("base", "cand"):
-                r[f"{arm}_step1_us"] = t[f"{arm}_step1:prefix"]["trimmed_us"] - t[f"{arm}_empty:prefix"]["trimmed_us"]
-                r[f"{arm}_step1_median_us"] = t[f"{arm}_step1:prefix"]["median_us"] - t[f"{arm}_empty:prefix"][
+            for arm, _ in arms:
+                e = "cand" if arm == "candnr" else arm
+                r[f"{arm}_step1_us"] = t[f"{arm}_step1:prefix"]["trimmed_us"] - t[f"{e}_empty:prefix"]["trimmed_us"]
+                r[f"{arm}_step1_median_us"] = t[f"{arm}_step1:prefix"]["median_us"] - t[f"{e}_empty:prefix"][
                     "median_us"]
         for what in ("prefix", "total"):
             r[f"{what}_delta_pct"] = 100.0 * (t[f"cand:{what}"]["trimmed_us"] / t[f"base:{what}"]["trimmed_us"] - 1)
@@ -279,6 +293,7 @@ def main():
     p.add_argument("--table-calls", type=int, default=10)
     p.add_argument("--flush-mb", type=int, default=384)
     p.add_argument("--step0", type=int, default=1)
+    p.add_argument("--norot", type=int, default=0)
     a = p.parse_args()
     cl.init_cuda()
     {"bench": mode_bench, "check": mode_check}[a.mode](a)

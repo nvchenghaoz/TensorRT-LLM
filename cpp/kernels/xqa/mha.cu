@@ -3169,6 +3169,9 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMP
 #endif
 
 #if XQA_CASCADE_PREFIX
+#ifndef XQA_PFX_SCAN_ROTATE
+#define XQA_PFX_SCAN_ROTATE 1
+#endif
 namespace cascade
 {
 constexpr uint32_t nbRowWarps = 4;                    // each owns 16 rows
@@ -3285,6 +3288,14 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
     constexpr uint32_t pScanUnroll = 18;
     uint32_t const kCap = maxPages * tokensPerPage / 256U;
     uint32_t const nbPScan = kCap * nbOther;
+    // Every CTA scans the same pairs (and the CTAs of one chunk the same pages); each starts at its own warp-aligned
+    // offset and wraps, so the CTAs do not all request the same L2 lines at the same moment. Same pairs, same result.
+    uint32_t const ctaLinear = (idxHeadGrp * gridDim.y + idxRowGrp) * nbChunks + idxChunk;
+    uint32_t const nbCtas = nbChunks * gridDim.y * gridDim.z;
+    auto const rotation = [&](uint32_t n, uint32_t rank, uint32_t nbRanks)
+    { return XQA_PFX_SCAN_ROTATE ? uint32_t(uint64_t(n) * rank / nbRanks) & ~31U : 0U; };
+    auto const rotate = [](uint32_t idx, uint32_t rot, uint32_t n) { return idx + rot < n ? idx + rot : idx + rot - n; };
+    uint32_t const pRot = rotation(nbPScan, ctaLinear, nbCtas);
     KVCachePageIndex pScanK[pScanUnroll];
     KVCachePageIndex pScanV[pScanUnroll];
     KVCachePageIndex pScanK0[pScanUnroll];
@@ -3294,9 +3305,10 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
 #pragma unroll
         for (uint32_t i = 0; i < pScanUnroll; i++)
         {
-            uint32_t const idx = idx0 + ctaThreads * i;
-            if (idx < nbPScan)
+            uint32_t const idxRaw = idx0 + ctaThreads * i;
+            if (idxRaw < nbPScan)
             {
+                uint32_t const idx = rotate(idxRaw, pRot, nbPScan);
                 uint32_t const k = idx / nbOther;
                 uint32_t const r = 1 + idx % nbOther;
                 uint32_t const j = (256 * (k + 1) - 1) / tokensPerPage;
@@ -3312,10 +3324,10 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
 #pragma unroll
         for (uint32_t i = 0; i < pScanUnroll; i++)
         {
-            uint32_t const idx = idx0 + ctaThreads * i;
-            if (idx < nbPScan)
+            uint32_t const idxRaw = idx0 + ctaThreads * i;
+            if (idxRaw < nbPScan)
             {
-                uint32_t const k = idx / nbOther;
+                uint32_t const k = rotate(idxRaw, pRot, nbPScan) / nbOther;
                 if (k < maxTiles && (pScanK[i] != pScanK0[i] || pScanV[i] != pScanV0[i]))
                 {
                     firstBad = mha::min(firstBad, k);
@@ -3364,6 +3376,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
         uint32_t const pageBeg = subBeg * tokTile / tokensPerPage;
         uint32_t const nbChkPages = (subEnd - subBeg) * tokTile / tokensPerPage;
         uint32_t const nbVScan = nbChkPages * nbOther;
+        // the CTAs sharing this chunk: gridDim.y row groups x gridDim.z KV heads
+        uint32_t const vRot = rotation(nbVScan, idxHeadGrp * gridDim.y + idxRowGrp, gridDim.y * gridDim.z);
         bool bad = false;
         for (uint32_t idx0 = tid; idx0 < nbVScan; idx0 += ctaThreads * vScanUnroll)
         {
@@ -3374,9 +3388,10 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
 #pragma unroll
             for (uint32_t i = 0; i < vScanUnroll; i++)
             {
-                uint32_t const idx = idx0 + ctaThreads * i;
-                if (idx < nbVScan)
+                uint32_t const idxRaw = idx0 + ctaThreads * i;
+                if (idxRaw < nbVScan)
                 {
+                    uint32_t const idx = rotate(idxRaw, vRot, nbVScan);
                     uint32_t const r = 1 + idx / nbChkPages;
                     uint32_t const j = pageBeg + idx % nbChkPages;
                     vsK[i] = kPage(r, j);
