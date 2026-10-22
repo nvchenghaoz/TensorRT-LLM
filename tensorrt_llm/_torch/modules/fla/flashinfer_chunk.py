@@ -30,6 +30,7 @@ at process start; do not import it lazily inside hot paths.
 
 import functools
 import inspect
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -50,8 +51,10 @@ def sm120_indexed_state_io_supported() -> bool:
 
     When true, the adapter passes the pool and slot ids straight to the kernel
     instead of gathering an fp32 copy and scattering it back, so callers need no
-    fp32 state workspace.
+    fp32 state workspace. Kill switch: ``TLLM_GDN_SM120_POOL_IO=0``.
     """
+    if os.environ.get("TLLM_GDN_SM120_POOL_IO", "1") == "0":
+        return False
     if get_sm_version() // 10 != 12:
         return False
     try:
