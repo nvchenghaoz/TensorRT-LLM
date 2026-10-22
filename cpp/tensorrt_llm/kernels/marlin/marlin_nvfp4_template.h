@@ -194,6 +194,18 @@ __device__ inline void scale_float(float* c, typename MarlinType<scalar_t>::Frag
     c[1] = __fmul_rn(c[1], MarlinType<scalar_t>::num2float(s_ptr[1]));
 }
 
+// 16-byte global load cached at L2 only (the caching of cp.async.cg); volatile + memory
+// clobber keeps it after a preceding griddepcontrol.wait.
+__device__ inline int4 ld_global_cg_int4(int4 const* ptr)
+{
+    int4 v;
+    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(ptr)
+                 : "memory");
+    return v;
+}
+
 // Wait until barrier reaches `count`, then lock for current threadblock.
 __device__ inline void barrier_acquire(int* lock, int count)
 {
@@ -979,9 +991,7 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
 
     // Asynchronously fetch the next A, B and s tile from global to the next
     // shared memory pipeline location.
-    // b_prefetched: this stage's B / weight-scale copies were already issued before
-    // griddepcontrol.wait (pdl_prewait), so only its A copies are issued here.
-    auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true, bool b_prefetched = false)
+    auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true)
     {
         if (pred)
         {
@@ -992,10 +1002,7 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                 cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]],
                     &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off], a_sh_wr_pred[i]);
             }
-            if (!b_prefetched)
-            {
-                fetch_b_s_to_shared(pipe, a_off);
-            }
+            fetch_b_s_to_shared(pipe, a_off);
         }
         // Insert a fence even when we are winding down the pipeline to ensure that
         // waiting is also correct at this point.
@@ -1876,10 +1883,53 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     // Start global fetch and register load pipelines.
     auto start_pipes = [&](bool b_prefetched = false)
     {
+        if constexpr (can_prewait_b)
+        {
+            if (b_prefetched)
+            {
+                // The first `stages - 1` stages' B / scales are already in flight, one
+                // committed cp.async group per stage (issued before griddepcontrol.wait).
+                // Their A tiles are loaded here with plain L2 loads (all issued before any
+                // store) instead of cp.async: a cp.async group issued now would be younger
+                // than every prefetched B group, so waiting for stage 0's A would also
+                // wait for all prefetched B stages and stall the stream. The group count
+                // stays one per stage, so wait_for_stage below waits for stage 0's B only,
+                // and its __syncthreads publishes the A stores.
+                int4 a_pref[stages - 1][a_sh_wr_iters];
+#pragma unroll
+                for (int i = 0; i < stages - 1; i++)
+                {
+#pragma unroll
+                    for (int j = 0; j < a_sh_wr_iters; j++)
+                    {
+                        if (i < slice_iters && a_sh_wr_pred[j])
+                        {
+                            a_pref[i][j] = ld_global_cg_int4(&A[a_gl_rd_delta_i * j + a_gl_rd + a_gl_rd_delta_o * i]);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < stages - 1; i++)
+                {
+#pragma unroll
+                    for (int j = 0; j < a_sh_wr_iters; j++)
+                    {
+                        if (i < slice_iters && a_sh_wr_pred[j])
+                        {
+                            sh_a[a_sh_stage * i + a_sh_wr_trans[j]] = a_pref[i][j];
+                        }
+                    }
+                }
+            }
+        }
 
 #pragma unroll
         for (int i = 0; i < stages - 1; i++)
         {
+            if (b_prefetched)
+            {
+                break;
+            }
             if (has_act_order && i == 0)
             {
                 int last_g_idx = slice_k_start + stages * tb_k * 2;
@@ -1901,7 +1951,7 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                     }
                 }
             }
-            fetch_to_shared(i, i, i < slice_iters, b_prefetched);
+            fetch_to_shared(i, i, i < slice_iters);
         }
 
         zero_accums();
@@ -1917,10 +1967,9 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
         }
     };
     // pdl_prewait: issue the first slice's first `stages - 1` B / weight-scale
-    // stages before griddepcontrol.wait, uncommitted. start_pipes then issues each
-    // stage's A copies and commits one group per stage, so the first group holds
-    // all prefetched B / scales plus stage 0's A, and every later wait_for_stage
-    // still finds its stage's B complete (it is in an older group).
+    // stages before griddepcontrol.wait, one committed cp.async group per stage
+    // (the same group count start_pipes commits otherwise); start_pipes then loads
+    // those stages' A tiles after the wait.
     bool b_prefetched = false;
     if constexpr (can_prewait_b)
     {
@@ -1933,6 +1982,7 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                 {
                     fetch_b_s_to_shared(i, i);
                 }
+                cp_async_fence();
             }
             b_prefetched = true;
         }
