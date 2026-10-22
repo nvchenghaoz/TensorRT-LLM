@@ -36,6 +36,8 @@ def h(ts):
         idx = torch.arange(v.numel(), device=v.device, dtype=torch.int64)
         acc = (acc * 1000003 + int(((v + 40000) * (idx % 65521 + 1)).sum().item())) % (2 ** 61 - 1)
     return str(acc)
+def eqv(a, b):
+    return bool(torch.equal(a.contiguous().view(torch.int16), b.contiguous().view(torch.int16)))
 def setarm(arm):
     os.environ.pop("TRTLLM_MARLIN_M16_CFG", None)
     if arm.startswith("kill"):
@@ -50,13 +52,16 @@ for n, k, C, w in SH:
     log("built", n, k, "copies", C, "mem GB %.2f" % (torch.cuda.memory_allocated() / 1e9))
 res = dict()
 hashes = dict()
+direct = dict()
 step = dict()
 for m in MS:
     graphs = dict()
     outs = dict()
+    xs = dict()
     for n, k, C, w in SH:
         g = torch.Generator(device=dev).manual_seed(7 + m)
         x = torch.randn(m, k, generator=g, device=dev).to(torch.bfloat16)
+        xs[(n, k)] = x
         for arm in ARMS:
             setarm(arm)
             s0 = torch.cuda.Stream()
@@ -91,6 +96,28 @@ for m in MS:
             e1.record()
             evs[key].append((e0, e1))
     torch.cuda.synchronize()
+    # Direct bitwise checks after the timed loop (int16 view, torch.equal), per (arm, shape, M):
+    # (a) every graph output == a fresh eager gemm on the same copy under the same arm's env;
+    # (b) every graph output == the kill arm's graph output (expected False for default at M>8 in the candidate);
+    # (c) diagnostic: fresh eager default == fresh eager kill.
+    for n, k, C, w in SH:
+        key = "%d,%d" % (n, k)
+        x = xs[(n, k)]
+        eager = dict()
+        for arm in ARMS:
+            setarm(arm)
+            eager[arm] = [gemm(x, c, n, k) for c in copies[(n, k)]]
+        torch.cuda.synchronize()
+        setarm("default")
+        for arm in ARMS:
+            a_ok = all(eqv(o, e) for o, e in zip(outs[(arm, n, k)], eager[arm]))
+            b_ok = all(eqv(o, e) for o, e in zip(outs[(arm, n, k)], outs[("kill", n, k)]))
+            c_ok = all(eqv(o, e) for o, e in zip(eager[arm], eager["kill"]))
+            direct.setdefault(arm, dict()).setdefault(key, dict())[str(m)] = dict(
+                graph_eq_fresh_eager=a_ok, graph_eq_kill_graph=b_ok, eager_eq_kill_eager=c_ok, copies=C)
+            log("direct (%d,%d) M=%d arm=%s graph==fresh_eager %s graph==kill_graph %s eager==kill_eager %s (%d copies)"
+                % (n, k, m, arm, a_ok, b_ok, c_ok, C))
+        del eager
     for arm in ARMS:
         per_it = [0.0] * ITERS
         for n, k, C, w in SH:
@@ -124,7 +151,8 @@ batch = dict()
 for mm in ["8", "16"]:
     batch[mm] = step["default"][mm]
 out = dict(batch=batch, measure="per-step weighted dense Marlin decode time: 64 x (5120,6144) + 48 x (16384,5120) + 16 x (14336,5120), ms; median of 100 rotated replays",
-           step_by_arm=step, shapes=res, output_hashes=hashes, warmup=WARM, iters=ITERS)
-out["output"] = dict(note="rows 9-16 reordered (see check job); rows 8 and the kill arm bitwise equal to base via output_hashes")
+           step_by_arm=step, shapes=res, output_hashes=hashes, direct_checks=direct, warmup=WARM, iters=ITERS)
+out["output"] = dict(note="rows 9-16 reordered (see check job); rows 8 and the kill arm bitwise equal to base via output_hashes; "
+                     "direct_checks: torch.equal on int16 views of every graph output vs fresh eager (same arm env) and vs the kill arm")
 out["output"]["class"] = "reordered"
 print(json.dumps(out))

@@ -5,7 +5,7 @@
 #     magnitude (protocol class "reordered"). Rows 1-8 (outside the table) must be bitwise equal to
 #     main's selection. No NaN/Inf.
 #  B. Repeated execution with the timed loop's structure: C distinct copies in one CUDA graph (PDL on),
-#     10 warmup + 50 replays; before every replay the outputs are NaN-poisoned; after every replay all
+#     10 warmup + 100 replays (24/9/10 copies, as pair_bench); before every replay the outputs are NaN-poisoned; after every replay all
 #     outputs must be bitwise equal to replay 1 and to the eager call of that copy; an eager call
 #     (rotating copy) between replays must equal that copy's first eager call.
 #  C. Persistent lock workspace: every bound slot reads 0 after all calls complete.
@@ -18,7 +18,7 @@ import torch  # noqa: E402
 
 from common import SHAPES, eq, err, gemm, log, make_copy, set_cfg  # noqa: E402
 
-WARM, ITERS = 10, 50
+WARM, ITERS = 10, 100
 fails = []
 summary = dict()
 
@@ -30,7 +30,6 @@ def check(cond, msg):
 
 
 for (n, k), C in SHAPES.items():
-    C = min(C, 12)
     copies, refs = [], None
     for i in range(C):
         c, r = make_copy(n, k, 3000 + i, want_ref=(i == 0))
@@ -68,6 +67,9 @@ for (n, k), C in SHAPES.items():
         g = torch.Generator(device="cuda").manual_seed(200 + m)
         x = torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16)
         eager0 = [gemm(x, c, n, k).clone() for c in copies]
+        set_cfg("main")
+        eager_main = [gemm(x, c, n, k).clone() for c in copies]
+        set_cfg(None)
         s0 = torch.cuda.Stream()
         s0.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s0):
@@ -97,8 +99,18 @@ for (n, k), C in SHAPES.items():
             ye = gemm(x, copies[j], n, k)
             if not eq(ye, eager0[j]):
                 n_eager_diff += 1
+        # Is the table launch actually in the graph? Rows 9-16: every graph output must differ from main's
+        # selection (eager, TABLE=0); rows 8: every graph output must equal it.
+        n_eq_main = sum(int(eq(a, b)) for a, b in zip(first, eager_main))
         summary[key]["repeated"][str(m)] = dict(replay_diffs=ndiff, eager_diffs=n_eager_diff, nan_outputs=nan_seen,
-                                                max_abs_drift=max_err_vs_first)
+                                                max_abs_drift=max_err_vs_first, copies=C,
+                                                graph_eq_main_selection=n_eq_main)
+        if m > 8:
+            check(n_eq_main == 0, "B (%d,%d) M=%d table active in graph: %d/%d graph outputs != main selection" % (
+                n, k, m, C - n_eq_main, C))
+        else:
+            check(n_eq_main == C, "B (%d,%d) M=%d graph bitwise == main selection on %d/%d copies" % (
+                n, k, m, n_eq_main, C))
         check(ndiff == 0 and n_eager_diff == 0 and nan_seen == 0,
               "B (%d,%d) M=%d %d NaN-poisoned replays x %d copies bitwise == replay 1 == eager; interleaved eager "
               "bitwise stable (replay diffs %d, eager diffs %d, NaN outputs %d)" % (
@@ -116,6 +128,6 @@ print(json.dumps(dict(passed=not fails, failures=fails, summary=summary,
                       compared_against="independent FP32 reference from the dequantized NVFP4 operands "
                                        "(E2M1 LUT x E4M3 SF x global, subnormal-scale blocks flushed as Marlin does); "
                                        "main's selection (TRTLLM_MARLIN_M16_TABLE=0) on the same inputs",
-                      repeated_execution="<=12 distinct copies per shape in one CUDA graph (PDL), %d warmup + %d "
-                                         "NaN-poisoned replays per M in 8,9,12,16, interleaved eager calls" % (
-                                             WARM, ITERS))))
+                      repeated_execution="24/9/10 distinct copies per shape (as pair_bench) in one CUDA graph (PDL), "
+                                         "%d warmup + %d NaN-poisoned replays per M in 8,9,12,16, interleaved eager "
+                                         "calls" % (WARM, ITERS))))
