@@ -2495,17 +2495,24 @@ _FP8_NVFP4_DECODE_ENV = "TRTLLM_GDN_INPROJ_NVFP4_DECODE"
 # Per-(N, K) Marlin row cap above the default 16, for shapes where the W4A16
 # decode copy beats the W4A4 prefill copy (fp4_quantize + nvfp4_gemm, plus the
 # K/V FP8 GEMM + copy for attn qkv) at 17-32 rows on SM120 (cold-L2 graph
-# chain, per layer at M=32: qkv 47.8 vs 62.6 us, (5120, 6144) 22.8 vs 24.5 us;
-# in_proj_qkvz (16384, 5120) stays at 16: Marlin 53.7 vs W4A4 52.4 us).
+# chain, per layer at M=32: qkv 47.8 vs 62.6 us, (5120, 6144) 22.8 vs 24.5 us).
+# With the rows 17-32 Marlin launch table (kM32Table, marlin_nvfp4_gemm.cu),
+# in_proj_qkvz (16384, 5120) joins: Marlin 35.0/35.1/35.2 vs W4A4
+# 37.3/37.7/37.9 us at rows 17/24/32 (cold-L2 graph, PDL).
 #  - (14336, 5120): gated-attention qkv_proj (x16);
-#  - (5120, 6144): GDN out_proj (x48) and gated-attention o_proj (x16).
+#  - (5120, 6144): GDN out_proj (x48) and gated-attention o_proj (x16);
+#  - (16384, 5120): GDN in_proj_qkvz (x48).
 # Kill switch, read at weight load: TRTLLM_FP8_NVFP4_DECODE_WIDE=0 keeps every
 # shape at _FP8_NVFP4_DECODE_MAX_ROWS.
 _FP8_NVFP4_DECODE_ROW_CAPS = {
     (14336, 5120): 32,
     (5120, 6144): 32,
+    (16384, 5120): 32,
 }
 _FP8_NVFP4_DECODE_WIDE_ENV = "TRTLLM_FP8_NVFP4_DECODE_WIDE"
+# Kill switch for in_proj_qkvz only, read at weight load:
+# TRTLLM_FP8_NVFP4_DECODE_WIDE_QKVZ=0 keeps (16384, 5120) at 16 rows (W4A4 above).
+_FP8_NVFP4_DECODE_WIDE_QKVZ_ENV = "TRTLLM_FP8_NVFP4_DECODE_WIDE_QKVZ"
 # Rows above _FP8_NVFP4_DECODE_MAX_ROWS run Marlin with an FP32 split-K reduce
 # (marlin_nvfp4_gemm workspace_mode=2). Kill switch, read at weight load:
 # TRTLLM_FP8_NVFP4_DECODE_FP32_REDUCE=0 keeps the BF16 split-K chain.
@@ -2517,6 +2524,9 @@ def _fp8_nvfp4_decode_row_cap(module: Linear) -> int:
     if os.environ.get(_FP8_NVFP4_DECODE_WIDE_ENV, "1") == "0":
         return _FP8_NVFP4_DECODE_MAX_ROWS
     key = (module.out_features, module.in_features)
+    if key == (16384, 5120) and os.environ.get(
+            _FP8_NVFP4_DECODE_WIDE_QKVZ_ENV, "1") == "0":
+        return _FP8_NVFP4_DECODE_MAX_ROWS
     return max(_FP8_NVFP4_DECODE_MAX_ROWS,
                _FP8_NVFP4_DECODE_ROW_CAPS.get(key, 0))
 
