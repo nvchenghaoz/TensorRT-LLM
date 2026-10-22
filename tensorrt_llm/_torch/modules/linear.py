@@ -805,8 +805,10 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                                             output.shape[-1])
                 return output
         if (nvfp4_decode_weight is not None and input.dtype == torch.bfloat16
-                and input.shape[0] <= _FP8_NVFP4_DECODE_MAX_ROWS):
-            # Decode-only W4A16 NVFP4 copy of this FP8 weight (Marlin).
+                and input.shape[0] <= module.__dict__.get(
+                    "_nvfp4_decode_max_rows", _FP8_NVFP4_DECODE_MAX_ROWS)):
+            # Decode-only W4A16 NVFP4 copy of this FP8 weight (Marlin), up to
+            # the per-(N, K) row cap (_FP8_NVFP4_DECODE_ROW_CAPS).
             output = torch.ops.trtllm.marlin_nvfp4_gemm(
                 input.contiguous(),
                 nvfp4_decode_weight,
@@ -2477,6 +2479,41 @@ def _pack_nvfp4_weight_for_marlin(
 # Decode-time (rows <= this) NVFP4 W4A16 copy of an FP8 per-tensor weight.
 _FP8_NVFP4_DECODE_MAX_ROWS = 16
 _FP8_NVFP4_DECODE_ENV = "TRTLLM_GDN_INPROJ_NVFP4_DECODE"
+# Per-(N, K) Marlin row cap above the default 16, for shapes where the W4A16
+# decode copy beats the W4A4 prefill copy (fp4_quantize + nvfp4_gemm, plus the
+# K/V FP8 GEMM + copy for attn qkv) at 17-32 rows on SM120 (cold-L2 graph
+# chain, per layer at M=32: qkv 47.8 vs 62.6 us, (5120, 6144) 22.8 vs 24.5 us;
+# in_proj_qkvz (16384, 5120) stays at 16: Marlin 53.7 vs W4A4 52.4 us).
+#  - (14336, 5120): gated-attention qkv_proj (x16);
+#  - (5120, 6144): GDN out_proj (x48) and gated-attention o_proj (x16).
+# Kill switch, read at weight load: TRTLLM_FP8_NVFP4_DECODE_WIDE=0 keeps every
+# shape at _FP8_NVFP4_DECODE_MAX_ROWS.
+_FP8_NVFP4_DECODE_ROW_CAPS = {
+    (14336, 5120): 32,
+    (5120, 6144): 32,
+}
+_FP8_NVFP4_DECODE_WIDE_ENV = "TRTLLM_FP8_NVFP4_DECODE_WIDE"
+
+
+def _fp8_nvfp4_decode_row_cap(module: Linear) -> int:
+    """Marlin row cap for this module's decode copy (load time)."""
+    if os.environ.get(_FP8_NVFP4_DECODE_WIDE_ENV, "1") == "0":
+        return _FP8_NVFP4_DECODE_MAX_ROWS
+    key = (module.out_features, module.in_features)
+    return max(_FP8_NVFP4_DECODE_MAX_ROWS,
+               _FP8_NVFP4_DECODE_ROW_CAPS.get(key, 0))
+
+
+def fp8_nvfp4_decode_max_rows(module: torch.nn.Module) -> int:
+    """Rows up to which ``module`` runs its W4A16 decode copy (0: no copy).
+
+    The single routing helper for FP8-origin linears: FP8QDQLinearMethod.apply
+    and the GDN gated norm (gdn_mixer._postprocess_gdn_output) both use it.
+    """
+    if getattr(module, "_nvfp4_decode_weight", None) is None:
+        return 0
+    return module.__dict__.get("_nvfp4_decode_max_rows",
+                               _FP8_NVFP4_DECODE_MAX_ROWS)
 
 
 def _fp8_nvfp4_decode_copy_enabled(module: Linear) -> bool:
@@ -2606,6 +2643,7 @@ def _build_fp8_nvfp4_decode_copy(module: Linear) -> None:
     module._nvfp4_decode_weight = marlin_weight
     module._nvfp4_decode_scale = marlin_scale
     module._nvfp4_decode_global_scale = weight_global_scale
+    module._nvfp4_decode_max_rows = _fp8_nvfp4_decode_row_cap(module)
 
 
 # Opt-in (TRTLLM_MARLIN_FORK_FRESH_WORKSPACE=1): Marlin decode calls that run
@@ -2653,17 +2691,20 @@ def log_fp8_nvfp4_decode_copies(model: torch.nn.Module) -> None:
     shapes: Dict[Tuple[int, int], int] = {}
     gemv_shapes: Dict[Tuple[int, int], int] = {}
     gemv_caps: Dict[Tuple[int, int], int] = {}
+    marlin_caps: Dict[Tuple[int, int], int] = {}
     for mod in model.modules():
         if getattr(mod, "_nvfp4_decode_weight", None) is not None:
             key = (mod.out_features, mod.in_features)
             shapes[key] = shapes.get(key, 0) + 1
+            marlin_caps[key] = fp8_nvfp4_decode_max_rows(mod)
             if mod.__dict__.get("_nvfp4_decode_gemv") is not None:
                 gemv_shapes[key] = gemv_shapes.get(key, 0) + 1
                 gemv_caps[key] = mod.__dict__.get(
                     "_nvfp4_decode_gemv_max_rows", 0)
     if shapes:
         logger.info(f"[nvfp4_decode_copy] built {sum(shapes.values())} "
-                    f"decode NVFP4 W4A16 copies (N,K)->count: {shapes}; "
+                    f"decode NVFP4 W4A16 copies (N,K)->count: {shapes}, "
+                    f"(N,K)->Marlin max rows: {marlin_caps}; "
                     f"cuda-core GEMV copies (N,K)->count: {gemv_shapes}, "
                     f"(N,K)->max rows: {gemv_caps}")
 

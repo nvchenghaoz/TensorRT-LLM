@@ -35,7 +35,13 @@ from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_c
 from ...speculative import SpecMetadata
 from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
 from ..fp8_prefill_nvfp4 import get_prefill_nvfp4_copy
-from ..linear import _FP8_NVFP4_DECODE_MAX_ROWS, FP8QDQLinearMethod, Linear, TensorParallelMode
+from ..linear import (
+    _FP8_NVFP4_DECODE_MAX_ROWS,
+    FP8QDQLinearMethod,
+    Linear,
+    TensorParallelMode,
+    fp8_nvfp4_decode_max_rows,
+)
 from ..multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from . import PAD_SLOT_ID
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -614,10 +620,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # gated norm reads it through its token stride instead of packing a
         # copy.
         fp8_scale = self.norm.fp8_scale
-        if (
-            z.shape[0] <= _FP8_NVFP4_DECODE_MAX_ROWS
-            and getattr(self.out_proj, "_nvfp4_decode_weight", None) is not None
-        ):
+        decode_rows = fp8_nvfp4_decode_max_rows(self.out_proj)
+        if decode_rows > 0 and z.shape[0] <= decode_rows:
             # BF16 rows go to out_proj's NVFP4 W4A16 decode copy (Marlin).
             fp8_scale = None
         elif (
