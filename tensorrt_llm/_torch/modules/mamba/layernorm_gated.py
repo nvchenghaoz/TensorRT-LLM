@@ -26,7 +26,8 @@ import triton.language.extra.libdevice as tldevice
 
 from ...._utils import get_sm_version
 from ...utils import Fp4QuantizedTensor
-from ..fused_silu_mul_nvfp4 import (_cvt_e2m1x8, _cvt_e4m3_bits, _mul_rn,
+from ..fused_silu_mul_nvfp4 import (_cvt_e2m1x8, _cvt_e4m3_bits,
+                                    _gdc_wait_with_memory_clobber, _mul_rn,
                                     _rcp_approx_ftz, _sf_offset)
 
 
@@ -336,6 +337,9 @@ GDN_GATED_NORM_NVFP4_ENABLED = os.environ.get("TRTLLM_GDN_GATED_NORM_NVFP4",
                                               "1") != "0"
 _NVFP4_SF_VEC = 16
 _NVFP4_PAD_COLS = 128
+# TRTLLM_GDN_GATED_NORM_NVFP4_PDL=0 launches the fused kernel without PDL.
+_GATED_NORM_NVFP4_PDL = os.environ.get("TRTLLM_GDN_GATED_NORM_NVFP4_PDL",
+                                       "1") != "0"
 
 
 @triton.jit
@@ -358,6 +362,7 @@ def _rms_norm_gated_nvfp4_kernel(
     GATE_SIGMOID: tl.constexpr,
     NUM_K_TILES: tl.constexpr,
     PAD_COLS: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     """_rms_norm_gated_fwd_multirow_kernel's expressions, then NVFP4.
 
@@ -366,7 +371,13 @@ def _rms_norm_gated_nvfp4_kernel(
     the unfused path stores it. The quantize tail is fused_silu_mul_nvfp4's
     (cvt_warp_fp16_to_fp4 as built). Programs past num_main_programs zero the
     SF padding rows [num_tokens, ceil128(num_tokens)).
+
+    With USE_PDL every load/store stays behind griddepcontrol.wait, and the
+    dependents (the W4A4 GEMM) are released only after this program's
+    stores, as quantize_with_block_size does.
     """
+    if USE_PDL:
+        _gdc_wait_with_memory_clobber()
     pid = tl.program_id(0)
     NSF: tl.constexpr = N // 16
     if pid < num_main_programs:
@@ -437,6 +448,8 @@ def _rms_norm_gated_nvfp4_kernel(
         pmask = ((prow >= num_tokens)[:, None] &
                  (pcols < HEADS_PER_TOK * NSF)[None, :])
         tl.store(SF + off, tl.zeros([128, PAD_COLS], tl.uint8), mask=pmask)
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _rms_norm_gated_nvfp4_eligible(x: torch.Tensor, z: torch.Tensor) -> bool:
@@ -494,6 +507,7 @@ def rms_norm_gated_token_major_nvfp4(
     if num_main + num_pad == 0:
         return fp4, sf
     device_index = x.device.index
+    use_pdl = _pdl_device_policy(device_index)[0] and _GATED_NORM_NVFP4_PDL
     with torch.cuda.device(device_index):
         _rms_norm_gated_nvfp4_kernel[(num_main + num_pad, )](
             x,
@@ -514,7 +528,9 @@ def rms_norm_gated_token_major_nvfp4(
             GATE_SIGMOID=gate_activation == "sigmoid",
             NUM_K_TILES=num_k_tiles,
             PAD_COLS=_NVFP4_PAD_COLS,
+            USE_PDL=use_pdl,
             num_warps=_MULTIROW_NUM_WARPS,
+            launch_pdl=use_pdl,
         )
     return fp4, sf
 

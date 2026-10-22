@@ -23,6 +23,8 @@ unchanged avoids coupling the optimization to weight loading, quantization,
 LoRA, or attention-backend fallback behavior.
 """
 
+import functools
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -30,8 +32,15 @@ import triton
 import triton.language as tl
 
 from ...modules.fused_silu_mul_nvfp4 import (_cvt_e2m1x8, _cvt_e4m3_bits,
+                                             _gdc_wait_with_memory_clobber,
                                              _mul_rn, _rcp_approx_ftz,
                                              _sf_offset)
+
+
+@functools.lru_cache(maxsize=None)
+def _sm_at_least_90(device: torch.device) -> bool:
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 10 + minor >= 90
 
 
 @triton.jit
@@ -442,10 +451,15 @@ def _fused_sigmoid_mul_nvfp4_kernel(
     head_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_K_TILES: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     """_fused_sigmoid_mul_kernel's expression, rounded to BF16 as stored,
     then fp4_quantize(r, scale, 16) (fused_silu_mul_nvfp4's quantize tail).
-    Program row num_tokens zeroes the SF padding rows."""
+    Program row num_tokens zeroes the SF padding rows. With USE_PDL all
+    accesses stay behind griddepcontrol.wait and dependents are released
+    after the stores."""
+    if USE_PDL:
+        _gdc_wait_with_memory_clobber()
     i = tl.program_id(0).to(tl.int64)
     j = tl.program_id(1)
     NSF: tl.constexpr = BLOCK_SIZE // 16
@@ -502,9 +516,15 @@ def _fused_sigmoid_mul_nvfp4_kernel(
         pmask = (rows >= num_tokens)[:, None] & (sf_cols
                                                  < num_sf_cols)[None, :]
         tl.store(sf_ptr + off, tl.zeros([128, NSF], tl.uint8), mask=pmask)
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 _SIGMOID_MUL_NVFP4_BLOCK = 512
+# TRTLLM_ATTN_GATE_NVFP4_PDL=0 launches the fused gate kernel without PDL.
+_SIGMOID_MUL_NVFP4_PDL = (
+    os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    and os.environ.get("TRTLLM_ATTN_GATE_NVFP4_PDL", "1") != "0")
 
 
 def fused_sigmoid_mul_nvfp4_eligible(attention_output: torch.Tensor,
@@ -553,6 +573,8 @@ def fused_sigmoid_mul_nvfp4(
     if grid_rows == 0:
         return fp4, sf
     grid = (grid_rows, triton.cdiv(hidden_size, _SIGMOID_MUL_NVFP4_BLOCK))
+    use_pdl = _SIGMOID_MUL_NVFP4_PDL and _sm_at_least_90(
+        attention_output.device)
     _fused_sigmoid_mul_nvfp4_kernel[grid](
         fp4.view(torch.int32),
         sf,
@@ -567,7 +589,9 @@ def fused_sigmoid_mul_nvfp4(
         head_dim=head_dim,
         BLOCK_SIZE=_SIGMOID_MUL_NVFP4_BLOCK,
         NUM_K_TILES=num_k_tiles,
+        USE_PDL=use_pdl,
         num_warps=4,
+        launch_pdl=use_pdl,
     )
     return fp4, sf
 
