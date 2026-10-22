@@ -133,9 +133,14 @@ struct m16_table_entry_t
 };
 
 // Decode rows 9-16 (one 16-row m block) launch shapes per (N, K), chosen by a cold-L2
-// CUDA-graph sweep on SM120 (RTX PRO 6000, 188 SMs). Exact (N, K) match only.
+// CUDA-graph + PDL sweep on SM120 (RTX PRO 6000, 188 SMs). Exact (N, K) match only.
+// Rows 16, us/call, main (188 CTAs, 4 stages) -> table:
+//  - (5120, 6144) GDN out_proj / attn o_proj: 17.05 -> 16.25. 160 CTAs = 2 stripes per
+//    64-wide column, one BF16 reduction step, no stripe wrap. (80 full-K CTAs: 18.1.)
+//  - (16384, 5120) GDN in_proj_qkvz: 37.04 -> 34.77. One full-K CTA per 128-wide column.
+//  - (14336, 5120) attn qkv_proj: 32.84 -> 30.89. One full-K CTA per 128-wide column.
 m16_table_entry_t const kM16Table[] = {
-    {5120, 6144, {{128, 64, 128}, 80, 8}},
+    {5120, 6144, {{128, 64, 128}, 160, 8}},
     {16384, 5120, {{64, 128, 128}, 128, 6}},
     {14336, 5120, {{64, 128, 128}, 112, 6}},
 };
