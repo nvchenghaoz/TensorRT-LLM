@@ -331,6 +331,20 @@ bool marlin_debug_skip_wait()
     return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
+// The instances compiled with the pre-wait prefetch (marlin_prewait_instance in the
+// template: 128 threads, n tile 128, k tile 64, 6 stages, not full_k): the qkv / qkvz
+// decode kernels at rows <= 8 (full-K), 9-16 (kM16Table) and 17-32 (kM32Table).
+bool marlin_prewait_kernel(MarlinFuncPtr kernel)
+{
+    static_assert(marlin_prewait_instance<128, 8, 4, 6, false>(), "pre-wait instance set mismatch");
+    static_assert(!marlin_prewait_instance<128, 4, 8, 8, false>(), "(5120,6144) kM16Table must stay stock");
+    static_assert(!marlin_prewait_instance<128, 4, 8, 4, false>(), "(5120,6144) kM32Table must stay stock");
+    static_assert(!marlin_prewait_instance<128, 4, 8, 8, true>(), "(5120,6144) full_k must stay stock");
+    return kernel == Marlin<nv_bfloat16, 128, 1, 8, 4, true, 6, 1>
+        || kernel == Marlin<nv_bfloat16, 128, 1, 8, 4, false, 6, 1>
+        || kernel == Marlin<nv_bfloat16, 128, 2, 8, 4, false, 6, 1>;
+}
+
 // Largest number of split-K stripes the default `grid`-CTA launch gives one column.
 int full_k_max_stripes(int k_tiles, int n_tiles, int grid)
 {
@@ -369,14 +383,14 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
     if (prob_n <= 4096)
         max_par_val = 16 * 8;
     int max_shared_mem_new = max_shared_mem;
-    int const pdl_flags = enable_pdl ? (kMarlinNvfp4PdlLaunchFlag
-                                           | (marlin_prewait_b_enabled()
-                                                   ? (kMarlinNvfp4PreWaitFlag
-                                                       | (marlin_prewait_depth_code()
-                                                           << kMarlinNvfp4PreWaitDepthShift))
-                                                   : 0)
-                                           | (marlin_debug_skip_wait() ? kMarlinNvfp4DebugSkipWaitFlag : 0))
-                                     : 0;
+    // Pre-wait flags (and the test-only skip-wait flag) go only to the pre-wait
+    // instances; every other launch gets exactly the stock flag word.
+    int const prewait_flags = enable_pdl
+        ? ((marlin_prewait_b_enabled()
+                   ? (kMarlinNvfp4PreWaitFlag | (marlin_prewait_depth_code() << kMarlinNvfp4PreWaitDepthShift))
+                   : 0)
+            | (marlin_debug_skip_wait() ? kMarlinNvfp4DebugSkipWaitFlag : 0))
+        : 0;
     int rest_m = prob_m;
     int max_thread_m_blocks = 4;
     int lda = prob_k;
@@ -530,7 +544,8 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
             num_groups, prob_m_split, prob_n, prob_k, lda, locks,
             false,  // has_bias
             false,  // use_atomic_add
-            use_fp32_reduce, max_shared_mem_new | full_k_flags | pdl_flags);
+            use_fp32_reduce, max_shared_mem_new | full_k_flags | (enable_pdl ? kMarlinNvfp4PdlLaunchFlag : 0)
+                | (marlin_prewait_kernel(kernel) ? prewait_flags : 0));
         // clang-format on
 
         A_ptr += prob_m_split * (lda / 8);

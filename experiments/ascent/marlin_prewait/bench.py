@@ -16,14 +16,20 @@ from tensorrt_llm._torch.modules.linear import _pack_nvfp4_weight_for_marlin
 #   K = TRTLLM_MARLIN_PREWAIT_B=0 + stock norm = main's code path.
 # In the base tree neither switch nor op exists, so P = K = main (an in-process A/A).
 # batch[M].kernel_ms = arm P chain time per decode step, weighted by Marlin calls per step:
-#   qkvz x48 (rows <= 16 only) + qkv x16 + out_proj x48 (GDN; o_proj not modelled).
+#   qkvz x48 + qkv x16 + out_proj x48 (GDN; o_proj not modelled). Main 39fda45f: qkvz runs Marlin up to row 32
+#   (kM32Table at rows 17-32, workspace_mode 2), like qkv and out_proj.
+# Rows 24/32 run twice the iterations (ITERS_WIDE) so their per-step floor is not set by one shape's tail.
 dev = torch.device("cuda")
 EPS, WARM, ITERS = 1e-6, 10, 60
+ITERS_WIDE = int(os.environ.get("BENCH_ITERS_WIDE", "120"))
 HEADS, HD = 48, 128
 SHAPES = [("qkvz", 16384, 5120, 6, 48), ("qkv", 14336, 5120, 7, 16), ("outproj", 5120, 6144, 16, 48)]
 MS = [4, 8, 12, 16, 24, 32]
 def rows_for(sname):
-    return MS if sname != "qkvz" else [m for m in MS if m <= 16]
+    return MS
+def iters_for(m):
+    return ITERS if m <= 16 else ITERS_WIDE
+TABLE_FLAGS = ["TRTLLM_MARLIN_FULLK", "TRTLLM_MARLIN_INPROJ_FULLK", "TRTLLM_MARLIN_M16_TABLE", "TRTLLM_MARLIN_M32_TABLE"]
 def mode_for(m):
     return 2 if m > 16 else 0
 ARMS = ["P", "K"]
@@ -137,7 +143,7 @@ for sname, n, k, c, calls in SHAPES:
                 gr.replay()
         torch.cuda.synchronize()
         evs = dict((a, []) for a in ARMS)
-        for it in range(ITERS):
+        for it in range(iters_for(m)):
             for a in (ARMS if it % 2 == 0 else ARMS[::-1]):
                 e0 = torch.cuda.Event(enable_timing=True)
                 e1 = torch.cuda.Event(enable_timing=True)
@@ -174,7 +180,7 @@ for sname, n, k, c, calls in SHAPES:
         xg = torch.Generator(device=dev).manual_seed(7 + m)
         xin = (torch.randn(m, k, generator=xg, device=dev) * 0.5).to(torch.bfloat16)
         for fam in ["served", "splitk"]:
-            for flag in ["TRTLLM_MARLIN_FULLK", "TRTLLM_MARLIN_INPROJ_FULLK", "TRTLLM_MARLIN_M16_TABLE"]:
+            for flag in TABLE_FLAGS:
                 os.environ[flag] = "1" if fam == "served" else "0"
             for a in ARMS:
                 set_arm(a)
@@ -185,7 +191,7 @@ for sname, n, k, c, calls in SHAPES:
                 hashes["eager_%s_M%d_%s_%s" % (sname, m, fam, a)] = h(o1)
             same = hashes["eager_%s_M%d_%s_P" % (sname, m, fam)] == hashes["eager_%s_M%d_%s_K" % (sname, m, fam)]
             bitwise_ok = bitwise_ok and same
-        for flag in ["TRTLLM_MARLIN_FULLK", "TRTLLM_MARLIN_INPROJ_FULLK", "TRTLLM_MARLIN_M16_TABLE"]:
+        for flag in TABLE_FLAGS:
             os.environ.pop(flag, None)
     del ws
     torch.cuda.empty_cache()

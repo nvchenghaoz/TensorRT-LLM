@@ -35,13 +35,17 @@ EPS = 1e-6
 WARM, ITERS = 10, 60
 SHAPES = [("qkvz", 16384, 5120, 6), ("qkv", 14336, 5120, 7), ("outproj", 5120, 6144, 16)]
 MS = [4, 8, 12, 16]
-# Rows 17-32 run Marlin only on qkv and out_proj/o_proj (main 7f09143a, per-(N,K) caps), with workspace_mode 2
-# (split-K partials reduced in FP32 through a per-call C_tmp), as FP8QDQLinearMethod.apply dispatches them.
-MS_FP32_REDUCE = [24, 32]
+# Rows 17-32 run Marlin on all three shapes (main 39fda45f, landing 11: qkvz cap 32, kM32Table), with
+# workspace_mode 2 (FP32 reduce through a per-call C_tmp), as FP8QDQLinearMethod.apply dispatches them.
+MS_FP32_REDUCE = [17, 24, 32]
+# Shapes whose served kernels are the pre-wait instances (compile-time, marlin_prewait_instance). out_proj /
+# o_proj (5120,6144) compiles main's stock prologue: the skip-wait negative control does not apply to it (the
+# stock kernel ignores the flag), so there it must instead leave the output unchanged.
+PREWAIT_SHAPES = ("qkvz", "qkv")
 
 
 def rows_for(sname):
-    return MS + (MS_FP32_REDUCE if sname in ("qkv", "outproj") else [])
+    return MS + MS_FP32_REDUCE
 
 
 def mode_for(m):
@@ -85,6 +89,7 @@ def arm_env(prewait, fullk):
     # fullk=False: the default split-K launch at every row count.
     env(TRTLLM_MARLIN_PREWAIT_B="1" if prewait else "0", TRTLLM_MARLIN_FULLK="1" if fullk else "0",
         TRTLLM_MARLIN_INPROJ_FULLK="1" if fullk else "0", TRTLLM_MARLIN_M16_TABLE="1" if fullk else "0",
+        TRTLLM_MARLIN_M32_TABLE="1" if fullk else "0",
         TRTLLM_MARLIN_DEBUG_SKIP_WAIT=None, TRTLLM_MARLIN_M16_CFG=None)
 
 
@@ -322,8 +327,13 @@ def main():
                                               + live["negative_control_skip_wait"]["graph_bad"]) > 0
             if not live["live_check_passes"]:
                 failures.append(f"pdl_live {key} prewait")
-            if not live["negative_control_fails"]:
-                failures.append(f"pdl_live {key} negative control did not fail")
+            if sname in PREWAIT_SHAPES:
+                if not live["negative_control_fails"]:
+                    failures.append(f"pdl_live {key} negative control did not fail")
+            else:
+                live["negative_control_na_stock_kernel"] = True
+                if live["negative_control_fails"]:
+                    failures.append(f"pdl_live {key} stock kernel reacted to the skip-wait flag")
             report["pdl_live"][key] = live
             if sha([x]) != xsha:
                 failures.append(f"input x changed {key}")
