@@ -120,6 +120,224 @@ def fused_sigmoid_gating_delta_rule_update_t1_kernel(
     tl.store(p_h0, b_h.to(h0_source.dtype.element_ty), mask=has_state)
 
 
+@triton.jit
+def _warp32x4_sum_sq(x):
+    """sum(x * x) over a 1-D [128] fp32 vector in exactly the order Triton
+    3.8 uses for tl.sum over a single-warp blocked layout with 4 contiguous
+    elements per lane (sizePerThread [4], threadsPerWarp [32]): per lane the
+    packed tree (x0^2 + x2^2) + (x1^2 + x3^2) (mul.f32 x4, add.f32x2,
+    add.f32), then an xor butterfly over the 32 lanes (offsets 16, 8, 4, 2,
+    1). This is the order of the q/k L2 norms in the T == 1 kernel and of the
+    sum of squares in _rms_norm_gated_fwd_multirow_kernel ([1, 4] x [1, 32]).
+    Element extraction is a masked sum with zeros (exact), every butterfly
+    level is one add per pair, and squares of bf16-valued x are exact in
+    fp32 (so FMA contraction cannot change them): the result is bitwise
+    independent of the layout Triton picks for this multi-warp program."""
+    xr = tl.reshape(x, (32, 4))
+    cols = tl.arange(0, 4)[None, :]
+    e0 = tl.sum(tl.where(cols == 0, xr, 0.0), axis=1)
+    e1 = tl.sum(tl.where(cols == 1, xr, 0.0), axis=1)
+    e2 = tl.sum(tl.where(cols == 2, xr, 0.0), axis=1)
+    e3 = tl.sum(tl.where(cols == 3, xr, 0.0), axis=1)
+    s = (e0 * e0 + e2 * e2) + (e1 * e1 + e3 * e3)
+    s = tl.sum(tl.reshape(s, (2, 16)), axis=0)
+    s = tl.sum(tl.reshape(s, (2, 8)), axis=0)
+    s = tl.sum(tl.reshape(s, (2, 4)), axis=0)
+    s = tl.sum(tl.reshape(s, (2, 2)), axis=0)
+    return tl.sum(s, axis=0)
+
+
+@triton.jit
+def fused_sigmoid_gating_delta_rule_update_t1_norm_kernel(
+    A_log,
+    a,
+    dt_bias,
+    softplus_beta,
+    softplus_threshold,
+    q,
+    k,
+    v,
+    b,
+    z,
+    norm_w,
+    y,
+    o_dbg,
+    h0_source,
+    h0_indices,
+    scale,
+    eps,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_a,
+    stride_b,
+    stride_z,
+    s_h0_0,
+    h0_dim0,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    STORE_DEBUG: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    r_dbg=None,
+):
+    """T == 1 decode with the GDN gated RMSNorm (silu gate, norm before gate)
+    folded in: one program (4 or 8 warps) per (sequence, value head) owns the whole
+    [V, K] state, so the norm over V needs no cross-program step. Bitwise
+    equal to fused_sigmoid_gating_delta_rule_update_t1_kernel followed by
+    _rms_norm_gated_fwd_multirow_kernel: the state tile keeps the T == 1
+    kernel's per-warp [1, 8] x [2, 16] grouping over K (warps split V only),
+    so the K contractions are unchanged; the q/k L2 norms and the norm's sum
+    of squares reproduce those kernels' single-warp reduce order with
+    _warp32x4_sum_sq; o is rounded to the output dtype before the norm, as
+    the stored o would be, and the norm's elementwise ops are the multirow
+    kernel's in the same order. STORE_DEBUG also stores o and rstd."""
+    tl.static_assert(K == 128 and V == 128)
+    pid = tl.program_id(0)
+    i_n = (pid // HV).to(tl.int64)
+    i_hv = pid % HV
+    i_h = i_hv // (HV // H)
+
+    o_k = tl.arange(0, K)
+    o_v = tl.arange(0, V)
+
+    idx = tl.load(h0_indices + i_n).to(tl.int64)
+    has_state = idx >= 0
+    tl.device_assert(idx < h0_dim0, "idx out of bounds in h0_source access")
+    p_h0 = (h0_source + idx * s_h0_0 + i_hv * V * K + o_v[:, None] * K +
+            o_k[None, :])
+    b_h = tl.load(p_h0, mask=has_state, other=0).to(tl.float32)
+
+    b_q = tl.load(q + i_n * stride_q + i_h * K + o_k).to(tl.float32)
+    b_k = tl.load(k + i_n * stride_k + i_h * K + o_k).to(tl.float32)
+    b_v = tl.load(v + i_n * stride_v + i_hv * V + o_v).to(tl.float32)
+    b_b = tl.load(b + i_n * stride_b + i_hv).to(tl.float32)
+    b_a = tl.load(a + i_n * stride_a + i_hv).to(tl.float32)
+    b_A_log = tl.load(A_log + i_hv).to(tl.float32)
+    b_dt_bias = tl.load(dt_bias + i_hv).to(tl.float32)
+    b_z = tl.load(z + i_n * stride_z + i_hv * V + o_v).to(tl.float32)
+    b_w = tl.load(norm_w + o_v).to(tl.float32)
+
+    x = b_a + b_dt_bias
+    beta_x = softplus_beta * x
+    softplus_x = tl.where(
+        beta_x <= softplus_threshold,
+        (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+        x,
+    )
+    b_g = -tl.exp(b_A_log) * softplus_x
+    b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+
+    if USE_QK_L2NORM_IN_KERNEL:
+        b_q = b_q / (tl.sqrt(_warp32x4_sum_sq(b_q)) + 1e-6)
+        b_k = b_k / (tl.sqrt(_warp32x4_sum_sq(b_k)) + 1e-6)
+    b_q = b_q * scale
+
+    b_h *= tl.exp(b_g)
+    b_v -= tl.sum(b_h * b_k[None, :], 1)
+    b_v *= b_beta
+    b_h += b_k[None, :] * b_v[:, None]
+    b_o = tl.sum(b_h * b_q[None, :], 1)
+
+    tl.store(p_h0, b_h.to(h0_source.dtype.element_ty), mask=has_state)
+    b_o = b_o.to(y.dtype.element_ty)
+    if STORE_DEBUG:
+        tl.store(o_dbg + (i_n * HV + i_hv) * V + o_v, b_o)
+    # Gated RMSNorm (norm before gate, silu gate), as the multirow kernel.
+    xo = b_o.to(tl.float32)
+    var = _warp32x4_sum_sq(xo) / V
+    rstd = 1.0 / tl.sqrt(var + eps)
+    if STORE_DEBUG:
+        tl.store(r_dbg + i_n * HV + i_hv, rstd)
+    b_y = xo * rstd * b_w
+    gate = tl.sigmoid(b_z)
+    gate *= b_z
+    b_y *= gate
+    tl.store(y + (i_n * HV + i_hv) * V + o_v, b_y.to(y.dtype.element_ty))
+
+
+def fused_sigmoid_gating_delta_rule_update_t1_norm(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    softplus_beta: float,
+    softplus_threshold: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float,
+    use_qk_l2norm_in_kernel: bool,
+    output: Optional[torch.Tensor] = None,
+    o_debug: Optional[torch.Tensor] = None,
+    rstd_debug: Optional[torch.Tensor] = None,
+    num_warps: Optional[int] = None,
+) -> torch.Tensor:
+    """T == 1 decode + GDN gated RMSNorm (silu gate); returns y [N * HV, V].
+
+    z is the [N, HV, V] gate view (V contiguous, heads packed per token, any
+    token stride). Bitwise equal to fused_sigmoid_gating_delta_rule_update_t1
+    followed by rms_norm_gated_token_major(o, z, norm_weight, eps) with a
+    bf16 output (see the kernel docstring). Requires K == V == 128."""
+    _, N, H, K = k.shape
+    HV, V = v.shape[2], v.shape[3]
+    s_h0_0, s_h0_1, s_h0_2, s_h0_3 = initial_state_source.stride()
+    assert s_h0_3 == 1 and s_h0_2 == K and s_h0_1 == V * K
+    assert z.stride(-1) == 1 and z.stride(-2) == V
+    norm_weight = norm_weight.contiguous()
+    y = output if output is not None else q.new_empty(N * HV, V)
+    debug = o_debug is not None
+    if num_warps is None:
+        # SM120, HV=48, 48-layer cold-state chain (us/layer vs T1 + norm):
+        # 8 warps is best at N <= 6, 4 warps at N = 8/16/32.
+        num_warps = 4 if N >= 8 else 8
+    grid = (N * HV, )
+    with custom_device_ctx(q.device.index):
+        fused_sigmoid_gating_delta_rule_update_t1_norm_kernel[grid](
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            z=z,
+            norm_w=norm_weight,
+            y=y,
+            o_dbg=o_debug if o_debug is not None else y,
+            h0_source=initial_state_source,
+            h0_indices=initial_state_indices,
+            scale=scale,
+            eps=eps,
+            stride_q=q.stride(1),
+            stride_k=k.stride(1),
+            stride_v=v.stride(1),
+            stride_a=a.stride(-2),
+            stride_b=b.stride(-2),
+            stride_z=z.stride(0),
+            s_h0_0=s_h0_0,
+            h0_dim0=initial_state_source.shape[0],
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            STORE_DEBUG=debug,
+            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+            r_dbg=rstd_debug if debug else None,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+    return y
+
+
 def gdn_t1_decode_config(num_heads_total: int, V: int) -> Tuple[int, int]:
     """(BV, num_warps) for N * HV (sequence, value-head) pairs.
 
