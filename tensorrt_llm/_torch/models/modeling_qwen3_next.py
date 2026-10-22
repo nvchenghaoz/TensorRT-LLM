@@ -1384,6 +1384,10 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                # Its decode consumers (in_proj_qkvz / qkv_proj, dense Marlin)
+                # prefetch weights before their PDL wait: trigger early
+                # (rms_norm._EARLY_TRIGGER_MAX_ROWS; bitwise-identical output).
+                layer.next_layer_layernorm.early_pdl_trigger = True
 
     def cache_derived_state(self) -> None:
         super().cache_derived_state()

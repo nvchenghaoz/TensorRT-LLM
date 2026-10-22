@@ -123,9 +123,14 @@ def dequant(qv, sf, gs, rows, k):
     return v * s.repeat_interleave(16, dim=1) / gs
 
 
+def norm_early(x, r, w):
+    torch.ops.trtllm.flashinfer_gemma_fused_add_rmsnorm_early_trigger(x, r, w, EPS)
+
+
 class Chain:
-    def __init__(self, n, k, m, ws, wn1, wn2, seed):
+    def __init__(self, n, k, m, ws, wn1, wn2, seed, early=False):
         self.n, self.k, self.m, self.ws, self.wn1, self.wn2 = n, k, m, ws, wn1, wn2
+        self.early = early
         c = len(ws)
         per = m * k * 2 + m * n
         g = torch.Generator(device=dev).manual_seed(seed)
@@ -147,7 +152,7 @@ class Chain:
         self.st.copy_(self.st0)
         ys = []
         for i in range(len(self.ws)):
-            norm(self.x[i], self.r1[i], self.wn1)
+            (norm_early if self.early else norm)(self.x[i], self.r1[i], self.wn1)
             y = marlin(self.x[i], self.ws[i], self.n, self.k)
             norm(y, self.r2[i], self.wn2)
             ys.append(y)
@@ -252,9 +257,9 @@ def main():
             eref = che.state(che.run())
             torch.cuda.synchronize()
             rr = {}
-            for prewait in (True, False):
+            for prewait, early in ((True, False), (False, False), (True, True)):
                 arm_env(prewait, True)
-                ch = Chain(n, k, m, ws, wn1, wn2, 100 + m)
+                ch = Chain(n, k, m, ws, wn1, wn2, 100 + m, early=early)
                 gr, ys = capture(ch.run)
                 ch.ys = ys
                 first, ok1, okr, worst = None, True, True, 0.0
@@ -271,7 +276,7 @@ def main():
                     if not er:
                         d = torch.nan_to_num((out.float() - eref.float()).abs(), nan=float("inf")).max().item()
                         worst = max(worst, d)
-                arm = "prewait" if prewait else "kill"
+                arm = ("prewait" if prewait else "kill") + ("+early_trigger_norm" if early else "")
                 rr[arm] = {"replays": WARM + ITERS, "eq_replay1": ok1, "eq_kill_eager": okr, "max_dev": worst}
                 if not (ok1 and okr):
                     failures.append(f"replay {key} {arm} eq1={ok1} eqref={okr} dev={worst}")

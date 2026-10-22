@@ -2,27 +2,32 @@ import os, sys, json, hashlib, time, subprocess
 os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
 import torch
 import tensorrt_llm._torch.custom_ops
+import tensorrt_llm._torch.modules.mamba.layernorm_gated
 from tensorrt_llm._torch.modules.linear import _pack_nvfp4_weight_for_marlin
-# Idea 28 stage 1 pair bench (brace-free: passed verbatim via python -c to both trees).
-# Per layer, one CUDA graph node chain: gemma fused add RMSNorm (FlashInfer, PDL) writing Marlin's BF16 input ->
-# trtllm::marlin_nvfp4_gemm (PDL) -> gemma fused add RMSNorm reading Marlin's output. Cold L2: C distinct
-# Marlin-packed weight copies per shape (>= 250 MB) chained in one graph; all mutable state restored by one copy.
+# Idea 28 pair bench (brace-free: passed verbatim via python -c to both trees).
+# Per layer, one CUDA graph node chain with the served producer of each decode Marlin GEMM:
+#   qkvz (16384,5120) / qkv (14336,5120): gemma fused add-RMSNorm (next layer's input_layernorm, H=5120) -> Marlin
+#   out_proj (5120,6144): Triton gated RMSNorm (rms_norm_gated_token_major, 48 heads x 128) -> Marlin
+# then a gemma fused add-RMSNorm consuming Marlin's output. Cold L2: C distinct Marlin-packed weight copies per shape
+# chained in one graph; all mutable state restored by one copy at the start of every replay.
 # Arms captured in one process and replayed alternately (order flipped every iteration):
-#   P = default (candidate: B / weight-scale cp.async issued before griddepcontrol.wait)
-#   K = TRTLLM_MARLIN_PREWAIT_B=0 (candidate: main's wait-first prologue).
-# In the base tree the switch does not exist, so P = K = main (an in-process A/A).
+#   P = served candidate: Marlin pre-wait L2 weight prefetch + early-trigger norm (qkvz/qkv sites, when the
+#       trtllm::flashinfer_gemma_fused_add_rmsnorm_early_trigger op exists)
+#   K = TRTLLM_MARLIN_PREWAIT_B=0 + stock norm = main's code path.
+# In the base tree neither switch nor op exists, so P = K = main (an in-process A/A).
 # batch[M].kernel_ms = arm P chain time per decode step, weighted by Marlin calls per step:
-#   qkvz (16384,5120) x48 (rows <= 16 only) + qkv (14336,5120) x16 + out_proj/o_proj (5120,6144) x64.
+#   qkvz x48 (rows <= 16 only) + qkv x16 + out_proj x48 (GDN; o_proj not modelled).
 dev = torch.device("cuda")
 EPS, WARM, ITERS = 1e-6, 10, 60
-SHAPES = [("qkvz", 16384, 5120, 6, 48), ("qkv", 14336, 5120, 7, 16), ("outproj", 5120, 6144, 16, 64)]
+HEADS, HD = 48, 128
+SHAPES = [("qkvz", 16384, 5120, 6, 48), ("qkv", 14336, 5120, 7, 16), ("outproj", 5120, 6144, 16, 48)]
 MS = [4, 8, 12, 16, 24, 32]
-# Rows 17-32: only qkv and out_proj/o_proj run Marlin (workspace_mode 2, FP32 split-K reduce); qkvz runs W4A4 there.
 def rows_for(sname):
     return MS if sname != "qkvz" else [m for m in MS if m <= 16]
 def mode_for(m):
     return 2 if m > 16 else 0
 ARMS = ["P", "K"]
+HAS_EARLY = hasattr(torch.ops.trtllm, "flashinfer_gemma_fused_add_rmsnorm_early_trigger")
 T0 = time.time()
 def log(*a):
     print("[%6.1fs]" % (time.time() - T0), *a, flush=True)
@@ -33,7 +38,8 @@ def git(args):
         return "n/a " + str(e)
 head = git(["rev-parse", "HEAD"])
 dirty = git(["status", "--porcelain"])
-print("TREE_COMMIT=" + head, "dirty_files=%d" % (len(dirty.splitlines()) if dirty else 0), flush=True)
+print("TREE_COMMIT=" + head, "dirty_files=%d" % (len(dirty.splitlines()) if dirty else 0), "has_early_op", HAS_EARLY,
+      flush=True)
 def set_arm(a):
     os.environ["TRTLLM_MARLIN_PREWAIT_B"] = "1" if a == "P" else "0"
 def h(t):
@@ -51,29 +57,38 @@ def marlin(x, wt, n, k):
         workspace_mode=mode_for(x.shape[0]))
 def norm(x, r, w):
     torch.ops.trtllm.flashinfer_gemma_fused_add_rmsnorm(x, r, w, EPS)
+def norm_early(x, r, w):
+    torch.ops.trtllm.flashinfer_gemma_fused_add_rmsnorm_early_trigger(x, r, w, EPS)
 class Chain:
-    def __init__(self, n, k, m, ws, wn1, wn2, seed):
-        self.n, self.k, self.m, self.ws, self.wn1, self.wn2 = n, k, m, ws, wn1, wn2
+    def __init__(self, site, n, k, m, ws, wn1, wn2, seed, early):
+        self.site, self.n, self.k, self.m, self.ws, self.wn1, self.wn2, self.early = site, n, k, m, ws, wn1, wn2, early
         c = len(ws)
-        per = m * k * 2 + m * n
+        per = 3 * m * k + m * n
         g = torch.Generator(device=dev).manual_seed(seed)
         st0 = torch.zeros(c * per, device=dev, dtype=torch.bfloat16)
         for i in range(c):
-            st0[i * per: i * per + 2 * m * k] = (torch.randn(2 * m * k, generator=g, device=dev) * 0.5).to(torch.bfloat16)
+            st0[i * per: i * per + 3 * m * k] = (torch.randn(3 * m * k, generator=g, device=dev) * 0.5).to(torch.bfloat16)
         self.st0 = st0
         self.st = st0.clone()
-        self.x, self.r1, self.r2 = [], [], []
+        self.x, self.r1, self.z, self.r2 = [], [], [], []
         for i in range(c):
             b = i * per
             self.x.append(self.st[b: b + m * k].view(m, k))
             self.r1.append(self.st[b + m * k: b + 2 * m * k].view(m, k))
-            self.r2.append(self.st[b + 2 * m * k: b + per].view(m, n))
+            self.z.append(self.st[b + 2 * m * k: b + 3 * m * k].view(m, k))
+            self.r2.append(self.st[b + 3 * m * k: b + per].view(m, n))
     def run(self):
         self.st.copy_(self.st0)
         ys = []
         for i in range(len(self.ws)):
-            norm(self.x[i], self.r1[i], self.wn1)
-            y = marlin(self.x[i], self.ws[i], self.n, self.k)
+            if self.site == "outproj":
+                a = torch.ops.trtllm.rms_norm_gated_token_major(
+                    self.x[i].view(self.m * HEADS, HD), self.z[i].view(self.m, HEADS, HD), self.wn1, EPS)
+                a = a.view(self.m, self.k)
+            else:
+                (norm_early if self.early else norm)(self.x[i], self.r1[i], self.wn1)
+                a = self.x[i]
+            y = marlin(a, self.ws[i], self.n, self.k)
             norm(y, self.r2[i], self.wn2)
             ys.append(y)
         return ys
@@ -104,14 +119,14 @@ for sname, n, k, c, calls in SHAPES:
     del base
     mb = sum(sum(t.numel() * t.element_size() for t in w) for w in ws) / 1e6
     g = torch.Generator(device=dev).manual_seed(5)
-    wn1 = (0.1 * torch.randn(k, generator=g, device=dev)).to(torch.bfloat16)
+    wn1 = (0.1 * torch.randn(HD if sname == "outproj" else k, generator=g, device=dev)).to(torch.bfloat16)
     wn2 = (0.1 * torch.randn(n, generator=g, device=dev)).to(torch.bfloat16)
     log("shape", sname, n, k, "copies", c, "weight MB %.1f" % mb)
     for m in rows_for(sname):
         objs, graphs, outs, eager = dict(), dict(), dict(), dict()
         for a in ARMS:
             set_arm(a)
-            obj = Chain(n, k, m, ws, wn1, wn2, 100 + m)
+            obj = Chain(sname, n, k, m, ws, wn1, wn2, 100 + m, HAS_EARLY and a == "P" and sname != "outproj")
             eager[a] = obj.state(obj.run())
             gr, o = capture(obj)
             objs[a], graphs[a], outs[a] = obj, gr, o
@@ -179,8 +194,8 @@ for m in MS:
     log("M=%2d chain ms/step  P %.4f  K %.4f  P-K %+.4f ms (%+.2f%%)" % (m, per_step[s]["P"], per_step[s]["K"],
         per_step[s]["P"] - per_step[s]["K"], 100.0 * (per_step[s]["P"] - per_step[s]["K"]) / per_step[s]["K"]))
 out = dict(batch=res)
-out["output"] = dict(measure="norm->Marlin->norm chain per decode step (48 qkvz + 16 qkv + 64 out_proj), "
-                     "cold L2, CUDA graph, PDL; kernel_ms = arm P", detail=detail, hashes=hashes,
+out["output"] = dict(measure="served-producer -> Marlin -> norm chains per decode step (48 qkvz + 16 qkv + 48 out_proj), "
+                     "cold L2, CUDA graph, PDL; kernel_ms = arm P", detail=detail, hashes=hashes, has_early_op=HAS_EARLY,
                      bitwise_arms_and_eager=bitwise_ok, warmup=WARM, iters=ITERS, tree=head)
 out["output"]["class"] = "exact"
 print(json.dumps(out))
