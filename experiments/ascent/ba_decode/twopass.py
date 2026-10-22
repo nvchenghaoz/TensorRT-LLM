@@ -39,7 +39,6 @@ def corpus_ids(tok, n_tokens):
     files = sorted(glob.glob("docs/source/**/*.md", recursive=True))
     files += sorted(glob.glob("tensorrt_llm/_torch/**/*.md", recursive=True))
     files += sorted(glob.glob("examples/**/*.md", recursive=True))
-    files += sorted(glob.glob("tensorrt_llm/_torch/modules/**/*.py", recursive=True))
     ids = []
     for f in files:
         try:
