@@ -20,9 +20,14 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
 )
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
+    _can_use_flashinfer_gdn_decode,
     _can_use_flashinfer_gdn_verify,
     _flashinfer_gdn_verify,
     fused_sigmoid_gating_delta_rule_update,
+)
+from tensorrt_llm._torch.modules.fla.gdn_decode_t1 import (
+    can_use_gdn_t1_decode,
+    fused_sigmoid_gating_delta_rule_update_t1_norm,
 )
 from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
@@ -65,6 +70,13 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 # Skip the prefill state reset when every prefill has initial state (a no-op
 # launch). Read once at import; "0" restores the unconditional launch.
 _SKIP_NOOP_RESET = os.environ.get("TRTLLM_GDN_SKIP_NOOP_STATE_RESET", "1") != "0"
+
+# Pure decode at these row counts runs the T == 1 delta rule with the gated
+# RMSNorm folded in (one kernel, bitwise equal to T1 + rms_norm_gated_token_major)
+# when the norm output is bf16. "0" restores the two-kernel path.
+_T1_NORM_FUSION = os.environ.get("TRTLLM_GDN_T1_NORM_FUSION", "1") != "0"
+_T1_NORM_FUSION_MIN_ROWS = int(os.environ.get("TRTLLM_GDN_T1_NORM_FUSION_MIN_ROWS", "5"))
+_T1_NORM_FUSION_MAX_ROWS = 32
 
 
 # FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
@@ -923,6 +935,54 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         key = key.view(1, seq_len, self.num_k_heads_per_tp, self.head_k_dim)
         value = value.view(1, seq_len, self.num_v_heads_per_tp, self.head_v_dim)
 
+        norm_fusion = kwargs.get("norm_fusion")
+        if norm_fusion is not None:
+            # Return y = gated_rmsnorm(o, z) [tokens * heads, V] instead of o.
+            z, norm_weight, norm_eps = norm_fusion
+            n_seq = query_start_loc_long.shape[0] - 1
+            K, V = self.head_k_dim, self.head_v_dim
+            if not _can_use_flashinfer_gdn_decode(
+                ssm_states, K, V, seq_len, n_seq
+            ) and can_use_gdn_t1_decode(
+                ssm_states, query_start_loc_long, 1, seq_len, n_seq, K, V
+            ):
+                return fused_sigmoid_gating_delta_rule_update_t1_norm(
+                    A_log=self.A_log,
+                    a=a,
+                    dt_bias=self.dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=query,
+                    k=key,
+                    v=value,
+                    b=b,
+                    z=z,
+                    norm_weight=norm_weight,
+                    eps=norm_eps,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    scale=K**-0.5,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc_long,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+            )
+            return rms_norm_gated_token_major(
+                core_attn_out.reshape(-1, V), z, norm_weight, norm_eps
+            )
+
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=self.A_log,
             dt_bias=self.dt_bias,
@@ -1362,6 +1422,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
             maybe_bcg_gdn_custom_op_inplace(mixed_qkv, a, b, self.layer_idx_str, attn_out)
         else:
+            norm_fusion = self._decode_norm_fusion(mixed_qkv, z, attn_metadata, spec_metadata)
             attn_out = self.forward_core(
                 mixed_qkv,
                 a,
@@ -1370,9 +1431,46 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 mamba_metadata,
                 spec_metadata=spec_metadata,
                 conv_fused=gemv_conv is not None,
+                norm_fusion=norm_fusion,
             )
+            if norm_fusion is not None:
+                # attn_out is already the gated-norm output (bf16 rows for
+                # out_proj's NVFP4 W4A16 decode copy).
+                return self.out_proj(
+                    attn_out.view(-1, self.value_dim_per_tp), all_reduce_params=all_reduce_params
+                )
 
         return self._postprocess_gdn_output(attn_out, z, all_reduce_params)
+
+    def _decode_norm_fusion(self, mixed_qkv, z, attn_metadata, spec_metadata):
+        """(z, weight, eps) when a pure-decode step can fold the gated RMSNorm
+        into the T == 1 delta rule, else None.
+
+        Only where _postprocess_gdn_output would run the bf16 multirow gated
+        norm: out_proj takes BF16 rows (its NVFP4 W4A16 decode copy), z is a
+        token-major [tokens, heads, 128] view, K == V == 128.
+        """
+        if not _T1_NORM_FUSION or spec_metadata is not None:
+            return None
+        rows = mixed_qkv.shape[0]
+        if attn_metadata.num_contexts != 0 or not (
+            _T1_NORM_FUSION_MIN_ROWS <= rows <= _T1_NORM_FUSION_MAX_ROWS
+        ):
+            return None
+        if self.head_k_dim != 128 or self.head_v_dim != 128:
+            return None
+        decode_rows = fp8_nvfp4_decode_max_rows(self.out_proj)
+        if not (decode_rows > 0 and rows <= decode_rows):
+            return None
+        if (
+            mixed_qkv.dtype != torch.bfloat16
+            or z.dtype != torch.bfloat16
+            or z.dim() != 3
+            or z.stride(2) != 1
+            or z.stride(1) != self.head_v_dim
+        ):
+            return None
+        return (z, self.norm.weight, self.norm.eps)
 
     def forward_core(
         self,
@@ -1384,6 +1482,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         spec_metadata: Optional[SpecMetadata] = None,
         output: Optional[torch.Tensor] = None,
         conv_fused: bool = False,
+        norm_fusion: Optional[tuple] = None,
     ):
         ### sglang linear attn
         # has_initial_states = None
@@ -1481,6 +1580,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # mixed_qkv was convolved by in_proj_qkvz's fused GEMV epilogue (pure decode only).
         assert not conv_fused or (num_prefills == 0 and not is_target_verify)
         kwargs["conv_fused"] = conv_fused
+        if norm_fusion is not None:
+            # forward_decode returns the gated-norm output instead of o.
+            assert num_prefills == 0 and not is_target_verify and output is None
+            kwargs["norm_fusion"] = norm_fusion
         if num_prefills > 0:
             attn_out = self.forward_extend(
                 conv_states,
