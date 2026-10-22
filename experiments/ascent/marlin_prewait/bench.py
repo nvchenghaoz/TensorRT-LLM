@@ -27,6 +27,9 @@ def rows_for(sname):
 def mode_for(m):
     return 2 if m > 16 else 0
 ARMS = ["P", "K"]
+# Each replay runs REP x C layers: C weight copies cycled REP times (cold L2: C copies exceed the 128 MB L2), each
+# layer with its own state slot (no in-place kernel consumes its own output). Longer samples cut per-replay jitter.
+REP = int(os.environ.get("BENCH_REP", "8"))
 HAS_EARLY = hasattr(torch.ops.trtllm, "flashinfer_gemma_fused_add_rmsnorm_early_trigger")
 T0 = time.time()
 def log(*a):
@@ -62,7 +65,7 @@ def norm_early(x, r, w):
 class Chain:
     def __init__(self, site, n, k, m, ws, wn1, wn2, seed, early):
         self.site, self.n, self.k, self.m, self.ws, self.wn1, self.wn2, self.early = site, n, k, m, ws, wn1, wn2, early
-        c = len(ws)
+        c = len(ws) * REP
         per = 3 * m * k + m * n
         g = torch.Generator(device=dev).manual_seed(seed)
         st0 = torch.zeros(c * per, device=dev, dtype=torch.bfloat16)
@@ -80,7 +83,7 @@ class Chain:
     def run(self):
         self.st.copy_(self.st0)
         ys = []
-        for i in range(len(self.ws)):
+        for i in range(len(self.ws) * REP):
             if self.site == "outproj":
                 a = torch.ops.trtllm.rms_norm_gated_token_major(
                     self.x[i].view(self.m * HEADS, HD), self.z[i].view(self.m, HEADS, HD), self.wn1, EPS)
@@ -88,7 +91,7 @@ class Chain:
             else:
                 (norm_early if self.early else norm)(self.x[i], self.r1[i], self.wn1)
                 a = self.x[i]
-            y = marlin(a, self.ws[i], self.n, self.k)
+            y = marlin(a, self.ws[i % len(self.ws)], self.n, self.k)
             norm(y, self.r2[i], self.wn2)
             ys.append(y)
         return ys
@@ -146,7 +149,7 @@ for sname, n, k, c, calls in SHAPES:
         key = "%s_M%d" % (sname, m)
         detail[key] = dict()
         for a in ARMS:
-            t = sorted(e0.elapsed_time(e1) * 1e3 / c for e0, e1 in evs[a])
+            t = sorted(e0.elapsed_time(e1) * 1e3 / (c * REP) for e0, e1 in evs[a])
             med, p10, p90 = t[len(t) // 2], t[len(t) // 10], t[(9 * len(t)) // 10]
             st = objs[a].state(outs[a])
             eq_eager = bool(torch.equal(st, eager[a]))
@@ -196,6 +199,6 @@ for m in MS:
 out = dict(batch=res)
 out["output"] = dict(measure="served-producer -> Marlin -> norm chains per decode step (48 qkvz + 16 qkv + 48 out_proj), "
                      "cold L2, CUDA graph, PDL; kernel_ms = arm P", detail=detail, hashes=hashes, has_early_op=HAS_EARLY,
-                     bitwise_arms_and_eager=bitwise_ok, warmup=WARM, iters=ITERS, tree=head)
+                     bitwise_arms_and_eager=bitwise_ok, warmup=WARM, iters=ITERS, rep=REP, tree=head)
 out["output"]["class"] = "exact"
 print(json.dumps(out))
