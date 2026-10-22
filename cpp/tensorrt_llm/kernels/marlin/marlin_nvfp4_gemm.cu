@@ -27,6 +27,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -97,6 +98,84 @@ MarlinFuncPtr get_marlin_kernel(int thread_m_blocks, int thread_n_blocks, int th
 #undef MARLIN_KERNEL_MATCH
 #undef MARLIN_KERNEL_IF
     return MarlinDefault;
+}
+
+// Deeper-pipeline single-m-block 16-row kernels (decode rows 9-16), see get_m16_launch.
+MarlinFuncPtr get_m16_kernel(thread_config_t const& th, int stages)
+{
+#define MARLIN_M16_IF(T, N, K, S)                                                                                      \
+    if (th.num_threads == (T) && th.thread_n == (N) * 16 && th.thread_k == (K) * 16 && stages == (S))                  \
+        return Marlin<nv_bfloat16, T, 1, N, K, false, S, 1>;
+    MARLIN_M16_IF(128, 4, 8, 4)
+    MARLIN_M16_IF(128, 4, 8, 6)
+    MARLIN_M16_IF(128, 4, 8, 8)
+    MARLIN_M16_IF(128, 8, 4, 4)
+    MARLIN_M16_IF(128, 8, 4, 6)
+    MARLIN_M16_IF(128, 8, 4, 8)
+    MARLIN_M16_IF(256, 8, 8, 4)
+    MARLIN_M16_IF(256, 8, 8, 6)
+#undef MARLIN_M16_IF
+    return MarlinDefault;
+}
+
+struct m16_launch_t
+{
+    thread_config_t th;
+    int blocks;
+    int stages;
+};
+
+struct m16_table_entry_t
+{
+    int prob_n;
+    int prob_k;
+    m16_launch_t launch;
+};
+
+// Decode rows 9-16 (one 16-row m block) launch shapes per (N, K), chosen by a cold-L2
+// CUDA-graph + PDL sweep on SM120 (RTX PRO 6000, 188 SMs). Exact (N, K) match only.
+// Rows 16, us/call, main (188 CTAs, 4 stages) -> table:
+//  - (5120, 6144) GDN out_proj / attn o_proj: 17.05 -> 16.25. 160 CTAs = 2 stripes per
+//    64-wide column, one BF16 reduction step, no stripe wrap. (80 full-K CTAs: 18.1.)
+//  - (16384, 5120) GDN in_proj_qkvz: 37.04 -> 34.77. One full-K CTA per 128-wide column.
+//  - (14336, 5120) attn qkv_proj: 32.84 -> 30.89. One full-K CTA per 128-wide column.
+m16_table_entry_t const kM16Table[] = {
+    {5120, 6144, {{128, 64, 128}, 160, 8}},
+    {16384, 5120, {{64, 128, 128}, 128, 6}},
+    {14336, 5120, {{64, 128, 128}, 112, 6}},
+};
+
+// TRTLLM_MARLIN_M16_CFG="thread_k,thread_n,threads,blocks,stages" overrides every rows 9-16 call
+// (sweeps); TRTLLM_MARLIN_M16_TABLE=0 disables the table. Both are read per call (uncached).
+bool get_m16_launch(int prob_n, int prob_k, int sms, m16_launch_t& out)
+{
+    char const* cfg = std::getenv("TRTLLM_MARLIN_M16_CFG");
+    if (cfg != nullptr && cfg[0] != '\0')
+    {
+        m16_launch_t o{{-1, -1, -1}, 0, 0};
+        if (std::sscanf(cfg, "%d,%d,%d,%d,%d", &o.th.thread_k, &o.th.thread_n, &o.th.num_threads, &o.blocks,
+                &o.stages)
+            == 5)
+        {
+            out = o;
+            return true;
+        }
+        return false;
+    }
+    char const* table = std::getenv("TRTLLM_MARLIN_M16_TABLE");
+    if (table != nullptr && table[0] == '0' && table[1] == '\0')
+        return false;
+    if (sms != 188)
+        return false;
+    for (auto const& e : kM16Table)
+    {
+        if (e.prob_n == prob_n && e.prob_k == prob_k)
+        {
+            out = e.launch;
+            return true;
+        }
+    }
+    return false;
 }
 
 exec_config_t determine_exec_config(int prob_m, int prob_n, int prob_k, int thread_m_blocks, bool m_block_size_8,
@@ -288,6 +367,22 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
             grid = prob_n / in_proj_cfg.thread_n;
         }
 
+        // Decode rows 9-16 (one 16-row m block): per-(N, K) thread config, grid and
+        // cp.async stages (kM16Table). With grid == n_tiles each CTA streams one full-K
+        // column (no split-K BF16 chain through C, no stripe wrap). Reordered.
+        m16_launch_t m16;
+        if (full_k_flags == 0 && !m_block_size_8 && thread_m_blocks == 1 && prob_m_split > 8 && group_blocks == 1
+            && exec_cfg.blocks_per_sm == 1 && !use_fp32_reduce && get_m16_launch(prob_n, prob_k, sms, m16)
+            && m16.blocks >= 1 && m16.blocks <= sms
+            && is_valid_config(
+                m16.th, thread_m_blocks, prob_n, prob_k, num_bits, group_size, m16.stages, max_shared_mem_new - 512)
+            && get_m16_kernel(m16.th, m16.stages) != MarlinDefault)
+        {
+            kernel = get_m16_kernel(m16.th, m16.stages);
+            num_threads = m16.th.num_threads;
+            grid = m16.blocks;
+        }
+
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new);
 
         // The kernel starts with griddepcontrol.wait, so a PDL launch orders all of
@@ -338,6 +433,12 @@ template __global__ void Marlin<nv_bfloat16, 128, 4, 8, 4, false, 4, 1>( MARLIN_
 template __global__ void Marlin<nv_bfloat16, 128, 4, 4, 8, false, 4, 1>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, true,  8, 1, true>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 128, 1, 8, 4, true,  6, 1>( MARLIN_KERNEL_PARAMS );
+// Decode rows 9-16 deeper-pipeline variants (get_m16_kernel).
+template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, false, 6, 1>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, false, 8, 1>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<nv_bfloat16, 128, 1, 8, 4, false, 6, 1>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<nv_bfloat16, 128, 1, 8, 4, false, 8, 1>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<nv_bfloat16, 256, 1, 8, 8, false, 6, 1>( MARLIN_KERNEL_PARAMS );
 
 // clang-format on
 

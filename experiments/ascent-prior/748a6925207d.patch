@@ -1,0 +1,758 @@
+diff --git a/cpp/tensorrt_llm/kernels/marlin/marlin_nvfp4_gemm.cu b/cpp/tensorrt_llm/kernels/marlin/marlin_nvfp4_gemm.cu
+index 294d6c75f..47369e1a1 100644
+--- a/cpp/tensorrt_llm/kernels/marlin/marlin_nvfp4_gemm.cu
++++ b/cpp/tensorrt_llm/kernels/marlin/marlin_nvfp4_gemm.cu
+@@ -26,6 +26,9 @@
+ #include "tensorrt_llm/common/cudaUtils.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <cuda_bf16.h>
+ #include <cuda_fp8.h>
+ #include <cuda_runtime.h>
+@@ -69,12 +72,17 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks, int
+ MarlinFuncPtr get_marlin_kernel(int thread_m_blocks, int thread_n_blocks, int thread_k_blocks, bool m_block_size_8,
+     int group_blocks, int threads, int stages)
+ {
+-#define MARLIN_KERNEL_MATCH(T, M, N, K, M8)                                                                            \
++#define MARLIN_KERNEL_MATCH(T, M, N, K, M8, S)                                                                         \
+     (threads == (T) && thread_m_blocks == (M) && thread_n_blocks == (N) && thread_k_blocks == (K)                      \
+-        && m_block_size_8 == (M8) && stages == 4 && group_blocks == 1)
+-#define MARLIN_KERNEL_IF(T, M, N, K, M8)                                                                               \
+-    if (MARLIN_KERNEL_MATCH(T, M, N, K, M8))                                                                           \
+-        return Marlin<nv_bfloat16, T, M, N, K, M8, 4, 1>;
++        && m_block_size_8 == (M8) && stages == (S) && group_blocks == 1)
++#define MARLIN_KERNEL_IF_S(T, M, N, K, M8, S)                                                                          \
++    if (MARLIN_KERNEL_MATCH(T, M, N, K, M8, S))                                                                        \
++        return Marlin<nv_bfloat16, T, M, N, K, M8, S, 1>;
++#define MARLIN_KERNEL_IF(T, M, N, K, M8) MARLIN_KERNEL_IF_S(T, M, N, K, M8, 4)
++
++    // Deeper cp.async pipelines for the small-M (rows <= 8) launch-shape table below.
++    MARLIN_KERNEL_IF_S(128, 1, 4, 8, true, 8)
++    MARLIN_KERNEL_IF_S(128, 1, 8, 4, true, 6)
+ 
+     MARLIN_KERNEL_IF(256, 1, 8, 8, true)
+     MARLIN_KERNEL_IF(128, 1, 8, 4, true)
+@@ -94,9 +102,75 @@ MarlinFuncPtr get_marlin_kernel(int thread_m_blocks, int thread_n_blocks, int th
+ 
+ #undef MARLIN_KERNEL_MATCH
+ #undef MARLIN_KERNEL_IF
++#undef MARLIN_KERNEL_IF_S
+     return MarlinDefault;
+ }
+ 
++// Small-M (thread_m_blocks == 1, rows <= 8) launch shape: thread config, grid size and cp.async stages.
++struct small_m_launch_t
++{
++    thread_config_t th;
++    int blocks;
++    int stages;
++};
++
++struct small_m_table_entry_t
++{
++    int prob_n;
++    int prob_k;
++    int max_rows;
++    small_m_launch_t launch;
++};
++
++// Hard-coded per-(N,K) launch shapes for decode rows <= 8, chosen by a cold-L2 CUDA-graph sweep on SM120
++// (RTX PRO 6000, 188 SMs). Exact (N,K) match only; every other shape (lm_head included) and rows > max_rows
++// keep the default selection. Deterministic: no autotuning, so a given (N,K,M) always runs the same partition.
++// Each grid is n_tiles CTAs: one full-K column per CTA, so no split-K BF16 partial reduction through C and
++// no stripe wrapping into a second column (main: 188 CTAs, ~1.5-3 CTAs per column, serial lock-ordered
++// reductions). Sweep at M=1 (us/call, main -> table): (5120,6144) 17.17 -> 15.63; (16384,5120) 36.79 -> 35.11;
++// (14336,5120) 32.70 -> 31.24.
++small_m_table_entry_t const kSmallMTable[] = {
++    // GDN out_proj / attn o_proj: 80 x {128k,64n} tiles, 8-stage cp.async pipeline.
++    {5120, 6144, 8, {{128, 64, 128}, 80, 8}},
++    // GDN in_proj_qkvz: 128 x {64k,128n} tiles; leaves 60 SMs for the parallel in_proj_ba GEMV.
++    {16384, 5120, 8, {{64, 128, 128}, 128, 6}},
++    // attn qkv_proj: 112 x {64k,128n} tiles.
++    {14336, 5120, 8, {{64, 128, 128}, 112, 6}},
++};
++
++// TRTLLM_MARLIN_SMALLM_CFG="thread_k,thread_n,threads,blocks,stages" overrides every small-M call (tests and
++// sweeps). TRTLLM_MARLIN_SMALLM_TABLE=0 disables the table. Both read uncached on every call.
++bool get_small_m_launch(int prob_m, int prob_n, int prob_k, int sms, small_m_launch_t& out)
++{
++    char const* cfg = std::getenv("TRTLLM_MARLIN_SMALLM_CFG");
++    if (cfg != nullptr && cfg[0] != '\0')
++    {
++        small_m_launch_t o{{-1, -1, -1}, 0, 0};
++        if (std::sscanf(cfg, "%d,%d,%d,%d,%d", &o.th.thread_k, &o.th.thread_n, &o.th.num_threads, &o.blocks,
++                &o.stages)
++            == 5)
++        {
++            out = o;
++            return true;
++        }
++        return false;
++    }
++    char const* table = std::getenv("TRTLLM_MARLIN_SMALLM_TABLE");
++    if (table != nullptr && std::strcmp(table, "0") == 0)
++        return false;
++    if (sms != 188)
++        return false; // the table was swept on 188-SM parts only
++    for (auto const& e : kSmallMTable)
++    {
++        if (e.prob_n == prob_n && e.prob_k == prob_k && prob_m <= e.max_rows)
++        {
++            out = e.launch;
++            return true;
++        }
++    }
++    return false;
++}
++
+ exec_config_t determine_exec_config(int prob_m, int prob_n, int prob_k, int thread_m_blocks, bool m_block_size_8,
+     int num_bits, int group_size, int stages, int max_shared_mem, int sms)
+ {
+@@ -186,10 +260,30 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
+             }
+         }
+ 
++        // Small-M launch shape (per-(N,K) table or env override). Falls back to the default selection above
++        // when the requested shape is invalid or not instantiated.
++        int run_stages = stages;
++        int run_blocks = sms * exec_cfg.blocks_per_sm;
++        small_m_launch_t sm_launch;
++        if (thread_m_blocks == 1 && exec_cfg.blocks_per_sm == 1
++            && get_small_m_launch(prob_m_split, prob_n, prob_k, sms, sm_launch)
++            && sm_launch.blocks >= 1 && sm_launch.blocks <= sms
++            && is_valid_config(sm_launch.th, thread_m_blocks, prob_n, prob_k, num_bits, group_size, sm_launch.stages,
++                max_shared_mem - 512)
++            && get_marlin_kernel(thread_m_blocks, sm_launch.th.thread_n / 16, sm_launch.th.thread_k / 16,
++                   m_block_size_8, group_blocks, sm_launch.th.num_threads, sm_launch.stages)
++                != MarlinDefault)
++        {
++            thread_tfg = sm_launch.th;
++            exec_cfg = {1, thread_tfg};
++            run_stages = sm_launch.stages;
++            run_blocks = sm_launch.blocks;
++        }
++
+         int num_threads = thread_tfg.num_threads;
+         int thread_k = thread_tfg.thread_k;
+         int thread_n = thread_tfg.thread_n;
+-        int blocks = sms * exec_cfg.blocks_per_sm;
++        int blocks = run_blocks;
+         if (exec_cfg.blocks_per_sm > 1)
+             max_shared_mem_new = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+ 
+@@ -197,7 +291,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
+         int thread_n_blocks = thread_n / 16;
+ 
+         auto kernel = get_marlin_kernel(
+-            thread_m_blocks, thread_n_blocks, thread_k_blocks, m_block_size_8, group_blocks, num_threads, stages);
++            thread_m_blocks, thread_n_blocks, thread_k_blocks, m_block_size_8, group_blocks, num_threads, run_stages);
+ 
+         if (kernel == MarlinDefault)
+         {
+@@ -243,6 +337,9 @@ template __global__ void Marlin<nv_bfloat16, 128, 3, 4, 8, false, 4, 1>( MARLIN_
+ template __global__ void Marlin<nv_bfloat16, 256, 4, 16, 4, false, 4, 1>( MARLIN_KERNEL_PARAMS );
+ template __global__ void Marlin<nv_bfloat16, 128, 4, 8, 4, false, 4, 1>( MARLIN_KERNEL_PARAMS );
+ template __global__ void Marlin<nv_bfloat16, 128, 4, 4, 8, false, 4, 1>( MARLIN_KERNEL_PARAMS );
++// Small-M deeper-pipeline variants (rows <= 8) used by kSmallMTable.
++template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, true,  8, 1>( MARLIN_KERNEL_PARAMS );
++template __global__ void Marlin<nv_bfloat16, 128, 1, 8, 4, true,  6, 1>( MARLIN_KERNEL_PARAMS );
+ 
+ // clang-format on
+ 
+diff --git a/experiments/ascent/marlin_smallm/check.py b/experiments/ascent/marlin_smallm/check.py
+new file mode 100644
+index 000000000..f4605cfb7
+--- /dev/null
++++ b/experiments/ascent/marlin_smallm/check.py
+@@ -0,0 +1,126 @@
++# Correctness check for the dense Marlin NVFP4 small-M launch-shape table.
++#  A. Accuracy, rows 1-16 at every tabled shape: table output (default env) vs an independent
++#     FP32 reference of the dequantized NVFP4 operands; main's selection (TRTLLM_MARLIN_SMALLM_TABLE=0)
++#     on the same inputs gives the bar: max-abs and mean-abs <= main's + 1 BF16 ulp of the output
++#     magnitude (stricter than the protocol's 1.25x main + 1 ulp). Rows the table does not cover
++#     must be bitwise equal to main's selection. No NaN/Inf.
++#  B. Repeated execution, the timed loop's structure: C distinct copies in one CUDA graph,
++#     10 warmup + 50 replays; before every replay the graph's outputs are NaN-poisoned; after every
++#     replay all outputs must be bitwise equal to replay 1, and an eager call (rotating copy) made
++#     between replays must equal the first eager call of that copy and the graph output.
++#  C. Kill switch: TRTLLM_MARLIN_SMALLM_TABLE=0 is bitwise equal to the explicit main configuration
++#     (the default selection: 188 CTAs, 4 stages) forced through TRTLLM_MARLIN_SMALLM_CFG, and the
++#     cross-tree comparison with the base build is in the pair bench's output_hashes.
++#  D. Lock workspace: zeroed per call on this base (at::zeros), nothing persistent to check.
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import torch  # noqa: E402
++
++from common import SHAPES, err, gemm, log, make_copy, set_cfg  # noqa: E402
++
++TABLE_ROWS = int(os.environ.get("CHECK_TABLE_MAX_ROWS", "8"))
++MAIN_CFG = {(5120, 6144): "128,64,128,188,4", (16384, 5120): "128,128,256,188,4",
++            (14336, 5120): "128,128,256,188,4"}
++WARM, ITERS = 10, 50
++fails = []
++summary = dict()
++
++
++def check(cond, msg):
++    log(("PASS " if cond else "FAIL ") + msg)
++    if not cond:
++        fails.append(msg)
++
++
++def eq(a, b):
++    return bool(torch.equal(a.view(torch.int16), b.view(torch.int16)))
++
++
++for (n, k), C in SHAPES.items():
++    copies, refs = [], None
++    for i in range(C):
++        c, r = make_copy(n, k, 3000 + i, want_ref=(i == 0))
++        copies.append(c)
++        if r is not None:
++            refs = r
++    key = "%d,%d" % (n, k)
++    summary[key] = dict(subnormal_blocks=refs["n_sub"], rows=dict())
++    # ---------------- A + C
++    for m in range(1, 17):
++        g = torch.Generator(device="cuda").manual_seed(100 + m)
++        x = (torch.randn(m, k, generator=g, device="cuda")).to(torch.bfloat16)
++        ref = x.float() @ refs["w_ref"].t()
++        set_cfg(None)
++        y_t = gemm(x, copies[0], n, k)
++        set_cfg("main")
++        y_m = gemm(x, copies[0], n, k)
++        set_cfg(MAIN_CFG[(n, k)])
++        y_f = gemm(x, copies[0], n, k)
++        set_cfg(None)
++        et, em = err(y_t, ref), err(y_m, ref)
++        ulp = et["bf16_ulp"]
++        same = eq(y_t, y_m)
++        summary[key]["rows"][str(m)] = dict(table_max_abs=et["max_abs"], table_mean_abs=et["mean_abs"],
++                                            main_max_abs=em["max_abs"], main_mean_abs=em["mean_abs"],
++                                            bf16_ulp=ulp, bitwise_vs_main=same)
++        log("A (%d,%d) rows=%2d table max %.5f mean %.6f | main max %.5f mean %.6f | ulp %.4f | bitwise_vs_main %s" % (
++            n, k, m, et["max_abs"], et["mean_abs"], em["max_abs"], em["mean_abs"], ulp, same))
++        check(et["finite"], "A (%d,%d) rows=%d finite" % (n, k, m))
++        check(et["max_abs"] <= em["max_abs"] + ulp and et["mean_abs"] <= em["mean_abs"] + ulp,
++              "A (%d,%d) rows=%d table error <= main's + 1 BF16 ulp" % (n, k, m))
++        if m > TABLE_ROWS:
++            check(same, "A (%d,%d) rows=%d (outside the table) bitwise == main selection" % (n, k, m))
++        check(eq(y_m, y_f), "C (%d,%d) rows=%d TABLE=0 bitwise == explicit main config %s" % (
++            n, k, m, MAIN_CFG[(n, k)]))
++    # ---------------- B
++    for m in [1, 2, 3, 4, 8, 16]:
++        set_cfg(None)
++        g = torch.Generator(device="cuda").manual_seed(200 + m)
++        x = (torch.randn(m, k, generator=g, device="cuda")).to(torch.bfloat16)
++        eager0 = [gemm(x, c, n, k).clone() for c in copies]
++        s0 = torch.cuda.Stream()
++        s0.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(s0):
++            for _ in range(2):
++                o = [gemm(x, c, n, k) for c in copies]
++        torch.cuda.current_stream().wait_stream(s0)
++        torch.cuda.synchronize()
++        gr = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(gr):
++            outs = [gemm(x, c, n, k) for c in copies]
++        first, ndiff, n_eager_diff, nan_seen = None, 0, 0, 0
++        for it in range(WARM + ITERS):
++            for t in outs:
++                t.fill_(float("nan"))
++            gr.replay()
++            torch.cuda.synchronize()
++            cur = [t.clone() for t in outs]
++            nan_seen += sum(int(torch.isnan(t.float()).any().item()) for t in cur)
++            if first is None:
++                first = cur
++            for a, b, e in zip(cur, first, eager0):
++                if not (eq(a, b) and eq(a, e)):
++                    ndiff += 1
++            j = it % C
++            ye = gemm(x, copies[j], n, k)
++            if not eq(ye, eager0[j]):
++                n_eager_diff += 1
++        check(ndiff == 0 and n_eager_diff == 0 and nan_seen == 0,
++              "B (%d,%d) M=%d %d NaN-poisoned replays x %d copies bitwise == replay 1 == eager; interleaved eager "
++              "bitwise stable (replay diffs %d, eager diffs %d, NaN outputs %d)" % (
++                  n, k, m, WARM + ITERS, C, ndiff, n_eager_diff, nan_seen))
++        del gr, outs
++    del copies, refs
++    torch.cuda.empty_cache()
++
++print(json.dumps(dict(passed=not fails, failures=fails, summary=summary,
++                      compared_against="independent FP32 reference from the dequantized NVFP4 operands "
++                                       "(LUT E2M1 x E4M3 SF x g, subnormal-scale blocks flushed as Marlin does); "
++                                       "main's selection (TRTLLM_MARLIN_SMALLM_TABLE=0) on the same inputs; "
++                                       "explicit main config via TRTLLM_MARLIN_SMALLM_CFG",
++                      repeated_execution="15/6/7 distinct copies per shape in one CUDA graph, %d warmup + %d "
++                                         "NaN-poisoned replays per M in 1,2,3,4,8,16, interleaved eager calls" % (
++                                             WARM, ITERS))))
+diff --git a/experiments/ascent/marlin_smallm/common.py b/experiments/ascent/marlin_smallm/common.py
+new file mode 100644
+index 000000000..d8478b9e8
+--- /dev/null
++++ b/experiments/ascent/marlin_smallm/common.py
+@@ -0,0 +1,95 @@
++# Shared helpers for the dense Marlin NVFP4 small-M launch-shape sweep / checks.
++# Builds the same load-time NVFP4 W4A16 Marlin copies that linear.py's
++# _build_fp8_nvfp4_decode_copy builds from an FP8 per-tensor weight, plus an
++# independent FP32 reference from the dequantized NVFP4 operands.
++import os
++
++import torch
++
++from tensorrt_llm._torch.modules import linear as L
++
++dev = torch.device("cuda")
++LUT = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
++                   dtype=torch.float32, device=dev)
++
++# (N, K) -> number of distinct copies so that copies x bytes >= 256 MB (cold L2).
++SHAPES = {
++    (5120, 6144): 15,   # GDN out_proj x48 + attn o_proj x16, 17.7 MB each
++    (16384, 5120): 6,   # GDN in_proj_qkvz x48, 47.2 MB each
++    (14336, 5120): 7,   # attn qkv_proj x16, 41.3 MB each
++}
++
++
++def log(*a):
++    print(*a, flush=True)
++
++
++def nbytes(n, k):
++    return n * k // 2 + n * k // 16
++
++
++def make_copy(n, k, seed, want_ref=False):
++    g = torch.Generator(device=dev).manual_seed(seed)
++    w = torch.randn(n, k, generator=g, device=dev) * 0.02
++    w = w * (torch.rand(n, 1, generator=g, device=dev) * 1.5 + 0.25)
++    s = (w.abs().amax() / 448.0).float()
++    w8 = (w / s).to(torch.float8_e4m3fn)
++    del w
++    wv = w8.to(torch.bfloat16)
++    amax = wv.abs().amax().float() * s
++    gg = torch.exp2(torch.ceil(torch.log2(amax / 2688.0)))
++    fp4, sf = torch.ops.trtllm.fp4_quantize(wv, (s / gg).reshape(1), 16, False, True)
++    del wv
++    mw, ms_, mg = L._pack_nvfp4_weight_for_marlin(fp4, sf, gg.reshape(1).to(torch.float32), n, k, 16)
++    ref = None
++    if want_ref:
++        sf2 = torch.ops.trtllm.block_scale_interleave_reverse(sf.view(n, -1))[:, :k // 16].contiguous()
++        sb = sf2.view(torch.uint8)
++        pk = fp4.view(torch.uint8)
++        vals = torch.stack([LUT[(pk & 0xF).long()], LUT[(pk >> 4).long()]], -1).reshape(n, k)
++        w_deq = (vals.view(n, k // 16, 16) * sf2.view(torch.float8_e4m3fn).float().unsqueeze(-1)).reshape(n, k) * gg
++        # Marlin flushes blocks whose E4M3 scale is subnormal (see gdn_nvfp4/check.py).
++        sub_blk = (((sb & 0x78) == 0) & ((sb & 7) != 0))
++        w_ref = (w_deq.view(n, k // 16, 16) * (~sub_blk).unsqueeze(-1)).reshape(n, k)
++        ref = dict(w_ref=w_ref, n_sub=int(sub_blk.sum().item()))
++        del w_deq, vals
++    del fp4, sf, w8
++    return (mw, ms_, mg), ref
++
++
++def gemm(x, c, n, k):
++    return torch.ops.trtllm.marlin_nvfp4_gemm(x, c[0], scale_a=None, scale_b=c[1], alpha=None,
++                                              weight_global_scale=c[2], bias=None,
++                                              out_dtype=torch.bfloat16, size_n=n, size_k=k)
++
++
++def set_cfg(cfg, table="1"):
++    """cfg None -> no override; 'main' -> table off (main's selection)."""
++    os.environ.pop("TRTLLM_MARLIN_SMALLM_CFG", None)
++    os.environ["TRTLLM_MARLIN_SMALLM_TABLE"] = table
++    if cfg == "main":
++        os.environ["TRTLLM_MARLIN_SMALLM_TABLE"] = "0"
++    elif cfg is not None:
++        os.environ["TRTLLM_MARLIN_SMALLM_CFG"] = cfg
++
++
++def smem_ok(cfg, maxsmem):
++    tk, tn, thr, blocks, st = [int(v) for v in cfg.split(",")]
++    sh_a = st * 16 * tk * 2
++    sh_b = st * (tk * tn // 8) * 4
++    sh_red = 16 * (tn + 8) * 2
++    tmp = max(max(sh_b, sh_red), min(sh_b, sh_red) + tn * 2)
++    sh_s = (tk // 16) * tn * 2 * st
++    return tmp + sh_a + sh_s <= maxsmem - 512, tmp + sh_a + sh_s
++
++
++def max_smem():
++    p = torch.cuda.get_device_properties(0)
++    return int(getattr(p, "shared_memory_per_block_optin", 101376)), int(p.multi_processor_count)
++
++
++def err(out, ref):
++    d = (out.float() - ref).abs()
++    return dict(max_abs=d.max().item(), mean_abs=d.mean().item(),
++                bf16_ulp=(ref.abs().max() * 2 ** -8).item(),
++                finite=bool(torch.isfinite(out.float()).all().item()))
+diff --git a/experiments/ascent/marlin_smallm/fork.py b/experiments/ascent/marlin_smallm/fork.py
+new file mode 100644
+index 000000000..b46fa553b
+--- /dev/null
++++ b/experiments/ascent/marlin_smallm/fork.py
+@@ -0,0 +1,104 @@
++# GDN decode fork chain at (16384,5120): in_proj_qkvz on dense Marlin (main
++# stream) || in_proj_ba small-N Triton GEMV (N=96, aux stream), exactly as
++# GatedDeltaNet._compute_tokenwise_inputs runs it via maybe_execute_in_parallel
++# with multi-stream on (CUDA-graph decode). Pitfall 592: a Marlin grid/smem
++# change at this site changes whether the GEMV co-resides, so the fork must be
++# timed, not only the serial chain.
++# Per layer: elementwise predecessor (x * norm weight) -> fork -> join.
++# Cold L2: C=6 distinct qkvz copies (283 MB) + 6 in_proj_ba weights in one graph.
++# Arms (env, re-captured per arm, replayed alternately in one process):
++#   A = main selection (TRTLLM_MARLIN_SMALLM_TABLE=0), T* = small-M overrides.
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import torch  # noqa: E402
++
++from common import gemm, log, make_copy, set_cfg  # noqa: E402
++from tensorrt_llm._torch.modules.multi_stream_utils import (  # noqa: E402
++    maybe_execute_in_parallel, with_multi_stream)
++from tensorrt_llm._torch.modules.small_n_gemv import maybe_small_n_gemv  # noqa: E402
++
++N, K, NBA, C = 16384, 5120, 96, 6
++WARM, ITERS = 10, int(os.environ.get("FORK_ITERS", "100"))
++MS = [int(v) for v in os.environ.get("FORK_MS", "1,2,3,4").split(",")]
++# Job 450 (sweep build) ran FORK_ARMS="main;table;64,128,128,128,6;128,128,256,128,4;128,128,256,188,6".
++ARMS = os.environ.get("FORK_ARMS", "main;table").split(";")
++
++copies = [make_copy(N, K, 2000 + i)[0] for i in range(C)]
++g = torch.Generator(device="cuda").manual_seed(5)
++bas = [(torch.randn(NBA, K, generator=g, device="cuda") * 0.02).to(torch.bfloat16) for _ in range(C)]
++nws = [(1.0 + 0.1 * torch.randn(K, generator=g, device="cuda")).to(torch.bfloat16) for _ in range(C)]
++aux = torch.cuda.Stream()
++ev0, ev1 = torch.cuda.Event(), torch.cuda.Event()
++log("built", C, "qkvz copies; mem GB %.2f" % (torch.cuda.memory_allocated() / 1e9))
++
++
++def layer(x, i):
++    h = x * nws[i]
++    qkvz, ba = maybe_execute_in_parallel(lambda: gemm(h, copies[i], N, K),
++                                         lambda: maybe_small_n_gemv(h, bas[i]), ev0, ev1, aux)
++    return qkvz, ba
++
++
++def chain(x, fork):
++    outs = []
++    with with_multi_stream(fork):
++        for i in range(C):
++            outs.append(layer(x, i))
++    return outs
++
++
++res = dict()
++for m in MS:
++    x = (torch.randn(m, K, generator=g, device="cuda")).to(torch.bfloat16)
++    assert maybe_small_n_gemv(x, bas[0]) is not None, "in_proj_ba not routed to small_n_gemv"
++    graphs, outs = dict(), dict()
++    keys = []
++    for arm in ARMS:
++        for fork in (True, False):
++            key = "%s|%s" % (arm, "fork" if fork else "serial")
++            set_cfg(None if arm == "table" else arm)
++            s0 = torch.cuda.Stream()
++            s0.wait_stream(torch.cuda.current_stream())
++            with torch.cuda.stream(s0):
++                for _ in range(2):
++                    chain(x, False)
++            torch.cuda.current_stream().wait_stream(s0)
++            torch.cuda.synchronize()
++            gr = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(gr):
++                o = chain(x, fork)
++            graphs[key], outs[key] = gr, o
++            keys.append(key)
++    set_cfg("main")
++    for key in keys:
++        for _ in range(WARM):
++            graphs[key].replay()
++    torch.cuda.synchronize()
++    evs = dict((key, []) for key in keys)
++    for it in range(ITERS):
++        for key in (keys if it % 2 == 0 else keys[::-1]):
++            e0 = torch.cuda.Event(enable_timing=True)
++            e1 = torch.cuda.Event(enable_timing=True)
++            e0.record()
++            graphs[key].replay()
++            e1.record()
++            evs[key].append((e0, e1))
++    torch.cuda.synchronize()
++    mres = dict()
++    ref_key = "main|fork"
++    for key in keys:
++        t = sorted(e0.elapsed_time(e1) * 1e3 / C for e0, e1 in evs[key])
++        med, p10, p90 = t[len(t) // 2], t[len(t) // 10], t[(9 * len(t)) // 10]
++        same_ba = all(torch.equal(a[1], b[1]) for a, b in zip(outs[key], outs[ref_key]))
++        mres[key] = dict(us=med, p10=p10, p90=p90, ba_bitwise_vs_main=bool(same_ba))
++    for key in keys:
++        r = mres[key]
++        log("M=%d %-32s median %6.2f us/layer p10 %6.2f p90 %6.2f  d_vs_main_same_mode=%+6.2f" % (
++            m, key, r["us"], r["p10"], r["p90"],
++            r["us"] - mres["main|" + key.split("|")[1]]["us"]))
++    res[str(m)] = mres
++    del graphs, outs
++print(json.dumps(dict(fork=res, copies=C, warmup=WARM, iters=ITERS)))
+diff --git a/experiments/ascent/marlin_smallm/pair_bench.py b/experiments/ascent/marlin_smallm/pair_bench.py
+new file mode 100644
+index 000000000..d3f97582e
+--- /dev/null
++++ b/experiments/ascent/marlin_smallm/pair_bench.py
+@@ -0,0 +1,115 @@
++import os, sys, json
++import torch
++from tensorrt_llm._torch.modules import linear as L
++# Dense Marlin NVFP4 W4A16 decode GEMM, cold-L2 CUDA-graph pair bench (brace-free on purpose:
++# passed verbatim via python -c to the base and candidate trees).
++# Shapes (N,K,copies): GDN out_proj / attn o_proj (5120,6144) x15, GDN in_proj_qkvz (16384,5120) x6,
++# attn qkv_proj (14336,5120) x7: each graph replays C distinct copies (>= 256 MB, cold L2).
++# Two arms per tree, captured separately and replayed alternately in one process:
++#   default = this tree's selection; kill = TRTLLM_MARLIN_SMALLM_TABLE=0 (main's selection).
++# On the base tree both arms are main. Output hashes (all C outputs) let the candidate's kill arm
++# be compared bitwise with the base tree's default arm across the pair.
++SH = [(5120, 6144, 15), (16384, 5120, 6), (14336, 5120, 7)]
++MS = [1, 2, 4, 8]
++WARM, ITERS = 10, 100
++dev = torch.device("cuda")
++def log(*a):
++    print(*a, flush=True)
++def mk(n, k, seed):
++    g = torch.Generator(device=dev).manual_seed(seed)
++    w = torch.randn(n, k, generator=g, device=dev) * 0.02
++    w = w * (torch.rand(n, 1, generator=g, device=dev) * 1.5 + 0.25)
++    s = (w.abs().amax() / 448.0).float()
++    w8 = (w / s).to(torch.float8_e4m3fn)
++    del w
++    wv = w8.to(torch.bfloat16)
++    amax = wv.abs().amax().float() * s
++    gg = torch.exp2(torch.ceil(torch.log2(amax / 2688.0)))
++    fp4, sf = torch.ops.trtllm.fp4_quantize(wv, (s / gg).reshape(1), 16, False, True)
++    return L._pack_nvfp4_weight_for_marlin(fp4, sf, gg.reshape(1).to(torch.float32), n, k, 16)
++def gemm(x, c, n, k):
++    return torch.ops.trtllm.marlin_nvfp4_gemm(x, c[0], scale_a=None, scale_b=c[1], alpha=None,
++        weight_global_scale=c[2], bias=None, out_dtype=torch.bfloat16, size_n=n, size_k=k)
++def h(ts):
++    acc = 0
++    for t in ts:
++        v = t.contiguous().view(torch.int16).view(-1).to(torch.int64)
++        idx = torch.arange(v.numel(), device=v.device, dtype=torch.int64)
++        acc = (acc * 1000003 + int(((v + 40000) * (idx % 65521 + 1)).sum().item())) % (2 ** 61 - 1)
++    return str(acc)
++def setarm(arm):
++    os.environ.pop("TRTLLM_MARLIN_SMALLM_CFG", None)
++    if arm == "kill":
++        os.environ["TRTLLM_MARLIN_SMALLM_TABLE"] = "0"
++    else:
++        os.environ.pop("TRTLLM_MARLIN_SMALLM_TABLE", None)
++ARMS = ["default", "kill"]
++res = dict()
++hashes = dict()
++for n, k, C in SH:
++    copies = [mk(n, k, 1000 + i) for i in range(C)]
++    torch.cuda.synchronize()
++    nb = n * k // 2 + n * k // 16
++    log("shape", n, k, "copies", C, "MB/copy %.1f" % (nb / 1e6))
++    for m in MS:
++        g = torch.Generator(device=dev).manual_seed(7 + m)
++        x = torch.randn(m, k, generator=g, device=dev).to(torch.bfloat16)
++        graphs = dict()
++        outs = dict()
++        for arm in ARMS:
++            setarm(arm)
++            s0 = torch.cuda.Stream()
++            s0.wait_stream(torch.cuda.current_stream())
++            with torch.cuda.stream(s0):
++                for _ in range(2):
++                    o = [gemm(x, c, n, k) for c in copies]
++            torch.cuda.current_stream().wait_stream(s0)
++            torch.cuda.synchronize()
++            gr = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(gr):
++                o = [gemm(x, c, n, k) for c in copies]
++            graphs[arm] = gr
++            outs[arm] = o
++        setarm("default")
++        for arm in ARMS:
++            for _ in range(WARM):
++                graphs[arm].replay()
++        torch.cuda.synchronize()
++        evs = dict((arm, []) for arm in ARMS)
++        for it in range(ITERS):
++            for arm in (ARMS if it % 2 == 0 else ARMS[::-1]):
++                e0 = torch.cuda.Event(enable_timing=True)
++                e1 = torch.cuda.Event(enable_timing=True)
++                e0.record()
++                graphs[arm].replay()
++                e1.record()
++                evs[arm].append((e0, e1))
++        torch.cuda.synchronize()
++        for arm in ARMS:
++            t = sorted(e0.elapsed_time(e1) / C for e0, e1 in evs[arm])
++            med, p10, p90 = t[len(t) // 2], t[len(t) // 10], t[(9 * len(t)) // 10]
++            key = "%d,%d" % (n, k)
++            res.setdefault(arm, dict()).setdefault(key, dict())[str(m)] = dict(
++                kernel_ms=med, p10_ms=p10, p90_ms=p90, noise_floor=(p90 - p10) / med,
++                tb_s=nb / (med * 1e-3) / 1e12)
++            hashes.setdefault(arm, dict()).setdefault(key, dict())[str(m)] = h(outs[arm])
++        d = res["default"]["%d,%d" % (n, k)][str(m)]
++        kk = res["kill"]["%d,%d" % (n, k)][str(m)]
++        same = hashes["default"]["%d,%d" % (n, k)][str(m)] == hashes["kill"]["%d,%d" % (n, k)][str(m)]
++        log("(%d,%d) M=%d default %.2f us (p10 %.2f p90 %.2f) kill %.2f us (p10 %.2f p90 %.2f) d=%+.2f us outputs_equal=%s" % (
++            n, k, m, d["kernel_ms"] * 1e3, d["p10_ms"] * 1e3, d["p90_ms"] * 1e3, kk["kernel_ms"] * 1e3,
++            kk["p10_ms"] * 1e3, kk["p90_ms"] * 1e3, (d["kernel_ms"] - kk["kernel_ms"]) * 1e3, same))
++        del graphs, outs
++    del copies
++    torch.cuda.empty_cache()
++prim = res["default"]["5120,6144"]
++batch = dict((mm, dict(kernel_ms=prim[mm]["kernel_ms"], noise_floor=prim[mm]["noise_floor"], p90_ms=prim[mm]["p90_ms"])) for mm in prim)
++w = dict((("5120,6144", 64), ("16384,5120", 48), ("14336,5120", 16)))
++step = dict()
++for arm in ARMS:
++    step[arm] = dict((mm, sum(res[arm][key][mm]["kernel_ms"] * cnt for key, cnt in w.items())) for mm in prim)
++out = dict(batch=batch, primary_shape="(5120,6144) GDN out_proj + attn o_proj, us/call median over 100 graph replays of 15 cold copies",
++           shapes=res, output_hashes=hashes, per_step_marlin_ms_weighted_64_48_16=step, warmup=WARM, iters=ITERS)
++out["output"] = dict(class_note="see check job; kill arm bitwise vs base via output_hashes")
++out["output"]["class"] = "reordered"
++print(json.dumps(out))
+diff --git a/experiments/ascent/marlin_smallm/sweep.py b/experiments/ascent/marlin_smallm/sweep.py
+new file mode 100644
+index 000000000..f546b1420
+--- /dev/null
++++ b/experiments/ascent/marlin_smallm/sweep.py
+@@ -0,0 +1,124 @@
++# STEP 1 sweep: dense Marlin NVFP4 small-M launch shape (thread cfg x grid x stages)
++# for (5120,6144), (16384,5120), (14336,5120) at M=1,2,4.
++# Cold L2: each config's CUDA graph runs C distinct weight copies back to back
++# (>= 256 MB). All configs of one (shape, M) are captured, then replayed
++# alternately in one process; main's selection (TRTLLM_MARLIN_SMALLM_TABLE=0,
++# no override) is the in-process reference. Outputs of copy 0 are compared
++# bitwise with main's and against an FP32 reference of the dequantized operands.
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import torch  # noqa: E402
++
++from common import (SHAPES, err, gemm, log, make_copy, max_smem, nbytes,  # noqa: E402
++                    set_cfg, smem_ok)
++
++WARM, ITERS = 10, int(os.environ.get("SWEEP_ITERS", "80"))
++MS = [int(v) for v in os.environ.get("SWEEP_MS", "1,2,4").split(",")]
++
++CFGS = {
++    (5120, 6144): [
++        "128,64,128,188,8", "128,64,128,188,10",
++        "128,64,128,160,4", "128,64,128,160,6", "128,64,128,160,8", "128,64,128,160,10",
++        "128,64,128,80,8", "128,64,128,80,10",
++        "128,128,256,188,4", "128,128,256,188,6", "128,128,256,120,4", "128,128,256,120,6",
++        "128,128,256,160,6", "128,128,256,80,6",
++        "64,128,128,160,4", "64,128,128,160,8", "64,128,128,120,8", "64,128,128,80,8",
++        "64,128,128,188,8",
++    ],
++    (16384, 5120): [
++        "128,128,256,188,6", "128,128,256,128,4", "128,128,256,128,6",
++        "64,128,128,128,6", "64,128,128,128,8", "64,128,128,188,8", "64,128,128,188,4",
++    ],
++    (14336, 5120): [
++        "128,128,256,188,6", "128,128,256,112,4", "128,128,256,112,6",
++        "64,128,128,112,6", "64,128,128,112,8", "64,128,128,188,8", "64,128,128,188,4",
++    ],
++}
++
++only = os.environ.get("SWEEP_SHAPES")
++maxsm, sms = max_smem()
++log("device", torch.cuda.get_device_name(0), "sms", sms, "max smem optin", maxsm)
++result = dict()
++for (n, k), C in SHAPES.items():
++    if only and "%d,%d" % (n, k) not in only.split(";"):
++        continue
++    copies, refs = [], None
++    for i in range(C):
++        c, r = make_copy(n, k, 1000 + i, want_ref=(i == 0))
++        copies.append(c)
++        if r is not None:
++            refs = r
++    torch.cuda.synchronize()
++    log("shape", (n, k), "copies", C, "MB/copy %.1f" % (nbytes(n, k) / 1e6), "subnormal blocks", refs["n_sub"],
++        "mem GB %.2f" % (torch.cuda.memory_allocated() / 1e9))
++    cfgs = ["main"]
++    for cfg in CFGS[(n, k)]:
++        ok, sz = smem_ok(cfg, maxsm)
++        if not ok:
++            log("  skip (smem %d > %d)" % (sz, maxsm - 512), cfg)
++            continue
++        cfgs.append(cfg)
++    shape_res = dict()
++    for m in MS:
++        g = torch.Generator(device="cuda").manual_seed(7 + m)
++        x = (torch.randn(m, k, generator=g, device="cuda") * 1.0).to(torch.bfloat16)
++        ref = x.float() @ refs["w_ref"].t()
++        graphs, outs, eager = dict(), dict(), dict()
++        for cfg in cfgs:
++            set_cfg(cfg)
++            eager[cfg] = gemm(x, copies[0], n, k).clone()
++            s0 = torch.cuda.Stream()
++            s0.wait_stream(torch.cuda.current_stream())
++            with torch.cuda.stream(s0):
++                for _ in range(2):
++                    o = [gemm(x, c, n, k) for c in copies]
++            torch.cuda.current_stream().wait_stream(s0)
++            torch.cuda.synchronize()
++            gr = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(gr):
++                o = [gemm(x, c, n, k) for c in copies]
++            graphs[cfg] = gr
++            outs[cfg] = o
++        set_cfg("main")
++        for cfg in cfgs:
++            for _ in range(WARM):
++                graphs[cfg].replay()
++        torch.cuda.synchronize()
++        evs = dict((cfg, []) for cfg in cfgs)
++        for it in range(ITERS):
++            order = cfgs if it % 2 == 0 else cfgs[::-1]
++            for cfg in order:
++                e0 = torch.cuda.Event(enable_timing=True)
++                e1 = torch.cuda.Event(enable_timing=True)
++                e0.record()
++                graphs[cfg].replay()
++                e1.record()
++                evs[cfg].append((e0, e1))
++        torch.cuda.synchronize()
++        mres = dict()
++        for cfg in cfgs:
++            t = sorted(e0.elapsed_time(e1) * 1e3 / C for e0, e1 in evs[cfg])
++            med, p10, p90 = t[len(t) // 2], t[len(t) // 10], t[(9 * len(t)) // 10]
++            o0 = outs[cfg][0]
++            e = err(o0, ref)
++            mres[cfg] = dict(us=med, p10=p10, p90=p90, tbs=nbytes(n, k) / (med * 1e-6) / 1e12,
++                             bitwise_vs_main=bool(torch.equal(o0.view(torch.int16), outs["main"][0].view(torch.int16))),
++                             replay_eq_eager=bool(torch.equal(o0.view(torch.int16), eager[cfg].view(torch.int16))),
++                             max_abs=e["max_abs"], mean_abs=e["mean_abs"], ulp=e["bf16_ulp"], finite=e["finite"])
++        base = mres["main"]["us"]
++        for cfg in sorted(cfgs, key=lambda c: mres[c]["us"]):
++            r = mres[cfg]
++            log("  (%d,%d) M=%d %-20s median %6.2f us p10 %6.2f p90 %6.2f  %.3f TB/s  d=%+6.2f us  bitwise=%s "
++                "replay==eager=%s max_abs %.4g mean_abs %.4g (ulp %.3g)" % (
++                    n, k, m, cfg, r["us"], r["p10"], r["p90"], r["tbs"], r["us"] - base, r["bitwise_vs_main"],
++                    r["replay_eq_eager"], r["max_abs"], r["mean_abs"], r["ulp"]))
++        shape_res[str(m)] = mres
++        del graphs, outs
++        torch.cuda.synchronize()
++    result["%d,%d" % (n, k)] = shape_res
++    del copies, refs
++    torch.cuda.empty_cache()
++print(json.dumps(dict(sweep=result, warmup=WARM, iters=ITERS)))
