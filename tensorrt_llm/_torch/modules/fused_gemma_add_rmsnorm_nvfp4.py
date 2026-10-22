@@ -345,3 +345,72 @@ def _(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
     num_k_tiles = (h // _SF_VEC + 3) // 4
     return (x.new_empty((m, h // 2), dtype=torch.uint8),
             x.new_empty((m_pad * num_k_tiles * 4, ), dtype=torch.uint8))
+
+
+# ---------------------------------------------------------------------------
+# Decode-sized rows: FlashInfer CuTe-DSL gemma FusedAddRMSNorm (the stock
+# decode norm, 64 threads per row, 16-byte vectors) with an NVFP4 epilogue
+# (overlay module flashinfer/norm/kernels/fused_add_rmsnorm_nvfp4.py). The
+# Triton kernel above is latency-bound there (7.9 vs 4.1 us at M=1). Same
+# bitwise contract as above: residual, FP4 and swizzled SF (zeroed padding
+# rows) equal to gemma_fused_add_rmsnorm + fp4_quantize. x is not modified.
+# ---------------------------------------------------------------------------
+
+_FI_PDL: Optional[bool] = None
+
+
+def _flashinfer_pdl(device: torch.device) -> bool:
+    global _FI_PDL
+    if _FI_PDL is None:
+        from flashinfer.utils import device_support_pdl
+
+        from ..flashinfer_utils import get_env_enable_pdl
+        _FI_PDL = bool(get_env_enable_pdl()) and bool(
+            device_support_pdl(device))
+    return _FI_PDL
+
+
+def flashinfer_nvfp4_launch(x: torch.Tensor, residual: torch.Tensor,
+                            weight: torch.Tensor, eps: float,
+                            global_scale: torch.Tensor, fp4: torch.Tensor,
+                            sf: torch.Tensor) -> None:
+    from flashinfer.norm.kernels.fused_add_rmsnorm_nvfp4 import \
+        gemma_fused_add_rmsnorm_nvfp4_cute
+    gemma_fused_add_rmsnorm_nvfp4_cute(x,
+                                       residual,
+                                       weight,
+                                       global_scale,
+                                       eps,
+                                       enable_pdl=_flashinfer_pdl(x.device),
+                                       fp4_out=fp4,
+                                       sf_out=sf)
+
+
+@torch.library.custom_op("trtllm::flashinfer_gemma_fused_add_rmsnorm_nvfp4",
+                         mutates_args=("residual", ))
+def flashinfer_gemma_fused_add_rmsnorm_nvfp4(
+        x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+        eps: float,
+        global_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """residual += x (in place, BF16); returns NVFP4 (FP4 bytes [M, H/2],
+    swizzled E4M3 SF) of gemma_rmsnorm(residual) * (weight + 1). Decode
+    sizes; FlashInfer CuTe-DSL kernel."""
+    m, h = x.shape
+    fp4 = torch.empty((m, h // 2), dtype=torch.uint8, device=x.device)
+    m_pad = (m + 127) // 128 * 128
+    num_k_tiles = (h // _SF_VEC + 3) // 4
+    sf = torch.empty((m_pad * num_k_tiles * 4, ),
+                     dtype=torch.uint8,
+                     device=x.device)
+    flashinfer_nvfp4_launch(x, residual, weight, eps, global_scale, fp4, sf)
+    return fp4, sf
+
+
+@flashinfer_gemma_fused_add_rmsnorm_nvfp4.register_fake
+def _(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+      eps: float, global_scale: torch.Tensor):
+    m, h = x.shape
+    m_pad = (m + 127) // 128 * 128
+    num_k_tiles = (h // _SF_VEC + 3) // 4
+    return (x.new_empty((m, h // 2), dtype=torch.uint8),
+            x.new_empty((m_pad * num_k_tiles * 4, ), dtype=torch.uint8))
