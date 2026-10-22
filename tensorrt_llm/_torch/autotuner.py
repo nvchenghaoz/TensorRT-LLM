@@ -147,6 +147,10 @@ class TuningConfig:
             candidate order whose median is within (1 + tolerance) of the fastest is picked,
             so near-tied tactics do not flip between processes. Returning 0 (or no function)
             keeps the plain fastest-single-measurement pick.
+        near_tie_parent_fn (Callable): Optional; maps a near-tie profile's opt shapes to the
+            opt shapes of a "parent" profile tuned before it (e.g. the power-of-two bucket the
+            row count would otherwise use). If the parent's cached (runner, tactic) is inside
+            the near-tie band it is picked ahead of candidate order.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -157,6 +161,7 @@ class TuningConfig:
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
     near_tie_tolerance_fn: Callable = None
+    near_tie_parent_fn: Callable = None
 
 
 @dataclass(unsafe_hash=True)
@@ -1609,6 +1614,20 @@ class AutoTuner:
         fastest = min(med)
         pick = next(i for i, v in enumerate(med)
                     if v <= fastest * (1.0 + tie_tol))
+        # Prefer the parent profile's pick (tuned earlier: profiles run in
+        # ascending order) when it is inside the band.
+        if tuning_config.near_tie_parent_fn is not None:
+            parent_shapes = tuning_config.near_tie_parent_fn(
+                profile.get_opt_shapes())
+            if parent_shapes is not None:
+                hit, p_runner, p_tactic, _ = self.profiling_cache.search_cache(
+                    custom_op, [c[1] for c in candidates], parent_shapes,
+                    tuning_config,
+                    apply_map_to_tuning_buckets=False)
+                if hit and (p_runner, p_tactic) in order:
+                    pi = order.index((p_runner, p_tactic))
+                    if med[pi] <= fastest * (1.0 + tie_tol):
+                        pick = pi
         for i, (runner_id, tac) in enumerate(order):
             self._debug_logger(
                 f"[Autotuner] Candidate: custom_op={custom_op}, "

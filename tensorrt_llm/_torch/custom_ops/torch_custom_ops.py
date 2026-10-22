@@ -1339,6 +1339,17 @@ def _nvfp4_near_tie_tolerance(opt_shapes) -> float:
     return _NVFP4_MIXED_M_TIE_TOL if _nvfp4_mixed_m_bucket(m) == m else 0.0
 
 
+def _nvfp4_near_tie_parent(opt_shapes):
+    # Inside the near-tie band a mixed bucket keeps the tactic of the
+    # power-of-two bucket these rows used before (2080 -> 2048, 4128 -> 4096,
+    # 8191 -> 4096), so it only moves off that pick for a > band gain.
+    m = opt_shapes[0][0]
+    if _nvfp4_mixed_m_bucket(m) != m:
+        return None
+    parent = (last_positive_power_of_2(m), ) + tuple(opt_shapes[0][1:])
+    return (parent, ) + tuple(opt_shapes[1:])
+
+
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(
@@ -1350,6 +1361,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         # from DRAM in serving, so L2-warm timings mis-rank small-M tactics.
         use_cold_l2_cache=True,
         near_tie_tolerance_fn=_nvfp4_near_tie_tolerance,
+        near_tie_parent_fn=_nvfp4_near_tie_parent,
     )
 
     def __init__(self,
