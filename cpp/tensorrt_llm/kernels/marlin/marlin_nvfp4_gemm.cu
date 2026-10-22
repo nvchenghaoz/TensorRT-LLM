@@ -178,6 +178,73 @@ bool get_m16_launch(int prob_n, int prob_k, int sms, m16_launch_t& out)
     return false;
 }
 
+// Deeper-pipeline two-m-block (32-row) kernels (decode rows 17-32), see get_m32_launch.
+MarlinFuncPtr get_m32_kernel(thread_config_t const& th, int stages)
+{
+#define MARLIN_M32_IF(T, N, K, S)                                                                                      \
+    if (th.num_threads == (T) && th.thread_n == (N) * 16 && th.thread_k == (K) * 16 && stages == (S))                  \
+        return Marlin<nv_bfloat16, T, 2, N, K, false, S, 1>;
+    MARLIN_M32_IF(128, 8, 4, 4)
+    MARLIN_M32_IF(128, 8, 4, 6)
+    MARLIN_M32_IF(128, 8, 4, 8)
+    MARLIN_M32_IF(128, 4, 8, 4)
+    MARLIN_M32_IF(128, 4, 8, 6)
+    MARLIN_M32_IF(256, 16, 4, 4)
+    MARLIN_M32_IF(256, 16, 4, 6)
+#undef MARLIN_M32_IF
+    return MarlinDefault;
+}
+
+// Decode rows 17-32 (one 32-row m block, FP32 split-K reduce, workspace_mode 2) launch
+// shapes per (N, K), chosen by a cold-L2 CUDA-graph + PDL sweep on SM120 (RTX PRO 6000,
+// 188 SMs). Exact (N, K) match only. Without an entry, rows 17-32 keep the generic
+// launch (188 CTAs, 4 stages, kLargeBatchConfigs). Rows 17/24/32, us/call, generic -> table:
+//  - (5120, 6144) GDN out_proj / attn o_proj: 17.05/17.09/17.18 -> 16.54/16.63/16.71.
+//    160 CTAs = 2 stripes per 64-wide column, one FP32 reduce step through C_tmp.
+//  - (16384, 5120) GDN in_proj_qkvz: 41.6/41.8/42.0 -> 34.8/34.9/35.2. One full-K CTA per
+//    128-wide column (no reduce).
+//  - (14336, 5120) attn qkv_proj: 37.4/37.6/37.7 -> 32.9/33.0/33.3. One full-K CTA per
+//    128-wide column (no reduce).
+m16_table_entry_t const kM32Table[] = {
+    {5120, 6144, {{128, 64, 128}, 160, 4}},
+    {16384, 5120, {{64, 128, 128}, 128, 6}},
+    {14336, 5120, {{64, 128, 128}, 112, 6}},
+};
+
+// TRTLLM_MARLIN_M32_CFG="thread_k,thread_n,threads,blocks,stages" overrides every rows 17-32
+// FP32-reduce call (sweeps); TRTLLM_MARLIN_M32_TABLE=0 disables the table. Both are read per
+// call (uncached).
+bool get_m32_launch(int prob_n, int prob_k, int sms, m16_launch_t& out)
+{
+    char const* cfg = std::getenv("TRTLLM_MARLIN_M32_CFG");
+    if (cfg != nullptr && cfg[0] != '\0')
+    {
+        m16_launch_t o{{-1, -1, -1}, 0, 0};
+        if (std::sscanf(cfg, "%d,%d,%d,%d,%d", &o.th.thread_k, &o.th.thread_n, &o.th.num_threads, &o.blocks,
+                &o.stages)
+            == 5)
+        {
+            out = o;
+            return true;
+        }
+        return false;
+    }
+    char const* table = std::getenv("TRTLLM_MARLIN_M32_TABLE");
+    if (table != nullptr && table[0] == '0' && table[1] == '\0')
+        return false;
+    if (sms != 188)
+        return false;
+    for (auto const& e : kM32Table)
+    {
+        if (e.prob_n == prob_n && e.prob_k == prob_k)
+        {
+            out = e.launch;
+            return true;
+        }
+    }
+    return false;
+}
+
 exec_config_t determine_exec_config(int prob_m, int prob_n, int prob_k, int thread_m_blocks, bool m_block_size_8,
     int num_bits, int group_size, int stages, int max_shared_mem, int sms)
 {
@@ -383,6 +450,23 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
             grid = m16.blocks;
         }
 
+        // Decode rows 17-32 (one 32-row m block) with the FP32 split-K reduce: per-(N, K)
+        // thread config, grid and cp.async stages (kM32Table). grid == n_tiles streams one
+        // full-K column per CTA (no reduce); a larger grid splits each column into stripes
+        // that reduce in FP32 through C_tmp (one lock / C_tmp slot per column < sms).
+        m16_launch_t m32;
+        if (full_k_flags == 0 && !m_block_size_8 && thread_m_blocks == 2 && prob_m_split > 16 && group_blocks == 1
+            && exec_cfg.blocks_per_sm == 1 && use_fp32_reduce && get_m32_launch(prob_n, prob_k, sms, m32)
+            && m32.blocks >= 1 && m32.blocks <= sms
+            && is_valid_config(
+                m32.th, thread_m_blocks, prob_n, prob_k, num_bits, group_size, m32.stages, max_shared_mem_new - 512)
+            && get_m32_kernel(m32.th, m32.stages) != MarlinDefault)
+        {
+            kernel = get_m32_kernel(m32.th, m32.stages);
+            num_threads = m32.th.num_threads;
+            grid = m32.blocks;
+        }
+
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new);
 
         // The kernel starts with griddepcontrol.wait, so a PDL launch orders all of
@@ -439,6 +523,11 @@ template __global__ void Marlin<nv_bfloat16, 128, 1, 4, 8, false, 8, 1>( MARLIN_
 template __global__ void Marlin<nv_bfloat16, 128, 1, 8, 4, false, 6, 1>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 128, 1, 8, 4, false, 8, 1>( MARLIN_KERNEL_PARAMS );
 template __global__ void Marlin<nv_bfloat16, 256, 1, 8, 8, false, 6, 1>( MARLIN_KERNEL_PARAMS );
+// Decode rows 17-32 deeper-pipeline variants (get_m32_kernel).
+template __global__ void Marlin<nv_bfloat16, 128, 2, 8, 4, false, 6, 1>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<nv_bfloat16, 128, 2, 8, 4, false, 8, 1>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<nv_bfloat16, 128, 2, 4, 8, false, 6, 1>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<nv_bfloat16, 256, 2, 16, 4, false, 6, 1>( MARLIN_KERNEL_PARAMS );
 
 // clang-format on
 
