@@ -2493,6 +2493,10 @@ _FP8_NVFP4_DECODE_ROW_CAPS = {
     (5120, 6144): 32,
 }
 _FP8_NVFP4_DECODE_WIDE_ENV = "TRTLLM_FP8_NVFP4_DECODE_WIDE"
+# Rows above _FP8_NVFP4_DECODE_MAX_ROWS run Marlin with an FP32 split-K reduce
+# (marlin_nvfp4_gemm workspace_mode=2). Kill switch, read at weight load:
+# TRTLLM_FP8_NVFP4_DECODE_FP32_REDUCE=0 keeps the BF16 split-K chain.
+_FP8_NVFP4_DECODE_FP32_REDUCE_ENV = "TRTLLM_FP8_NVFP4_DECODE_FP32_REDUCE"
 
 
 def _fp8_nvfp4_decode_row_cap(module: Linear) -> int:
@@ -2644,6 +2648,8 @@ def _build_fp8_nvfp4_decode_copy(module: Linear) -> None:
     module._nvfp4_decode_scale = marlin_scale
     module._nvfp4_decode_global_scale = weight_global_scale
     module._nvfp4_decode_max_rows = _fp8_nvfp4_decode_row_cap(module)
+    if os.environ.get(_FP8_NVFP4_DECODE_FP32_REDUCE_ENV, "1") != "0":
+        module._marlin_fp32_reduce_min_rows = _FP8_NVFP4_DECODE_MAX_ROWS
 
 
 # Opt-in (TRTLLM_MARLIN_FORK_FRESH_WORKSPACE=1): Marlin decode calls that run
@@ -2659,7 +2665,15 @@ _MARLIN_FORK_FRESH_WORKSPACE_ENV = "TRTLLM_MARLIN_FORK_FRESH_WORKSPACE"
 
 def _marlin_workspace_mode(module: Linear, rows: int) -> int:
     min_rows = module.__dict__.get("_marlin_fresh_workspace_min_rows")
-    return 1 if min_rows is not None and rows >= min_rows else 0
+    if min_rows is not None and rows >= min_rows:
+        return 1
+    if rows > module.__dict__.get("_marlin_fp32_reduce_min_rows", 1 << 30):
+        # Rows above main's 16-row Marlin cap (per-(N, K) caps,
+        # _FP8_NVFP4_DECODE_ROW_CAPS): split-K partials reduce in FP32 and each
+        # output is rounded to BF16 once, as in the W4A4 GEMM these rows ran
+        # on before; rows <= 16 keep main's BF16 split-K chain (bitwise).
+        return 2
+    return 0
 
 
 def mark_marlin_fork_sites(model: torch.nn.Module) -> int:

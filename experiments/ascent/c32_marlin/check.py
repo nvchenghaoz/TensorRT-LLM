@@ -85,13 +85,19 @@ def make_lin(n, k, in_scale, split):
     return m
 
 
-def marlin(m, x):
+def marlin(m, x, mode=None):
+    if mode is None:  # the mode apply() passes for these rows
+        mode = L._marlin_workspace_mode(m, x.shape[0])
     return torch.ops.trtllm.marlin_nvfp4_gemm(
         x, m._nvfp4_decode_weight, scale_a=None,
         scale_b=m._nvfp4_decode_scale, alpha=None,
         weight_global_scale=m._nvfp4_decode_global_scale, bias=None,
         out_dtype=torch.bfloat16, size_n=m.out_features,
-        size_k=m.in_features)
+        size_k=m.in_features, workspace_mode=mode)
+
+
+def marlin_bf16_chain(m, x):
+    return marlin(m, x, 0)
 
 
 def gemv(m, x):
@@ -219,7 +225,9 @@ for sname, n, k, R, split in SHAPES:
         x = xs[M]
         ref = x.float() @ Wd.t()
         e = {}
-        for nm, f in (("marlin_w4a16", marlin), ("w4a4_main", w4a4)):
+        for nm, f in (("marlin_w4a16_fp32_reduce", marlin),
+                      ("marlin_w4a16_bf16_chain", marlin_bf16_chain),
+                      ("w4a4_main", w4a4)):
             d = f(m0, x).float() - ref
             e[nm] = {"rel_rms": float(d.norm() / ref.norm()),
                      "max_abs": float(d.abs().max())}
@@ -243,6 +251,16 @@ for sname, n, k, R, split in SHAPES:
             fail(f"kill {sname} M={M} {kres}")
     if kres["cap"] != 16:
         fail(f"kill cap {sname} {kres['cap']}")
+    if (n, k) in WIDE:
+        os.environ[L._FP8_NVFP4_DECODE_FP32_REDUCE_ENV] = "0"
+        mk2 = make_lin(n, k, s_in, split)
+        os.environ.pop(L._FP8_NVFP4_DECODE_FP32_REDUCE_ENV)
+        y = mk2(xs[32])
+        eq0 = bool(torch.equal(y, marlin(mk2, xs[32], 0)))
+        kres["fp32_reduce_off_M32_eq_bf16_chain"] = eq0
+        if not eq0:
+            fail(f"fp32 reduce kill {sname}")
+        del mk2
     res["kill"][sname] = kres
     log(sname, "kill switch", kres)
     del mods, mk, xs, Wd
