@@ -22,7 +22,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp8.h>
+#include <algorithm>
+#include <map>
 #include <torch/extension.h>
+#include <tuple>
 #include <unordered_map>
 
 using torch::Tensor;
@@ -191,6 +194,29 @@ public:
         return static_cast<int64_t>(num_algos);
     }
 
+    // Shape-stable identities of the heuristic algorithms for a given matrix shape, in heuristic order.
+    // An identity names the algorithm descriptor itself (hash of the opaque cublasLtMatmulAlgo_t, which
+    // cuBLASLt documents as trivially serializable), not its position in the list, so a tactic tuned at
+    // one M runs the same algorithm at another M (the heuristic list is re-queried, and may be reordered,
+    // per M). Identities are >= kAlgoIdFlag; runGemm still accepts positional indices below that.
+    std::vector<int64_t> getHeuristicAlgoIds(
+        at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale, at::Tensor const& mat2_scale)
+    {
+        int m = mat1.size(0);
+        int k = mat1.size(1) * 2;
+        int n = mat2.size(0);
+        auto& cache = getOrCreateAlgoCache(m, k, n, mat1.device(), mat1_scale, mat2_scale);
+        std::vector<int64_t> unique;
+        for (auto id : cache.ids)
+        {
+            if (std::find(unique.begin(), unique.end(), id) == unique.end())
+            {
+                unique.push_back(id);
+            }
+        }
+        return unique;
+    }
+
     // Run GEMM with specified tactic (-1 for default/best). Optional `bias`
     // is fused via CUBLASLT_EPILOGUE_BIAS.
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
@@ -215,7 +241,40 @@ public:
         bool has_algo = false;
         cublasLtMatmulAlgo_t const* algo_ptr = nullptr;
 
-        if (tactic >= 0 && tactic < static_cast<int64_t>(cache.heuristics.size()))
+        if (tactic >= kAlgoIdFlag)
+        {
+            // Shape-stable identity: the same algorithm descriptor the tuner profiled, whatever its position
+            // in this M's heuristic list.
+            for (size_t i = 0; i < cache.ids.size(); ++i)
+            {
+                if (cache.ids[i] == tactic)
+                {
+                    algo_ptr = &cache.heuristics[i].algo;
+                    has_algo = true;
+                    break;
+                }
+            }
+            if (!has_algo)
+            {
+                auto it = mAlgoById.find(tactic);
+                if (it != mAlgoById.end()
+                    && isAlgoValidForShape(m, k, n, mat1.device(), mat1_scale, mat2_scale, tactic, it->second))
+                {
+                    algo_ptr = &it->second;
+                    has_algo = true;
+                }
+                else if (!cache.heuristics.empty())
+                {
+                    TLLM_LOG_WARNING(
+                        "CublasLtFP4GemmRunner: algorithm id %ld unknown or invalid for shape (m=%d, n=%d, k=%d); "
+                        "using the first heuristic algorithm",
+                        tactic, m, n, k);
+                    algo_ptr = &cache.heuristics[0].algo;
+                    has_algo = true;
+                }
+            }
+        }
+        else if (tactic >= 0 && tactic < static_cast<int64_t>(cache.heuristics.size()))
         {
             // Use specified tactic
             algo_ptr = &cache.heuristics[tactic].algo;
@@ -258,8 +317,75 @@ private:
     struct AlgoCache
     {
         std::vector<cublasLtMatmulHeuristicResult_t> heuristics;
-        int64_t best_tactic = 0; // Index of the best algorithm
+        std::vector<int64_t> ids; // shape-stable identity of each heuristic entry
+        int64_t best_tactic = 0;  // Index of the best algorithm
     };
+
+    static constexpr int64_t kAlgoIdFlag = int64_t{1} << 62;
+
+    // FNV-1a over the algorithm's documented configuration attributes (not the raw descriptor bytes,
+    // which differ between processes for the same algorithm), mapped into [2^62, 2^63).
+    static int64_t algoIdentity(cublasLtMatmulAlgo_t const& algo)
+    {
+        static cublasLtMatmulAlgoConfigAttributes_t const kAttrs[] = {CUBLASLT_ALGO_CONFIG_ID,
+            CUBLASLT_ALGO_CONFIG_TILE_ID, CUBLASLT_ALGO_CONFIG_STAGES_ID, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+            CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
+            CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,
+            CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID};
+        uint64_t h = 1469598103934665603ULL;
+        auto mix = [&h](uint64_t v)
+        {
+            for (int b = 0; b < 8; ++b)
+            {
+                h ^= (v >> (8 * b)) & 0xFF;
+                h *= 1099511628211ULL;
+            }
+        };
+        for (auto attr : kAttrs)
+        {
+            uint64_t value = 0;
+            size_t needed = 0;
+            if (cublasLtMatmulAlgoConfigGetAttribute(&algo, attr, nullptr, 0, &needed) != CUBLAS_STATUS_SUCCESS
+                || needed == 0 || needed > sizeof(value)
+                || cublasLtMatmulAlgoConfigGetAttribute(&algo, attr, &value, needed, nullptr) != CUBLAS_STATUS_SUCCESS)
+            {
+                value = ~uint64_t{0}; // attribute unavailable in this cuBLASLt
+            }
+            mix(static_cast<uint64_t>(attr));
+            mix(value);
+        }
+        return static_cast<int64_t>((h & (static_cast<uint64_t>(kAlgoIdFlag) - 1)) | static_cast<uint64_t>(kAlgoIdFlag));
+    }
+
+    cudaDataType_t outCudaType() const
+    {
+        return mOutputDtype == at::ScalarType::Half
+            ? CUDA_R_16F
+            : (mOutputDtype == at::ScalarType::BFloat16 ? CUDA_R_16BF : CUDA_R_32F);
+    }
+
+    // cublasLtMatmulAlgoCheck of a registered algorithm on another shape, cached per (shape, id).
+    bool isAlgoValidForShape(int m, int k, int n, c10::Device device, at::Tensor const& mat1_scale,
+        at::Tensor const& mat2_scale, int64_t id, cublasLtMatmulAlgo_t const& algo) const
+    {
+        auto key = std::make_tuple(m, k, n, static_cast<int>(device.index()), id);
+        auto it = mAlgoValid.find(key);
+        if (it != mAlgoValid.end())
+        {
+            return it->second;
+        }
+        at::cuda::CUDAGuard deviceGuard(device);
+        auto cublasWrapper = std::make_shared<CublasMMWrapper>(getCublasHandle(), getCublasLtHandle(), nullptr, nullptr);
+        cublasWrapper->setFP4GemmConfig(outCudaType());
+        cublasWrapper->createDescriptors(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, k, k, n, 0);
+        void* a_sf_ptr = const_cast<void*>(reinterpret_cast<void const*>(mat1_scale.data_ptr()));
+        void* b_sf_ptr = const_cast<void*>(reinterpret_cast<void const*>(mat2_scale.data_ptr()));
+        cublasWrapper->setScaleDescriptors(a_sf_ptr, b_sf_ptr);
+        bool ok = cublasWrapper->checkTactic(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, k, k, n, algo);
+        cublasWrapper->destroyDescriptors();
+        mAlgoValid[key] = ok;
+        return ok;
+    }
 
     // Cache key: (m, k, n, device_id, output_dtype) for algorithm list storage
     // Different output dtypes may have different optimal algorithms
@@ -290,6 +416,9 @@ private:
     };
 
     mutable std::unordered_map<ShapeKey, AlgoCache, ShapeKeyHash> mAlgoCache;
+    // Every algorithm seen in any heuristic list, by identity.
+    mutable std::unordered_map<int64_t, cublasLtMatmulAlgo_t> mAlgoById;
+    mutable std::map<std::tuple<int, int, int, int, int64_t>, bool> mAlgoValid;
     at::ScalarType mOutputDtype;
 
     AlgoCache& getOrCreateAlgoCache(
@@ -338,7 +467,10 @@ private:
             {
                 if (h.state == CUBLAS_STATUS_SUCCESS && h.workspaceSize <= CUBLAS_WORKSPACE_SIZE)
                 {
-                    cache.heuristics.push_back(h);
+                    int64_t id = algoIdentity(h.algo);
+                    cache.heuristics.push_back(h); // positional list unchanged
+                    cache.ids.push_back(id);
+                    mAlgoById.emplace(id, h.algo); // first descriptor seen per identity
                 }
             }
 
@@ -464,5 +596,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::CublasLtFP4GemmRunner>("CublasLtFP4GemmRunner")
         .def(torch::init<at::ScalarType>())
         .def("run_gemm", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::runGemm)
-        .def("get_num_heuristic_algos", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::getNumHeuristicAlgos);
+        .def("get_num_heuristic_algos", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::getNumHeuristicAlgos)
+        .def("get_heuristic_algo_ids", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::getHeuristicAlgoIds);
 }
