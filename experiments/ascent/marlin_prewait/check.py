@@ -207,9 +207,13 @@ def _standin_producer(src, dst, n, delay_ns, BLOCK: tl.constexpr):
 
 
 def producer(src, dst):
+    # Few CTAs (<= 24 at 32 x 6144) so most SMs stay free for Marlin's CTAs: with a grid that covers every SM
+    # (e.g. 192 CTAs of 1024) a full-SM Marlin CTA cannot launch until the producer exits, and the negative
+    # control could not race.
     n = src.numel()
-    BLOCK = 1024
-    _standin_producer[(triton.cdiv(n, BLOCK),)](src, dst, n, DELAY_US * 1000, BLOCK=BLOCK, launch_pdl=True)
+    BLOCK = 8192
+    _standin_producer[(triton.cdiv(n, BLOCK),)](src, dst, n, DELAY_US * 1000, BLOCK=BLOCK, num_warps=8,
+                                                 launch_pdl=True)
 
 
 def main():
