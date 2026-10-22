@@ -51,7 +51,8 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_gemma_add_rmsnorm_nvfp4 import (
-    SUPPORTED_HIDDEN_SIZE as _GEMMA_NVFP4_HIDDEN, fused_gemma_add_rmsnorm_nvfp4)
+    SUPPORTED_HIDDEN_SIZE as _GEMMA_NVFP4_HIDDEN,
+    flashinfer_gemma_fused_add_rmsnorm_nvfp4, fused_gemma_add_rmsnorm_nvfp4)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
                               is_static_nvfp4_input_eligible)
@@ -538,6 +539,16 @@ def _post_attn_nvfp4_eligible(layer) -> bool:
 _POST_ATTN_NVFP4_MIN_ROWS = int(
     os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_MIN_ROWS", "2048"))
 
+# Decode rows 1.._POST_ATTN_NVFP4_DECODE_MAX_ROWS instead run FlashInfer's
+# CuTe-DSL gemma add+RMSNorm (main's decode norm) with an NVFP4 epilogue
+# (trtllm::flashinfer_gemma_fused_add_rmsnorm_nvfp4), bitwise-equal to that
+# norm + fp4_quantize; it drops one fp4_quantize launch per layer.
+# TRTLLM_GEMMA_NORM_NVFP4_DECODE=0 turns it off.
+_POST_ATTN_NVFP4_DECODE = os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_DECODE",
+                                         "1") != "0"
+_POST_ATTN_NVFP4_DECODE_MAX_ROWS = int(
+    os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_DECODE_MAX_ROWS", "32"))
+
 
 def _post_attention_norm(layer, hidden_states, residual, lora_params):
     """post_attention_layernorm; on the fused path its output is the gate_up
@@ -547,16 +558,23 @@ def _post_attention_norm(layer, hidden_states, residual, lora_params):
         ok = _post_attn_nvfp4_eligible(layer)
         layer._post_attn_nvfp4_ok = ok
     if (ok and not lora_params and hidden_states.dim() == 2
-            and hidden_states.shape[0] >= max(1, _POST_ATTN_NVFP4_MIN_ROWS)
             and hidden_states.dtype == torch.bfloat16
             and residual is not None and residual.shape == hidden_states.shape
             and residual.dtype == torch.bfloat16
             and hidden_states.is_contiguous() and residual.is_contiguous()):
+        rows = hidden_states.shape[0]
         norm = layer.post_attention_layernorm
-        fp4, sf = fused_gemma_add_rmsnorm_nvfp4(
-            hidden_states, residual, norm.weight, norm.variance_epsilon,
-            layer.mlp.mlp.gate_up_proj.input_scale)
-        return Fp4QuantizedTensor(fp4, sf), residual
+        if rows >= max(1, _POST_ATTN_NVFP4_MIN_ROWS):
+            fp4, sf = fused_gemma_add_rmsnorm_nvfp4(
+                hidden_states, residual, norm.weight, norm.variance_epsilon,
+                layer.mlp.mlp.gate_up_proj.input_scale)
+            return Fp4QuantizedTensor(fp4, sf), residual
+        if (_POST_ATTN_NVFP4_DECODE
+                and 0 < rows <= _POST_ATTN_NVFP4_DECODE_MAX_ROWS):
+            fp4, sf = flashinfer_gemma_fused_add_rmsnorm_nvfp4(
+                hidden_states, residual, norm.weight, norm.variance_epsilon,
+                layer.mlp.mlp.gate_up_proj.input_scale)
+            return Fp4QuantizedTensor(fp4, sf), residual
     return layer.post_attention_layernorm(hidden_states, residual)
 
 
