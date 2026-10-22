@@ -141,6 +141,12 @@ class TuningConfig:
         exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
             Use for JIT-driven ops where caching the tactic across processes would skip
             the JIT warmup. In-process cache still works.
+        near_tie_tolerance_fn (Callable): Optional; maps a profile's opt shapes to a relative
+            tolerance. When it returns > 0 for a profile, every tactic is timed in
+            ``NEAR_TIE_ROUNDS`` interleaved rounds (median per tactic) and the FIRST tactic in
+            candidate order whose median is within (1 + tolerance) of the fastest is picked,
+            so near-tied tactics do not flip between processes. Returning 0 (or no function)
+            keeps the plain fastest-single-measurement pick.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -150,6 +156,7 @@ class TuningConfig:
     use_cuda_graph: bool = True
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
+    near_tie_tolerance_fn: Callable = None
 
 
 @dataclass(unsafe_hash=True)
@@ -1414,6 +1421,17 @@ class AutoTuner:
                 f"time={(0.0 if best_runner_id is not None else float('inf')):.3f}ms"
             )
         else:
+            tie_tol = 0.0
+            if tuning_config.near_tie_tolerance_fn is not None:
+                tie_tol = float(
+                    tuning_config.near_tie_tolerance_fn(
+                        profile.get_opt_shapes()) or 0.0)
+            if tie_tol > 0:
+                (best_runner_id, best_tactic, min_time,
+                 has_tuning_failure_occurred) = self._profile_near_tie_stable(
+                     custom_op, candidates, input_tensors, profile,
+                     tuning_config, tie_tol, **kwargs)
+                candidates = []  # profiled above
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
                 valid_tactics = self._maybe_parallelize_tactics(
                     all_valid_tactics,
@@ -1510,6 +1528,96 @@ class AutoTuner:
             )
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
+
+    NEAR_TIE_ROUNDS = 5
+
+    def _profile_near_tie_stable(
+        self,
+        custom_op: str,
+        candidates: List[Tuple],
+        input_tensors: List[torch.Tensor],
+        profile: OptimizationProfile,
+        tuning_config: TuningConfig,
+        tie_tol: float,
+        **kwargs,
+    ) -> Tuple:
+        """Timed profile with a process-stable pick (see TuningConfig.near_tie_tolerance_fn).
+
+        Every (runner, tactic) is timed in NEAR_TIE_ROUNDS interleaved rounds; its time is the
+        median. The pick is the first pair in candidate order within (1 + tie_tol) of the
+        fastest median, so two processes agree unless a pair sits right at the band edge.
+        """
+        order, times = [], {}
+        has_failure = False
+        for rnd in range(self.NEAR_TIE_ROUNDS):
+            for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
+                valid_tactics = self._maybe_parallelize_tactics(
+                    all_valid_tactics,
+                    tuning_config.distributed_tuning_strategy)
+                if rnd == 0 and "do_preparation" in runner_arg_names and len(
+                        valid_tactics) > 0:
+                    runner(input_tensors,
+                           tactic=-1,
+                           do_preparation=True,
+                           **kwargs)
+                for tac in valid_tactics:
+                    if rnd == 0:
+                        order.append((runner_id, tac))
+                        idx = len(order) - 1
+                        times[idx] = []
+                    else:
+                        idx = order.index((runner_id, tac))
+                    if times[idx] and times[idx][0] == float('inf'):
+                        continue  # failed in round 0
+                    try:
+                        with nvtx_range(
+                                f"r{runner_id}, tactic {tac}, round {rnd}"):
+                            t = self._profile_single_kernel(
+                                runner=runner,
+                                inputs=input_tensors,
+                                tactic=tac,
+                                tuning_config=tuning_config,
+                                use_cuda_graph=tuning_config.use_cuda_graph,
+                                **kwargs,
+                            )
+                    except Exception as e:
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
+                        shapes = self._get_input_sizes(input_tensors)
+                        logger.warning_once(
+                            f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
+                            key=(custom_op, "warning_autotuning_profile_failure"),
+                        )
+                        self.stats.failed_profiling_count[custom_op].add(
+                            self.profiling_cache.get_cache_key(
+                                custom_op,
+                                runner,
+                                profile.get_opt_shapes(),
+                                tuning_config,
+                                apply_map_to_tuning_buckets=False))
+                        t = float('inf')
+                        has_failure = True
+                    times[idx].append(t)
+        med = []
+        for idx in range(len(order)):
+            ts = sorted(times[idx])
+            med.append(ts[len(ts) // 2] if ts else float('inf'))
+        if not med or min(med) == float('inf'):
+            return None, None, float('inf'), has_failure
+        fastest = min(med)
+        pick = next(i for i, v in enumerate(med)
+                    if v <= fastest * (1.0 + tie_tol))
+        for i, (runner_id, tac) in enumerate(order):
+            self._debug_logger(
+                f"[Autotuner] Candidate: custom_op={custom_op}, "
+                f"runner={candidates[runner_id][1]}, "
+                f"tactic={tac}, shapes={profile.get_opt_shapes()}, "
+                f"time={med[i]:.4f}ms (median of {len(times[i])}, near-tie band {tie_tol:.3f})"
+            )
+        best_runner_id, best_tactic = order[pick]
+        return best_runner_id, best_tactic, med[pick], has_failure
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
 

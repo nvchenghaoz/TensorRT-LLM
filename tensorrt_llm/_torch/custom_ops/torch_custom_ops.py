@@ -912,6 +912,7 @@ class CublasLtFP4GemmRunner(TunableRunner):
     Uses cuBLASLt's heuristic to discover and tune across multiple algorithms.
     """
     runner_dict = dict()
+    STABLE_ID_MIN_M = 1024
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, get_last_power_of_2_num_tokens_buckets,
         last_positive_power_of_2), ),
@@ -944,12 +945,23 @@ class CublasLtFP4GemmRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
-        """Get all valid tactics (algorithms) from cuBLASLt heuristic."""
+        """Get all valid tactics (algorithms) from cuBLASLt heuristic.
+
+        For M > STABLE_ID_MIN_M a tactic is the shape-stable identity of the
+        algorithm (heuristic order kept), not its position in the heuristic
+        list: the list is re-queried per actual M and can be reordered, so a
+        position tuned at the bucket M could name another algorithm at the
+        actual M. Smaller M (decode buckets) keep positional indices.
+        """
         mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
         # Pass actual scale tensors to avoid creating dummy tensors in C++
-        num_algos = self.cublaslt_runner.get_num_heuristic_algos(
-            mat1, mat2, mat1_scale, mat2_scale)
-        return list(range(num_algos))
+        if mat1.shape[0] <= self.STABLE_ID_MIN_M:
+            num_algos = self.cublaslt_runner.get_num_heuristic_algos(
+                mat1, mat2, mat1_scale, mat2_scale)
+            return list(range(num_algos))
+        return list(
+            self.cublaslt_runner.get_heuristic_algo_ids(mat1, mat2, mat1_scale,
+                                                        mat2_scale))
 
     def forward(
         self,
@@ -1272,17 +1284,72 @@ def _(
                              dtype=output_dtype)
 
 
+# Mixed prefill steps: prefill rows at or just under a power of two plus up to
+# 31 decode rows. Examples: 2048+g and 4096+g (one or two 2048-token chunks),
+# and 6144+2016+g = 8160+g (the 4th context is chunked down to fit
+# max_num_tokens 8192). Power-of-two buckets run these steps on another row
+# count's tactic: 2048+g runs the 2048 pick and 8160+g runs the 4096 pick.
+# That pick has a different wave shape (one more 128-row M-tile above p, half
+# the rows below p), and its ranking measurably differs (e.g. 4096+31: the
+# W4A4 GEMM sum is 7.7-9.3% slower than with the best tactics on SM120).
+# Rows in (p, p + 32] for p a power of two >= 2048 get a bucket profiled at
+# p + 32. Rows in [p - 32, p) for p >= 4096 get one profiled at p - 1. Each
+# bucket has the same 128- and 256-row tile counts as every row count it
+# serves. All other rows keep the power-of-two buckets.
+_NVFP4_MIXED_M_MIN_BASE = 2048
+_NVFP4_MIXED_M_BAND = 32
+# Near-tie band for the mixed buckets: the first tactic in candidate order
+# within 3% of the fastest (median of interleaved rounds) is picked, so fresh
+# processes agree on the tactic (a 1% band still flipped between processes).
+_NVFP4_MIXED_M_TIE_TOL = 0.03
+
+
+def _nvfp4_mixed_m_bucket(m: int) -> Optional[int]:
+    if m <= _NVFP4_MIXED_M_MIN_BASE:
+        return None
+    hi = next_positive_power_of_2(m)
+    if hi != m and hi >= 2 * _NVFP4_MIXED_M_MIN_BASE \
+            and hi - m <= _NVFP4_MIXED_M_BAND:
+        return hi - 1
+    lo = last_positive_power_of_2(m - 1)
+    if m - lo <= _NVFP4_MIXED_M_BAND:
+        return lo + _NVFP4_MIXED_M_BAND
+    return None
+
+
+def _nvfp4_gen_m_buckets(max_num_tokens: int) -> Tuple[int, ...]:
+    buckets = set(get_last_power_of_2_num_tokens_buckets(max_num_tokens))
+    p = _NVFP4_MIXED_M_MIN_BASE
+    while p - _NVFP4_MIXED_M_BAND <= max_num_tokens:
+        if p >= 2 * _NVFP4_MIXED_M_MIN_BASE:
+            buckets.add(p - 1)
+        if p < max_num_tokens:
+            buckets.add(p + _NVFP4_MIXED_M_BAND)
+        p *= 2
+    return tuple(sorted(buckets))
+
+
+def _nvfp4_map_m(m: int) -> int:
+    mixed = _nvfp4_mixed_m_bucket(m)
+    return mixed if mixed is not None else last_positive_power_of_2(m)
+
+
+def _nvfp4_near_tie_tolerance(opt_shapes) -> float:
+    m = opt_shapes[0][0]
+    return _NVFP4_MIXED_M_TIE_TOL if _nvfp4_mixed_m_bucket(m) == m else 0.0
+
+
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2), ),
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, _nvfp4_gen_m_buckets,
+                                                _nvfp4_map_m), ),
         constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
         # Profile with rotated input copies (cold L2): decode weights stream
         # from DRAM in serving, so L2-warm timings mis-rank small-M tactics.
         use_cold_l2_cache=True,
+        near_tie_tolerance_fn=_nvfp4_near_tie_tolerance,
     )
 
     def __init__(self,
