@@ -253,7 +253,7 @@ def kernels(fn):
 KILL = len(sys.argv) > 1 and sys.argv[1] == "--kill"
 g_layer = G(3000)
 a_layer = A(4000)
-GM = [8, 16, 17, 31, 32, 64, 2048, 2079, 8223]
+GM = [8, 16, 17, 31, 32, 33, 64, 2048, 2079, 8223]
 AM = [8, 16, 17, 32, 33, 2016, 2048, 8192]
 hashes = dict()
 log("== module chains (kill=%s) ==" % KILL)
@@ -400,6 +400,29 @@ except AssertionError:
 if not refused:
     fails.append("Fp4QuantizedTensor at rows 8 was not refused")
 log("Fp4QuantizedTensor at rows<=16 refused:", refused)
+
+# ---------------------------- 7. routing helper honours a per-module decode cap
+# (as linear.fp8_nvfp4_decode_max_rows on main 7f09143a: Marlin up to the cap).
+import tensorrt_llm._torch.modules.linear as _linear_mod  # noqa: E402
+
+had = hasattr(_linear_mod, "fp8_nvfp4_decode_max_rows")
+saved = getattr(_linear_mod, "fp8_nvfp4_decode_max_rows", None)
+_linear_mod.fp8_nvfp4_decode_max_rows = lambda module: 32
+fpn._decode_max_rows_fn = None
+lin.__dict__["_nvfp4_decode_weight"] = torch.empty(1, device=dev)
+route = dict((r, fpn.uses_prefill_nvfp4_copy(lin, r) is not None) for r in [16, 17, 32, 33, 2048])
+del lin.__dict__["_nvfp4_decode_weight"]
+route_nodec = dict((r, fpn.uses_prefill_nvfp4_copy(lin, r) is not None) for r in [16, 17, 32, 33])
+if had:
+    _linear_mod.fp8_nvfp4_decode_max_rows = saved
+else:
+    del _linear_mod.fp8_nvfp4_decode_max_rows
+fpn._decode_max_rows_fn = None
+exp = {16: False, 17: False, 32: False, 33: True, 2048: True}
+exp_nodec = {16: False, 17: True, 32: True, 33: True}
+if route != exp or route_nodec != exp_nodec:
+    fails.append("routing helper with cap 32: %s / %s" % (route, route_nodec))
+log("helper with decode cap 32 (decode copy):", route, "(no decode copy):", route_nodec)
 
 # ------------------------------------------------------ 5. kill switch process
 env = dict(os.environ)

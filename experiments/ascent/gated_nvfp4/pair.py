@@ -30,7 +30,7 @@ CONV = QKVZ - VD
 AH, AD = 24, 256
 EPS = 1e-6
 WARM, ITERS = 10, 60
-MS = [int(v) for v in os.environ.get("BENCH_MS", "32,2048,8192").split(",")]
+MS = [int(v) for v in os.environ.get("BENCH_MS", "32,33,2048,8192").split(",")]
 PATTERN = ["G", "G", "G", "A"] * 6
 dev = torch.device("cuda")
 
