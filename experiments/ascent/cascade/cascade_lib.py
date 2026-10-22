@@ -80,6 +80,8 @@ class Kernels:
         self.has_cascade_args = self.prefix is not None
         if self.prefix is not None:
             self.psmem = self._global_u32(b"prefixSmemSize")
+            err = cu.cuModuleGetGlobal(self.mod, b"prefixCtaSize")[0]
+            self.pcta = self._global_u32(b"prefixCtaSize") if int(err) == 0 else 128
             ck(cu.cuFuncSetAttribute(self.prefix, A.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, self.psmem),
                "attr prefix")
             self.pregs = ck(cu.cuFuncGetAttribute(A.CU_FUNC_ATTRIBUTE_NUM_REGS, self.prefix), "pregs")
@@ -140,7 +142,8 @@ class Call:
 
     def launch(self):
         if self.cascade:
-            Kernels._launch(self.kern.prefix, (self.c, self.g, NB_K), (128, 1, 1), self.kern.psmem, self.pfx_args)
+            Kernels._launch(self.kern.prefix, (self.c, self.g, NB_K), (self.kern.pcta, 1, 1), self.kern.psmem,
+                            self.pfx_args)
         Kernels._launch(self.kern.mha, (self.m, NB_K, self.b), (128, 1, 2), self.kern.smem, self.mha_args)
 
     def capture(self):

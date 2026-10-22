@@ -640,7 +640,7 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
                         &launchParams.batch_size,
                         &launchParams.kv_scale_quant_orig, &nbSubSeqMha, &prefixInfo, &prefixScratch, nullptr};
                     cubinObj->launchPrefix(
-                        dim3{static_cast<uint32_t>(chunks), nbRowGrps, nbKVHeads}, dim3{128, 1, 1}, stream, prefixParams);
+                        dim3{static_cast<uint32_t>(chunks), nbRowGrps, nbKVHeads}, stream, prefixParams);
                     sync_check_cuda_error(stream);
                 }
             }

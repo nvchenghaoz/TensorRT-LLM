@@ -85,7 +85,7 @@ def main():
             pf = cl.Call(kern, inp, b, m, cascade=True)
             g1 = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g1):
-                cl.Kernels._launch(kern.prefix, (pf.c, pf.g, cl.NB_K), (128, 1, 1), kern.psmem, pf.pfx_args)
+                cl.Kernels._launch(kern.prefix, (pf.c, pf.g, cl.NB_K), (kern.pcta, 1, 1), kern.psmem, pf.pfx_args)
             pf.graph = g1
             d["prefix_only_us"] = time_graph(pf, flush, a, f"prefix B={b}")["kernel_ms"] * 1e3
             g2 = torch.cuda.CUDAGraph()

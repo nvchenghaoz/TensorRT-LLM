@@ -3005,12 +3005,16 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMP
 #if XQA_CASCADE_PREFIX
 namespace cascade
 {
-constexpr uint32_t nbWarps = 4;
-constexpr uint32_t ctaRows = nbWarps * 16;            // rows = (request, q head in group) pairs
+constexpr uint32_t nbRowWarps = 4;                    // each owns 16 rows
+constexpr uint32_t nbTokSplit = 2;                    // warps per row block, each on its own half of every tile
+constexpr uint32_t nbWarps = nbRowWarps * nbTokSplit;
+constexpr uint32_t ctaThreads = nbWarps * 32;
+constexpr uint32_t ctaRows = nbRowWarps * 16;         // rows = (request, q head in group) pairs
 constexpr uint32_t tokTile = 64;                      // tokens per pipeline stage
+constexpr uint32_t warpToks = tokTile / nbTokSplit;   // 32
 constexpr uint32_t cacheHeadBytes = 256;              // e4m3 head of 256 elements
-constexpr uint32_t qRowBytes = 256 * 2 + 16;          // padded BF16 Q row (conflict-free 8-byte fragment loads)
-constexpr uint32_t qBytes = ctaRows * qRowBytes;      // 33792
+constexpr uint32_t qRowBytes = 256 * 2 + 32;          // padded BF16 Q row (conflict-free 8-byte fragment loads)
+constexpr uint32_t qBytes = ctaRows * qRowBytes;      // 34816
 constexpr uint32_t kvTileBytes = tokTile * cacheHeadBytes; // 16384
 constexpr uint32_t kOffset = qBytes;
 constexpr uint32_t vOffset = kOffset + 2 * kvTileBytes;
@@ -3019,6 +3023,10 @@ constexpr uint32_t smemBytes = miscOffset + 64;
 static_assert(tokensPerPage <= tokTile && tokTile % tokensPerPage == 0 && 256 % tokTile == 0);
 static_assert(sizeof(GMemCacheHead) == cacheHeadBytes && sizeof(IOHead) == 512);
 static_assert(gemm1WarpsPerGrp == 4 && gemm1NbWarpGrps == 1 && SharedMem::XSmemBuffer::cols == 8);
+// end-of-kernel exchange of the second token-half warps' state: [rowWarp][128 O + 2 max + 2 sum][lane] floats
+constexpr uint32_t xchgFloats = 132;
+static_assert(nbRowWarps * xchgFloats * 32 * sizeof(float) <= miscOffset);
+constexpr uint32_t kvGrainsPerThread = kvTileBytes / grainBytes / ctaThreads; // 4
 
 __device__ inline void cpAsync16(uint32_t dst, void const* src)
 {
@@ -3075,8 +3083,9 @@ __device__ inline uint32_t packBf16(float x, float y, float& sum)
 } // namespace cascade
 
 CUBIN_EXPORT __device__ constexpr uint32_t prefixSmemSize = cascade::smemBytes;
+CUBIN_EXPORT __device__ constexpr uint32_t prefixCtaSize = cascade::ctaThreads;
 
-CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_t const nbKHeads, float const qScale,
+CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mha_prefix(uint32_t const nbKHeads, float const qScale,
     IOHead const* __restrict__ const q, KVCacheList<usePagedKVCache> const cacheList, uint32_t const batchSize,
     float const* __restrict__ kvCacheScale, uint32_t const nbSubSeqMha, uint32_t* __restrict__ const cascadeInfo,
     void* __restrict__ const scratch)
@@ -3169,29 +3178,46 @@ CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_
 
     uint8_t const* const poolBytes = reinterpret_cast<uint8_t const*>(cacheList.pool);
     uint32_t const smemBase = static_cast<uint32_t>(__cvta_generic_to_shared(pfxSmem));
-    // K and V of 64 prefix tokens (request 0's pages) -> smem, 16-byte grain c of token t at grain c ^ (t % 8).
-    auto const loadKV = [&](uint32_t sub, uint32_t buf)
+    // K and V of 64 prefix tokens (request 0's pages) -> smem, 16-byte grain c of token t at grain c ^ (t % 8). The
+    // page indices of a tile are fetched one tile ahead, so the cp.async issue does not wait on them.
+    uint32_t const ldTok0 = tid / 16;
+    uint32_t const ldGrain = tid % 16;
+    uint32_t pgK[kvGrainsPerThread];
+    uint32_t pgV[kvGrainsPerThread];
+    auto const fetchPages = [&](uint32_t sub)
     {
 #pragma unroll
-        for (uint32_t i = 0; i < kvTileBytes / grainBytes / 128; i++)
+        for (uint32_t i = 0; i < kvGrainsPerThread; i++)
         {
-            uint32_t const idx = tid + 128 * i;
-            uint32_t const tok = idx / 16;
-            uint32_t const grain = idx % 16;
-            uint32_t const tokAbs = tokTile * sub + tok;
-            uint32_t const page = tokAbs / tokensPerPage;
-            uint32_t const dstOff = tok * cacheHeadBytes + ((grain ^ (tok % 8)) * grainBytes);
-            uint64_t const kHead
-                = (uint64_t(uint32_t(kPage(0, page))) * nbKHeads + idxHeadGrp) * tokensPerPage + tokAbs % tokensPerPage;
-            uint64_t const vHead
-                = (uint64_t(uint32_t(vPage(0, page))) * nbKHeads + idxHeadGrp) * tokensPerPage + tokAbs % tokensPerPage;
-            cpAsync16(smemBase + kOffset + buf * kvTileBytes + dstOff, poolBytes + kHead * cacheHeadBytes + grain * 16);
-            cpAsync16(smemBase + vOffset + buf * kvTileBytes + dstOff, poolBytes + vHead * cacheHeadBytes + grain * 16);
+            uint32_t const page = (tokTile * sub + ldTok0 + 16 * i) / tokensPerPage;
+            pgK[i] = uint32_t(kPage(0, page));
+            pgV[i] = uint32_t(vPage(0, page));
+        }
+    };
+    auto const issueKV = [&](uint32_t sub, uint32_t buf)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < kvGrainsPerThread; i++)
+        {
+            uint32_t const tok = ldTok0 + 16 * i;
+            uint32_t const inPage = (tokTile * sub + tok) % tokensPerPage;
+            uint32_t const dstOff = tok * cacheHeadBytes + ((ldGrain ^ (tok % 8)) * grainBytes);
+            uint64_t const kHead = (uint64_t(pgK[i]) * nbKHeads + idxHeadGrp) * tokensPerPage + inPage;
+            uint64_t const vHead = (uint64_t(pgV[i]) * nbKHeads + idxHeadGrp) * tokensPerPage + inPage;
+            cpAsync16(smemBase + kOffset + buf * kvTileBytes + dstOff,
+                poolBytes + kHead * cacheHeadBytes + ldGrain * grainBytes);
+            cpAsync16(smemBase + vOffset + buf * kvTileBytes + dstOff,
+                poolBytes + vHead * cacheHeadBytes + ldGrain * grainBytes);
         }
     };
     if (subBeg < subEnd)
     {
-        loadKV(subBeg, 0);
+        fetchPages(subBeg);
+        issueKV(subBeg, 0);
+        if (subBeg + 1 < subEnd)
+        {
+            fetchPages(subBeg + 1);
+        }
     }
     cpAsyncCommit();
 
@@ -3200,9 +3226,9 @@ CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_
     uint32_t const nbQHeads = nbKHeads * headGrpSize;
     uint32_t const nbRows = batchSize * headGrpSize;
 #pragma unroll 4
-    for (uint32_t i = 0; i < ctaRows * 32 / 128; i++)
+    for (uint32_t i = 0; i < ctaRows * 32 / ctaThreads; i++)
     {
-        uint32_t const idx = tid + 128 * i;
+        uint32_t const idx = tid + ctaThreads * i;
         uint32_t const row = idx / 32;
         uint32_t const grain = idx % 32;
         uint32_t const rho = ctaRows * idxRowGrp + row;
@@ -3216,8 +3242,11 @@ CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_
         *reinterpret_cast<LdGrain*>(pfxSmem + row * qRowBytes + grain * grainBytes) = v;
     }
 
-    // 3. Flash attention over the chunk, one warp per 16 rows.
-    uint32_t const rowBase = ctaRows * idxRowGrp + 16 * warpRank;
+    // 3. Flash attention over the chunk. Warp (rowWarp, tokHalf) owns 16 rows and tokens [32 tokHalf, 32 tokHalf + 32)
+    // of every 64-token tile; the two halves are merged at the end.
+    uint32_t const rowWarp = warpRank % nbRowWarps;
+    uint32_t const tokHalf = warpRank / nbRowWarps;
+    uint32_t const rowBase = ctaRows * idxRowGrp + 16 * rowWarp;
     bool const warpActive = rowBase < nbRows;
     uint32_t const g = lane / 4;
     uint32_t const t = lane % 4;
@@ -3234,29 +3263,34 @@ CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_
     }
     float rowMax[2] = {safeInitRowMax, safeInitRowMax};
     float rowSum[2] = {0.F, 0.F}; // per-thread partial sums of the rounded probabilities
-    uint32_t const qAddr0 = smemBase + (16 * warpRank + g) * qRowBytes + 8 * t;
+    uint32_t const qAddr0 = smemBase + (16 * rowWarp + g) * qRowBytes + 8 * t;
     uint32_t const qAddr1 = qAddr0 + 8 * qRowBytes;
     uint32_t const ldRow = lane % 8;
     uint32_t const ldMat = lane / 8;
+    constexpr uint32_t nbSTiles = warpToks / 8; // 4 n-tiles of 8 keys
     for (uint32_t sub = subBeg; sub < subEnd; sub++)
     {
         uint32_t const buf = (sub - subBeg) & 1U;
         if (sub + 1 < subEnd)
         {
-            loadKV(sub + 1, buf ^ 1U);
+            issueKV(sub + 1, buf ^ 1U);
+            if (sub + 2 < subEnd)
+            {
+                fetchPages(sub + 2);
+            }
         }
         cpAsyncCommit();
         cpAsyncWait<1>();
         __syncthreads();
         if (warpActive)
         {
-            uint32_t const kBase = smemBase + kOffset + buf * kvTileBytes;
-            uint32_t const vBase = smemBase + vOffset + buf * kvTileBytes;
+            uint32_t const kBase = smemBase + kOffset + buf * kvTileBytes + warpToks * tokHalf * cacheHeadBytes;
+            uint32_t const vBase = smemBase + vOffset + buf * kvTileBytes + warpToks * tokHalf * cacheHeadBytes;
             // S = Q K^T. Within each 16-element k step the head dims are permuted identically for Q and K: a lane's
             // fragment holds physical dims 4t..4t+3 (one e4m3 word of K, as ldmatrix delivers it).
-            float s[8][4];
+            float s[nbSTiles][4];
 #pragma unroll
-            for (uint32_t j = 0; j < 8; j++)
+            for (uint32_t j = 0; j < nbSTiles; j++)
             {
 #pragma unroll
                 for (uint32_t e = 0; e < 4; e++)
@@ -3276,7 +3310,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_
                     lds64(qa[kk][1], qa[kk][3], qAddr1 + kOff);
                 }
 #pragma unroll
-                for (uint32_t j = 0; j < 8; j++)
+                for (uint32_t j = 0; j < nbSTiles; j++)
                 {
                     uint32_t kr[4];
                     ldsm4(kr, kBase + (8 * j + ldRow) * cacheHeadBytes + (((4 * kg + ldMat) ^ ldRow) * grainBytes));
@@ -3291,7 +3325,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_
             // online softmax (base-2 exponent of the scaled logits, like kernel_mha)
             float tileMax[2] = {rowMax[0], rowMax[1]};
 #pragma unroll
-            for (uint32_t j = 0; j < 8; j++)
+            for (uint32_t j = 0; j < nbSTiles; j++)
             {
 #pragma unroll
                 for (uint32_t e = 0; e < 4; e++)
@@ -3316,10 +3350,10 @@ CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_
                 rowMax[i] = tileMax[i];
                 bias[i] = tileMax[i] * log2e;
             }
-            uint32_t p[8][2];
+            uint32_t p[nbSTiles][2];
             float pSum[2] = {0.F, 0.F};
 #pragma unroll
-            for (uint32_t j = 0; j < 8; j++)
+            for (uint32_t j = 0; j < nbSTiles; j++)
             {
                 p[j][0] = packBf16(exp2f(s[j][0] * log2e - bias[0]), exp2f(s[j][1] * log2e - bias[0]), pSum[0]);
                 p[j][1] = packBf16(exp2f(s[j][2] * log2e - bias[1]), exp2f(s[j][3] * log2e - bias[1]), pSum[1]);
@@ -3340,7 +3374,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_
             // O += P V. V fragments via ldmatrix.trans on e4m3 pairs: after the byte permute and conversion, a lane holds
             // keys (2t, 2t+1) of head dims d+2g (even n-tile) and d+2g+1 (odd n-tile).
 #pragma unroll
-            for (uint32_t ks = 0; ks < 4; ks++)
+            for (uint32_t ks = 0; ks < warpToks / 16; ks++)
             {
                 uint32_t const a0 = p[2 * ks][0];
                 uint32_t const a1 = p[2 * ks][1];
@@ -3369,16 +3403,62 @@ CUBIN_EXPORT __global__ __launch_bounds__(128, 1) void kernel_mha_prefix(uint32_
     cpAsyncWait<0>();
     preExit();
 
+    // Merge the two token halves of each row block (same lane <-> same rows and columns in both warps).
+    float* const xchg = reinterpret_cast<float*>(pfxSmem) + rowWarp * xchgFloats * warp_size + lane;
+    if (tokHalf == 1)
+    {
+        if (warpActive)
+        {
+#pragma unroll
+            for (uint32_t n = 0; n < 32; n++)
+            {
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++)
+                {
+                    xchg[(4 * n + e) * warp_size] = o[n][e];
+                }
+            }
+            xchg[128 * warp_size] = rowMax[0];
+            xchg[129 * warp_size] = rowMax[1];
+            xchg[130 * warp_size] = rowSum[0];
+            xchg[131 * warp_size] = rowSum[1];
+        }
+    }
+    __syncthreads();
+    if (tokHalf == 1 || !warpActive)
+    {
+        return;
+    }
+    {
+        float s0[2];
+        float s1[2];
+#pragma unroll
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            float const otherMax = xchg[(128 + i) * warp_size];
+            float const m = fmaxf(rowMax[i], otherMax);
+            s0[i] = expf(rowMax[i] - m);
+            s1[i] = expf(otherMax - m);
+            rowMax[i] = m;
+            rowSum[i] = rowSum[i] * s0[i] + xchg[(130 + i) * warp_size] * s1[i];
+        }
+#pragma unroll
+        for (uint32_t n = 0; n < 32; n++)
+        {
+#pragma unroll
+            for (uint32_t e = 0; e < 4; e++)
+            {
+                o[n][e] = o[n][e] * s0[e / 2] + xchg[(4 * n + e) * warp_size] * s1[e / 2];
+            }
+        }
+    }
+
     // 4. Partial results in kernel_mha's multi-block scratch layout, slot nbSubSeqMha + idxChunk.
 #pragma unroll
     for (uint32_t i = 0; i < 2; i++)
     {
         rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 1);
         rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 2);
-    }
-    if (!warpActive)
-    {
-        return;
     }
     uint32_t const nbParts = nbSubSeqMha + nbChunks;
     uint32_t const nbSubSeqTotal = nbParts * nbKHeads * batchSize;

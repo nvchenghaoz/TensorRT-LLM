@@ -56,7 +56,8 @@ public:
         return mInitialized && mPrefixKernel != nullptr;
     }
 
-    void launchPrefix(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams) const;
+    // Block size is the cubin's prefixCtaSize.
+    void launchPrefix(dim3 gridDim, CUstream hStream, void** kernelParams) const;
 
     // It is safe to call getSerializeSize()/serialize() before calling initialize().
     size_t getSerializationSize() const noexcept;
@@ -83,6 +84,7 @@ private:
     static constexpr char const* kKernelTypeName = "kernelType";
     static constexpr char const* kPrefixFuncName = "kernel_mha_prefix";
     static constexpr char const* kPrefixSmemName = "prefixSmemSize";
+    static constexpr char const* kPrefixCtaSizeName = "prefixCtaSize";
     // Constructors should populate mContent.
     std::string mContent;
 
@@ -95,6 +97,7 @@ private:
     XQAKernelType mKernelType;
     CUkernel mPrefixKernel = nullptr;
     unsigned int mPrefixSharedMemBytes = 0;
+    unsigned int mPrefixCtaSize = 0;
 };
 
 } // namespace jit
