@@ -35,10 +35,13 @@ SMALL_N_GEMV_ENABLED = os.environ.get("TRTLLM_SMALL_N_BF16_GEMV", "1") != "0"
 
 # Route table: (max N, max M). Measured on SM120 (RTX PRO 6000) at N=96,
 # K=5120 with cold L2 and CUDA-graph replay (experiments/ascent/small_n_gemv/):
-# per call 2.9/2.9/3.2/3.4 us vs cuBLAS 5.1/31.6/31.6/31.6 us at M=1..4. From
-# M=5 cuBLAS switches to a faster kernel (3.8 us) and, beside the FP8
-# in_proj_qkvz GEMV on the other stream, exposes less time than this GEMV.
-_MAX_M_BY_N = ((128, 4), )
+# per call 2.9/2.9/3.2/3.4 us vs cuBLAS 5.1/31.6/31.6/31.6 us at M=1..4.
+# M=5..16: cuBLAS runs nvjet split-K + splitKreduce (two launches) on the aux
+# stream beside in_proj_qkvz's Marlin; in the 48-layer GDN decode graph window
+# (experiments/ascent/ba_decode/window.py) the one-launch GEMV exposes
+# 0.26-0.51 us/layer vs cuBLAS 0.70-1.0 us/layer. At M>16 (W4A4 in_proj_qkvz)
+# cuBLAS's fork is fully hidden (exposure <= 0), so those rows keep cuBLAS.
+_MAX_M_BY_N = ((128, 16), )
 _MAX_N = max(n for n, _ in _MAX_M_BY_N)
 _MAX_M = max(m for _, m in _MAX_M_BY_N)
 # Upper bound on K so the statically unrolled K loop stays small.
@@ -97,10 +100,11 @@ def _small_n_gemv_kernel(
 def _default_config(m: int, n: int, k: int):
     """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps) for an [m, k] x [n, k]^T GEMV."""
     # One weight row and one activation row per program, 8 warps, one BF16
-    # element per thread per 256-wide K step: the fastest config at M<=6 (the
-    # routed range), single-stream and next to in_proj_qkvz. Larger M (only
+    # element per thread per 256-wide K step: the fastest config at M<=16 (the
+    # routed range) next to in_proj_qkvz on the other stream (more programs,
+    # each short, fill the SMs the partner leaves free). Larger M (only
     # reached by benchmarks) amortizes weight loads over more rows.
-    if m <= 6 or k % 1024 != 0:
+    if m <= 16 or k % 1024 != 0:
         return 1, 1, 256, 8
     if m <= 8:
         return 1, 2, 1024, 4
