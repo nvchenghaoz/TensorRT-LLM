@@ -117,7 +117,7 @@ def main():
             graphs[arm] = (g, outs)
         print(f"M={m} captured", flush=True)
 
-        ts = {a_: [] for a_ in arms]
+        ts = {a_: [] for a_ in arms}
         na = len(arms)
         for it in range(WARM + ITERS):
             order = arms[it % na:] + arms[:it % na]
