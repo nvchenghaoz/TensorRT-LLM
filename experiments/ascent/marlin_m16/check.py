@@ -29,13 +29,25 @@ def check(cond, msg):
         fails.append(msg)
 
 
+MS_B = [8, 9, 12, 16]
 for (n, k), C in SHAPES.items():
+    # Part B inputs and the per-copy FP32 reference outputs (every copy gets its own reference).
+    xb = dict()
+    for m in MS_B:
+        g = torch.Generator(device="cuda").manual_seed(200 + m)
+        xb[m] = torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16)
+    ref_b = dict((m, []) for m in MS_B)
     copies, refs = [], None
     for i in range(C):
-        c, r = make_copy(n, k, 3000 + i, want_ref=(i == 0))
+        c, r = make_copy(n, k, 3000 + i, want_ref=True)
         copies.append(c)
-        if r is not None:
+        for m in MS_B:
+            ref_b[m].append(xb[m].float() @ r["w_ref"].t())
+        if i == 0:
             refs = r
+        else:
+            del r
+    torch.cuda.empty_cache()
     key = "%d,%d" % (n, k)
     summary[key] = dict(subnormal_blocks=refs["n_sub"], rows=dict(), repeated=dict())
     # ---------------- A
@@ -62,14 +74,21 @@ for (n, k), C in SHAPES.items():
         if m <= 8:
             check(same, "A (%d,%d) rows=%d (outside the table) bitwise == main selection" % (n, k, m))
     # ---------------- B
-    for m in [8, 9, 12, 16]:
+    for m in MS_B:
         set_cfg(None)
-        g = torch.Generator(device="cuda").manual_seed(200 + m)
-        x = torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16)
+        x = xb[m]
         eager0 = [gemm(x, c, n, k).clone() for c in copies]
         set_cfg("main")
         eager_main = [gemm(x, c, n, k).clone() for c in copies]
         set_cfg(None)
+        # Per-copy FP32 reference bar: max-abs and mean-abs <= 1.25 x main's error on that copy + 1 BF16 ulp.
+        refs_m = torch.stack(ref_b[m])  # [C, m, n] fp32
+        d_main = (torch.stack(eager_main).float() - refs_m).abs()
+        ulp_c = refs_m.abs().amax(dim=(1, 2)) * 2 ** -8
+        bar_max = 1.25 * d_main.amax(dim=(1, 2)) + ulp_c
+        bar_mean = 1.25 * d_main.mean(dim=(1, 2)) + ulp_c
+        del d_main
+        ref_fail, it_max_err, it_mean_err = 0, [], []
         s0 = torch.cuda.Stream()
         s0.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s0):
@@ -95,6 +114,15 @@ for (n, k), C in SHAPES.items():
                 if not (eq(a, b) and eq(a, e)):
                     ndiff += 1
                     max_err_vs_first = max(max_err_vs_first, (a.float() - b.float()).abs().max().item())
+            # Every replay, every copy vs its FP32 reference (reordered-class bar).
+            d = (torch.stack(cur).float() - refs_m).abs()
+            mx, mn = d.amax(dim=(1, 2)), d.mean(dim=(1, 2))
+            ok = bool(((mx <= bar_max) & (mn <= bar_mean)).all().item())
+            if not ok:
+                ref_fail += 1
+            it_max_err.append(mx.max().item())
+            it_mean_err.append(mn.max().item())
+            del d
             j = it % C
             ye = gemm(x, copies[j], n, k)
             if not eq(ye, eager0[j]):
@@ -104,7 +132,15 @@ for (n, k), C in SHAPES.items():
         n_eq_main = sum(int(eq(a, b)) for a, b in zip(first, eager_main))
         summary[key]["repeated"][str(m)] = dict(replay_diffs=ndiff, eager_diffs=n_eager_diff, nan_outputs=nan_seen,
                                                 max_abs_drift=max_err_vs_first, copies=C,
-                                                graph_eq_main_selection=n_eq_main)
+                                                graph_eq_main_selection=n_eq_main,
+                                                ref_bar_failures=ref_fail,
+                                                per_iter_max_abs_first_last=[it_max_err[0], it_max_err[-1]],
+                                                per_iter_max_abs_range=[min(it_max_err), max(it_max_err)],
+                                                per_iter_mean_abs_range=[min(it_mean_err), max(it_mean_err)],
+                                                main_bar_max_abs_min=bar_max.min().item())
+        check(ref_fail == 0, "B (%d,%d) M=%d every replay x every copy within 1.25 x main's FP32-ref error + 1 ulp "
+              "(failing replays %d; per-iter max-abs range %.5f..%.5f)" % (
+                  n, k, m, ref_fail, min(it_max_err), max(it_max_err)))
         if m > 8:
             check(n_eq_main == 0, "B (%d,%d) M=%d table active in graph: %d/%d graph outputs != main selection" % (
                 n, k, m, C - n_eq_main, C))
@@ -115,8 +151,8 @@ for (n, k), C in SHAPES.items():
               "B (%d,%d) M=%d %d NaN-poisoned replays x %d copies bitwise == replay 1 == eager; interleaved eager "
               "bitwise stable (replay diffs %d, eager diffs %d, NaN outputs %d)" % (
                   n, k, m, WARM + ITERS, C, ndiff, n_eager_diff, nan_seen))
-        del gr, outs
-    del copies, refs
+        del gr, outs, refs_m
+    del copies, refs, ref_b
     torch.cuda.empty_cache()
 
 torch.cuda.synchronize()
@@ -129,5 +165,8 @@ print(json.dumps(dict(passed=not fails, failures=fails, summary=summary,
                                        "(E2M1 LUT x E4M3 SF x global, subnormal-scale blocks flushed as Marlin does); "
                                        "main's selection (TRTLLM_MARLIN_M16_TABLE=0) on the same inputs",
                       repeated_execution="24/9/10 distinct copies per shape (as pair_bench) in one CUDA graph (PDL), "
-                                         "%d warmup + %d NaN-poisoned replays per M in 8,9,12,16, interleaved eager "
-                                         "calls" % (WARM, ITERS))))
+                                         "%d warmup + %d NaN-poisoned replays per M in 8,9,12,16 (same warmup/iters/"
+                                         "copy set as pair_bench's timed loop); every replay x every copy compared "
+                                         "bitwise with replay 1 and eager, and against its own FP32 reference "
+                                         "(<= 1.25 x main's error + 1 BF16 ulp); interleaved eager calls" % (
+                                             WARM, ITERS))))
