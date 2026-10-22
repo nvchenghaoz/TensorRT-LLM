@@ -11,10 +11,11 @@
 #   late    : same ba kernel on aux, join moved to just before the delta-rule kernel
 #   before  : ba on the main stream before qkvz
 #   g_<cfg> / gl_<cfg> : Triton small_n_gemv with launch config cfg, early join / late join
-#   tree    : the tree's GdnMixer._compute_tokenwise_inputs + its own join placement
-#             (gdn_mixer._ba_late_join_rows if present), i.e. production code
-# Exposure per layer = arm - noop.
-# Brace-free; extra argv words are printed first.
+#   empty   : fork/join floor, a trivial clone kernel on aux instead of the GEMV
+#   tree    : the tree's Qwen3NextGatedDeltaNet._compute_tokenwise_inputs under with_multi_stream(True)
+#             (production fork + ba routing), i.e. production code
+# Exposure per layer = arm - noop. kernel_ms = the tree arm's 48-layer window median.
+# Brace-free (run_gpu_pair runs it inline as python -c in the base tree); extra argv words are printed first.
 import json
 import os
 import statistics
@@ -140,7 +141,7 @@ class FakeGDN:
 
 
 FAKES = [FakeGDN(QS[i % C], BAS[i]) for i in range(LAYERS)]
-HAS_TREE_LATE = hasattr(G.Qwen3NextGatedDeltaNet, "_ba_join")
+log("small_n_gemv route table", SNG._MAX_M_BY_N)
 
 
 def make_fn(arm, m, xs, rs, cps, sps, idx, cu, ab_const):
@@ -348,5 +349,5 @@ for m, r in results.items():
     pick = "tree" if "tree" in r else ("main" if "main" in r else list(r)[0])
     d = r[pick]
     batch[m] = dict(kernel_ms=d["med"] * LAYERS / 1e3, noise_floor=(d["p90"] - d["p10"]) / d["med"])
-print(json.dumps(dict(batch=batch, output=dict([("class", "exact")]), per_layer_us=results,
+print(json.dumps(dict(batch=batch, output=dict([("class", os.environ.get("W_CLASS", "exact"))]), per_layer_us=results,
                       exposure=summary, layers=LAYERS)))
