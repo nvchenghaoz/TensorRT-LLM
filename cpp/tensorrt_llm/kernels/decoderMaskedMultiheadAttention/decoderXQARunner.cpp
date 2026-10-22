@@ -16,7 +16,11 @@
 
 #include "decoderXQARunner.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 #include <string.h>
 
 #include "tensorrt_llm/common/assert.h"
@@ -463,6 +467,12 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
         appendParam(&launchParams.kv_scale_quant_orig);
         appendParam(&launchParams.semaphores);
         appendParam(&launchParams.scratch);
+        // mha.cu's kernel_mha takes the shared-prefix (cascade) arguments last; unused for speculative decoding.
+        uint32_t const* const noCascadeInfo = nullptr;
+        uint32_t const noPrefixParts = 0;
+        appendParam(&noCascadeInfo);
+        appendParam(&noPrefixParts);
+        kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
 
         uint32_t multiBlock = 1;
         if (xqaParams.multi_block_mode)
@@ -537,6 +547,14 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
         }
         appendParam(&launchParams.semaphores);
         appendParam(&launchParams.scratch);
+        // Shared-prefix (cascade) decode arguments of mha.cu's kernel_mha; set below when kernel_mha_prefix runs.
+        uint32_t const* cascadeInfo = nullptr;
+        uint32_t nbPrefixParts = 0;
+        if (isHMMAKernel)
+        {
+            appendParam(&cascadeInfo);
+            appendParam(&nbPrefixParts);
+        }
         kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
         uint32_t multiBlock = 1;
         if (xqaParams.multi_block_mode)
@@ -577,6 +595,67 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
             multiBlock = std::min(multiBlock, oneWave);
         }
         uint32_t const nbKVHeads = xqaParams.num_kv_heads;
+
+        // Shared-prefix (cascade) decode on SM120/121, batch >= TRTLLM_XQA_CASCADE_MIN_BATCH (default 8): when all
+        // requests start with the same KV pages (block reuse), kernel_mha_prefix attends every request's query rows of
+        // one KV head against the shared pages together and writes partial results into kernel_mha's multi-block
+        // scratch; kernel_mha then walks only each request's suffix and merges them. The shared length is detected on
+        // the device (graph safe; 0 -> the plain path). TRTLLM_XQA_CASCADE=0 disables it.
+        if (isHMMAKernel && !isSpecDec && xqaParams.multi_block_mode && cubinObj->hasPrefixKernel()
+            && (mSM == 120 || mSM == 121) && beamWidth == 1 && xqaParams.head_size == 256)
+        {
+            static bool const cascadeEnabled = []()
+            {
+                char const* const env = std::getenv("TRTLLM_XQA_CASCADE");
+                return env == nullptr || std::string(env) != "0";
+            }();
+            static uint32_t const cascadeMinBatch = []()
+            {
+                char const* const env = std::getenv("TRTLLM_XQA_CASCADE_MIN_BATCH");
+                return env == nullptr ? 8U : static_cast<uint32_t>(std::max(1, std::atoi(env)));
+            }();
+            uint32_t const batch = xqaParams.batch_size;
+            if (cascadeEnabled && batch >= std::max(2U, cascadeMinBatch))
+            {
+                // Scratch layout (mha.cu cascadeFold): 4 KiB of cascade info words, then one FP32 record per
+                // (request, KV head, prefix chunk), then kernel_mha's own multi-block scratch. Bounded by the
+                // multi-block budget getWorkspaceSize reserves for kernel_mha alone (6000 sub-sequences).
+                constexpr uint32_t kCascadeRowsPerCta = 64;
+                constexpr int32_t kCascadeMaxChunks = 63;
+                constexpr size_t kCascadeInfoBytes = 4096;
+                constexpr size_t kMhaBytesPerSubSeq = 4096; // >= row max + row sum + BF16 partial tile
+                auto const roundUpSize = [](size_t a, size_t b) { return (a + b - 1) / b * b; };
+                size_t const nbSeq = static_cast<size_t>(batch) * nbKVHeads;
+                size_t const recordBytes = sizeof(float)
+                    * (static_cast<size_t>(numQHeadsOverKV) * xqaParams.head_size
+                        + 2 * roundUpSize(numQHeadsOverKV, 4));
+                size_t const budget = static_cast<size_t>(getXqaMaxNumSubSeq(false)) * 3328;
+                size_t const mhaBytes = static_cast<size_t>(multiBlock) * nbSeq * kMhaBytesPerSubSeq;
+                uint32_t const nbRowGrps = divUp(batch * numQHeadsOverKV, kCascadeRowsPerCta);
+                int32_t chunks = std::min<int32_t>(
+                    kCascadeMaxChunks, multiprocessorCount / static_cast<int32_t>(nbRowGrps * nbKVHeads));
+                int64_t const fit = budget > mhaBytes + 2 * kCascadeInfoBytes
+                    ? static_cast<int64_t>((budget - mhaBytes - 2 * kCascadeInfoBytes) / (nbSeq * recordBytes))
+                    : 0;
+                chunks = static_cast<int32_t>(std::min<int64_t>(chunks, fit));
+                if (chunks >= 1)
+                {
+                    auto* const base = static_cast<std::byte*>(launchParams.scratch);
+                    uint32_t* prefixInfo = reinterpret_cast<uint32_t*>(base);
+                    cascadeInfo = prefixInfo;
+                    nbPrefixParts = static_cast<uint32_t>(chunks);
+                    launchParams.scratch
+                        = base + kCascadeInfoBytes + roundUpSize(nbSeq * chunks * recordBytes, kCascadeInfoBytes);
+                    void* prefixParams[] = {&launchParams.num_k_heads, &launchParams.qScale,
+                        const_cast<void*>(static_cast<void const*>(&kernelInputTokens)), &launchParams.kvCacheParams,
+                        &launchParams.batch_size, &launchParams.kv_scale_quant_orig, &prefixInfo, nullptr};
+                    cubinObj->launchPrefix(
+                        dim3{static_cast<uint32_t>(chunks), nbRowGrps, nbKVHeads}, stream, prefixParams);
+                    sync_check_cuda_error(stream);
+                }
+            }
+        }
+
         auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multiBlock, nbKVHeads * xqaParams.batch_size}
                                            : dim3{multiBlock, nbKVHeads, xqaParams.batch_size});
         dim3 const blockDim(128, 1, isGMMAKernel ? 3 : 2);

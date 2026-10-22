@@ -1564,6 +1564,146 @@ __device__ inline void addAttentionSinks(
     }
 }
 
+// Shared-prefix (cascade) decode, see kernel_mha_prefix. The prefix pass leaves, after the cascadeInfo words, one FP32
+// record per (request, KV head, prefix chunk): the unnormalized output O = sum(p * V) (V not yet scaled by the KV
+// scale), then the row max and the row sum of p, in the same units as kernel_mha's accumulator. kernel_mha folds them
+// in FP32 (into its accumulator with one sub-sequence, into the multi-block merge otherwise), so the output is rounded
+// to the IO type at the same points as without the cascade.
+namespace cascadeFold
+{
+constexpr uint32_t infoBytes = 4096;
+constexpr uint32_t statStride = roundUp(headGrpSize, 4U);
+constexpr uint32_t recFloats = headGrpSize * validElemsPerHead + 2 * statStride;
+
+__device__ inline float const* record(
+    uint32_t const* cascadeInfo, uint32_t nbParts, uint32_t idxSeq, uint32_t idxPart)
+{
+    return reinterpret_cast<float const*>(reinterpret_cast<char const*>(cascadeInfo) + infoBytes)
+        + size_t(idxSeq * nbParts + idxPart) * recFloats;
+}
+
+// The fold works in the MMA quad layout: lane l handles head row l / 4 (rows of the first 8-row slice; the cascade is
+// only enabled for head groups of <= 8 rows), while ThrdRegRowMax holds row l in lane l.
+constexpr bool supported = !SPEC_DEC && headGrpSize <= 8 && warpTile.y == 16 && WarpAcc::rows == 1;
+constexpr uint32_t batch = 4; // records whose loads are issued together
+
+__device__ inline float toQuad(ThrdRegRowMax const& v)
+{
+    return __shfl_sync(~0U, v[0], laneId() / 4);
+}
+
+// Value of row l (held by quad l) moved to lane l; lanes >= 8 keep their own value.
+__device__ inline float fromQuad(float q, float own)
+{
+    float const v = __shfl_sync(~0U, q, 4 * (laneId() % 8));
+    return laneId() < 8 ? v : own;
+}
+
+// Max of this lane's quad row over prefix records [cBeg, cEnd) (safeInitRowMax for rows beyond the head group).
+__device__ inline float quadPrefixMax(
+    uint32_t const* cascadeInfo, uint32_t nbParts, uint32_t idxSeq, uint32_t cBeg, uint32_t cEnd)
+{
+    uint32_t const row = laneId() / 4;
+    float mx = safeInitRowMax;
+    if (row < headGrpSize)
+    {
+        float const* const base = record(cascadeInfo, nbParts, idxSeq, 0) + headGrpSize * validElemsPerHead + row;
+#pragma unroll 8
+        for (uint32_t c = cBeg; c < cEnd; c++)
+        {
+            mx = fmaxf(mx, base[size_t(c) * recFloats]);
+        }
+    }
+    return mx;
+}
+
+// Adds sum_c O_c * exp(m_c - rowMaxQ) to acc over records [cBeg, cEnd), in order, and returns
+// sum_c l_c * exp(m_c - rowMaxQ) for this lane's quad row (rowMaxQ already includes those m_c). colBase: first head
+// dim of this warp's accumulator columns. outReordered: acc columns are in kernel_mha's e4m3-V conversion order (a lane
+// holds 4 consecutive dims across n-tiles 2n, 2n+1), else in natural order.
+template <bool outReordered>
+__device__ inline float addPrefix(WarpAcc& acc, float rowMaxQ, uint32_t const* cascadeInfo, uint32_t nbParts,
+    uint32_t idxSeq, uint32_t cBeg, uint32_t cEnd, uint32_t colBase)
+{
+    uint32_t const lane = laneId();
+    uint32_t const row = lane / 4;
+    float sum = 0.F;
+    if (row >= headGrpSize)
+    {
+        return sum;
+    }
+    constexpr uint32_t nbVecs = outReordered ? WarpAcc::cols / 2 : WarpAcc::cols;
+    using Vec4 = float4;
+    float const* const base = record(cascadeInfo, nbParts, idxSeq, 0);
+    for (uint32_t c0 = cBeg; c0 < cEnd; c0 += batch)
+    {
+        float m[batch];
+        float l[batch];
+        Vec4 v[batch][outReordered ? nbVecs : nbVecs / 2];
+#pragma unroll
+        for (uint32_t k = 0; k < batch; k++)
+        {
+            uint32_t const c = mha::min(c0 + k, cEnd - 1);
+            float const* const rec = base + size_t(c) * recFloats;
+            m[k] = rec[headGrpSize * validElemsPerHead + row];
+            l[k] = rec[headGrpSize * validElemsPerHead + statStride + row];
+            float const* const src = rec + row * validElemsPerHead + colBase;
+            if constexpr (outReordered)
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs; n++)
+                {
+                    v[k][n] = reinterpret_cast<Vec4 const&>(src[16 * n + 4 * (lane % 4)]);
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs / 2; n++)
+                {
+                    float2 const a = reinterpret_cast<float2 const&>(src[16 * n + 2 * (lane % 4)]);
+                    float2 const b = reinterpret_cast<float2 const&>(src[16 * n + 8 + 2 * (lane % 4)]);
+                    v[k][n] = make_float4(a.x, a.y, b.x, b.y);
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < batch; k++)
+        {
+            if (c0 + k >= cEnd)
+            {
+                break;
+            }
+            float const so = expf(m[k] - rowMaxQ);
+            sum += l[k] * so;
+            if constexpr (outReordered)
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs; n++)
+                {
+                    acc(0, 2 * n)(0, 0) += so * v[k][n].x;
+                    acc(0, 2 * n + 1)(0, 0) += so * v[k][n].y;
+                    acc(0, 2 * n)(0, 1) += so * v[k][n].z;
+                    acc(0, 2 * n + 1)(0, 1) += so * v[k][n].w;
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs / 2; n++)
+                {
+                    acc(0, 2 * n)(0, 0) += so * v[k][n].x;
+                    acc(0, 2 * n)(0, 1) += so * v[k][n].y;
+                    acc(0, 2 * n + 1)(0, 0) += so * v[k][n].z;
+                    acc(0, 2 * n + 1)(0, 1) += so * v[k][n].w;
+                }
+            }
+        }
+    }
+    return sum;
+}
+} // namespace cascadeFold
+
 // With PDL, issue the first K/V tile loads of a sub-sequence before griddepcontrol.wait when that tile cannot hold the
 // token the preceding RoPE/KV-append kernel writes (see earlyKV in kernel_mha_impl). Q always waits.
 #define XQA_PDL_EARLY_KV (ENABLE_PDL == 2 && !SPEC_DEC && BEAM_WIDTH == 1 && USE_PAGED_KV_CACHE)
@@ -1609,7 +1749,10 @@ CUBIN_EXPORT __global__
         uint32_t const batchSize,
         float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
                                                 // int8/fp8 KV cache.
-        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
+        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr,
+        // Shared-prefix (cascade) decode, see kernel_mha_prefix: cascadeInfo[0] = shared prefix tokens P (multiple of
+        // ctaTile.x), cascadeInfo[1 + c] != 0 if prefix chunk c failed page verification. nullptr: disabled.
+        uint32_t const* __restrict__ cascadeInfo = nullptr, uint32_t nbPrefixParts = 0)
 {
     assert(allowMultiBlockMode || gridDim.x == 1);
     bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
@@ -1728,6 +1871,12 @@ CUBIN_EXPORT __global__
     preExit();
 #if !XQA_PDL_EARLY_KV
     acqBulk();
+#else
+    if (cascadeInfo != nullptr)
+    {
+        // cascadeInfo is written by the preceding kernel_mha_prefix: wait before reading it.
+        acqBulk();
+    }
 #endif
 #endif
 
@@ -1810,19 +1959,38 @@ CUBIN_EXPORT __global__
 #endif
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
+    // Shared-prefix (cascade) mode: kernel_mha_prefix already attended the leading cascadeTokens (shared by every
+    // request) and wrote nbPrefixParts partial results after this CTA's own nbSubSeqPerSeq slots; this kernel walks
+    // only the suffix [cascadeTokens, cacheSeqLen) and the merging CTA folds the prefix partials in.
+    uint32_t cascadeTokens = 0;
+    if (cascadeFold::supported && cascadeInfo != nullptr && nbPrefixParts != 0)
+    {
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < nbPrefixParts; i++)
+        {
+            bad |= cascadeInfo[1 + i];
+        }
+        cascadeTokens = (bad != 0) ? 0U : cascadeInfo[0];
+        assert(cascadeTokens % ctaTile.x == 0 && cascadeTokens < cacheSeqLen);
+    }
 #if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
     uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1;
     int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
     uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
     bool const rtIsReallySliding = (cacheSeqLen + actualQSeqLen > slidingWinSize);
+    bool const cascadeActive = false;
 #elif SLIDING_WINDOW
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
     assert(!SPEC_DEC || !rtIsReallySliding);
-    uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
+    bool const cascadeActive = !SPEC_DEC && !rtIsReallySliding && cascadeTokens != 0;
+    uint32_t const nbTotalSkipTokens
+        = rtIsReallySliding ? cacheSeqLen - slidingWinSize : (cascadeActive ? cascadeTokens : 0U);
 #else
     constexpr bool rtIsReallySliding = false;
-    constexpr uint32_t nbTotalSkipTokens = 0;
+    bool const cascadeActive = !SPEC_DEC && cascadeTokens != 0;
+    uint32_t const nbTotalSkipTokens = cascadeActive ? cascadeTokens : 0U;
 #endif
+
 #if USE_PAGED_KV_CACHE
     uint32_t const nbSkipLeadingPages = nbTotalSkipTokens / tokensPerPage;
 #endif
@@ -2648,8 +2816,34 @@ CUBIN_EXPORT __global__
             }
         }
 
+        // Shared-prefix cascade: sub-sequence i folds prefix records [i*C/m, (i+1)*C/m) into its FP32 accumulator, so the
+        // output is rounded exactly where it is without the cascade (once with m = 1, per partial then merged with m > 1).
+        bool cascadeFolded = false;
+        if constexpr (cascadeFold::supported)
+        {
+            uint32_t const cBeg = nbPrefixParts * idxSubSeqInSeq / nbSubSeqPerSeq;
+            uint32_t const cEnd = nbPrefixParts * (idxSubSeqInSeq + 1) / nbSubSeqPerSeq;
+            if (cascadeActive && cBeg < cEnd)
+            {
+                cascadeFolded = true;
+                uint32_t const idxSeq = nbKHeads * idxReq + idxHeadGrp;
+                float const newMaxQ = fmaxf(cascadeFold::toQuad(globalRowMax),
+                    cascadeFold::quadPrefixMax(cascadeInfo, nbPrefixParts, idxSeq, cBeg, cEnd));
+                ThrdRegRowMax newRowMax = globalRowMax;
+                newRowMax[0] = cascadeFold::fromQuad(newMaxQ, globalRowMax[0]);
+                ThrdRegRowMax selfScale;
+                selfScale[0] = expf(globalRowMax[0] - newRowMax[0]);
+                globalRowSum[0] = globalRowSum[0] * selfScale[0];
+                rescaleAcc(warp, acc, fullRescaleMask, selfScale);
+                globalRowMax = newRowMax;
+                float const sumQ = cascadeFold::addPrefix<inputElemSize == 2 && cacheElemSize == 1>(
+                    acc, newMaxQ, cascadeInfo, nbPrefixParts, idxSeq, cBeg, cEnd, warpTile.x * warpIdxInGrp);
+                float const sumRow = cascadeFold::fromQuad(sumQ, 0.F);
+                globalRowSum[0] += laneId() < headGrpSize ? sumRow : 0.F;
+            }
+        }
         float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
-        if (seqIterInit < nbSeqIters)
+        if (seqIterInit < nbSeqIters || cascadeFolded)
         {
             // In multi-block mode, assign the virtual sink token to exactly one partial CTA.
             if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
@@ -2834,6 +3028,7 @@ CUBIN_EXPORT __global__
                     mergedRowMax = fmaxf(mergedRowMax, mbbuf.partialRowMax[w].loadToReg<false>(warp));
                 }
 
+
                 // Scaled row sum of each partial result of a chunk: its weight in the merged output.
                 auto storeChunkTileRowScales = [&](uint32_t chunkBeg, uint32_t chunkEnd)
                 {
@@ -2948,6 +3143,534 @@ constexpr uint32_t nbCtaPerSM = 1;
 
 CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMPERE_WARP_SPECIALIZED;
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Shared-prefix (cascade) decode pass for kernel_mha.
+//
+// When every request of a decode batch starts with the same KV pages (block reuse of a common prompt prefix),
+// kernel_mha_prefix attends all requests' query rows of one KV head against those shared tokens together: rows are
+// (request, q head in group) pairs, 64 rows per CTA (4 row blocks of 16 MMA rows, each split over 2 warps by key
+// halves), so each prefix K/V tile is read once per 64 rows instead of once per request, and the MMA rows are filled.
+// Grid: {nbChunks, nbRowGroups, nbKHeads}; chunk c attends a contiguous range of the shared prefix. Each CTA writes
+// FP32 records (unnormalized O, row max, row sum; see cascadeFold) after the cascadeInfo words, and kernel_mha
+// (launched next with cascadeInfo and nbPrefixParts = nbChunks) walks only the suffix and folds the records into its
+// FP32 accumulator or multi-block merge in a fixed order, so the output is rounded once as without the cascade.
+//
+// The shared length is found on the device (CUDA-graph safe): P = the leading 256-token tiles whose last page is the
+// same K and V page for every request, capped so that every request keeps >= 1 suffix token. Each chunk verifies all
+// pages of its own range for every request and flags a mismatch; kernel_mha then falls back to P = 0 (the plain
+// path, partials ignored). P is published in cascadeInfo[0], the flags in cascadeInfo[1 + c].
+// ---------------------------------------------------------------------------------------------------------------------
+#if !SPEC_DEC && BEAM_WIDTH == 1 && USE_PAGED_KV_CACHE && PAGED_KV_CACHE_LAYOUT == 0 && !USE_INPUT_KV                 \
+    && !LOW_PREC_OUTPUT && CACHE_ELEM_ENUM == 2 && !INPUT_FP16 && HEAD_ELEMS == 256 && !IS_MLA && HEAD_GRP_SIZE <= 8   \
+    && (TOKENS_PER_PAGE == 16 || TOKENS_PER_PAGE == 32 || TOKENS_PER_PAGE == 64)
+#define XQA_CASCADE_PREFIX 1
+#else
+#define XQA_CASCADE_PREFIX 0
+#endif
+
+#if XQA_CASCADE_PREFIX
+namespace cascade
+{
+constexpr uint32_t nbRowWarps = 4;                    // each owns 16 rows
+constexpr uint32_t nbTokSplit = 2;                    // warps per row block, each on its own half of every tile
+constexpr uint32_t nbWarps = nbRowWarps * nbTokSplit;
+constexpr uint32_t ctaThreads = nbWarps * 32;
+constexpr uint32_t ctaRows = nbRowWarps * 16;         // rows = (request, q head in group) pairs
+constexpr uint32_t tokTile = 64;                      // tokens per pipeline stage
+constexpr uint32_t warpToks = tokTile / nbTokSplit;   // 32
+constexpr uint32_t cacheHeadBytes = 256;              // e4m3 head of 256 elements
+constexpr uint32_t qRowBytes = 256 * 2 + 32;          // padded BF16 Q row (conflict-free 8-byte fragment loads)
+constexpr uint32_t qBytes = ctaRows * qRowBytes;      // 34816
+constexpr uint32_t kvTileBytes = tokTile * cacheHeadBytes; // 16384
+constexpr uint32_t kOffset = qBytes;
+constexpr uint32_t vOffset = kOffset + 2 * kvTileBytes;
+constexpr uint32_t miscOffset = vOffset + 2 * kvTileBytes;
+constexpr uint32_t smemBytes = miscOffset + 64;
+static_assert(tokensPerPage <= tokTile && tokTile % tokensPerPage == 0 && 256 % tokTile == 0);
+static_assert(sizeof(GMemCacheHead) == cacheHeadBytes && sizeof(IOHead) == 512);
+static_assert(gemm1WarpsPerGrp == 4 && gemm1NbWarpGrps == 1 && SharedMem::XSmemBuffer::cols == 8);
+static_assert(cascadeFold::supported, "kernel_mha must be able to fold the prefix records");
+// end-of-kernel exchange of the second token-half warps' state: [rowWarp][128 O + 2 max + 2 sum][lane] floats
+constexpr uint32_t xchgFloats = 132;
+static_assert(nbRowWarps * xchgFloats * 32 * sizeof(float) <= miscOffset);
+constexpr uint32_t kvGrainsPerThread = kvTileBytes / grainBytes / ctaThreads; // 4
+
+__device__ inline void cpAsync16(uint32_t dst, void const* src)
+{
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+}
+
+__device__ inline void cpAsyncCommit()
+{
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <uint32_t n>
+__device__ inline void cpAsyncWait()
+{
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(n) : "memory");
+}
+
+__device__ inline void ldsm4(uint32_t (&r)[4], uint32_t addr)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr)
+                 : "memory");
+}
+
+__device__ inline void ldsm4T(uint32_t (&r)[4], uint32_t addr)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr)
+                 : "memory");
+}
+
+__device__ inline void lds64(uint32_t& a, uint32_t& b, uint32_t addr)
+{
+    asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];\n" : "=r"(a), "=r"(b) : "r"(addr) : "memory");
+}
+
+__device__ inline void mmaBf16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1)
+{
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ inline uint32_t packBf16(float x, float y, float& sum)
+{
+    __nv_bfloat162 const v = __floats2bfloat162_rn(x, y);
+    float2 const f = __bfloat1622float2(v);
+    sum += f.x + f.y;
+    return reinterpret_cast<uint32_t const&>(v);
+}
+} // namespace cascade
+
+CUBIN_EXPORT __device__ constexpr uint32_t prefixSmemSize = cascade::smemBytes;
+CUBIN_EXPORT __device__ constexpr uint32_t prefixCtaSize = cascade::ctaThreads;
+
+CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mha_prefix(uint32_t const nbKHeads, float const qScale,
+    IOHead const* __restrict__ const q, KVCacheList<usePagedKVCache> const cacheList, uint32_t const batchSize,
+    float const* __restrict__ kvCacheScale, uint32_t* __restrict__ const cascadeInfo)
+{
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+    using namespace cascade;
+    extern __shared__ __align__(128) uint8_t pfxSmem[];
+    uint32_t const tid = threadIdx.x;
+    uint32_t const lane = tid % warp_size;
+    uint32_t const warpRank = tid / warp_size;
+    uint32_t const nbChunks = gridDim.x;
+    uint32_t const idxChunk = blockIdx.x;
+    uint32_t const idxRowGrp = blockIdx.y;
+    uint32_t const idxHeadGrp = blockIdx.z;
+    uint32_t const maxPages = cacheList.maxNbPagesPerSeq;
+    KVCachePageIndex const* const pageList = cacheList.kvCachePageList;
+    auto const kPage = [&](uint32_t r, uint32_t j) { return pageList[2 * maxPages * r + j]; };
+    auto const vPage = [&](uint32_t r, uint32_t j) { return pageList[2 * maxPages * r + maxPages + j]; };
+    uint32_t* const misc = reinterpret_cast<uint32_t*>(pfxSmem + miscOffset);
+
+    // 1. Shared prefix length and this chunk's page verification. Page tables and sequence lengths are ready before
+    // the preceding RoPE/KV-append kernel, and only old prefix pages are read here, so this runs before the PDL wait.
+    if (tid == 0)
+    {
+        misc[0] = ~0U;
+        misc[2] = 0U;
+    }
+    __syncthreads();
+    for (uint32_t r = tid; r < batchSize; r += blockDim.x)
+    {
+        atomicMin(&misc[0], uint32_t(cacheList.seqLenList[r]));
+    }
+    __syncthreads();
+    uint32_t const minLen = misc[0];
+    uint32_t const maxTiles = mha::min(minLen == 0 ? 0U : (minLen - 1) / 256U, maxPages * tokensPerPage / 256U);
+    __syncthreads();
+    if (tid == 0)
+    {
+        misc[1] = maxTiles;
+    }
+    __syncthreads();
+    uint32_t const nbOther = batchSize - 1;
+    if (nbOther != 0)
+    {
+        for (uint32_t idx = tid; idx < maxTiles * nbOther; idx += blockDim.x)
+        {
+            uint32_t const k = idx / nbOther;
+            uint32_t const r = 1 + idx % nbOther;
+            uint32_t const j = (256 * (k + 1) - 1) / tokensPerPage;
+            if (kPage(r, j) != kPage(0, j) || vPage(r, j) != vPage(0, j))
+            {
+                atomicMin(&misc[1], k);
+            }
+        }
+    }
+    __syncthreads();
+    uint32_t const nbPfxTiles = misc[1];
+    uint32_t const nbSub = nbPfxTiles * (256 / tokTile);
+    uint32_t const subBeg = nbSub * idxChunk / nbChunks;
+    uint32_t const subEnd = nbSub * (idxChunk + 1) / nbChunks;
+    if (nbOther != 0)
+    {
+        uint32_t const pageBeg = subBeg * tokTile / tokensPerPage;
+        uint32_t const nbChkPages = (subEnd - subBeg) * tokTile / tokensPerPage;
+        for (uint32_t idx = tid; idx < nbChkPages * nbOther; idx += blockDim.x)
+        {
+            uint32_t const j = pageBeg + idx / nbOther;
+            uint32_t const r = 1 + idx % nbOther;
+            if (kPage(r, j) != kPage(0, j) || vPage(r, j) != vPage(0, j))
+            {
+                misc[2] = 1U;
+            }
+        }
+    }
+    __syncthreads();
+    uint32_t const chunkBad = misc[2];
+    // cascadeInfo and the records are written only after the PDL wait (no earlier kernel can still read them).
+    auto const publishInfo = [&]()
+    {
+        if (idxRowGrp == 0 && idxHeadGrp == 0 && tid == 0)
+        {
+            cascadeInfo[1 + idxChunk] = chunkBad;
+            if (idxChunk == 0)
+            {
+                cascadeInfo[0] = nbPfxTiles * 256;
+            }
+        }
+    };
+    if (nbSub == 0)
+    {
+        // kernel_mha ignores the records when P == 0. Still wait: kernel_mha's own wait must imply the RoPE kernel.
+        acqBulk();
+        publishInfo();
+        return;
+    }
+
+    uint8_t const* const poolBytes = reinterpret_cast<uint8_t const*>(cacheList.pool);
+    uint32_t const smemBase = static_cast<uint32_t>(__cvta_generic_to_shared(pfxSmem));
+    // K and V of 64 prefix tokens (request 0's pages) -> smem, 16-byte grain c of token t at grain c ^ (t % 8). The
+    // page indices of a tile are fetched one tile ahead, so the cp.async issue does not wait on them.
+    uint32_t const ldTok0 = tid / 16;
+    uint32_t const ldGrain = tid % 16;
+    uint32_t pgK[kvGrainsPerThread];
+    uint32_t pgV[kvGrainsPerThread];
+    auto const fetchPages = [&](uint32_t sub)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < kvGrainsPerThread; i++)
+        {
+            uint32_t const page = (tokTile * sub + ldTok0 + 16 * i) / tokensPerPage;
+            pgK[i] = uint32_t(kPage(0, page));
+            pgV[i] = uint32_t(vPage(0, page));
+        }
+    };
+    auto const issueKV = [&](uint32_t sub, uint32_t buf)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < kvGrainsPerThread; i++)
+        {
+            uint32_t const tok = ldTok0 + 16 * i;
+            uint32_t const inPage = (tokTile * sub + tok) % tokensPerPage;
+            uint32_t const dstOff = tok * cacheHeadBytes + ((ldGrain ^ (tok % 8)) * grainBytes);
+            uint64_t const kHead = (uint64_t(pgK[i]) * nbKHeads + idxHeadGrp) * tokensPerPage + inPage;
+            uint64_t const vHead = (uint64_t(pgV[i]) * nbKHeads + idxHeadGrp) * tokensPerPage + inPage;
+            cpAsync16(smemBase + kOffset + buf * kvTileBytes + dstOff,
+                poolBytes + kHead * cacheHeadBytes + ldGrain * grainBytes);
+            cpAsync16(smemBase + vOffset + buf * kvTileBytes + dstOff,
+                poolBytes + vHead * cacheHeadBytes + ldGrain * grainBytes);
+        }
+    };
+    if (subBeg < subEnd)
+    {
+        fetchPages(subBeg);
+        issueKV(subBeg, 0);
+        if (subBeg + 1 < subEnd)
+        {
+            fetchPages(subBeg + 1);
+        }
+    }
+    cpAsyncCommit();
+
+    // 2. Q (written by the preceding RoPE kernel).
+    acqBulk();
+    publishInfo();
+    uint32_t const nbQHeads = nbKHeads * headGrpSize;
+    uint32_t const nbRows = batchSize * headGrpSize;
+#pragma unroll 4
+    for (uint32_t i = 0; i < ctaRows * 32 / ctaThreads; i++)
+    {
+        uint32_t const idx = tid + ctaThreads * i;
+        uint32_t const row = idx / 32;
+        uint32_t const grain = idx % 32;
+        uint32_t const rho = ctaRows * idxRowGrp + row;
+        LdGrain v = {0U, 0U, 0U, 0U};
+        if (rho < nbRows)
+        {
+            uint32_t const req = rho / headGrpSize;
+            uint32_t const jh = rho % headGrpSize;
+            v = reinterpret_cast<LdGrain const*>(&q[nbQHeads * req + headGrpSize * idxHeadGrp + jh])[grain];
+        }
+        *reinterpret_cast<LdGrain*>(pfxSmem + row * qRowBytes + grain * grainBytes) = v;
+    }
+
+    // 3. Flash attention over the chunk. Warp (rowWarp, tokHalf) owns 16 rows and tokens [32 tokHalf, 32 tokHalf + 32)
+    // of every 64-token tile; the two halves are merged at the end.
+    uint32_t const rowWarp = warpRank % nbRowWarps;
+    uint32_t const tokHalf = warpRank / nbRowWarps;
+    uint32_t const rowBase = ctaRows * idxRowGrp + 16 * rowWarp;
+    bool const warpActive = rowBase < nbRows;
+    uint32_t const g = lane / 4;
+    uint32_t const t = lane % 4;
+    float const qkScale = qScale * kvCacheScale[0] * rsqrtf(validElemsPerHead);
+    float o[32][4];
+#pragma unroll
+    for (uint32_t n = 0; n < 32; n++)
+    {
+#pragma unroll
+        for (uint32_t e = 0; e < 4; e++)
+        {
+            o[n][e] = 0.F;
+        }
+    }
+    float rowMax[2] = {safeInitRowMax, safeInitRowMax};
+    float rowSum[2] = {0.F, 0.F}; // per-thread partial sums of the rounded probabilities
+    uint32_t const qAddr0 = smemBase + (16 * rowWarp + g) * qRowBytes + 8 * t;
+    uint32_t const qAddr1 = qAddr0 + 8 * qRowBytes;
+    uint32_t const ldRow = lane % 8;
+    uint32_t const ldMat = lane / 8;
+    constexpr uint32_t nbSTiles = warpToks / 8; // 4 n-tiles of 8 keys
+    for (uint32_t sub = subBeg; sub < subEnd; sub++)
+    {
+        uint32_t const buf = (sub - subBeg) & 1U;
+        if (sub + 1 < subEnd)
+        {
+            issueKV(sub + 1, buf ^ 1U);
+            if (sub + 2 < subEnd)
+            {
+                fetchPages(sub + 2);
+            }
+        }
+        cpAsyncCommit();
+        cpAsyncWait<1>();
+        __syncthreads();
+        if (warpActive)
+        {
+            uint32_t const kBase = smemBase + kOffset + buf * kvTileBytes + warpToks * tokHalf * cacheHeadBytes;
+            uint32_t const vBase = smemBase + vOffset + buf * kvTileBytes + warpToks * tokHalf * cacheHeadBytes;
+            // S = Q K^T. Within each 16-element k step the head dims are permuted identically for Q and K: a lane's
+            // fragment holds physical dims 4t..4t+3 (one e4m3 word of K, as ldmatrix delivers it).
+            float s[nbSTiles][4];
+#pragma unroll
+            for (uint32_t j = 0; j < nbSTiles; j++)
+            {
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++)
+                {
+                    s[j][e] = 0.F;
+                }
+            }
+#pragma unroll
+            for (uint32_t kg = 0; kg < 4; kg++)
+            {
+                uint32_t qa[4][4];
+#pragma unroll
+                for (uint32_t kk = 0; kk < 4; kk++)
+                {
+                    uint32_t const kOff = 32 * (4 * kg + kk);
+                    lds64(qa[kk][0], qa[kk][2], qAddr0 + kOff);
+                    lds64(qa[kk][1], qa[kk][3], qAddr1 + kOff);
+                }
+#pragma unroll
+                for (uint32_t j = 0; j < nbSTiles; j++)
+                {
+                    uint32_t kr[4];
+                    ldsm4(kr, kBase + (8 * j + ldRow) * cacheHeadBytes + (((4 * kg + ldMat) ^ ldRow) * grainBytes));
+#pragma unroll
+                    for (uint32_t kk = 0; kk < 4; kk++)
+                    {
+                        Vec<uint32_t, 2> const b = convertKCacheWordToF16<InputElem, CacheElem>(kr[kk]);
+                        mmaBf16(s[j], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b[0], b[1]);
+                    }
+                }
+            }
+            // online softmax (base-2 exponent of the scaled logits, like kernel_mha)
+            float tileMax[2] = {rowMax[0], rowMax[1]};
+#pragma unroll
+            for (uint32_t j = 0; j < nbSTiles; j++)
+            {
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++)
+                {
+                    s[j][e] *= qkScale;
+                }
+                tileMax[0] = fmaxf(tileMax[0], fmaxf(s[j][0], s[j][1]));
+                tileMax[1] = fmaxf(tileMax[1], fmaxf(s[j][2], s[j][3]));
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < 2; i++)
+            {
+                tileMax[i] = fmaxf(tileMax[i], __shfl_xor_sync(~0U, tileMax[i], 1));
+                tileMax[i] = fmaxf(tileMax[i], __shfl_xor_sync(~0U, tileMax[i], 2));
+            }
+            float corr[2];
+            float bias[2];
+#pragma unroll
+            for (uint32_t i = 0; i < 2; i++)
+            {
+                corr[i] = expf(rowMax[i] - tileMax[i]);
+                rowMax[i] = tileMax[i];
+                bias[i] = tileMax[i] * log2e;
+            }
+            uint32_t p[nbSTiles][2];
+            float pSum[2] = {0.F, 0.F};
+#pragma unroll
+            for (uint32_t j = 0; j < nbSTiles; j++)
+            {
+                p[j][0] = packBf16(exp2f(s[j][0] * log2e - bias[0]), exp2f(s[j][1] * log2e - bias[0]), pSum[0]);
+                p[j][1] = packBf16(exp2f(s[j][2] * log2e - bias[1]), exp2f(s[j][3] * log2e - bias[1]), pSum[1]);
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < 2; i++)
+            {
+                rowSum[i] = rowSum[i] * corr[i] + pSum[i];
+            }
+#pragma unroll
+            for (uint32_t n = 0; n < 32; n++)
+            {
+                o[n][0] *= corr[0];
+                o[n][1] *= corr[0];
+                o[n][2] *= corr[1];
+                o[n][3] *= corr[1];
+            }
+            // O += P V. V fragments via ldmatrix.trans on e4m3 pairs: after the byte permute and conversion, a lane holds
+            // keys (2t, 2t+1) of head dims d+2g (even n-tile) and d+2g+1 (odd n-tile).
+#pragma unroll
+            for (uint32_t ks = 0; ks < warpToks / 16; ks++)
+            {
+                uint32_t const a0 = p[2 * ks][0];
+                uint32_t const a1 = p[2 * ks][1];
+                uint32_t const a2 = p[2 * ks + 1][0];
+                uint32_t const a3 = p[2 * ks + 1][1];
+                uint32_t const tok = 16 * ks + 8 * (ldMat & 1U) + ldRow;
+#pragma unroll
+                for (uint32_t db = 0; db < 8; db++)
+                {
+                    uint32_t const grain = 2 * db + (ldMat >> 1);
+                    uint32_t vr[4];
+                    ldsm4T(vr, vBase + tok * cacheHeadBytes + ((grain ^ ldRow) * grainBytes));
+                    Vec<uint32_t, 2> const e0 = convertVCacheWordToF16<InputElem, CacheElem>(vr[0]);
+                    Vec<uint32_t, 2> const e1 = convertVCacheWordToF16<InputElem, CacheElem>(vr[1]);
+                    Vec<uint32_t, 2> const e2 = convertVCacheWordToF16<InputElem, CacheElem>(vr[2]);
+                    Vec<uint32_t, 2> const e3 = convertVCacheWordToF16<InputElem, CacheElem>(vr[3]);
+                    mmaBf16(o[4 * db + 0], a0, a1, a2, a3, e0[0], e1[0]);
+                    mmaBf16(o[4 * db + 1], a0, a1, a2, a3, e0[1], e1[1]);
+                    mmaBf16(o[4 * db + 2], a0, a1, a2, a3, e2[0], e3[0]);
+                    mmaBf16(o[4 * db + 3], a0, a1, a2, a3, e2[1], e3[1]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    cpAsyncWait<0>();
+    preExit();
+
+    // Merge the two token halves of each row block (same lane <-> same rows and columns in both warps).
+    float* const xchg = reinterpret_cast<float*>(pfxSmem) + rowWarp * xchgFloats * warp_size + lane;
+    if (tokHalf == 1)
+    {
+        if (warpActive)
+        {
+#pragma unroll
+            for (uint32_t n = 0; n < 32; n++)
+            {
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++)
+                {
+                    xchg[(4 * n + e) * warp_size] = o[n][e];
+                }
+            }
+            xchg[128 * warp_size] = rowMax[0];
+            xchg[129 * warp_size] = rowMax[1];
+            xchg[130 * warp_size] = rowSum[0];
+            xchg[131 * warp_size] = rowSum[1];
+        }
+    }
+    __syncthreads();
+    if (tokHalf == 1 || !warpActive)
+    {
+        return;
+    }
+    {
+        float s0[2];
+        float s1[2];
+#pragma unroll
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            float const otherMax = xchg[(128 + i) * warp_size];
+            float const m = fmaxf(rowMax[i], otherMax);
+            s0[i] = expf(rowMax[i] - m);
+            s1[i] = expf(otherMax - m);
+            rowMax[i] = m;
+            rowSum[i] = rowSum[i] * s0[i] + xchg[(130 + i) * warp_size] * s1[i];
+        }
+#pragma unroll
+        for (uint32_t n = 0; n < 32; n++)
+        {
+#pragma unroll
+            for (uint32_t e = 0; e < 4; e++)
+            {
+                o[n][e] = o[n][e] * s0[e / 2] + xchg[(4 * n + e) * warp_size] * s1[e / 2];
+            }
+        }
+    }
+
+    // 4. FP32 partial record of chunk idxChunk for each (request, KV head) row: unnormalized O, row max, row sum.
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 1);
+        rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 2);
+    }
+    float* const records = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(cascadeInfo) + cascadeFold::infoBytes);
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        uint32_t const rho = rowBase + g + 8 * i;
+        if (rho >= nbRows)
+        {
+            continue;
+        }
+        uint32_t const req = rho / headGrpSize;
+        uint32_t const jh = rho % headGrpSize;
+        float* const rec
+            = records + size_t((nbKHeads * req + idxHeadGrp) * nbChunks + idxChunk) * cascadeFold::recFloats;
+        if (t == 0)
+        {
+            rec[headGrpSize * validElemsPerHead + jh] = rowMax[i];
+            rec[headGrpSize * validElemsPerHead + cascadeFold::statStride + jh] = rowSum[i];
+        }
+#pragma unroll
+        for (uint32_t db = 0; db < 8; db++)
+        {
+#pragma unroll
+            for (uint32_t half = 0; half < 2; half++)
+            {
+                // even n-tile: dims d + 4t, d + 4t + 2; odd n-tile: d + 4t + 1, d + 4t + 3
+                float const(&ev)[4] = o[4 * db + 2 * half];
+                float const(&od)[4] = o[4 * db + 2 * half + 1];
+                reinterpret_cast<float4&>(rec[jh * validElemsPerHead + 32 * db + 16 * half + 4 * t])
+                    = make_float4(ev[2 * i], od[2 * i], ev[2 * i + 1], od[2 * i + 1]);
+            }
+        }
+    }
+#else
+    asm volatile("trap;\n");
+#endif
+}
+#endif // XQA_CASCADE_PREFIX
+
 #ifdef NDEBUG
 CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if SPEC_DEC
@@ -2976,7 +3699,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     uint32_t const batchSize,
     float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
                                             // int8/fp8 KV cache.
-    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
+    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr,
+    uint32_t const* __restrict__ cascadeInfo = nullptr, uint32_t nbPrefixParts = 0)
 {
 #if SPEC_DEC
     kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
@@ -2998,7 +3722,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kvCacheScale, semaphores, scratch, cascadeInfo, nbPrefixParts);
 }
 #else
 static constexpr auto kernel_mha = kernel_mha_impl;
@@ -3128,7 +3852,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kvCacheScale, semaphores, scratch, static_cast<uint32_t const*>(nullptr), 0U);
 #else
     KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
 #ifndef NDEBUG
@@ -3156,7 +3880,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kvCacheScale, semaphores, scratch, static_cast<uint32_t const*>(nullptr), 0U);
 #endif
     checkCuda(cudaPeekAtLastError());
 #endif // USE_INPUT_KV
