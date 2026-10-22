@@ -402,9 +402,20 @@ class GatedMLP(nn.Module):
         logger.debug(f"GatedMLP layer {self.layer_idx}: gate_up rows permuted "
                      "for the SM120 SwiGLU+NVFP4 GEMM epilogue")
 
-    # Rows from which gate_up runs the SwiGLU-epilogue GEMM (prefill).
+    # Rows from which gate_up runs the SwiGLU-epilogue GEMM. Measured on SM120
+    # (Qwen3.8-27B dense MLP chain, cold L2, CUDA graph + PDL): below 41 rows
+    # the autotuned nvfp4_gemm + fused_silu_mul_nvfp4_permuted is faster
+    # (M=24/32: 131.8/132.3 vs 144.1/143.6 us per layer); tile 1 wins from 48.
     _SWIGLU_EPI_MIN_ROWS = int(
-        os.environ.get("TRTLLM_GATEUP_SWIGLU_EPI_MIN_ROWS", "17"))
+        os.environ.get("TRTLLM_GATEUP_SWIGLU_EPI_MIN_ROWS", "41"))
+
+    @staticmethod
+    def _swiglu_epi_tile(m: int) -> int:
+        """CTA tile of the SwiGLU-epilogue GEMM: 0 = 256x128x128,
+        1 = 128x128x256. Both are bitwise equal. Measured crossover: tie at
+        384 rows, tile 0 faster from 512 (208.6 vs 231.7 us per MLP layer) and
+        at every prefill size incl. the 2048+d mixed tails."""
+        return 0 if m >= 448 else 1
 
     def _unpermute_gate_up_output(self, h1):
         """[gate | up] column order for consumers that are not index-aware."""
@@ -436,7 +447,7 @@ class GatedMLP(nn.Module):
             return None
         gate_up = self.gate_up_proj
         act_fp4, act_sf, alpha = gate_up.quant_method._input_prepare(gate_up, x)
-        tile = 0 if m >= 1024 else 1
+        tile = GatedMLP._swiglu_epi_tile(m)
         fp4, sf = torch.ops.trtllm.nvfp4_gate_up_swiglu_nvfp4(
             act_fp4, gate_up.weight, act_sf, gate_up.weight_scale, alpha,
             self.down_proj.input_scale, tile)
