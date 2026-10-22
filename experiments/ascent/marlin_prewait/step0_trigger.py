@@ -3,8 +3,8 @@
 #   producer (Triton gemma add-RMSNorm stand-in, PDL launch; trigger LATE = after its stores, as the FlashInfer
 #   norm does today, or EARLY = right after its global loads, before the reduction) -> Marlin -> FlashInfer
 #   gemma add-RMSNorm.
-# Arms (alternated each iteration): LK (late trigger, Marlin wait-first = main), LP (late, Marlin pre-wait B),
-# EK (early, wait-first), EP (early, pre-wait B), LP2 (= LP, in-process A/A).
+# Arms (rotated each iteration): LK (late trigger, Marlin wait-first = main), LP (late, Marlin pre-wait L2 prefetch
+# of (stages-1) k-tiles; _d2/_d4 = 2x/4x that depth), EK (early, wait-first), EP (early, pre-wait), LP2 (= LP, A/A).
 import json
 import os
 import time
@@ -21,7 +21,9 @@ dev = torch.device("cuda")
 EPS, WARM, ITERS = 1e-6, 10, 60
 SHAPES = [("qkvz", 16384, 5120, 6), ("qkv", 14336, 5120, 7), ("outproj", 5120, 6144, 16)]
 MS = [4, 8, 12, 16]
-ARMS = [("LK", False, False), ("LP", False, True), ("EK", True, False), ("EP", True, True), ("LP2", False, True)]
+ARMS = [("LK", False, False, 1), ("LP", False, True, 1), ("LP_d2", False, True, 2), ("LP_d4", False, True, 4),
+        ("EK", True, False, 1), ("EP", True, True, 1), ("EP_d2", True, True, 2), ("EP_d4", True, True, 4),
+        ("LP2", False, True, 1)]
 T0 = time.time()
 
 
@@ -131,8 +133,9 @@ def main():
         wn2 = (0.1 * torch.randn(n, generator=g, device=dev)).to(torch.bfloat16)
         for m in MS:
             objs, graphs, outs, eager = {}, {}, {}, {}
-            for name, early, prewait in ARMS:
+            for name, early, prewait, depth in ARMS:
                 os.environ["TRTLLM_MARLIN_PREWAIT_B"] = "1" if prewait else "0"
+                os.environ["TRTLLM_MARLIN_PREWAIT_DEPTH"] = str(depth)
                 obj = Chain(n, k, m, ws, wn1, wn2, 100 + m, early)
                 eager[name] = obj.state(obj.run())
                 gr, o = capture(obj)

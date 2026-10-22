@@ -299,13 +299,28 @@ bool marlin_inproj_full_k_enabled()
     return !(v != nullptr && v[0] == '0' && v[1] == '\0');
 }
 
-// PDL launches issue the first pipeline stages' B / weight-scale copies before
+// PDL launches prefetch the first pipeline stages' B / weight scales into L2 before
 // griddepcontrol.wait (kMarlinNvfp4PreWaitFlag): TRTLLM_MARLIN_PREWAIT_B, read per
 // call; "0" restores the wait-first prologue.
 bool marlin_prewait_b_enabled()
 {
     char const* v = std::getenv("TRTLLM_MARLIN_PREWAIT_B");
     return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+}
+
+constexpr int kMarlinPrewaitDefaultDepth = 1;
+
+// Prefetch depth in units of (stages - 1) k-tiles: TRTLLM_MARLIN_PREWAIT_DEPTH=1..4,
+// read per call (sweeps); returns the 2-bit code (depth - 1).
+int marlin_prewait_depth_code()
+{
+    char const* v = std::getenv("TRTLLM_MARLIN_PREWAIT_DEPTH");
+    int d = kMarlinPrewaitDefaultDepth;
+    if (v != nullptr && v[0] >= '1' && v[0] <= '4' && v[1] == '\0')
+    {
+        d = v[0] - '0';
+    }
+    return (d - 1) & kMarlinNvfp4PreWaitDepthMask;
 }
 
 // Test-only negative control for PDL-live checks: TRTLLM_MARLIN_DEBUG_SKIP_WAIT=1
@@ -355,7 +370,11 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
         max_par_val = 16 * 8;
     int max_shared_mem_new = max_shared_mem;
     int const pdl_flags = enable_pdl ? (kMarlinNvfp4PdlLaunchFlag
-                                           | (marlin_prewait_b_enabled() ? kMarlinNvfp4PreWaitFlag : 0)
+                                           | (marlin_prewait_b_enabled()
+                                                   ? (kMarlinNvfp4PreWaitFlag
+                                                       | (marlin_prewait_depth_code()
+                                                           << kMarlinNvfp4PreWaitDepthShift))
+                                                   : 0)
                                            | (marlin_debug_skip_wait() ? kMarlinNvfp4DebugSkipWaitFlag : 0))
                                      : 0;
     int rest_m = prob_m;
@@ -492,8 +511,8 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
 
         // A PDL launch orders its A, lock and C accesses after the predecessor grid
         // (griddepcontrol.wait); that also serializes the launches of this loop, which
-        // share `locks`. Only the constant weight / weight-scale copies of the first
-        // pipeline stages may be issued before the wait (kMarlinNvfp4PreWaitFlag).
+        // share `locks`. Only L2 prefetches of the constant weights / weight scales of
+        // the first pipeline stages may be issued before the wait (kMarlinNvfp4PreWaitFlag).
         // Only a PDL launch (flag in the last argument) triggers dependents early.
         int4 const* b_bias_null = nullptr;
         float const* a_scales_null = nullptr;
