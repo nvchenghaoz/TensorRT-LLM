@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import nvfp4_coldtune as ct  # noqa: E402
 
 SH = {"qkvz": (16384, 5120), "qkv": (14336, 5120), "o_out": (5120, 6144), "down": (5120, 17408)}
-MIXED = (2055, 2063, 2079, 4103, 4111, 4127, 8168, 8176, 8191)
-PURE = (8, 16, 32, 2048, 4096, 6175, 8192)
+MIXED = (2055, 2063, 2079, 2080, 4103, 4111, 4127, 4128, 8168, 8176, 8191)
+PURE = (8, 16, 32, 2048, 4096, 6175, 6176, 6208, 8192)
 NUM_MS = (8, 16, 32, 2048, 2055, 2063, 2079, 4096, 4111, 4127, 6175, 8168, 8191, 8192)
 BUCKETS = (2080, 4128, 8191)
 ALL_MS = tuple(sorted(set(MIXED) | set(PURE) | set(NUM_MS) | set(BUCKETS)))
