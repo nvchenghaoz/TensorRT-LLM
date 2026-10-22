@@ -121,6 +121,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         probe_mode: int = 0,
+        pool_state_dtype: type[cutlass.Numeric] | None = None,
     ):
         self.needs_alpha = needs_alpha
         self.needs_beta = needs_beta
@@ -128,6 +129,20 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         self.needs_checkpointing = needs_checkpointing
         self.dtype = dtype
         self.acc_dtype = acc_dtype
+        # Pool mode (compile time): the state lives in an indexed pool
+        # [N_pool, H, V, K] of pool_state_dtype (bf16/fp16/fp32) with a padded
+        # slot stride. Sequence i reads and writes, in place, row
+        # state_indices[i]; the kernel converts to/from the fp32 MMA fragment
+        # (bf16/fp16 -> fp32 is exact; fp32 -> bf16/fp16 rounds to nearest even).
+        # In pool mode the host passes state_indices in the checkpoint_cu_starts
+        # slot and the slot stride (elements) in total_checkpoints; checkpoints
+        # are rejected in this mode.
+        self.pool_mode = pool_state_dtype is not None
+        self.state_dtype = pool_state_dtype if self.pool_mode else acc_dtype
+        if self.pool_mode and (needs_checkpointing or not needs_init_state):
+            raise RuntimeError(
+                "SM120 GDN pool-mode state I/O needs an initial state and no checkpoints"
+            )
         self.inverse_dtype = cutlass.Float16
         self.BLK_Q = 64
         self.BLK_KV = 64
@@ -162,6 +177,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             "o_stage",
             "alpha_beta_stage",
             "probe_mode",
+            "pool_mode",
+            "state_dtype",
         )
 
     def get_next_work(
@@ -645,7 +662,10 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         tKVcKV = kv_thr_mma.partition_C(c_kv)
         for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             v_idx, k_idx = tKVcKV[i]
-            tKVrKV[i] = gKV[k_idx, v_idx]
+            if cutlass.const_expr(self.pool_mode and self.state_dtype != self.acc_dtype):
+                tKVrKV[i] = gKV[k_idx, v_idx].to(self.acc_dtype)
+            else:
+                tKVrKV[i] = gKV[k_idx, v_idx]
 
     @cute.jit
     def kv_store(
@@ -658,7 +678,27 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         tKVcKV = kv_thr_mma.partition_C(c_kv)
         for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             v_idx, k_idx = tKVcKV[i]
-            gKV[k_idx, v_idx] = tKVrKV[i]
+            if cutlass.const_expr(self.pool_mode and self.state_dtype != self.acc_dtype):
+                gKV[k_idx, v_idx] = tKVrKV[i].to(self.state_dtype)
+            else:
+                gKV[k_idx, v_idx] = tKVrKV[i]
+
+    def pool_slot_kv(
+        self,
+        g_pool: cute.Tensor,
+        state_indices: cute.Tensor,
+        slot_stride: cutlass.Int32,
+        seq_idx: cutlass.Int32,
+        o_head_idx: cutlass.Int32,
+        num_sab_heads: cutlass.Int32,
+    ):
+        """(K, V) view of pool[state_indices[seq_idx], o_head_idx] (pool mode)."""
+        slot = cutlass.Int64(state_indices[seq_idx])
+        slot_ptr = g_pool.iterator + slot * cutlass.Int64(slot_stride)
+        slot_layout = cute.make_ordered_layout(
+            (self.D, self.D, num_sab_heads), order=(0, 1, 2)
+        )
+        return cute.make_tensor(slot_ptr, slot_layout)[None, None, o_head_idx]
 
     @cute.jit
     def maybe_store_checkpoint(
@@ -1256,12 +1296,25 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
         )
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
-        mState = cute.make_tensor(g_state.iterator, state_layout)
-        gStateKV = mState[None, None, o_head_idx, work_desc.seq_idx]
-        if cutlass.const_expr(self.needs_init_state):
-            mInitState = cute.make_tensor(g_init_state.iterator, state_layout)
-            gInitKV = mInitState[None, None, o_head_idx, work_desc.seq_idx]
-            self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
+        if cutlass.const_expr(self.pool_mode):
+            # In-place indexed pool I/O: checkpoint_cu_starts carries
+            # state_indices and total_checkpoints the slot stride.
+            gStateKV = self.pool_slot_kv(
+                g_state,
+                checkpoint_cu_starts,
+                total_checkpoints,
+                work_desc.seq_idx,
+                o_head_idx,
+                num_sab_heads,
+            )
+            self.kv_load(tKVrKV, gStateKV, kv_thr_mma)
+        else:
+            mState = cute.make_tensor(g_state.iterator, state_layout)
+            gStateKV = mState[None, None, o_head_idx, work_desc.seq_idx]
+            if cutlass.const_expr(self.needs_init_state):
+                mInitState = cute.make_tensor(g_init_state.iterator, state_layout)
+                gInitKV = mInitState[None, None, o_head_idx, work_desc.seq_idx]
+                self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
 
         first_B = work_desc.seq_len
         if first_B > cutlass.Int32(self.BLK_KV):
@@ -1983,6 +2036,7 @@ class _VSplitDeltaRuleSm120(_FullyFusedDeltaRuleSm120):
         kk_stage: int = 2,
         qk_stage: int = 2,
         stages: dict | None = None,
+        pool_state_dtype: type[cutlass.Numeric] | None = None,
     ):
         if needs_checkpointing:
             raise RuntimeError("V-split SM120 GDN prefill does not support checkpoints")
@@ -1998,6 +2052,7 @@ class _VSplitDeltaRuleSm120(_FullyFusedDeltaRuleSm120):
             dtype,
             acc_dtype,
             probe_mode,
+            pool_state_dtype=pool_state_dtype,
         )
         if stages:
             for name, value in stages.items():
@@ -2053,7 +2108,10 @@ class _VSplitDeltaRuleSm120(_FullyFusedDeltaRuleSm120):
         tKVcKV = kv_thr_mma.partition_C(c_kv)
         for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             v_idx, k_idx = tKVcKV[i]
-            tKVrKV[i] = gKV[k_idx, v_idx]
+            if cutlass.const_expr(self.pool_mode and self.state_dtype != self.acc_dtype):
+                tKVrKV[i] = gKV[k_idx, v_idx].to(self.acc_dtype)
+            else:
+                tKVrKV[i] = gKV[k_idx, v_idx]
 
     @cute.jit
     def kv_store_vs(self, tKVrKV: cute.Tensor, gKV: cute.Tensor, kv_thr_mma):
@@ -2061,7 +2119,10 @@ class _VSplitDeltaRuleSm120(_FullyFusedDeltaRuleSm120):
         tKVcKV = kv_thr_mma.partition_C(c_kv)
         for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             v_idx, k_idx = tKVcKV[i]
-            gKV[k_idx, v_idx] = tKVrKV[i]
+            if cutlass.const_expr(self.pool_mode and self.state_dtype != self.acc_dtype):
+                gKV[k_idx, v_idx] = tKVrKV[i].to(self.state_dtype)
+            else:
+                gKV[k_idx, v_idx] = tKVrKV[i]
 
     # ── TMA loads: full Q/K tiles, the CTA's 64-row V tile ──
 
@@ -2791,6 +2852,8 @@ class _VSplitDeltaRuleSm120(_FullyFusedDeltaRuleSm120):
         num_v_heads: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         num_seqs: cutlass.Int32,
+        pool_state_indices: cute.Tensor,
+        pool_slot_stride: cutlass.Int32,
     ):
         q_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.q_stage
@@ -2829,17 +2892,31 @@ class _VSplitDeltaRuleSm120(_FullyFusedDeltaRuleSm120):
             (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
         )
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
-        mState = cute.make_tensor(g_state.iterator, state_layout)
-        gStateKV = cute.flat_divide(
-            mState[None, None, o_head_idx, work_desc.seq_idx], (self.D, self.DV)
-        )[None, None, 0, v_half]
-        if cutlass.const_expr(self.needs_init_state):
-            mInitState = cute.make_tensor(g_init_state.iterator, state_layout)
-            gInitKV = cute.flat_divide(
-                mInitState[None, None, o_head_idx, work_desc.seq_idx],
+        if cutlass.const_expr(self.pool_mode):
+            gStateKV = cute.flat_divide(
+                self.pool_slot_kv(
+                    g_state,
+                    pool_state_indices,
+                    pool_slot_stride,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    num_sab_heads,
+                ),
                 (self.D, self.DV),
             )[None, None, 0, v_half]
-            self.kv_load_vs(tKVrKV, gInitKV, kv_thr_mma)
+            self.kv_load_vs(tKVrKV, gStateKV, kv_thr_mma)
+        else:
+            mState = cute.make_tensor(g_state.iterator, state_layout)
+            gStateKV = cute.flat_divide(
+                mState[None, None, o_head_idx, work_desc.seq_idx], (self.D, self.DV)
+            )[None, None, 0, v_half]
+            if cutlass.const_expr(self.needs_init_state):
+                mInitState = cute.make_tensor(g_init_state.iterator, state_layout)
+                gInitKV = cute.flat_divide(
+                    mInitState[None, None, o_head_idx, work_desc.seq_idx],
+                    (self.D, self.DV),
+                )[None, None, 0, v_half]
+                self.kv_load_vs(tKVrKV, gInitKV, kv_thr_mma)
 
         first_B = work_desc.seq_len
         if first_B > cutlass.Int32(self.BLK_KV):
@@ -3496,6 +3573,8 @@ class _VSplitDeltaRuleSm120(_FullyFusedDeltaRuleSm120):
                     num_v_heads,
                     num_sab_heads,
                     num_seqs,
+                    checkpoint_cu_starts,
+                    total_checkpoints,
                 )
 
 
@@ -3545,11 +3624,20 @@ def delta_rule_prefill_dsl(
     vsplit: bool | None = None,
     _probe_mode: int = 0,
     _vsplit_stages: dict | None = None,
+    state_indices: torch.Tensor | None = None,
 ):
     """``num_long_seqs``: optional host hint, an upper bound on the number of
     sequences longer than one token (mixed steps pass decodes as 1-token
     sequences). ``vsplit``: None = auto gate, True/False force the V-split x2
-    kernel on/off. ``_probe_mode`` is a timing-probe knob for benchmarks only."""
+    kernel on/off. ``_probe_mode`` is a timing-probe knob for benchmarks only.
+
+    ``state_indices`` (int32 ``[num_seqs]``): pool mode. ``state`` is then the
+    state pool ``[N_pool, H, D, D]`` (bf16, fp16 or fp32; inner ``[H, V, K]``
+    contiguous, padded slot stride allowed) and ``init_state`` must be the same
+    tensor: sequence ``i`` reads its initial state from and writes its final
+    state back to row ``state_indices[i]`` in place. Slot ids must be unique.
+    Results are bitwise equal to gathering the rows to fp32, running the packed
+    fp32 kernel and casting back with round-to-nearest-even."""
     from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
@@ -3587,12 +3675,56 @@ def delta_rule_prefill_dsl(
         raise RuntimeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
     if beta is not None and beta.dtype != torch.float32:
         raise RuntimeError(f"beta must have dtype torch.float32, got {beta.dtype}")
-    if init_state is not None and init_state.dtype != torch.float32:
-        raise RuntimeError(
-            f"init_state must have dtype torch.float32, got {init_state.dtype}"
-        )
-    if state.dtype != torch.float32:
-        raise RuntimeError(f"state must have dtype torch.float32, got {state.dtype}")
+    pool_mode = state_indices is not None
+    pool_state_dtype = None
+    if pool_mode:
+        pool_state_dtype = {
+            torch.bfloat16: cutlass.BFloat16,
+            torch.float16: cutlass.Float16,
+            torch.float32: cutlass.Float32,
+        }.get(state.dtype)
+        if pool_state_dtype is None:
+            raise RuntimeError(
+                f"pool-mode state must be bf16/fp16/fp32, got {state.dtype}"
+            )
+        if init_state is None or init_state.data_ptr() != state.data_ptr() or (
+            init_state.shape != state.shape or init_state.stride() != state.stride()
+        ):
+            raise RuntimeError("pool mode updates in place: init_state must be state")
+        if needs_checkpointing:
+            raise RuntimeError("pool mode does not support state checkpoints")
+        if (
+            state.dim() != 4
+            or tuple(state.shape[1:]) != (num_sab_heads, D, D)
+            or state.stride()[1:] != (D * D, D, 1)
+            or state.stride(0) < num_sab_heads * D * D
+            or state.stride(0) % 2 != 0
+            or state.stride(0) >= 2**31
+            or state.data_ptr() % 4 != 0
+        ):
+            raise RuntimeError(
+                "pool-mode state must be [N_pool, H, D, D] with a contiguous, "
+                "4-byte aligned [H, D, D] block per slot, got shape "
+                f"{tuple(state.shape)} stride {state.stride()}"
+            )
+        if (
+            state_indices.dtype != torch.int32
+            or state_indices.shape != (num_seqs,)
+            or not state_indices.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"state_indices must be contiguous int32 [{num_seqs}], got "
+                f"{state_indices.dtype} {tuple(state_indices.shape)}"
+            )
+    else:
+        if init_state is not None and init_state.dtype != torch.float32:
+            raise RuntimeError(
+                f"init_state must have dtype torch.float32, got {init_state.dtype}"
+            )
+        if state.dtype != torch.float32:
+            raise RuntimeError(
+                f"state must have dtype torch.float32, got {state.dtype}"
+            )
     if cu_seqlens.dtype != torch.int64:
         raise RuntimeError(
             f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
@@ -3603,14 +3735,17 @@ def delta_rule_prefill_dsl(
         ("k", k),
         ("v", v),
         ("o", o),
-        ("state", state),
         ("cu_seqlens", cu_seqlens),
     ):
         if not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
-    for name, tensor in (("alpha", alpha), ("beta", beta), ("init_state", init_state)):
+    for name, tensor in (("alpha", alpha), ("beta", beta)):
         if tensor is not None and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
+    if not pool_mode:
+        for name, tensor in (("state", state), ("init_state", init_state)):
+            if tensor is not None and not tensor.is_contiguous():
+                raise RuntimeError(f"{name} must be contiguous")
 
     total_seqlen = q.shape[0]
     num_o_heads = o.shape[1]
@@ -3659,24 +3794,44 @@ def delta_rule_prefill_dsl(
         if needs_beta
         else None
     )
-    state_cute = from_dlpack(state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-    init_state_cute = (
-        from_dlpack(init_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_init_state
-        else None
-    )
-    state_checkpoints_cute = (
-        from_dlpack(
-            state_checkpoints.reshape(-1), assumed_align=16
+    if pool_mode:
+        # Base pointer only: a 1-D view of slot 0's [H, D, D] block. The kernel
+        # addresses slot state_indices[i] itself with 64-bit offsets
+        # (slot * slot_stride elements), so the view stays small: a view spanning
+        # the whole pool can exceed the int32 extent of the CuTe memref (a
+        # serving pool holds thousands of slots, > 2^31 elements per layer).
+        state_cute = from_dlpack(
+            state.as_strided((num_sab_heads * D * D,), (1,)), assumed_align=4
         ).mark_layout_dynamic()
-        if needs_checkpointing
-        else None
-    )
-    checkpoint_cu_cute = (
-        from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
-        if needs_checkpointing
-        else None
-    )
+        init_state_cute = state_cute
+        state_checkpoints_cute = None
+        # Pool mode reuses the (unused) checkpoint arguments: the int32 slot ids
+        # ride in checkpoint_cu_starts and the slot stride in total_checkpoints.
+        checkpoint_cu_cute = from_dlpack(
+            state_indices, assumed_align=4
+        ).mark_layout_dynamic()
+        total_checkpoints = state.stride(0)
+    else:
+        state_cute = from_dlpack(
+            state.reshape(-1), assumed_align=16
+        ).mark_layout_dynamic()
+        init_state_cute = (
+            from_dlpack(init_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
+            if needs_init_state
+            else None
+        )
+        state_checkpoints_cute = (
+            from_dlpack(
+                state_checkpoints.reshape(-1), assumed_align=16
+            ).mark_layout_dynamic()
+            if needs_checkpointing
+            else None
+        )
+        checkpoint_cu_cute = (
+            from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
+            if needs_checkpointing
+            else None
+        )
     tensormaps_cute = from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic()
     cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
 
@@ -3700,6 +3855,7 @@ def delta_rule_prefill_dsl(
             kernel_dtype,
             probe_mode=_probe_mode,
             stages=_vsplit_stages,
+            pool_state_dtype=pool_state_dtype,
         )
         grid_x = num_seqs * num_sab_heads * delta_rule_kernel.v_split
     else:
@@ -3710,6 +3866,7 @@ def delta_rule_prefill_dsl(
             needs_checkpointing,
             kernel_dtype,
             probe_mode=_probe_mode,
+            pool_state_dtype=pool_state_dtype,
         )
         grid_x = num_seqs * num_sab_heads
 

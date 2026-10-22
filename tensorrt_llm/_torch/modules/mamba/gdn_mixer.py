@@ -1297,6 +1297,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # Blackwell uses indexed pool I/O directly, without state scratch.
         if not _use_flashinfer_gdn_prefill() or is_sm_100f():
             return None
+        # SM120 with in-place indexed pool I/O needs no fp32 state scratch either.
+        from tensorrt_llm._torch.modules.fla.flashinfer_chunk import sm120_pool_io_eligible
+
+        if sm120_pool_io_eligible(ssm_states):
+            return None
         key = (ssm_states.device, ssm_states.shape[1:])
         # First use during warmup reserves the configured maximum, not the current batch.
         # Sequential layers share this persistent input/output scratch.
