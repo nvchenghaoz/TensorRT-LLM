@@ -51,19 +51,29 @@ def make(seq_lens, seed=777, shift=6.0):
     return q, k, v, g_log, beta, cu
 
 
-def make_pool(dtype, seed=4242):
+def make_pool(dtype, seed=4242, nb=None):
+    nb = NB if nb is None else nb
     g = torch.Generator(device="cuda")
     g.manual_seed(seed)
-    buf = (torch.randn(NB, STRIDE_E, generator=g, device=dev) * 0.05).to(dtype)
-    pool = buf[:, GAP:].view(NB, H_V, D, D)
+    if nb == NB:
+        buf = (torch.randn(nb, STRIDE_E, generator=g, device=dev) * 0.05).to(dtype)
+    else:
+        buf = torch.randn(nb, STRIDE_E, generator=g, device=dev, dtype=dtype)
+        buf.mul_(0.05)
+    pool = buf[:, GAP:].view(nb, H_V, D, D)
     assert pool.stride(0) == STRIDE_E and pool.storage_offset() == GAP
     return buf, pool
 
 
-def slot_ids(n, seed=99):
+def slot_ids(n, seed=99, nb=None):
+    nb = NB if nb is None else nb
     g = torch.Generator()
     g.manual_seed(seed + n)
-    perm = torch.randperm(NB, generator=g)[:n]
+    perm = torch.randperm(nb, generator=g)[:n]
+    if nb != NB:
+        # make sure the top slots (element offsets > 2^31) are exercised
+        perm[0] = nb - 1
+        perm[1] = nb - 7
     return perm.to(torch.int32).to(dev)
 
 
@@ -100,12 +110,13 @@ def sha(t):
     return hashlib.sha256(iv(t.contiguous()).cpu().numpy().tobytes()).hexdigest()[:12]
 
 
-def case(name, seq_lens, dtype=torch.bfloat16, zero_first=False, warm=10, iters=50):
+def case(name, seq_lens, dtype=torch.bfloat16, zero_first=False, warm=10, iters=50, nb=None):
+    nb = NB if nb is None else nb
     inp = make(seq_lens)
     n = len(seq_lens)
     n_long = sum(1 for s in seq_lens if s > 1)
-    idx = slot_ids(n)
-    buf, pool = make_pool(dtype)
+    idx = slot_ids(n, nb=nb)
+    buf, pool = make_pool(dtype, nb=nb)
     if zero_first:
         # has_initial_state=False row: production zeroes the slot first
         # (reset_recurrent_state_rows in gdn_mixer.forward_core).
@@ -118,7 +129,8 @@ def case(name, seq_lens, dtype=torch.bfloat16, zero_first=False, warm=10, iters=
     torch.cuda.synchronize()
     ref_buf = buf.clone()
     touched = sorted(int(x) for x in idx.tolist())
-    untouched = [s for s in range(NB) if s not in touched]
+    untouched = [s for s in range(nb) if s not in touched]
+    rows = torch.tensor(touched, dtype=torch.long, device=dev)
     changed_slots = [s for s in touched if not torch.equal(iv(ref_buf[s]), iv(pristine[s]))]
     first = None
     bad_ref = 0
@@ -132,23 +144,29 @@ def case(name, seq_lens, dtype=torch.bfloat16, zero_first=False, warm=10, iters=
             bad_ref += 1
             if bad_ref == 1:
                 d = (out.float() - ref_out.float()).abs()
-                db = (buf.float() - ref_buf.float()).abs()
+                db = (buf[rows].float() - ref_buf[rows].float()).abs()
                 log(name, "MISMATCH it", it, "out maxdiff", d.max().item(), "n", int((d > 0).sum()),
                     "buf maxdiff", db.max().item(), "n", int((db > 0).sum()))
         if first is None:
             first = (out.clone(), buf.clone())
         elif not (torch.equal(iv(out), iv(first[0])) and torch.equal(iv(buf), iv(first[1]))):
             bad_first += 1
-    untouched_ok = all(torch.equal(iv(buf[s]), iv(pristine[s])) for s in untouched)
+    keep = torch.ones(nb, dtype=torch.bool, device=dev)
+    keep[rows] = False
+    untouched_ok = torch.equal(iv(buf[keep]), iv(pristine[keep]))
     gaps_ok = torch.equal(iv(buf[:, :GAP]), iv(pristine[:, :GAP]))
+    big = nb != NB
     r = dict(
         case=name, seq_lens="%d seqs, %d long, T=%d" % (n, n_long, sum(seq_lens)),
-        dtype=str(dtype), slot_ids=idx.tolist(), calls=warm + iters,
+        dtype=str(dtype), pool_slots=nb,
+        max_slot_element_offset=max(touched) * STRIDE_E + GAP,
+        slot_ids=idx.tolist() if n <= 32 else "%d ids" % n, calls=warm + iters,
         mismatch_vs_main_path=bad_ref, drift_vs_call1=bad_first,
         untouched_slots_and_gaps_unchanged=bool(untouched_ok and gaps_ok),
         touched_slots_updated=len(changed_slots), n_touched=len(touched),
         ref_sha_out=sha(ref_out), cand_sha_out=sha(out),
-        ref_sha_pool=sha(ref_buf), cand_sha_pool=sha(buf),
+        ref_sha_pool=sha(ref_buf[rows] if big else ref_buf),
+        cand_sha_pool=sha(buf[rows] if big else buf),
     )
     r["passed"] = bool(bad_ref == 0 and bad_first == 0 and untouched_ok and gaps_ok
                        and len(changed_slots) == len(touched))
@@ -168,10 +186,13 @@ def main():
         ("2x2048+30", [2048, 2048] + [1] * 30),
     ]
     res = []
+    big = 2700  # 2699 * 817152 > 2^31 elements: a serving-sized pool (~3900 slots)
     if quick:
         res.append(case("2048+7", [2048] + [1] * 7, warm=1, iters=2))
-        res.append(case("2x2048+30", [2048, 2048] + [1] * 30, warm=1, iters=2))
+        res.append(case("2048+31 big pool", [2048] + [1] * 31, warm=1, iters=2, nb=big))
     else:
+        res.append(case("2048+31 big pool", [2048] + [1] * 31, warm=2, iters=8, nb=big))
+        res.append(case("2x2048+30 big pool", [2048, 2048] + [1] * 30, warm=2, iters=8, nb=big))
         for name, sl in cases:
             res.append(case(name, sl))
         res.append(case("1x2048 has_initial_state=False", [2048], zero_first=True))
@@ -184,7 +205,8 @@ def main():
         compared=("TRT-LLM flashinfer_chunk adapter: SM120 in-place indexed pool path vs main's "
                   "gather->fp32 / packed fp32 kernel / RNE scatter path (same process); outputs + "
                   "entire pool buffer (touched, untouched slots, slot gaps) bitwise, 10+50 calls "
-                  "from a pristine pool, each == main path and == call 1"),
+                  "from a pristine pool, each == main path and == call 1; plus a 2700-slot pool "
+                  "whose top slots sit beyond 2^31 elements (serving pools hold ~3900 slots)"),
         cases=res,
     )), flush=True)
 

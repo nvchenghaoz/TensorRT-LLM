@@ -3795,11 +3795,13 @@ def delta_rule_prefill_dsl(
         else None
     )
     if pool_mode:
-        # Flat 1-D view spanning every pool slot (the slot gap stays untouched);
-        # the kernel addresses slot state_indices[i] at slot_stride elements.
-        span = (state.shape[0] - 1) * state.stride(0) + num_sab_heads * D * D
+        # Base pointer only: a 1-D view of slot 0's [H, D, D] block. The kernel
+        # addresses slot state_indices[i] itself with 64-bit offsets
+        # (slot * slot_stride elements), so the view stays small: a view spanning
+        # the whole pool can exceed the int32 extent of the CuTe memref (a
+        # serving pool holds thousands of slots, > 2^31 elements per layer).
         state_cute = from_dlpack(
-            state.as_strided((span,), (1,)), assumed_align=4
+            state.as_strided((num_sab_heads * D * D,), (1,)), assumed_align=4
         ).mark_layout_dynamic()
         init_state_cute = state_cute
         state_checkpoints_cute = None
