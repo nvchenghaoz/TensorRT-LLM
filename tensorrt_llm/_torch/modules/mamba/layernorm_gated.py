@@ -160,6 +160,12 @@ def _multirow_pdl(grid_size: int, device_index: int) -> bool:
     return allowed and grid_size < num_sms
 
 
+def _multirow_early_trigger() -> bool:
+    """TRTLLM_GATED_NORM_EARLY_TRIGGER=1: trigger PDL dependents right after the
+    loads instead of after the stores (read per call, so A/B graphs can coexist)."""
+    return os.environ.get("TRTLLM_GATED_NORM_EARLY_TRIGGER", "0") == "1"
+
+
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
 @triton.jit
@@ -183,6 +189,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr = False,
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -217,6 +224,12 @@ def _rms_norm_gated_fwd_multirow_kernel(
     gate = tl.sigmoid(z)
     if not GATE_SIGMOID:
         gate *= z
+    if LAUNCH_WITH_PDL and EARLY_TRIGGER:
+        # Early trigger: every global load of this program (x, w, z) has landed
+        # (gate uses z). Dependents read Y / Rstd only after their own
+        # griddepcontrol.wait, which waits for this grid's completion, so this
+        # only lets them launch (and prefetch constant weights) sooner.
+        tl.extra.cuda.gdc_launch_dependents()
     y *= gate
     if OUTPUT_FP8:
         # Match the existing two-kernel path: RMSNorm first stores to the
@@ -226,7 +239,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
     y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
     tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
-    if LAUNCH_WITH_PDL:
+    if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
         # Release only after both Rstd (when present) and Y have been stored.
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -308,6 +321,7 @@ def rms_norm_gated_token_major(
             GATE_SIGMOID=gate_sigmoid,
             WEIGHT_IS_DELTA=False,
             LAUNCH_WITH_PDL=launch_with_pdl,
+            EARLY_TRIGGER=launch_with_pdl and _multirow_early_trigger(),
             num_warps=_MULTIROW_NUM_WARPS,
             launch_pdl=launch_with_pdl,
         )
@@ -624,6 +638,7 @@ def _layer_norm_fwd(
                 GATE_SIGMOID=gate_sigmoid,
                 WEIGHT_IS_DELTA=weight_is_delta,
                 LAUNCH_WITH_PDL=launch_with_pdl,
+                EARLY_TRIGGER=launch_with_pdl and _multirow_early_trigger(),
                 num_warps=_MULTIROW_NUM_WARPS,
                 launch_pdl=launch_with_pdl,
             )
