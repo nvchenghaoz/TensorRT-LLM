@@ -13,6 +13,8 @@
 #    (Marlin's griddepcontrol.wait removed) must FAIL (non-finite / mismatching output), proving the check
 #    is live.
 # 4. Advisory FP32 reference error (dequantized weights, BF16 activations) per shape/row.
+# Rows 24/32 (qkv, out_proj only; workspace_mode 2 = FP32 split-K reduce through C_tmp) go through 1-3 as well.
+# At the end the persistent lock workspace must read all zero; inputs are hashed before and after each case.
 import hashlib
 import json
 import os
@@ -33,6 +35,17 @@ EPS = 1e-6
 WARM, ITERS = 10, 60
 SHAPES = [("qkvz", 16384, 5120, 6), ("qkv", 14336, 5120, 7), ("outproj", 5120, 6144, 16)]
 MS = [4, 8, 12, 16]
+# Rows 17-32 run Marlin only on qkv and out_proj/o_proj (main 7f09143a, per-(N,K) caps), with workspace_mode 2
+# (split-K partials reduced in FP32 through a per-call C_tmp), as FP8QDQLinearMethod.apply dispatches them.
+MS_FP32_REDUCE = [24, 32]
+
+
+def rows_for(sname):
+    return MS + (MS_FP32_REDUCE if sname in ("qkv", "outproj") else [])
+
+
+def mode_for(m):
+    return 2 if m > 16 else 0
 DELAY_US = 30
 T0 = time.time()
 
@@ -87,7 +100,7 @@ def build(n, k, seed):
 def marlin(x, wt, n, k):
     return torch.ops.trtllm.marlin_nvfp4_gemm(x, wt[0], scale_a=None, scale_b=wt[1], alpha=None,
                                               weight_global_scale=wt[2], bias=None, out_dtype=torch.bfloat16,
-                                              size_n=n, size_k=k)
+                                              size_n=n, size_k=k, workspace_mode=mode_for(x.shape[0]))
 
 
 def norm(x, r, w):
@@ -206,10 +219,11 @@ def main():
         wn1 = (0.1 * torch.randn(k, generator=g, device=dev)).to(torch.bfloat16)
         wn2 = (0.1 * torch.randn(n, generator=g, device=dev)).to(torch.bfloat16)
         wref = dequant(raw[0], raw[1], raw[2], n, k)
-        for m in MS:
+        for m in rows_for(sname):
             key = f"{sname}_M{m}"
             gx = torch.Generator(device=dev).manual_seed(7 + m)
             x = (torch.randn(m, k, generator=gx, device=dev) * 0.5).to(torch.bfloat16)
+            xsha = sha([x])
             # 1. eager bitwise, both launch families
             rec = {}
             for fullk in (True, False):
@@ -302,12 +316,20 @@ def main():
             if not live["negative_control_fails"]:
                 failures.append(f"pdl_live {key} negative control did not fail")
             report["pdl_live"][key] = live
+            if sha([x]) != xsha:
+                failures.append(f"input x changed {key}")
             log(f"{key}: bitwise {json.dumps(rec)} | replays {json.dumps(rr)} | live {json.dumps(live)} | "
                 f"ref {json.dumps(report['ref'][key])}")
         if sha([t for w in ws for t in w]) != wsha:
             failures.append(f"weights changed {sname}")
         del ws, wref
         torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    snap = torch.ops.trtllm.marlin_nvfp4_persistent_workspace_snapshot(torch.empty(1, device=dev))
+    locks_zero = bool(snap.numel() > 0 and (snap == 0).all().item())
+    report["persistent_lock_workspace"] = {"ints": int(snap.numel()), "all_zero": locks_zero}
+    if not locks_zero:
+        failures.append("persistent lock workspace not all zero")
     report["passed"] = not failures
     report["failures"] = failures[:30]
     report["n_failures"] = len(failures)

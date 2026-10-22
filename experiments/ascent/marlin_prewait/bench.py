@@ -11,12 +11,17 @@ from tensorrt_llm._torch.modules.linear import _pack_nvfp4_weight_for_marlin
 #   P = default (candidate: B / weight-scale cp.async issued before griddepcontrol.wait)
 #   K = TRTLLM_MARLIN_PREWAIT_B=0 (candidate: main's wait-first prologue).
 # In the base tree the switch does not exist, so P = K = main (an in-process A/A).
-# batch[M].kernel_ms = arm P chain time per decode step, weighted by calls per step:
-#   qkvz (16384,5120) x48 + qkv (14336,5120) x16 + out_proj/o_proj (5120,6144) x64.
+# batch[M].kernel_ms = arm P chain time per decode step, weighted by Marlin calls per step:
+#   qkvz (16384,5120) x48 (rows <= 16 only) + qkv (14336,5120) x16 + out_proj/o_proj (5120,6144) x64.
 dev = torch.device("cuda")
 EPS, WARM, ITERS = 1e-6, 10, 60
 SHAPES = [("qkvz", 16384, 5120, 6, 48), ("qkv", 14336, 5120, 7, 16), ("outproj", 5120, 6144, 16, 64)]
-MS = [4, 8, 12, 16]
+MS = [4, 8, 12, 16, 24, 32]
+# Rows 17-32: only qkv and out_proj/o_proj run Marlin (workspace_mode 2, FP32 split-K reduce); qkvz runs W4A4 there.
+def rows_for(sname):
+    return MS if sname != "qkvz" else [m for m in MS if m <= 16]
+def mode_for(m):
+    return 2 if m > 16 else 0
 ARMS = ["P", "K"]
 T0 = time.time()
 def log(*a):
@@ -42,7 +47,8 @@ def build(n, k, seed):
     return _pack_nvfp4_weight_for_marlin(w_fp4, w_sf, (1.0 / gs).float(), n, k, 16)
 def marlin(x, wt, n, k):
     return torch.ops.trtllm.marlin_nvfp4_gemm(x, wt[0], scale_a=None, scale_b=wt[1], alpha=None,
-        weight_global_scale=wt[2], bias=None, out_dtype=torch.bfloat16, size_n=n, size_k=k)
+        weight_global_scale=wt[2], bias=None, out_dtype=torch.bfloat16, size_n=n, size_k=k,
+        workspace_mode=mode_for(x.shape[0]))
 def norm(x, r, w):
     torch.ops.trtllm.flashinfer_gemma_fused_add_rmsnorm(x, r, w, EPS)
 class Chain:
@@ -101,7 +107,7 @@ for sname, n, k, c, calls in SHAPES:
     wn1 = (0.1 * torch.randn(k, generator=g, device=dev)).to(torch.bfloat16)
     wn2 = (0.1 * torch.randn(n, generator=g, device=dev)).to(torch.bfloat16)
     log("shape", sname, n, k, "copies", c, "weight MB %.1f" % mb)
-    for m in MS:
+    for m in rows_for(sname):
         objs, graphs, outs, eager = dict(), dict(), dict(), dict()
         for a in ARMS:
             set_arm(a)
