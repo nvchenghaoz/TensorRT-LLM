@@ -18,7 +18,7 @@ from tensorrt_llm._torch.modules import gemma_add_rmsnorm_1row as G  # noqa: E40
 dev = torch.device("cuda")
 H, EPS = 5120, 1e-6
 ARMS = [(a.split(":")[0], int(a.split(":")[1])) for a in (
-    sys.argv[1].split(",") if len(sys.argv) > 1 else
+    sys.argv[1].split(",") if len(sys.argv) > 1 and sys.argv[1] != "op" else
     ["E:160", "E:128", "E:320", "E:64", "stock:64", "stock:128", "stock:160", "stock:320"])]
 MS = [1, 2, 4, 8, 16, 17, 24, 32]
 
