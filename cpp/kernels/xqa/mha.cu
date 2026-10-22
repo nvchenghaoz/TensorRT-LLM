@@ -2995,7 +2995,8 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMP
 // path, partials ignored). P is published in cascadeInfo[0], the flags in cascadeInfo[1 + c].
 // ---------------------------------------------------------------------------------------------------------------------
 #if !SPEC_DEC && BEAM_WIDTH == 1 && USE_PAGED_KV_CACHE && PAGED_KV_CACHE_LAYOUT == 0 && !USE_INPUT_KV                 \
-    && !LOW_PREC_OUTPUT && CACHE_ELEM_ENUM == 2 && !INPUT_FP16 && HEAD_ELEMS == 256 && !IS_MLA
+    && !LOW_PREC_OUTPUT && CACHE_ELEM_ENUM == 2 && !INPUT_FP16 && HEAD_ELEMS == 256 && !IS_MLA                         \
+    && (TOKENS_PER_PAGE == 16 || TOKENS_PER_PAGE == 32 || TOKENS_PER_PAGE == 64)
 #define XQA_CASCADE_PREFIX 1
 #else
 #define XQA_CASCADE_PREFIX 0
