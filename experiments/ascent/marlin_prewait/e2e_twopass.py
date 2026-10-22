@@ -7,12 +7,20 @@
 # pass 1 starts from an empty cache; pass 2 reruns all 56 prompts reusing the cached prefix and snapshot.
 # Compare per-prompt ids/logprob digests across the pair arms (exact change: equal in pass 1 and in pass 2).
 # Usage: python e2e_twopass.py <checkpoint>
+#
+# Idea 67 pinned mode (knowledge 124; diagnosis only, the pin never goes in engine.json):
+#   base arm : python -c <this> <ckpt> tune <nonce>     tunes into its own fresh cache, publishes it as the master
+#   cand arm : python e2e_twopass.py <ckpt> cand <nonce> run 1 pinned (own copy of the master), run 2 unpinned;
+#              compares both with the base arm per prompt (both passes) and names AutoTuner keys whose pick differs.
 import glob
 import hashlib
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -62,6 +70,196 @@ def digest_ids(ids):
 
 def digest_lp(lps):
     return hashlib.sha256(b"".join(struct.pack("<d", float("nan") if x is None else x) for x in lps)).hexdigest()
+
+
+def pin_dirs(ckpt, nonce):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(ckpt)))
+    return [os.path.join(root, "ascent_pin_b37", nonce), os.path.join("/tmp", "ascent_pin_b37", nonce)]
+
+
+def picks(path):
+    if not path or not os.path.exists(path):
+        return dict()
+    d = json.load(open(path))
+    out = dict()
+    for sect, ent in d.items():
+        if sect == "metadata":
+            continue
+        for k, v in ent.items():
+            out[sect + "|" + k] = "%s/%s" % (v.get("runner_id"), v.get("tactic"))
+    return out
+
+
+def run_engine(ckpt, cache_path, tag):
+    os.environ["TLLM_AUTOTUNER_CACHE_PATH"] = cache_path
+    import torch
+
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as cgr
+    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+
+    captures = set()
+    orig_capture = cgr.CUDAGraphRunner.capture
+
+    def capture(self, key, *a, **kw):
+        captures.add(cgr.KeyType(*key).batch_size)
+        return orig_capture(self, key, *a, **kw)
+
+    cgr.CUDAGraphRunner.capture = capture
+    engine_json = json.load(open("experiments/ascent-config/engine.json"))
+    pre = picks(cache_path)
+    log(tag, "cache", cache_path, "preloaded picks", len(pre), "PDL", os.environ.get("TRTLLM_ENABLE_PDL"),
+        "PREWAIT", os.environ.get("TRTLLM_MARLIN_PREWAIT_B"), "NORM_EARLY", os.environ.get("TRTLLM_NORM_EARLY_TRIGGER"))
+    kvc = dict(engine_json.get("kv_cache_config", dict()))
+    assert kvc.get("dtype") == "fp8", kvc
+    t = time.time()
+    llm = LLM(model=ckpt, max_seq_len=36864, max_batch_size=32, max_num_tokens=8192, enable_chunked_prefill=True,
+              cuda_graph_config=CudaGraphConfig(max_batch_size=32), kv_cache_config=KvCacheConfig(**kvc),
+              batch_wait_timeout_ms=BATCH_WAIT_MS)
+    log(tag, "LLM ready in %.1fs; graphs at %s" % (time.time() - t, sorted(captures)))
+    post_init = picks(cache_path)
+    tok = llm.tokenizer
+    n = sum(c for _, c in GROUPS)
+    ids = corpus_ids(tok, PREFIX + n * SUFFIX)
+    prefix = ids[:PREFIX]
+    prompts = [prefix + ids[PREFIX + i * SUFFIX:PREFIX + (i + 1) * SUFFIX] for i in range(n)]
+    sp = SamplingParams(max_tokens=OSL, temperature=0.0, top_k=1, ignore_eos=True, logprobs=1)
+
+    def run_pass(ptag):
+        res = dict()
+        base = 0
+        for g, conc in GROUPS:
+            idx = list(range(base, base + conc))
+            base += conc
+            t1 = time.time()
+            outs = llm.generate([prompts[i] for i in idx], sp, use_tqdm=False)
+            for j, o in enumerate(outs):
+                c = o.outputs[0]
+                lps = []
+                for tid, d in zip(c.token_ids, c.logprobs or []):
+                    lp = d.get(tid) if isinstance(d, dict) else None
+                    lps.append(float(lp.logprob) if lp is not None else None)
+                res["%s-p%d" % (g, j)] = dict(ids=list(c.token_ids), lp=lps)
+            log(tag, ptag, g, "%d prompts %.1fs" % (conc, time.time() - t1))
+        return res
+
+    p1 = run_pass("pass1")
+    p2 = run_pass("pass2")
+    torch.cuda.synchronize()
+    p2eq = sum(int(p1[k] == p2[k]) for k in p1)
+    out = dict(tag=tag, pass1=p1, pass2=p2, pass2_equals_pass1=p2eq, n=len(p1), graphs=sorted(captures),
+               prompt_ids_sha=digest_ids(prompts)[:16], picks_pre=len(pre), picks_post_init=post_init,
+               new_keys_vs_pre=sorted(k for k in post_init if k not in pre),
+               changed_vs_pre=sorted(k for k in post_init if k in pre and pre[k] != post_init[k]))
+    log(tag, "done; pass2==pass1 %d/%d; new keys vs preload %d, changed %d" % (
+        p2eq, len(p1), len(out["new_keys_vs_pre"]), len(out["changed_vs_pre"])))
+    try:
+        llm.shutdown()
+    except Exception as e:
+        log("shutdown error", repr(e))
+    return out
+
+
+def compare(a, b):
+    d1 = sorted(k for k in a["pass1"] if a["pass1"][k] != b["pass1"].get(k))
+    d2 = sorted(k for k in a["pass2"] if a["pass2"][k] != b["pass2"].get(k))
+    first = dict()
+    for k in sorted(set(d1) | set(d2)):
+        rec = dict()
+        for p in ("pass1", "pass2"):
+            x, y = a[p][k], b[p][k]
+            rec[p + "_first_token_div"] = next((i for i, (u, v) in enumerate(zip(x["ids"], y["ids"])) if u != v), None)
+            rec[p + "_first_lp_div"] = next((i for i, (u, v) in enumerate(zip(x["lp"], y["lp"])) if u != v), None)
+            li = rec[p + "_first_lp_div"]
+            if li is not None:
+                rec[p + "_lp_at_div"] = [x["lp"][li], y["lp"][li]]
+        first[k] = rec
+    return dict(pass1_equal=len(a["pass1"]) - len(d1), pass2_equal=len(a["pass2"]) - len(d2), n=len(a["pass1"]),
+                pass1_diff=d1, pass2_diff=d2, first_div=first)
+
+
+def pinned_main(ckpt, mode, nonce):
+    heartbeat()
+    art = os.environ.get("AUTO_DEV_ARTIFACTS") or tempfile.mkdtemp()
+    os.makedirs(art, exist_ok=True)
+    dirs = pin_dirs(ckpt, nonce)
+    if mode == "tune":
+        own = os.path.join(tempfile.mkdtemp(prefix="at_base_"), "cache.json")
+        r = run_engine(ckpt, own, "base_tuned")
+        published = []
+        for d in dirs:
+            try:
+                os.makedirs(d, exist_ok=True)
+                shutil.copy(own, os.path.join(d, "master.json"))
+                with open(os.path.join(d, "base_result.json"), "w") as f:
+                    json.dump(r, f)
+                published.append(d)
+            except Exception as e:
+                log("publish failed", d, repr(e))
+        shutil.copy(own, os.path.join(art, "master_base.json"))
+        with open(os.path.join(art, "base_result.json"), "w") as f:
+            json.dump(r, f)
+        print(json.dumps(dict(mode="tune", published=published, n_picks=len(r["picks_post_init"]),
+                              pass2_equals_pass1=r["pass2_equals_pass1"], n=r["n"], graphs=r["graphs"],
+                              prompt_ids_sha=r["prompt_ids_sha"])), flush=True)
+        os._exit(0)
+    src = None
+    for d in dirs:
+        if os.path.exists(os.path.join(d, "master.json")) and os.path.exists(os.path.join(d, "base_result.json")):
+            src = d
+            break
+    if src is None:
+        print(json.dumps(dict(passed=False, error="no master published by the base arm", looked=dirs)), flush=True)
+        os._exit(0)
+    log("master from", src)
+    master = os.path.join(src, "master.json")
+    shutil.copy(master, os.path.join(art, "master_from_base.json"))
+    base = json.load(open(os.path.join(src, "base_result.json")))
+    results = dict()
+    for tag in ("cand_pinned", "cand_unpinned"):
+        own = os.path.join(tempfile.mkdtemp(prefix="at_%s_" % tag), "cache.json")
+        if tag == "cand_pinned":
+            shutil.copy(master, own)
+        outp = os.path.join(art, tag + "_result.json")
+        t = time.time()
+        rc = subprocess.run([sys.executable, os.path.abspath(__file__), ckpt, "child", nonce, own, tag,
+                             outp]).returncode
+        log(tag, "exit", rc, "in %.0fs" % (time.time() - t))
+        if rc != 0 or not os.path.exists(outp):
+            print(json.dumps(dict(passed=False, error="%s failed rc=%s" % (tag, rc))), flush=True)
+            os._exit(0)
+        shutil.copy(own, os.path.join(art, tag + "_cache.json"))
+        results[tag] = json.load(open(outp))
+    mp = picks(master)
+    up = results["cand_unpinned"]["picks_post_init"]
+    flipped = dict((k, dict(master=mp.get(k), cand_unpinned=up.get(k))) for k in sorted(set(mp) | set(up))
+                   if mp.get(k) != up.get(k))
+    pin = results["cand_pinned"]
+    unp = results["cand_unpinned"]
+    cmp_pin = compare(base, pin)
+    cmp_unp = compare(base, unp)
+    exact_pinned = cmp_pin["pass1_equal"] == cmp_pin["n"] and cmp_pin["pass2_equal"] == cmp_pin["n"]
+    res = dict(passed=exact_pinned, base_vs_cand_pinned=cmp_pin, base_vs_cand_unpinned=cmp_unp,
+               pinned_new_keys=pin["new_keys_vs_pre"], pinned_changed_keys=pin["changed_vs_pre"],
+               flipped_keys_master_vs_unpinned=flipped, n_master_picks=len(mp),
+               pass2_equals_pass1=dict(base=base["pass2_equals_pass1"], cand_pinned=pin["pass2_equals_pass1"],
+                                       cand_unpinned=unp["pass2_equals_pass1"]),
+               prompt_ids_sha=dict(base=base["prompt_ids_sha"], pinned=pin["prompt_ids_sha"],
+                                   unpinned=unp["prompt_ids_sha"]),
+               graphs=dict(base=base["graphs"], cand_pinned=pin["graphs"], cand_unpinned=unp["graphs"]),
+               master_dir=src,
+               compared="base tree (tuned; publishes master) vs candidate pinned to a per-process copy of that "
+                        "master, and vs candidate unpinned; 56 prompts x 40 greedy tokens + logprobs, both passes")
+    print(json.dumps(res), flush=True)
+    os._exit(0)
+
+
+def child_main(ckpt, cache_path, tag, out_path):
+    heartbeat()
+    r = run_engine(ckpt, cache_path, tag)
+    with open(out_path, "w") as f:
+        json.dump(r, f)
+    os._exit(0)
 
 
 def main(ckpt):
@@ -163,4 +361,9 @@ def main(ckpt):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if len(sys.argv) > 2 and sys.argv[2] == "child":
+        child_main(sys.argv[1], sys.argv[4], sys.argv[5], sys.argv[6])
+    elif len(sys.argv) > 2:
+        pinned_main(sys.argv[1], sys.argv[2], sys.argv[3])
+    else:
+        main(sys.argv[1])
