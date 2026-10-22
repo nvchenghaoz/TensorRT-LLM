@@ -33,14 +33,8 @@ from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...speculative import SpecMetadata
-from ...utils import (
-    EventType,
-    Fp4QuantizedTensor,
-    get_model_extra_attrs,
-    is_gdn_replay_enabled,
-    is_torch_compiling,
-)
-from ..fp8_prefill_nvfp4 import uses_prefill_nvfp4_copy
+from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
+from ..fp8_prefill_nvfp4 import get_prefill_nvfp4_copy
 from ..linear import _FP8_NVFP4_DECODE_MAX_ROWS, FP8QDQLinearMethod, Linear, TensorParallelMode
 from ..multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from . import PAD_SLOT_ID
@@ -54,11 +48,7 @@ from .fuse_elementwise_ops import (
 from .gdn_prefill_conv import gdn_fused_transpose_conv_enabled, gdn_prefill_transpose_conv
 from .gdn_prefill_onepass import gdn_prefill_onepass, gdn_prefill_onepass_enabled
 from .layernorm_gated import RMSNorm as RMSNormGated
-from .layernorm_gated import (
-    GDN_GATED_NORM_NVFP4_ENABLED,
-    rms_norm_gated_token_major,
-    rms_norm_gated_token_major_nvfp4,
-)
+from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import Mamba2Metadata
 from .mamba2_mixer import _cached_arange
 from .recurrent_state_cache import reset_recurrent_state_rows
@@ -630,24 +620,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ):
             # BF16 rows go to out_proj's NVFP4 W4A16 decode copy (Marlin).
             fp8_scale = None
-        else:
-            copy = uses_prefill_nvfp4_copy(self.out_proj, z.shape[0])
-            if copy is not None:
-                if GDN_GATED_NORM_NVFP4_ENABLED and copy.split is None:
-                    # The norm quantizes for out_proj's W4A4 copy itself
-                    # (bitwise equal to BF16 norm + fp4_quantize).
-                    fp4, sf = rms_norm_gated_token_major_nvfp4(
-                        attn_out.reshape(-1, self.head_v_dim),
-                        z,
-                        self.norm.weight,
-                        self.norm.eps,
-                        copy.act_global,
-                    )
-                    return self.out_proj(
-                        Fp4QuantizedTensor(fp4, sf), all_reduce_params=all_reduce_params
-                    )
-                # BF16 rows go to out_proj's NVFP4 W4A4 prefill copy.
-                fp8_scale = None
+        elif (
+            z.shape[0] > _FP8_NVFP4_DECODE_MAX_ROWS
+            and get_prefill_nvfp4_copy(self.out_proj) is not None
+        ):
+            # BF16 rows go to out_proj's NVFP4 W4A4 prefill copy.
+            fp8_scale = None
         attn_out = rms_norm_gated_token_major(
             attn_out.reshape(-1, self.head_v_dim),
             z,
