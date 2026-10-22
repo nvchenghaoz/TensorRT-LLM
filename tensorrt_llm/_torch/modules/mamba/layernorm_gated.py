@@ -26,6 +26,8 @@ import triton.language.extra.libdevice as tldevice
 
 from ...._utils import get_sm_version
 from ...utils import Fp4QuantizedTensor
+from ..fused_silu_mul_nvfp4 import (_cvt_e2m1x8, _cvt_e4m3_bits, _mul_rn,
+                                    _rcp_approx_ftz, _sf_offset)
 
 
 def fused_gated_rmsnorm_quant_shape_ok(hidden_size: int,
@@ -323,6 +325,216 @@ def _(
     del z, weight, eps, gate_activation
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     return torch.empty_like(x, dtype=out_dtype)
+
+
+# Gated RMSNorm with the NVFP4 (group-16, E4M3 SF, swizzled 128x4) quantize of
+# the downstream W4A4 linear fused into its epilogue. Replaces
+# rms_norm_gated_token_major (BF16 out) + torch.ops.trtllm.fp4_quantize(y,
+# act_global, 16, False) with bitwise-identical FP4 and SF bytes.
+# TRTLLM_GDN_GATED_NORM_NVFP4=0 restores the two-kernel path.
+GDN_GATED_NORM_NVFP4_ENABLED = os.environ.get("TRTLLM_GDN_GATED_NORM_NVFP4",
+                                              "1") != "0"
+_NVFP4_SF_VEC = 16
+_NVFP4_PAD_COLS = 128
+
+
+@triton.jit
+def _rms_norm_gated_nvfp4_kernel(
+    X,  # [M, N] head rows (M = num_tokens * HEADS_PER_TOK)
+    W,  # [N] norm weight
+    Z,  # gate, token-major [num_tokens, HEADS_PER_TOK, N] view
+    FP4,  # int32 view of the uint8 [num_tokens, HEADS_PER_TOK * N / 2] output
+    SF,  # uint8 swizzled SF, ceil128(num_tokens) * NUM_K_TILES * 4 bytes
+    SCALE,  # 1-element fp32 global scale (6 / input_scale)
+    stride_x_row,
+    stride_z_tok,
+    M,
+    num_tokens,
+    num_main_programs,
+    eps,
+    N: tl.constexpr,
+    ROWS: tl.constexpr,
+    HEADS_PER_TOK: tl.constexpr,
+    GATE_SIGMOID: tl.constexpr,
+    NUM_K_TILES: tl.constexpr,
+    PAD_COLS: tl.constexpr,
+):
+    """_rms_norm_gated_fwd_multirow_kernel's expressions, then NVFP4.
+
+    The norm part is a copy of the multi-row kernel (same [ROWS, N] block,
+    same num_warps, so the same tl.sum reduction) and y is rounded to BF16 as
+    the unfused path stores it. The quantize tail is fused_silu_mul_nvfp4's
+    (cvt_warp_fp16_to_fp4 as built). Programs past num_main_programs zero the
+    SF padding rows [num_tokens, ceil128(num_tokens)).
+    """
+    pid = tl.program_id(0)
+    NSF: tl.constexpr = N // 16
+    if pid < num_main_programs:
+        rows = pid * ROWS + tl.arange(0, ROWS)
+        row_mask = rows < M
+        cols = tl.arange(0, N)
+        mask2d = row_mask[:, None]
+        x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
+        x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
+        var = tl.sum(x * x, axis=1) / N
+        rstd = 1.0 / tl.sqrt(var + eps)
+        w = tl.load(W + cols).to(tl.float32)
+        y = x * rstd[:, None] * w[None, :]
+        tok = rows // HEADS_PER_TOK
+        head = rows % HEADS_PER_TOK
+        z_off = (tok[:, None].to(tl.int64) * stride_z_tok +
+                 head[:, None] * N + cols[None, :])
+        z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
+        gate = tl.sigmoid(z)
+        if not GATE_SIGMOID:
+            gate *= z
+        y *= gate
+        # The unfused path stores BF16 and fp4_quantize reloads it.
+        y = y.to(tl.bfloat16).to(tl.float32)
+
+        h2 = tl.reshape(y, [ROWS * NSF, 16])
+        vmax = tl.max(tl.abs(h2), axis=1)
+        s = tl.load(SCALE)
+        s_v = tl.full([ROWS * NSF], 0.0, tl.float32) + s
+        r6 = _rcp_approx_ftz(tl.full([ROWS * NSF], 6.0, tl.float32))
+        sf_val = _mul_rn(s_v, _mul_rn(vmax, r6))
+        sf_u8 = _cvt_e4m3_bits(sf_val).to(tl.uint8)
+        sf_f = sf_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        out_scale = tl.where(
+            vmax != 0.0, _rcp_approx_ftz(_mul_rn(sf_f, _rcp_approx_ftz(s_v))),
+            0.0)
+        q = _mul_rn(h2, tl.broadcast_to(out_scale[:, None], [ROWS * NSF, 16]))
+        q8 = tl.reshape(q, [ROWS * N // 8, 2, 2, 2])
+        p, qq = tl.split(q8)
+        p0, p1 = tl.split(p)
+        q0, q1 = tl.split(qq)
+        p00, p01 = tl.split(p0)
+        p10, p11 = tl.split(p1)
+        q00, q01 = tl.split(q0)
+        q10, q11 = tl.split(q1)
+        packed = _cvt_e2m1x8(p00, q00, p10, q10, p01, q01, p11, q11)
+
+        # Head row r owns FP4 bytes [r * N / 2, (r + 1) * N / 2) of the
+        # contiguous [num_tokens, HEADS_PER_TOK * N / 2] output.
+        w_idx = tl.arange(0, ROWS * N // 8)
+        w_off = pid.to(tl.int64) * (ROWS * N // 8) + w_idx
+        tl.store(FP4 + w_off, packed, mask=w_off < M * (N // 8))
+
+        sf_idx = tl.arange(0, ROWS * NSF)
+        sf_row = pid * ROWS + sf_idx // NSF
+        sf_tok = sf_row // HEADS_PER_TOK
+        sf_col = (sf_row % HEADS_PER_TOK) * NSF + sf_idx % NSF
+        sf_off = _sf_offset(sf_tok.to(tl.int64), sf_col, NUM_K_TILES)
+        tl.store(SF + sf_off, sf_u8, mask=sf_row < M)
+    else:
+        # Zero SF padding rows [num_tokens, ceil128(num_tokens)) for one
+        # PAD_COLS-wide column block (as quantize_with_block_size does).
+        cb = pid - num_main_programs
+        pcols = cb * PAD_COLS + tl.arange(0, PAD_COLS)
+        m0 = (num_tokens // 128) * 128
+        prow = m0 + tl.arange(0, 128).to(tl.int64)
+        off = _sf_offset(prow[:, None], pcols[None, :], NUM_K_TILES)
+        pmask = ((prow >= num_tokens)[:, None] &
+                 (pcols < HEADS_PER_TOK * NSF)[None, :])
+        tl.store(SF + off, tl.zeros([128, PAD_COLS], tl.uint8), mask=pmask)
+
+
+def _rms_norm_gated_nvfp4_eligible(x: torch.Tensor, z: torch.Tensor) -> bool:
+    M, N = x.shape
+    heads = z.shape[1]
+    return (x.stride(-1) == 1 and z.stride(2) == 1 and z.stride(1) == N
+            and N <= _MULTIROW_MAX_N and (N & (N - 1)) == 0 and N % 64 == 0
+            and (heads * N // _NVFP4_SF_VEC) % 4 == 0
+            and x.dtype == torch.bfloat16 and z.dtype == torch.bfloat16)
+
+
+@torch.library.custom_op("trtllm::rms_norm_gated_token_major_nvfp4",
+                         mutates_args=())
+def rms_norm_gated_token_major_nvfp4(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    global_scale: torch.Tensor,
+    gate_activation: str = "silu",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """rms_norm_gated_token_major then fp4_quantize(y, global_scale, 16).
+
+    x: [num_tokens * heads, N], z: [num_tokens, heads, N] (token stride
+    arbitrary), global_scale: 1-element fp32 device tensor. Returns the FP4
+    uint8 [num_tokens, heads * N / 2] and the swizzled uint8 SF
+    [ceil128(num_tokens) * ceil4(heads * N / 16)], bitwise equal to the
+    two-kernel path (which is the fallback for ineligible shapes).
+    """
+    if gate_activation not in ("silu", "sigmoid"):
+        raise ValueError(
+            f"gate_activation must be 'silu' or 'sigmoid', got {gate_activation!r}"
+        )
+    M, N = x.shape
+    num_tokens, heads, n_z = z.shape
+    assert n_z == N and num_tokens * heads == M
+    if not _rms_norm_gated_nvfp4_eligible(x, z):
+        y = rms_norm_gated_token_major(x, z, weight, eps, None,
+                                       gate_activation)
+        return torch.ops.trtllm.fp4_quantize(
+            y.view(num_tokens, heads * N), global_scale, _NVFP4_SF_VEC,
+            False)
+    weight = weight.contiguous()
+    K = heads * N
+    num_sf_cols = K // _NVFP4_SF_VEC
+    num_k_tiles = (num_sf_cols + 3) // 4
+    m_pad = (num_tokens + 127) // 128 * 128
+    fp4 = torch.empty((num_tokens, K // 2), dtype=torch.uint8, device=x.device)
+    sf = torch.empty((m_pad * num_k_tiles * 4, ),
+                     dtype=torch.uint8,
+                     device=x.device)
+    num_main = triton.cdiv(M, _MULTIROW_ROWS)
+    num_pad = (triton.cdiv(num_k_tiles * 4, _NVFP4_PAD_COLS)
+               if num_tokens % 128 != 0 else 0)
+    if num_main + num_pad == 0:
+        return fp4, sf
+    device_index = x.device.index
+    with torch.cuda.device(device_index):
+        _rms_norm_gated_nvfp4_kernel[(num_main + num_pad, )](
+            x,
+            weight,
+            z,
+            fp4.view(torch.int32),
+            sf,
+            global_scale,
+            x.stride(0),
+            z.stride(0),
+            M,
+            num_tokens,
+            num_main,
+            eps,
+            N=N,
+            ROWS=_MULTIROW_ROWS,
+            HEADS_PER_TOK=heads,
+            GATE_SIGMOID=gate_activation == "sigmoid",
+            NUM_K_TILES=num_k_tiles,
+            PAD_COLS=_NVFP4_PAD_COLS,
+            num_warps=_MULTIROW_NUM_WARPS,
+        )
+    return fp4, sf
+
+
+@rms_norm_gated_token_major_nvfp4.register_fake
+def _(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    global_scale: torch.Tensor,
+    gate_activation: str = "silu",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weight, eps, global_scale, gate_activation
+    num_tokens, heads, n = z.shape
+    k = heads * n
+    num_k_tiles = (k // _NVFP4_SF_VEC + 3) // 4
+    m_pad = (num_tokens + 127) // 128 * 128
+    return (x.new_empty((num_tokens, k // 2), dtype=torch.uint8),
+            x.new_empty((m_pad * num_k_tiles * 4, ), dtype=torch.uint8))
 
 
 def _layer_norm_fwd(

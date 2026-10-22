@@ -137,6 +137,18 @@ def get_prefill_nvfp4_copy(module: torch.nn.Module):
     return module.__dict__.get(_ATTR)
 
 
+def uses_prefill_nvfp4_copy(module: torch.nn.Module, rows: int):
+    """The W4A4 prefill copy this FP8 linear runs for an input of ``rows``
+    rows, or None when those rows take the FP8 / decode-copy path.
+
+    The single routing decision shared by FP8QDQLinearMethod.apply and the
+    producers that emit NVFP4 for it (GDN gated norm, attention output gate).
+    """
+    if rows <= MAX_DECODE_ROWS:
+        return None
+    return module.__dict__.get(_ATTR)
+
+
 def _main_decoder_layers(model: torch.nn.Module) -> list:
     """Decoder layers [:num_hidden_layers] of every DecoderModel in the tree
     (the root may wrap the LM, e.g. Qwen3_5ForConditionalGeneration.llm)."""
@@ -267,6 +279,33 @@ def prefill_nvfp4_apply(copy, module: torch.nn.Module, input: torch.Tensor,
         output[:, split:].copy_(kv)
     if len(original_shape) > 2:
         output = output.reshape(*original_shape[:-1], output.shape[-1])
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+def prefill_nvfp4_apply_quantized(copy, module: torch.nn.Module, input,
+                                  bias: Optional[torch.Tensor]
+                                  ) -> torch.Tensor:
+    """NVFP4 W4A4 GEMM on an activation its producer already quantized with
+    copy.act_global (an Fp4QuantizedTensor with a swizzled SF): the same
+    nvfp4_gemm call as prefill_nvfp4_apply, minus its fp4_quantize."""
+    # The K/V overwrite of a split copy re-quantizes the BF16 input, which a
+    # pre-quantized activation does not have.
+    assert copy.split is None, "split W4A4 copies need a BF16 input"
+    assert input.is_sf_swizzled and input.fp4_tensor.dim() == 2
+    _stats["calls"] += 1
+    gs = _group_stats.get(copy.group)
+    if gs is not None:
+        gs["calls"] += 1
+    output = torch.ops.trtllm.nvfp4_gemm(
+        input.fp4_tensor,
+        copy.w_fp4,
+        input.scaling_factor,
+        copy.w_sf,
+        copy.alpha,
+        module.dtype or torch.bfloat16,
+        allowed_backends="cutlass,cublaslt,cuda_core")
     if bias is not None:
         output = output + bias
     return output

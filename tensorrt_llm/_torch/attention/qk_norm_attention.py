@@ -24,17 +24,25 @@ from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
+from ..modules.fp8_prefill_nvfp4 import uses_prefill_nvfp4_copy
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..utils import Fp4QuantizedTensor
 from .attention import Attention
 from .backends.interface import PositionalEmbeddingParams
 from .kernels.fused_qk_norm_rope_gate import (fused_qkv_gemma_rmsnorm_rope_gate,
-                                              fused_sigmoid_mul_inplace)
+                                              fused_sigmoid_mul_inplace,
+                                              fused_sigmoid_mul_nvfp4,
+                                              fused_sigmoid_mul_nvfp4_eligible)
 
 # Kill switch: TRTLLM_ROPE_GATE_STRIDED_POS=0 restores the per-layer
 # positions.contiguous() copy before the fused rope-gate kernel.
 _ROPE_GATE_STRIDED_POS = os.environ.get("TRTLLM_ROPE_GATE_STRIDED_POS",
                                         "1") != "0"
+# When o_proj takes its W4A4 prefill copy at these rows, the sigmoid gate
+# also quantizes for it (bitwise equal to gate + fp4_quantize).
+# TRTLLM_ATTN_GATE_NVFP4=0 restores the BF16 gate output.
+ATTN_GATE_NVFP4_ENABLED = os.environ.get("TRTLLM_ATTN_GATE_NVFP4", "1") != "0"
 
 
 # Move out from this class
@@ -303,6 +311,15 @@ class QKNormRoPEAttention(Attention):
                 and attention_output.stride(-1) == 1 and gate.dim() in (2, 3)
                 and gate.stride(-1) == 1
                 and gate.numel() == attention_output.numel()):
+            if ATTN_GATE_NVFP4_ENABLED:
+                copy = uses_prefill_nvfp4_copy(self.o_proj,
+                                               attention_output.shape[0])
+                if (copy is not None and copy.split is None
+                        and fused_sigmoid_mul_nvfp4_eligible(
+                            attention_output, gate)):
+                    fp4, sf = fused_sigmoid_mul_nvfp4(attention_output, gate,
+                                                      copy.act_global)
+                    return Fp4QuantizedTensor(fp4, sf)
             fused_sigmoid_mul_inplace(attention_output, gate)
             return attention_output
         return super().apply_output_gate(attention_output, gate)
