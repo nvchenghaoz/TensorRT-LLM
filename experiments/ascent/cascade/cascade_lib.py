@@ -56,12 +56,21 @@ def main_nb_sub_seq(b):
     return max(1, min(48, nb_sms() // (b * NB_K)))
 
 
+RECORD_BYTES = 4 * (GRP * HD + 2 * ((GRP + 3) // 4 * 4))  # mha.cu cascadeFold record
+
+
 def cascade_grid(b, m):
-    """Prefix-kernel grid {C, G, nbKV} as the host launcher computes it."""
+    """Prefix-kernel grid {C, G, nbKV} as the host launcher (decoderXQARunner.cpp) computes it."""
     g = math.ceil(b * GRP / 64)
-    c = max(1, min(63, nb_sms() // (g * NB_K)))
-    c = min(c, MAX_SUB_SEQ // (b * NB_K) - m)
-    return c, g
+    c = min(63, nb_sms() // (g * NB_K))
+    budget, mha_bytes, nb_seq = MAX_SUB_SEQ * 3328, m * b * NB_K * 4096, b * NB_K
+    fit = (budget - mha_bytes - 2 * CASCADE_INFO_BYTES) // (nb_seq * RECORD_BYTES)
+    return min(c, fit), g
+
+
+def mha_scratch_offset(b, c):
+    return CASCADE_INFO_BYTES + (b * NB_K * c * RECORD_BYTES + CASCADE_INFO_BYTES - 1) // CASCADE_INFO_BYTES * \
+        CASCADE_INFO_BYTES
 
 
 class Kernels:
@@ -123,7 +132,7 @@ class Call:
         base = inp["scratch_ptr"]
         if self.cascade:
             self.c, self.g = cascade_grid(b, m)
-            info, scratch = base, base + CASCADE_INFO_BYTES
+            info, scratch = base, base + mha_scratch_offset(b, self.c)
         else:
             self.c, self.g = 0, 0
             info, scratch = 0, base
@@ -137,8 +146,7 @@ class Call:
         if self.cascade:
             self.pfx_args = ParamPack([
                 ctypes.c_uint32(NB_K), ctypes.c_float(Q_SCALE), ctypes.c_uint64(inp["q"].data_ptr()), kv_list(inp),
-                ctypes.c_uint32(b), ctypes.c_uint64(inp["kvscale"].data_ptr()), ctypes.c_uint32(m),
-                ctypes.c_uint64(info), ctypes.c_uint64(scratch)])
+                ctypes.c_uint32(b), ctypes.c_uint64(inp["kvscale"].data_ptr()), ctypes.c_uint64(info)])
 
     def launch(self):
         if self.cascade:

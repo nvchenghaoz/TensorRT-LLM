@@ -617,28 +617,38 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
             uint32_t const batch = xqaParams.batch_size;
             if (cascadeEnabled && batch >= std::max(2U, cascadeMinBatch))
             {
+                // Scratch layout (mha.cu cascadeFold): 4 KiB of cascade info words, then one FP32 record per
+                // (request, KV head, prefix chunk), then kernel_mha's own multi-block scratch. Bounded by the
+                // multi-block budget getWorkspaceSize reserves for kernel_mha alone (6000 sub-sequences).
                 constexpr uint32_t kCascadeRowsPerCta = 64;
-                constexpr uint32_t kCascadeMaxChunks = 63;
+                constexpr int32_t kCascadeMaxChunks = 63;
                 constexpr size_t kCascadeInfoBytes = 4096;
+                constexpr size_t kMhaBytesPerSubSeq = 4096; // >= row max + row sum + BF16 partial tile
+                auto const roundUpSize = [](size_t a, size_t b) { return (a + b - 1) / b * b; };
+                size_t const nbSeq = static_cast<size_t>(batch) * nbKVHeads;
+                size_t const recordBytes = sizeof(float)
+                    * (static_cast<size_t>(numQHeadsOverKV) * xqaParams.head_size
+                        + 2 * roundUpSize(numQHeadsOverKV, 4));
+                size_t const budget = static_cast<size_t>(getXqaMaxNumSubSeq(false)) * 3328;
+                size_t const mhaBytes = static_cast<size_t>(multiBlock) * nbSeq * kMhaBytesPerSubSeq;
                 uint32_t const nbRowGrps = divUp(batch * numQHeadsOverKV, kCascadeRowsPerCta);
-                int32_t chunks = std::min<int32_t>(kCascadeMaxChunks,
-                    multiprocessorCount / static_cast<int32_t>(nbRowGrps * nbKVHeads));
-                chunks = std::min<int32_t>(chunks,
-                    getXqaMaxNumSubSeq(false) / static_cast<int32_t>(batch * nbKVHeads)
-                        - static_cast<int32_t>(multiBlock));
+                int32_t chunks = std::min<int32_t>(
+                    kCascadeMaxChunks, multiprocessorCount / static_cast<int32_t>(nbRowGrps * nbKVHeads));
+                int64_t const fit = budget > mhaBytes + 2 * kCascadeInfoBytes
+                    ? static_cast<int64_t>((budget - mhaBytes - 2 * kCascadeInfoBytes) / (nbSeq * recordBytes))
+                    : 0;
+                chunks = static_cast<int32_t>(std::min<int64_t>(chunks, fit));
                 if (chunks >= 1)
                 {
                     auto* const base = static_cast<std::byte*>(launchParams.scratch);
                     uint32_t* prefixInfo = reinterpret_cast<uint32_t*>(base);
-                    void* prefixScratch = base + kCascadeInfoBytes;
                     cascadeInfo = prefixInfo;
                     nbPrefixParts = static_cast<uint32_t>(chunks);
-                    launchParams.scratch = prefixScratch; // kernel_mha's partials follow the cascade info words
-                    uint32_t nbSubSeqMha = multiBlock;
+                    launchParams.scratch
+                        = base + kCascadeInfoBytes + roundUpSize(nbSeq * chunks * recordBytes, kCascadeInfoBytes);
                     void* prefixParams[] = {&launchParams.num_k_heads, &launchParams.qScale,
                         const_cast<void*>(static_cast<void const*>(&kernelInputTokens)), &launchParams.kvCacheParams,
-                        &launchParams.batch_size,
-                        &launchParams.kv_scale_quant_orig, &nbSubSeqMha, &prefixInfo, &prefixScratch, nullptr};
+                        &launchParams.batch_size, &launchParams.kv_scale_quant_orig, &prefixInfo, nullptr};
                     cubinObj->launchPrefix(
                         dim3{static_cast<uint32_t>(chunks), nbRowGrps, nbKVHeads}, stream, prefixParams);
                     sync_check_cuda_error(stream);

@@ -141,7 +141,7 @@ def main():
     # (1) repeated, serving shape
     set_case(inp, "shared", bmax)
     h0 = cl.readonly_hash(inp)
-    for b in (8, 16, 32):
+    for b in (8, 16, 24, 32):
         m = cl.main_nb_sub_seq(b)
         cc = cl.Call(cand, inp, b, m, cascade=True).capture()
         outs, sems = run_calls(cc, flush, n_calls)
@@ -155,18 +155,24 @@ def main():
         per_call_max = [errs(o, ref)[0] for o in outs[::max(1, n_calls // 12)]]
         ec, em = errs(outs[0], ref), errs(mouts[0], ref)
         ok15, ok125, ulp = tol_ok(ec, em, ref)
+        frac_eq = float((outs[0] == mouts[0]).float().mean())
+        max_vs_main = float((outs[0].float() - mouts[0].float()).abs().max())
+        rel_vs_main = float(((outs[0].float() - mouts[0].float()).abs() /
+                             mouts[0].float().abs().clamp_min(1e-6)).max())
         ok = rep_ok and all(sems) and fin and ok15 and ok125 and info[0] == 32768 and not any(info[1:])
         rep["repeated"][f"B{b}"] = dict(calls=n_calls, nb_sub_seq=m, prefix_chunks=cc.c, row_groups=cc.g,
                                         repeat_bitwise=rep_ok, semaphores_zero_every_call=all(sems), finite=fin,
                                         detected_prefix_tokens=info[0], chunk_flags_clear=not any(info[1:]),
                                         cand_max_abs=ec[0], cand_mean_abs=ec[1], main_max_abs=em[0],
                                         main_mean_abs=em[1], bf16_ulp_of_output=ulp, within_1p5x=ok15,
+                                        fraction_bitwise_equal_main=frac_eq, max_abs_vs_main=max_vs_main,
+                                        max_rel_vs_main=rel_vs_main,
                                         within_1p25x_plus_ulp=ok125, sampled_per_call_max_abs=per_call_max,
                                         passed=ok)
         passed &= ok
         log(f"repeated B={b} m={m} C={cc.c}: {n_calls} calls repeat-bitwise {rep_ok} sem0 {all(sems)} finite {fin} "
-            f"P={info[0]} | cand max {ec[0]:.3e} mean {ec[1]:.3e} | main max {em[0]:.3e} mean {em[1]:.3e} -> "
-            f"{'PASS' if ok else 'FAIL'}")
+            f"P={info[0]} | cand max {ec[0]:.3e} mean {ec[1]:.3e} | main max {em[0]:.3e} mean {em[1]:.3e} | "
+            f"bitwise==main {frac_eq:.4f}, max |cand-main| {max_vs_main:.3e} -> {'PASS' if ok else 'FAIL'}")
         del stack, outs
 
     # (2) ragged cases at B=16

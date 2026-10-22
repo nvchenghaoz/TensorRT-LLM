@@ -1564,6 +1564,146 @@ __device__ inline void addAttentionSinks(
     }
 }
 
+// Shared-prefix (cascade) decode, see kernel_mha_prefix. The prefix pass leaves, after the cascadeInfo words, one FP32
+// record per (request, KV head, prefix chunk): the unnormalized output O = sum(p * V) (V not yet scaled by the KV
+// scale), then the row max and the row sum of p, in the same units as kernel_mha's accumulator. kernel_mha folds them
+// in FP32 (into its accumulator with one sub-sequence, into the multi-block merge otherwise), so the output is rounded
+// to the IO type at the same points as without the cascade.
+namespace cascadeFold
+{
+constexpr uint32_t infoBytes = 4096;
+constexpr uint32_t statStride = roundUp(headGrpSize, 4U);
+constexpr uint32_t recFloats = headGrpSize * validElemsPerHead + 2 * statStride;
+
+__device__ inline float const* record(
+    uint32_t const* cascadeInfo, uint32_t nbParts, uint32_t idxSeq, uint32_t idxPart)
+{
+    return reinterpret_cast<float const*>(reinterpret_cast<char const*>(cascadeInfo) + infoBytes)
+        + size_t(idxSeq * nbParts + idxPart) * recFloats;
+}
+
+// The fold works in the MMA quad layout: lane l handles head row l / 4 (rows of the first 8-row slice; the cascade is
+// only enabled for head groups of <= 8 rows), while ThrdRegRowMax holds row l in lane l.
+constexpr bool supported = !SPEC_DEC && headGrpSize <= 8 && warpTile.y == 16 && WarpAcc::rows == 1;
+constexpr uint32_t batch = 4; // records whose loads are issued together
+
+__device__ inline float toQuad(ThrdRegRowMax const& v)
+{
+    return __shfl_sync(~0U, v[0], laneId() / 4);
+}
+
+// Value of row l (held by quad l) moved to lane l; lanes >= 8 keep their own value.
+__device__ inline float fromQuad(float q, float own)
+{
+    float const v = __shfl_sync(~0U, q, 4 * (laneId() % 8));
+    return laneId() < 8 ? v : own;
+}
+
+// Max of this lane's quad row over prefix records [cBeg, cEnd) (safeInitRowMax for rows beyond the head group).
+__device__ inline float quadPrefixMax(
+    uint32_t const* cascadeInfo, uint32_t nbParts, uint32_t idxSeq, uint32_t cBeg, uint32_t cEnd)
+{
+    uint32_t const row = laneId() / 4;
+    float mx = safeInitRowMax;
+    if (row < headGrpSize)
+    {
+        float const* const base = record(cascadeInfo, nbParts, idxSeq, 0) + headGrpSize * validElemsPerHead + row;
+#pragma unroll 8
+        for (uint32_t c = cBeg; c < cEnd; c++)
+        {
+            mx = fmaxf(mx, base[size_t(c) * recFloats]);
+        }
+    }
+    return mx;
+}
+
+// Adds sum_c O_c * exp(m_c - rowMaxQ) to acc over records [cBeg, cEnd), in order, and returns
+// sum_c l_c * exp(m_c - rowMaxQ) for this lane's quad row (rowMaxQ already includes those m_c). colBase: first head
+// dim of this warp's accumulator columns. outReordered: acc columns are in kernel_mha's e4m3-V conversion order (a lane
+// holds 4 consecutive dims across n-tiles 2n, 2n+1), else in natural order.
+template <bool outReordered>
+__device__ inline float addPrefix(WarpAcc& acc, float rowMaxQ, uint32_t const* cascadeInfo, uint32_t nbParts,
+    uint32_t idxSeq, uint32_t cBeg, uint32_t cEnd, uint32_t colBase)
+{
+    uint32_t const lane = laneId();
+    uint32_t const row = lane / 4;
+    float sum = 0.F;
+    if (row >= headGrpSize)
+    {
+        return sum;
+    }
+    constexpr uint32_t nbVecs = outReordered ? WarpAcc::cols / 2 : WarpAcc::cols;
+    using Vec4 = float4;
+    float const* const base = record(cascadeInfo, nbParts, idxSeq, 0);
+    for (uint32_t c0 = cBeg; c0 < cEnd; c0 += batch)
+    {
+        float m[batch];
+        float l[batch];
+        Vec4 v[batch][outReordered ? nbVecs : nbVecs / 2];
+#pragma unroll
+        for (uint32_t k = 0; k < batch; k++)
+        {
+            uint32_t const c = mha::min(c0 + k, cEnd - 1);
+            float const* const rec = base + size_t(c) * recFloats;
+            m[k] = rec[headGrpSize * validElemsPerHead + row];
+            l[k] = rec[headGrpSize * validElemsPerHead + statStride + row];
+            float const* const src = rec + row * validElemsPerHead + colBase;
+            if constexpr (outReordered)
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs; n++)
+                {
+                    v[k][n] = reinterpret_cast<Vec4 const&>(src[16 * n + 4 * (lane % 4)]);
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs / 2; n++)
+                {
+                    float2 const a = reinterpret_cast<float2 const&>(src[16 * n + 2 * (lane % 4)]);
+                    float2 const b = reinterpret_cast<float2 const&>(src[16 * n + 8 + 2 * (lane % 4)]);
+                    v[k][n] = make_float4(a.x, a.y, b.x, b.y);
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < batch; k++)
+        {
+            if (c0 + k >= cEnd)
+            {
+                break;
+            }
+            float const so = expf(m[k] - rowMaxQ);
+            sum += l[k] * so;
+            if constexpr (outReordered)
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs; n++)
+                {
+                    acc(0, 2 * n)(0, 0) += so * v[k][n].x;
+                    acc(0, 2 * n + 1)(0, 0) += so * v[k][n].y;
+                    acc(0, 2 * n)(0, 1) += so * v[k][n].z;
+                    acc(0, 2 * n + 1)(0, 1) += so * v[k][n].w;
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs / 2; n++)
+                {
+                    acc(0, 2 * n)(0, 0) += so * v[k][n].x;
+                    acc(0, 2 * n)(0, 1) += so * v[k][n].y;
+                    acc(0, 2 * n + 1)(0, 0) += so * v[k][n].z;
+                    acc(0, 2 * n + 1)(0, 1) += so * v[k][n].w;
+                }
+            }
+        }
+    }
+    return sum;
+}
+} // namespace cascadeFold
+
 // With PDL, issue the first K/V tile loads of a sub-sequence before griddepcontrol.wait when that tile cannot hold the
 // token the preceding RoPE/KV-append kernel writes (see earlyKV in kernel_mha_impl). Q always waits.
 #define XQA_PDL_EARLY_KV (ENABLE_PDL == 2 && !SPEC_DEC && BEAM_WIDTH == 1 && USE_PAGED_KV_CACHE)
@@ -1823,7 +1963,7 @@ CUBIN_EXPORT __global__
     // request) and wrote nbPrefixParts partial results after this CTA's own nbSubSeqPerSeq slots; this kernel walks
     // only the suffix [cascadeTokens, cacheSeqLen) and the merging CTA folds the prefix partials in.
     uint32_t cascadeTokens = 0;
-    if (cascadeInfo != nullptr && nbPrefixParts != 0)
+    if (cascadeFold::supported && cascadeInfo != nullptr && nbPrefixParts != 0)
     {
         uint32_t bad = 0;
         for (uint32_t i = 0; i < nbPrefixParts; i++)
@@ -1850,8 +1990,7 @@ CUBIN_EXPORT __global__
     bool const cascadeActive = !SPEC_DEC && cascadeTokens != 0;
     uint32_t const nbTotalSkipTokens = cascadeActive ? cascadeTokens : 0U;
 #endif
-    // Number of partial results the merging CTA combines: this kernel's sub-sequences, then the prefix chunks.
-    uint32_t const nbMergeParts = nbSubSeqPerSeq + (cascadeActive ? nbPrefixParts : 0U);
+
 #if USE_PAGED_KV_CACHE
     uint32_t const nbSkipLeadingPages = nbTotalSkipTokens / tokensPerPage;
 #endif
@@ -2677,8 +2816,34 @@ CUBIN_EXPORT __global__
             }
         }
 
+        // Shared-prefix cascade: sub-sequence i folds prefix records [i*C/m, (i+1)*C/m) into its FP32 accumulator, so the
+        // output is rounded exactly where it is without the cascade (once with m = 1, per partial then merged with m > 1).
+        bool cascadeFolded = false;
+        if constexpr (cascadeFold::supported)
+        {
+            uint32_t const cBeg = nbPrefixParts * idxSubSeqInSeq / nbSubSeqPerSeq;
+            uint32_t const cEnd = nbPrefixParts * (idxSubSeqInSeq + 1) / nbSubSeqPerSeq;
+            if (cascadeActive && cBeg < cEnd)
+            {
+                cascadeFolded = true;
+                uint32_t const idxSeq = nbKHeads * idxReq + idxHeadGrp;
+                float const newMaxQ = fmaxf(cascadeFold::toQuad(globalRowMax),
+                    cascadeFold::quadPrefixMax(cascadeInfo, nbPrefixParts, idxSeq, cBeg, cEnd));
+                ThrdRegRowMax newRowMax = globalRowMax;
+                newRowMax[0] = cascadeFold::fromQuad(newMaxQ, globalRowMax[0]);
+                ThrdRegRowMax selfScale;
+                selfScale[0] = expf(globalRowMax[0] - newRowMax[0]);
+                globalRowSum[0] = globalRowSum[0] * selfScale[0];
+                rescaleAcc(warp, acc, fullRescaleMask, selfScale);
+                globalRowMax = newRowMax;
+                float const sumQ = cascadeFold::addPrefix<inputElemSize == 2 && cacheElemSize == 1>(
+                    acc, newMaxQ, cascadeInfo, nbPrefixParts, idxSeq, cBeg, cEnd, warpTile.x * warpIdxInGrp);
+                float const sumRow = cascadeFold::fromQuad(sumQ, 0.F);
+                globalRowSum[0] += laneId() < headGrpSize ? sumRow : 0.F;
+            }
+        }
         float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
-        if (seqIterInit < nbSeqIters)
+        if (seqIterInit < nbSeqIters || cascadeFolded)
         {
             // In multi-block mode, assign the virtual sink token to exactly one partial CTA.
             if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
@@ -2732,7 +2897,7 @@ CUBIN_EXPORT __global__
         // Only the CTA that performs the multi-block merge may write the output; a non-last CTA
         // writing its unmerged partial would race with the merged result.
         bool writesOutput = true;
-        if (isMultiBlock || cascadeActive)
+        if (isMultiBlock)
         {
             static_assert(ctaShapeInWarps.y == 1, "not implemented");
 #if SPEC_DEC
@@ -2743,7 +2908,7 @@ CUBIN_EXPORT __global__
 #else
             uint32_t const nbSeq = nbKHeads * batchSize;
 #endif
-            uint32_t const nbSubSeq = nbMergeParts * nbSeq;
+            uint32_t const nbSubSeq = nbSubSeqPerSeq * nbSeq;
             MemSegmenter<false> segmenter{scratch};
 
 #if SPEC_DEC
@@ -2751,7 +2916,7 @@ CUBIN_EXPORT __global__
 #else
             uint32_t const idxSeq = nbKHeads * idxReq + idxHeadGrp;
 #endif
-            uint32_t const idxBufBase = nbMergeParts * idxSeq;
+            uint32_t const idxBufBase = nbSubSeqPerSeq * idxSeq;
             uint32_t const idxBuf = idxBufBase + idxSubSeqInSeq;
             // copy row max/sum
             TinyPtr<SMemWarpRowMax> const rowMaxBuffers = segmenter.newSeg<SMemWarpRowMax>(nbSubSeq);
@@ -2809,7 +2974,7 @@ CUBIN_EXPORT __global__
                 for (uint32_t i = 0; i + 1 < nbTileBuffers; i++)
                 {
                     uint32_t const n = warpGrpIdx + gemm1NbWarpGrps * i;
-                    if (n < nbMergeParts)
+                    if (n < nbSubSeqPerSeq)
                     {
                         loadBufAsync(n);
                     }
@@ -2835,11 +3000,11 @@ CUBIN_EXPORT __global__
                         }
                     }
                 };
-                uint32_t const chunk0End = mha::min(mergeChunkSize, nbMergeParts);
+                uint32_t const chunk0End = mha::min(mergeChunkSize, nbSubSeqPerSeq);
                 loadChunkRowStats(0, chunk0End);
 
                 // get row max. Max is exact, so splitting the sub-sequences among warps does not change the result.
-                if (warpIdx.x < nbMergeParts)
+                if (warpIdx.x < nbSubSeqPerSeq)
                 {
                     ThrdRegRowMax warpRowMax = chunkRowMax[0];
 #pragma unroll
@@ -2850,7 +3015,7 @@ CUBIN_EXPORT __global__
                             warpRowMax = fmaxf(warpRowMax, chunkRowMax[k]);
                         }
                     }
-                    for (uint32_t n = mergeChunkSize + warpIdx.x; n < nbMergeParts; n += nbMergeWarps)
+                    for (uint32_t n = mergeChunkSize + warpIdx.x; n < nbSubSeqPerSeq; n += nbMergeWarps)
                     {
                         warpRowMax = fmaxf(warpRowMax, rowMaxBuffers[idxBufBase + n].loadToReg<false>(warp));
                     }
@@ -2858,10 +3023,11 @@ CUBIN_EXPORT __global__
                 }
                 __syncthreads();
                 ThrdRegRowMax mergedRowMax = mbbuf.partialRowMax[0].loadToReg<false>(warp);
-                for (uint32_t w = 1; w < mha::min(nbMergeWarps, nbMergeParts); w++)
+                for (uint32_t w = 1; w < mha::min(nbMergeWarps, nbSubSeqPerSeq); w++)
                 {
                     mergedRowMax = fmaxf(mergedRowMax, mbbuf.partialRowMax[w].loadToReg<false>(warp));
                 }
+
 
                 // Scaled row sum of each partial result of a chunk: its weight in the merged output.
                 auto storeChunkTileRowScales = [&](uint32_t chunkBeg, uint32_t chunkEnd)
@@ -2884,9 +3050,9 @@ CUBIN_EXPORT __global__
                 // rescale and accumulate, in the order of the sub-sequences
                 WarpAcc sumAcc{};
                 ThrdRegRowMax partialMergedRowSum{};
-                for (uint32_t chunkBeg = 0; chunkBeg < nbMergeParts; chunkBeg += mergeChunkSize)
+                for (uint32_t chunkBeg = 0; chunkBeg < nbSubSeqPerSeq; chunkBeg += mergeChunkSize)
                 {
-                    uint32_t const chunkEnd = mha::min(chunkBeg + mergeChunkSize, nbMergeParts);
+                    uint32_t const chunkEnd = mha::min(chunkBeg + mergeChunkSize, nbSubSeqPerSeq);
                     if (chunkBeg != 0)
                     {
                         loadChunkRowStats(chunkBeg, chunkEnd);
@@ -2898,7 +3064,7 @@ CUBIN_EXPORT __global__
                     for (uint32_t n = chunkBeg + warpGrpIdx; n < chunkEnd; n += gemm1NbWarpGrps)
                     {
                         uint32_t const nPrefetch = n + gemm1NbWarpGrps * (nbTileBuffers - 1);
-                        if (nPrefetch < nbMergeParts)
+                        if (nPrefetch < nbSubSeqPerSeq)
                         {
                             loadBufAsync(nPrefetch);
                         }
@@ -2982,12 +3148,12 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMP
 //
 // When every request of a decode batch starts with the same KV pages (block reuse of a common prompt prefix),
 // kernel_mha_prefix attends all requests' query rows of one KV head against those shared tokens together: rows are
-// (request, q head in group) pairs, 64 rows per CTA (4 warps x 16 MMA rows), so each prefix K/V tile is read and
-// converted once per 64 rows instead of once per request, and the MMA rows are filled. Grid: {nbChunks, nbRowGroups,
-// nbKHeads}; chunk c attends a contiguous range of the shared prefix. Each CTA writes its partial results in
-// kernel_mha's multi-block scratch format (row max, row sum, normalized BF16 tile) into slots nbSubSeqMha + c of
-// every (request, KV head), and kernel_mha (launched next with the same scratch, cascadeInfo and nbPrefixParts =
-// nbChunks) walks only the suffix and merges the prefix partials after its own, in a fixed order.
+// (request, q head in group) pairs, 64 rows per CTA (4 row blocks of 16 MMA rows, each split over 2 warps by key
+// halves), so each prefix K/V tile is read once per 64 rows instead of once per request, and the MMA rows are filled.
+// Grid: {nbChunks, nbRowGroups, nbKHeads}; chunk c attends a contiguous range of the shared prefix. Each CTA writes
+// FP32 records (unnormalized O, row max, row sum; see cascadeFold) after the cascadeInfo words, and kernel_mha
+// (launched next with cascadeInfo and nbPrefixParts = nbChunks) walks only the suffix and folds the records into its
+// FP32 accumulator or multi-block merge in a fixed order, so the output is rounded once as without the cascade.
 //
 // The shared length is found on the device (CUDA-graph safe): P = the leading 256-token tiles whose last page is the
 // same K and V page for every request, capped so that every request keeps >= 1 suffix token. Each chunk verifies all
@@ -2995,7 +3161,7 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMP
 // path, partials ignored). P is published in cascadeInfo[0], the flags in cascadeInfo[1 + c].
 // ---------------------------------------------------------------------------------------------------------------------
 #if !SPEC_DEC && BEAM_WIDTH == 1 && USE_PAGED_KV_CACHE && PAGED_KV_CACHE_LAYOUT == 0 && !USE_INPUT_KV                 \
-    && !LOW_PREC_OUTPUT && CACHE_ELEM_ENUM == 2 && !INPUT_FP16 && HEAD_ELEMS == 256 && !IS_MLA                         \
+    && !LOW_PREC_OUTPUT && CACHE_ELEM_ENUM == 2 && !INPUT_FP16 && HEAD_ELEMS == 256 && !IS_MLA && HEAD_GRP_SIZE <= 8   \
     && (TOKENS_PER_PAGE == 16 || TOKENS_PER_PAGE == 32 || TOKENS_PER_PAGE == 64)
 #define XQA_CASCADE_PREFIX 1
 #else
@@ -3023,6 +3189,7 @@ constexpr uint32_t smemBytes = miscOffset + 64;
 static_assert(tokensPerPage <= tokTile && tokTile % tokensPerPage == 0 && 256 % tokTile == 0);
 static_assert(sizeof(GMemCacheHead) == cacheHeadBytes && sizeof(IOHead) == 512);
 static_assert(gemm1WarpsPerGrp == 4 && gemm1NbWarpGrps == 1 && SharedMem::XSmemBuffer::cols == 8);
+static_assert(cascadeFold::supported, "kernel_mha must be able to fold the prefix records");
 // end-of-kernel exchange of the second token-half warps' state: [rowWarp][128 O + 2 max + 2 sum][lane] floats
 constexpr uint32_t xchgFloats = 132;
 static_assert(nbRowWarps * xchgFloats * 32 * sizeof(float) <= miscOffset);
@@ -3087,8 +3254,7 @@ CUBIN_EXPORT __device__ constexpr uint32_t prefixCtaSize = cascade::ctaThreads;
 
 CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mha_prefix(uint32_t const nbKHeads, float const qScale,
     IOHead const* __restrict__ const q, KVCacheList<usePagedKVCache> const cacheList, uint32_t const batchSize,
-    float const* __restrict__ kvCacheScale, uint32_t const nbSubSeqMha, uint32_t* __restrict__ const cascadeInfo,
-    void* __restrict__ const scratch)
+    float const* __restrict__ kvCacheScale, uint32_t* __restrict__ const cascadeInfo)
 {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
     using namespace cascade;
@@ -3161,18 +3327,24 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
         }
     }
     __syncthreads();
-    if (idxRowGrp == 0 && idxHeadGrp == 0 && tid == 0)
+    uint32_t const chunkBad = misc[2];
+    // cascadeInfo and the records are written only after the PDL wait (no earlier kernel can still read them).
+    auto const publishInfo = [&]()
     {
-        cascadeInfo[1 + idxChunk] = misc[2];
-        if (idxChunk == 0)
+        if (idxRowGrp == 0 && idxHeadGrp == 0 && tid == 0)
         {
-            cascadeInfo[0] = nbPfxTiles * 256;
+            cascadeInfo[1 + idxChunk] = chunkBad;
+            if (idxChunk == 0)
+            {
+                cascadeInfo[0] = nbPfxTiles * 256;
+            }
         }
-    }
+    };
     if (nbSub == 0)
     {
-        // kernel_mha ignores the partials when P == 0. Still wait: kernel_mha's own wait must imply the RoPE kernel.
+        // kernel_mha ignores the records when P == 0. Still wait: kernel_mha's own wait must imply the RoPE kernel.
         acqBulk();
+        publishInfo();
         return;
     }
 
@@ -3223,6 +3395,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
 
     // 2. Q (written by the preceding RoPE kernel).
     acqBulk();
+    publishInfo();
     uint32_t const nbQHeads = nbKHeads * headGrpSize;
     uint32_t const nbRows = batchSize * headGrpSize;
 #pragma unroll 4
@@ -3453,22 +3626,14 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
         }
     }
 
-    // 4. Partial results in kernel_mha's multi-block scratch layout, slot nbSubSeqMha + idxChunk.
+    // 4. FP32 partial record of chunk idxChunk for each (request, KV head) row: unnormalized O, row max, row sum.
 #pragma unroll
     for (uint32_t i = 0; i < 2; i++)
     {
         rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 1);
         rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 2);
     }
-    uint32_t const nbParts = nbSubSeqMha + nbChunks;
-    uint32_t const nbSubSeqTotal = nbParts * nbKHeads * batchSize;
-    using ScratchBuf = Array2D<LdGrain, nbValidRows, SharedMem::XSmemBuffer::cols>;
-    MemSegmenter<false> segmenter{scratch};
-    TinyPtr<SMemWarpRowMax> const rowMaxBuffers = segmenter.newSeg<SMemWarpRowMax>(nbSubSeqTotal);
-    TinyPtr<SMemWarpRowMax> const rowSumBuffers = segmenter.newSeg<SMemWarpRowMax>(nbSubSeqTotal);
-    TinyPtr<Vec<ScratchBuf, gemm1WarpsPerGrp>> const scratchBuffers
-        = segmenter.newSeg<Vec<ScratchBuf, gemm1WarpsPerGrp>>(nbSubSeqTotal);
-    float const voScale = kvCacheScale[0];
+    float* const records = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(cascadeInfo) + cascadeFold::infoBytes);
 #pragma unroll
     for (uint32_t i = 0; i < 2; i++)
     {
@@ -3479,38 +3644,24 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
         }
         uint32_t const req = rho / headGrpSize;
         uint32_t const jh = rho % headGrpSize;
-        uint32_t const idxBuf = nbParts * (nbKHeads * req + idxHeadGrp) + nbSubSeqMha + idxChunk;
+        float* const rec
+            = records + size_t((nbKHeads * req + idxHeadGrp) * nbChunks + idxChunk) * cascadeFold::recFloats;
         if (t == 0)
         {
-            rowMaxBuffers[idxBuf][jh] = rowMax[i];
-            rowSumBuffers[idxBuf][jh] = rowSum[i];
-            if (jh == 0)
-            {
-                // rows beyond the head group are never output; keep them neutral in the merge.
-                for (uint32_t r = nbValidRows; r < ThrdRegRowMax::size * warp_size; r++)
-                {
-                    rowMaxBuffers[idxBuf][r] = safeInitRowMax;
-                    rowSumBuffers[idxBuf][r] = 0.F;
-                }
-            }
+            rec[headGrpSize * validElemsPerHead + jh] = rowMax[i];
+            rec[headGrpSize * validElemsPerHead + cascadeFold::statStride + jh] = rowSum[i];
         }
-        float const scale = (rowSum[i] == 0.F ? 0.F : __frcp_rn(rowSum[i])) * voScale;
 #pragma unroll
         for (uint32_t db = 0; db < 8; db++)
         {
 #pragma unroll
             for (uint32_t half = 0; half < 2; half++)
             {
+                // even n-tile: dims d + 4t, d + 4t + 2; odd n-tile: d + 4t + 1, d + 4t + 3
                 float const(&ev)[4] = o[4 * db + 2 * half];
                 float const(&od)[4] = o[4 * db + 2 * half + 1];
-                __nv_bfloat162 const w0 = __floats2bfloat162_rn(ev[2 * i] * scale, od[2 * i] * scale);
-                __nv_bfloat162 const w1 = __floats2bfloat162_rn(ev[2 * i + 1] * scale, od[2 * i + 1] * scale);
-                uint32_t const local = 32 * (db % 2) + 16 * half + 4 * t; // head dim within the 64-dim warp slice
-                uint32_t const grain = local / 8;
-                LdGrain* const tile = &scratchBuffers[idxBuf][db / 2](0, 0);
-                uint2* const dst = reinterpret_cast<uint2*>(
-                    reinterpret_cast<uint8_t*>(tile + jh * ScratchBuf::cols + (grain ^ jh)) + 8 * (t % 2));
-                *dst = make_uint2(reinterpret_cast<uint32_t const&>(w0), reinterpret_cast<uint32_t const&>(w1));
+                reinterpret_cast<float4&>(rec[jh * validElemsPerHead + 32 * db + 16 * half + 4 * t])
+                    = make_float4(ev[2 * i], od[2 * i], ev[2 * i + 1], od[2 * i + 1]);
             }
         }
     }
