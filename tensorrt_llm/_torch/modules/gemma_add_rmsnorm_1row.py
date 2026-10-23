@@ -295,8 +295,10 @@ def gemma_fused_add_rmsnorm_1row(input: torch.Tensor,
 _ENABLED = os.environ.get("TRTLLM_GEMMA_ADD_RMSNORM_1ROW", "1") == "1"
 # Step 0 (job 469, 10-layer cold-L2 PDL chain, both decode norm sites):
 # E:320 -2.15 / -2.77 / -3.07 us per layer at M = 16 / 24 / 32, +1.8 at M = 8.
+# c64/c128 run (job 24, same chain on main 77afeb85): E:320 -1.84 / -3.28 us
+# per layer at M = 64 / 128 (A/A +0.05 / +0.21), bitwise.
 _MIN_ROWS = int(os.environ.get("TRTLLM_GEMMA_ADD_RMSNORM_1ROW_MIN", "16"))
-_MAX_ROWS = int(os.environ.get("TRTLLM_GEMMA_ADD_RMSNORM_1ROW_MAX", "32"))
+_MAX_ROWS = int(os.environ.get("TRTLLM_GEMMA_ADD_RMSNORM_1ROW_MAX", "128"))
 _TPR = int(os.environ.get("TRTLLM_GEMMA_ADD_RMSNORM_1ROW_TPR", "320"))
 _ARM = os.environ.get("TRTLLM_GEMMA_ADD_RMSNORM_1ROW_ARM", "E")
 

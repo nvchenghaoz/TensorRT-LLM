@@ -62,7 +62,7 @@ def op_mode():
     rows = {}
     g = torch.Generator(device=dev).manual_seed(5)
     w = (torch.randn(H, generator=g, device=dev) * 0.3).to(torch.bfloat16)
-    for m in [1, 4, 8, 15, 16, 17, 20, 24, 31, 32, 33, 64, 2048]:
+    for m in [1, 4, 8, 15, 16, 17, 20, 24, 31, 32, 33, 48, 64, 96, 127, 128, 129, 2048, 8192]:
         x = (torch.randn((m, H), generator=g, device=dev) * 0.5).to(torch.bfloat16)
         r = (torch.randn((m, H), generator=g, device=dev) * 3.0).to(torch.bfloat16)
         ys, rs = stock(x, r, w)
@@ -80,7 +80,7 @@ def op_mode():
         ok &= bit and not drift
         log("OP M", m, rows[m])
     graph_ok = True
-    for m in range(1, 33):
+    for m in list(range(1, 33)) + [40, 48, 56, 64, 80, 96, 112, 128]:
         x = (torch.randn((m, H), generator=g, device=dev) * 0.5).to(torch.bfloat16)
         r = (torch.randn((m, H), generator=g, device=dev) * 3.0).to(torch.bfloat16)
         ys, rs = stock(x, r, w)
@@ -99,9 +99,9 @@ def op_mode():
             gr.replay()
             torch.cuda.synchronize()
             graph_ok &= torch.equal(xb, ys) and torch.equal(rb, rs)
-    log("graph op 1..32", graph_ok)
+    log("graph op 1..32 + 40..128", graph_ok)
     ok &= graph_ok
-    print(json.dumps({"passed": bool(ok), "graph_ok_1_32": graph_ok,
+    print(json.dumps({"passed": bool(ok), "graph_ok_1_128": graph_ok,
                       "compared": "trtllm::flashinfer_gemma_fused_add_rmsnorm (routed) vs stock FlashInfer gemma_fused_add_rmsnorm, y+residual bitwise, 10+50 calls",
                       "rows": {str(k): v for k, v in rows.items()}}))
 
