@@ -539,13 +539,16 @@ def _post_attn_nvfp4_eligible(layer) -> bool:
 _POST_ATTN_NVFP4_MIN_ROWS = int(
     os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_MIN_ROWS", "2048"))
 
-# Decode rows 1.._POST_ATTN_NVFP4_DECODE_MAX_ROWS instead run FlashInfer's
+# Decode rows 1.._POST_ATTN_NVFP4_DECODE_MAX_ROWS can instead run FlashInfer's
 # CuTe-DSL gemma add+RMSNorm (main's decode norm) with an NVFP4 epilogue
 # (trtllm::flashinfer_gemma_fused_add_rmsnorm_nvfp4), bitwise-equal to that
 # norm + fp4_quantize; it drops one fp4_quantize launch per layer.
-# TRTLLM_GEMMA_NORM_NVFP4_DECODE=0 turns it off.
+# Off by default: the isolated norm -> gate_up chain runs it ~1.2 us/layer
+# faster at M=4..32, but in serving it makes decode slower (Qwen3.8-27B-NVFP4,
+# SM120, order-alternated pairs: TPOT c8 +1.4%, c16 +0.9%, c32 +0.8%).
+# TRTLLM_GEMMA_NORM_NVFP4_DECODE=1 turns it on.
 _POST_ATTN_NVFP4_DECODE = os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_DECODE",
-                                         "1") != "0"
+                                         "0") != "0"
 _POST_ATTN_NVFP4_DECODE_MAX_ROWS = int(
     os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_DECODE_MAX_ROWS", "32"))
 
