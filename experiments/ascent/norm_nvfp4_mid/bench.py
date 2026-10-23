@@ -57,6 +57,12 @@ def rand_w(n, k, seed):
 def main():
     args = sys.argv[1:]
     arms = ("disp", "main", "cute", "triton")
+    op_only = False
+    if args and args[0] == "op":
+        # Time only the post-attn norm(+quant) ops (no GEMMs); x and the
+        # residual are restored from pristine copies before every replay.
+        op_only = True
+        args = args[1:]
     if args and not args[0].isdigit():
         arms = tuple(args[0].split(","))
         args = args[1:]
@@ -101,10 +107,25 @@ def main():
               3.0).to(torch.bfloat16)
         rp = r0.clone()
         tile = 0 if m >= 448 else 1
+        if op_only:
+            x0 = (torch.randn((L, m, H), generator=gen, device=dev) *
+                  0.7).to(torch.bfloat16)
+            xp = x0.clone()
+        else:
+            x0 = xp = None
+
+        def restore():
+            rp.copy_(r0)
+            if xp is not None:
+                xp.copy_(x0)
 
         def layer(i, arm):
-            x = torch.ops.trtllm.nvfp4_gemm(aq[i][0], wp[i][0], aq[i][1],
-                                            wp[i][1], alpha, torch.bfloat16)
+            if op_only:
+                x = xp[i]
+            else:
+                x = torch.ops.trtllm.nvfp4_gemm(aq[i][0], wp[i][0], aq[i][1],
+                                                wp[i][1], alpha,
+                                                torch.bfloat16)
             r = rp[i]
             norm = layers[i].post_attention_layernorm
             if arm == "disp":
@@ -123,6 +144,9 @@ def main():
                 torch.ops.trtllm.flashinfer_gemma_fused_add_rmsnorm(
                     x, r, norm.weight, EPS)
                 q, sf = torch.ops.trtllm.fp4_quantize(x, gs_x, 16, False)
+            if op_only:
+                return (q.view(torch.uint8).reshape(-1),
+                        sf.view(torch.uint8).reshape(-1))
             if m >= 41:
                 o = torch.ops.trtllm.nvfp4_gate_up_swiglu_nvfp4(
                     q, wg[i][0], sf, wg[i][1], alpha, gs_down, tile)
@@ -135,7 +159,7 @@ def main():
                     sf.view(torch.uint8).reshape(-1)) + o
 
         with autotune():
-            rp.copy_(r0)
+            restore()
             layer(0, "main")
         torch.cuda.synchronize()
         print(f"M={m} autotuned", flush=True)
@@ -150,7 +174,7 @@ def main():
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
                 for _ in range(2):
-                    rp.copy_(r0)
+                    restore()
                     body()
             torch.cuda.current_stream().wait_stream(s)
             torch.cuda.synchronize()
@@ -166,7 +190,7 @@ def main():
         for it in range(WARM + ITERS):
             order = arms[it % na:] + arms[:it % na]
             for arm in order:
-                rp.copy_(r0)
+                restore()
                 sink += scrub.sum()  # 256 MB read: cold L2
                 e0 = torch.cuda.Event(enable_timing=True)
                 e1 = torch.cuda.Event(enable_timing=True)
@@ -178,7 +202,7 @@ def main():
                     ts[arm].append(e0.elapsed_time(e1) * 1e3 / L)
         last = {}
         for arm in arms:
-            rp.copy_(r0)
+            restore()
             graphs[arm][0].replay()
             torch.cuda.synchronize()
             last[arm] = ([tuple(t.clone() for t in lo)
@@ -221,8 +245,12 @@ def main():
         "output": {"class": "exact"},
         "bitwise_all_arms": allbit,
         "reported_arm": rep,
-        "unit_note": "kernel_ms = median per-layer time of the chain "
-                     "producer GEMM -> post-attn norm(+quant) -> gate_up GEMM",
+        "mode": "op" if op_only else "chain",
+        "unit_note": ("kernel_ms = median per-layer time of post-attn "
+                      "norm(+gate_up input quant) only" if op_only else
+                      "kernel_ms = median per-layer time of the chain "
+                      "producer GEMM -> post-attn norm(+quant) -> gate_up "
+                      "GEMM"),
         "chain": results,
     }))
 
