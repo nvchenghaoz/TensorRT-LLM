@@ -3169,6 +3169,9 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMP
 #endif
 
 #if XQA_CASCADE_PREFIX
+#ifndef XQA_PFX_SCAN_ROTATE
+#define XQA_PFX_SCAN_ROTATE 1
+#endif
 namespace cascade
 {
 constexpr uint32_t nbRowWarps = 4;                    // each owns 16 rows
@@ -3274,56 +3277,141 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
 
     // 1. Shared prefix length and this chunk's page verification. Page tables and sequence lengths are ready before
     // the preceding RoPE/KV-append kernel, and only old prefix pages are read here, so this runs before the PDL wait.
+    // Both page-table scans batch their loads (all loads of an unrolled group are issued before any compare) and
+    // reduce locally (min / OR) with one shared-memory update per thread, so a thread waits on one L2 round trip per
+    // group instead of one per pair. The results equal a pair-by-pair scan: P = min(maxTiles, first mismatching
+    // tile), flag = any mismatching page of the chunk.
+    uint32_t const nbOther = batchSize - 1;
+    // P search over (tile k, request r >= 1) pairs, k-major (a warp's row-0 loads mostly broadcast). The tile range is
+    // bounded by the page table (kCap >= maxTiles) so the first group of loads is issued before the sequence-length
+    // reduction; pairs with k >= maxTiles are loaded (in bounds: j < maxPages) but ignored.
+    constexpr uint32_t pScanUnroll = 18;
+    uint32_t const kCap = maxPages * tokensPerPage / 256U;
+    uint32_t const nbPScan = kCap * nbOther;
+    // Every CTA scans the same pairs (and the CTAs of one chunk the same pages); each starts at its own warp-aligned
+    // offset and wraps, so the CTAs do not all request the same L2 lines at the same moment. Same pairs, same result.
+    uint32_t const ctaLinear = (idxHeadGrp * gridDim.y + idxRowGrp) * nbChunks + idxChunk;
+    uint32_t const nbCtas = nbChunks * gridDim.y * gridDim.z;
+    auto const rotation = [&](uint32_t n, uint32_t rank, uint32_t nbRanks)
+    { return XQA_PFX_SCAN_ROTATE ? uint32_t(uint64_t(n) * rank / nbRanks) & ~31U : 0U; };
+    auto const rotate = [](uint32_t idx, uint32_t rot, uint32_t n) { return idx + rot < n ? idx + rot : idx + rot - n; };
+    uint32_t const pRot = rotation(nbPScan, ctaLinear, nbCtas);
+    KVCachePageIndex pScanK[pScanUnroll];
+    KVCachePageIndex pScanV[pScanUnroll];
+    KVCachePageIndex pScanK0[pScanUnroll];
+    KVCachePageIndex pScanV0[pScanUnroll];
+    auto const loadPScan = [&](uint32_t idx0)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < pScanUnroll; i++)
+        {
+            uint32_t const idxRaw = idx0 + ctaThreads * i;
+            if (idxRaw < nbPScan)
+            {
+                uint32_t const idx = rotate(idxRaw, pRot, nbPScan);
+                uint32_t const k = idx / nbOther;
+                uint32_t const r = 1 + idx % nbOther;
+                uint32_t const j = (256 * (k + 1) - 1) / tokensPerPage;
+                pScanK[i] = kPage(r, j);
+                pScanV[i] = vPage(r, j);
+                pScanK0[i] = kPage(0, j);
+                pScanV0[i] = vPage(0, j);
+            }
+        }
+    };
+    auto const cmpPScan = [&](uint32_t idx0, uint32_t maxTiles, uint32_t& firstBad)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < pScanUnroll; i++)
+        {
+            uint32_t const idxRaw = idx0 + ctaThreads * i;
+            if (idxRaw < nbPScan)
+            {
+                uint32_t const k = rotate(idxRaw, pRot, nbPScan) / nbOther;
+                if (k < maxTiles && (pScanK[i] != pScanK0[i] || pScanV[i] != pScanV0[i]))
+                {
+                    firstBad = mha::min(firstBad, k);
+                }
+            }
+        }
+    };
     if (tid == 0)
     {
         misc[0] = ~0U;
+        misc[1] = ~0U;
         misc[2] = 0U;
     }
+    loadPScan(tid);
     __syncthreads();
-    for (uint32_t r = tid; r < batchSize; r += blockDim.x)
+    for (uint32_t r = tid; r < batchSize; r += ctaThreads)
     {
         atomicMin(&misc[0], uint32_t(cacheList.seqLenList[r]));
     }
     __syncthreads();
     uint32_t const minLen = misc[0];
-    uint32_t const maxTiles = mha::min(minLen == 0 ? 0U : (minLen - 1) / 256U, maxPages * tokensPerPage / 256U);
-    __syncthreads();
-    if (tid == 0)
+    uint32_t const maxTiles = mha::min(minLen == 0 ? 0U : (minLen - 1) / 256U, kCap);
     {
-        misc[1] = maxTiles;
-    }
-    __syncthreads();
-    uint32_t const nbOther = batchSize - 1;
-    if (nbOther != 0)
-    {
-        for (uint32_t idx = tid; idx < maxTiles * nbOther; idx += blockDim.x)
+        uint32_t firstBad = ~0U;
+        cmpPScan(tid, maxTiles, firstBad);
+        for (uint32_t idx0 = tid + ctaThreads * pScanUnroll; idx0 < nbPScan; idx0 += ctaThreads * pScanUnroll)
         {
-            uint32_t const k = idx / nbOther;
-            uint32_t const r = 1 + idx % nbOther;
-            uint32_t const j = (256 * (k + 1) - 1) / tokensPerPage;
-            if (kPage(r, j) != kPage(0, j) || vPage(r, j) != vPage(0, j))
-            {
-                atomicMin(&misc[1], k);
-            }
+            loadPScan(idx0);
+            cmpPScan(idx0, maxTiles, firstBad);
+        }
+        if (firstBad != ~0U)
+        {
+            atomicMin(&misc[1], firstBad);
         }
     }
     __syncthreads();
-    uint32_t const nbPfxTiles = misc[1];
+    uint32_t const nbPfxTiles = mha::min(misc[1], maxTiles);
     uint32_t const nbSub = nbPfxTiles * (256 / tokTile);
     uint32_t const subBeg = nbSub * idxChunk / nbChunks;
     uint32_t const subEnd = nbSub * (idxChunk + 1) / nbChunks;
     if (nbOther != 0)
     {
+        // This chunk's pages for every request r >= 1, r-major and j-minor: a warp reads consecutive page indices of
+        // one row (coalesced), and row 0's matching loads are the same lines for every r.
+        constexpr uint32_t vScanUnroll = 12;
         uint32_t const pageBeg = subBeg * tokTile / tokensPerPage;
         uint32_t const nbChkPages = (subEnd - subBeg) * tokTile / tokensPerPage;
-        for (uint32_t idx = tid; idx < nbChkPages * nbOther; idx += blockDim.x)
+        uint32_t const nbVScan = nbChkPages * nbOther;
+        // the CTAs sharing this chunk: gridDim.y row groups x gridDim.z KV heads
+        uint32_t const vRot = rotation(nbVScan, idxHeadGrp * gridDim.y + idxRowGrp, gridDim.y * gridDim.z);
+        bool bad = false;
+        for (uint32_t idx0 = tid; idx0 < nbVScan; idx0 += ctaThreads * vScanUnroll)
         {
-            uint32_t const j = pageBeg + idx / nbOther;
-            uint32_t const r = 1 + idx % nbOther;
-            if (kPage(r, j) != kPage(0, j) || vPage(r, j) != vPage(0, j))
+            KVCachePageIndex vsK[vScanUnroll];
+            KVCachePageIndex vsV[vScanUnroll];
+            KVCachePageIndex vsK0[vScanUnroll];
+            KVCachePageIndex vsV0[vScanUnroll];
+#pragma unroll
+            for (uint32_t i = 0; i < vScanUnroll; i++)
             {
-                misc[2] = 1U;
+                uint32_t const idxRaw = idx0 + ctaThreads * i;
+                if (idxRaw < nbVScan)
+                {
+                    uint32_t const idx = rotate(idxRaw, vRot, nbVScan);
+                    uint32_t const r = 1 + idx / nbChkPages;
+                    uint32_t const j = pageBeg + idx % nbChkPages;
+                    vsK[i] = kPage(r, j);
+                    vsV[i] = vPage(r, j);
+                    vsK0[i] = kPage(0, j);
+                    vsV0[i] = vPage(0, j);
+                }
             }
+#pragma unroll
+            for (uint32_t i = 0; i < vScanUnroll; i++)
+            {
+                if (idx0 + ctaThreads * i < nbVScan)
+                {
+                    bad |= (vsK[i] != vsK0[i]) || (vsV[i] != vsV0[i]);
+                }
+            }
+        }
+        if (bad)
+        {
+            misc[2] = 1U;
         }
     }
     __syncthreads();
