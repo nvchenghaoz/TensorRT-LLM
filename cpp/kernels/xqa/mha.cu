@@ -3172,6 +3172,16 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMP
 #ifndef XQA_PFX_SCAN_ROTATE
 #define XQA_PFX_SCAN_ROTATE 1
 #endif
+// FP8 math for the prefix pass (MathElem = CacheElem, as mla_sm120 does): S = Q K^T and O += P V run as
+// m16n8k32 e4m3 MMAs on the stored e4m3 K/V words (no K/V conversion). Q is split into two e4m3 terms with a per-row
+// power-of-two scale (hi = e4m3(q s), lo = e4m3(q s - hi), about BF16 precision; XQA_PFX_Q_TERMS 1 keeps hi only).
+// P is quantized to e4m3 as 448 p (the row sum adds the quantized values). 0 restores the BF16 m16n8k16 path.
+#ifndef XQA_PFX_FP8
+#define XQA_PFX_FP8 1
+#endif
+#ifndef XQA_PFX_Q_TERMS
+#define XQA_PFX_Q_TERMS 2
+#endif
 namespace cascade
 {
 constexpr uint32_t nbRowWarps = 4;                    // each owns 16 rows
@@ -3182,8 +3192,17 @@ constexpr uint32_t ctaRows = nbRowWarps * 16;         // rows = (request, q head
 constexpr uint32_t tokTile = 64;                      // tokens per pipeline stage
 constexpr uint32_t warpToks = tokTile / nbTokSplit;   // 32
 constexpr uint32_t cacheHeadBytes = 256;              // e4m3 head of 256 elements
+#if XQA_PFX_FP8
+// e4m3 Q term rows of 256 B + 16 B pad (conflict-free ldmatrix); bytes 256..259 of a hi-term row hold the row's 1/s.
+constexpr uint32_t qTermRowBytes = 256 + 16;
+constexpr uint32_t qTermBytes = ctaRows * qTermRowBytes; // 17408
+constexpr uint32_t qBytes = 2 * qTermBytes;              // 34816 (hi terms, then lo terms)
+constexpr float pQuantScale = 448.F;                     // P -> e4m3 as 448 p (kE4M3_MAX, as mha_sm90 / mla_sm120)
+constexpr float log2PQuantScale = 8.807354922057604F;    // log2(448)
+#else
 constexpr uint32_t qRowBytes = 256 * 2 + 32;          // padded BF16 Q row (conflict-free 8-byte fragment loads)
 constexpr uint32_t qBytes = ctaRows * qRowBytes;      // 34816
+#endif
 constexpr uint32_t kvTileBytes = tokTile * cacheHeadBytes; // 16384
 constexpr uint32_t kOffset = qBytes;
 constexpr uint32_t vOffset = kOffset + 2 * kvTileBytes;
@@ -3249,6 +3268,60 @@ __device__ inline uint32_t packBf16(float x, float y, float& sum)
     float2 const f = __bfloat1622float2(v);
     sum += f.x + f.y;
     return reinterpret_cast<uint32_t const&>(v);
+}
+
+__device__ inline void mmaE4m3(
+    float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1)
+{
+    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// 4 floats -> 4 e4m3 bytes (x0 in the lowest byte), round to nearest even, saturating to +-448.
+__device__ inline uint32_t packE4m3(float x0, float x1, float x2, float x3)
+{
+    uint32_t r;
+    asm("{\n"
+        ".reg .b16 lo, hi;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+        "mov.b32 %0, {lo, hi};\n"
+        "}\n"
+        : "=r"(r)
+        : "f"(x0), "f"(x1), "f"(x2), "f"(x3));
+    return r;
+}
+
+// 4 e4m3 bytes -> two half2 (exact): {bytes 0, 1} and {bytes 2, 3}.
+__device__ inline void unpackE4m3(uint32_t w, uint32_t& h01, uint32_t& h23)
+{
+    asm("{\n"
+        ".reg .b16 lo, hi;\n"
+        "mov.b32 {lo, hi}, %2;\n"
+        "cvt.rn.f16x2.e4m3x2 %0, lo;\n"
+        "cvt.rn.f16x2.e4m3x2 %1, hi;\n"
+        "}\n"
+        : "=r"(h01), "=r"(h23)
+        : "r"(w));
+}
+
+__device__ inline float2 half2ToFloat2(uint32_t h)
+{
+    return __half22float2(reinterpret_cast<__half2 const&>(h));
+}
+
+// Sum of the 8 e4m3 values of words w0 and w1 (pairs added in FP16, which holds them to 11 bits, then FP32).
+__device__ inline float sumE4m3x8(uint32_t w0, uint32_t w1)
+{
+    uint32_t a, b, c, d;
+    unpackE4m3(w0, a, b);
+    unpackE4m3(w1, c, d);
+    __half2 const s = __hadd2(__hadd2(reinterpret_cast<__half2 const&>(a), reinterpret_cast<__half2 const&>(b)),
+        __hadd2(reinterpret_cast<__half2 const&>(c), reinterpret_cast<__half2 const&>(d)));
+    float2 const f = __half22float2(s);
+    return f.x + f.y;
 }
 } // namespace cascade
 
@@ -3486,6 +3559,73 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
     publishInfo();
     uint32_t const nbQHeads = nbKHeads * headGrpSize;
     uint32_t const nbRows = batchSize * headGrpSize;
+#if XQA_PFX_FP8
+    // One warp per row (lane = 16-byte grain of 8 BF16 elements). s = 2^(7 - floor(log2 max|q|)), so |q s| < 256 and
+    // the scaling is exact; hi = e4m3(q s), lo = e4m3(q s - hi). Rows past nbRows are zero.
+#pragma unroll 2
+    for (uint32_t i = 0; i < ctaRows * 32 / ctaThreads; i++)
+    {
+        uint32_t const idx = tid + ctaThreads * i;
+        uint32_t const row = idx / 32;
+        uint32_t const grain = idx % 32;
+        uint32_t const rho = ctaRows * idxRowGrp + row;
+        LdGrain v = {0U, 0U, 0U, 0U};
+        if (rho < nbRows)
+        {
+            uint32_t const req = rho / headGrpSize;
+            uint32_t const jh = rho % headGrpSize;
+            v = reinterpret_cast<LdGrain const*>(&q[nbQHeads * req + headGrpSize * idxHeadGrp + jh])[grain];
+        }
+        float x[8];
+#pragma unroll
+        for (uint32_t k = 0; k < 4; k++)
+        {
+            float2 const f = __bfloat1622float2(reinterpret_cast<__nv_bfloat162 const&>(v[k]));
+            x[2 * k] = f.x;
+            x[2 * k + 1] = f.y;
+        }
+        float amax = 0.F;
+#pragma unroll
+        for (uint32_t e = 0; e < 8; e++)
+        {
+            amax = fmaxf(amax, fabsf(x[e]));
+        }
+#pragma unroll
+        for (uint32_t m = 16; m >= 1; m /= 2)
+        {
+            amax = fmaxf(amax, __shfl_xor_sync(~0U, amax, m));
+        }
+        uint32_t const ex = mha::min(mha::max(__float_as_uint(amax) >> 23, 8U), 254U); // biased exponent of max|q|
+        float const sc = __uint_as_float((261U - ex) << 23);
+        float const rcpSc = __uint_as_float((ex - 7U) << 23);
+        uint32_t hi[2];
+        uint32_t lo[2];
+#pragma unroll
+        for (uint32_t k = 0; k < 2; k++)
+        {
+            float y[4];
+#pragma unroll
+            for (uint32_t e = 0; e < 4; e++)
+            {
+                y[e] = x[4 * k + e] * sc;
+            }
+            hi[k] = packE4m3(y[0], y[1], y[2], y[3]);
+            uint32_t h01, h23;
+            unpackE4m3(hi[k], h01, h23);
+            float2 const f01 = half2ToFloat2(h01);
+            float2 const f23 = half2ToFloat2(h23);
+            lo[k] = packE4m3(y[0] - f01.x, y[1] - f01.y, y[2] - f23.x, y[3] - f23.y);
+        }
+        uint8_t* const hiRow = pfxSmem + row * qTermRowBytes;
+        *reinterpret_cast<uint2*>(hiRow + grain * 8) = uint2{hi[0], hi[1]};
+        *reinterpret_cast<uint2*>(hiRow + qTermBytes + grain * 8) = uint2{lo[0], lo[1]};
+        if (grain == 0)
+        {
+            *reinterpret_cast<float*>(hiRow + 256) = rcpSc;
+        }
+    }
+    __syncthreads();
+#else
 #pragma unroll 4
     for (uint32_t i = 0; i < ctaRows * 32 / ctaThreads; i++)
     {
@@ -3502,6 +3642,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
         }
         *reinterpret_cast<LdGrain*>(pfxSmem + row * qRowBytes + grain * grainBytes) = v;
     }
+#endif
 
     // 3. Flash attention over the chunk. Warp (rowWarp, tokHalf) owns 16 rows and tokens [32 tokHalf, 32 tokHalf + 32)
     // of every 64-token tile; the two halves are merged at the end.
@@ -3524,10 +3665,24 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
     }
     float rowMax[2] = {safeInitRowMax, safeInitRowMax};
     float rowSum[2] = {0.F, 0.F}; // per-thread partial sums of the rounded probabilities
-    uint32_t const qAddr0 = smemBase + (16 * rowWarp + g) * qRowBytes + 8 * t;
-    uint32_t const qAddr1 = qAddr0 + 8 * qRowBytes;
     uint32_t const ldRow = lane % 8;
     uint32_t const ldMat = lane / 8;
+#if XQA_PFX_FP8
+    // ldmatrix x4 of a Q term gives one m16n8k32 A fragment: matrices (rows 0-7 | 8-15) x (bytes 0-15 | 16-31).
+    uint32_t const qLdAddr
+        = smemBase + (16 * rowWarp + 8 * (ldMat & 1U) + ldRow) * qTermRowBytes + 16 * (ldMat >> 1);
+    // per-row logit scale, with the row's 1/s
+    float rowQkScale[2];
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        rowQkScale[i]
+            = qkScale * *reinterpret_cast<float const*>(pfxSmem + (16 * rowWarp + g + 8 * i) * qTermRowBytes + 256);
+    }
+#else
+    uint32_t const qAddr0 = smemBase + (16 * rowWarp + g) * qRowBytes + 8 * t;
+    uint32_t const qAddr1 = qAddr0 + 8 * qRowBytes;
+#endif
     constexpr uint32_t nbSTiles = warpToks / 8; // 4 n-tiles of 8 keys
     for (uint32_t sub = subBeg; sub < subEnd; sub++)
     {
@@ -3559,6 +3714,40 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
                     s[j][e] = 0.F;
                 }
             }
+#if XQA_PFX_FP8
+            // S = Q K^T as e4m3 m16n8k32: a K ldmatrix word is (token 8j+g, dims 4t..4t+3 of a 16-dim grain), which is
+            // the B fragment as stored; k step h of group kg covers dims 64 kg + 32 h + [0, 32).
+#pragma unroll
+            for (uint32_t kg = 0; kg < 4; kg++)
+            {
+                uint32_t qh[2][4];
+#if XQA_PFX_Q_TERMS == 2
+                uint32_t ql[2][4];
+#endif
+#pragma unroll
+                for (uint32_t h = 0; h < 2; h++)
+                {
+                    ldsm4(qh[h], qLdAddr + 32 * (2 * kg + h));
+#if XQA_PFX_Q_TERMS == 2
+                    ldsm4(ql[h], qLdAddr + qTermBytes + 32 * (2 * kg + h));
+#endif
+                }
+#pragma unroll
+                for (uint32_t j = 0; j < nbSTiles; j++)
+                {
+                    uint32_t kr[4];
+                    ldsm4(kr, kBase + (8 * j + ldRow) * cacheHeadBytes + (((4 * kg + ldMat) ^ ldRow) * grainBytes));
+#pragma unroll
+                    for (uint32_t h = 0; h < 2; h++)
+                    {
+                        mmaE4m3(s[j], qh[h][0], qh[h][1], qh[h][2], qh[h][3], kr[2 * h], kr[2 * h + 1]);
+#if XQA_PFX_Q_TERMS == 2
+                        mmaE4m3(s[j], ql[h][0], ql[h][1], ql[h][2], ql[h][3], kr[2 * h], kr[2 * h + 1]);
+#endif
+                    }
+                }
+            }
+#else
 #pragma unroll
             for (uint32_t kg = 0; kg < 4; kg++)
             {
@@ -3583,6 +3772,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
                     }
                 }
             }
+#endif
             // online softmax (base-2 exponent of the scaled logits, like kernel_mha)
             float tileMax[2] = {rowMax[0], rowMax[1]};
 #pragma unroll
@@ -3591,7 +3781,11 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
 #pragma unroll
                 for (uint32_t e = 0; e < 4; e++)
                 {
+#if XQA_PFX_FP8
+                    s[j][e] *= rowQkScale[e / 2];
+#else
                     s[j][e] *= qkScale;
+#endif
                 }
                 tileMax[0] = fmaxf(tileMax[0], fmaxf(s[j][0], s[j][1]));
                 tileMax[1] = fmaxf(tileMax[1], fmaxf(s[j][2], s[j][3]));
@@ -3611,6 +3805,26 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
                 rowMax[i] = tileMax[i];
                 bias[i] = tileMax[i] * log2e;
             }
+#if XQA_PFX_FP8
+            // P as e4m3 A fragments of one k32 step over the warp's 32 tokens. Logical k 4t..4t+3 = tokens 2t, 2t+1,
+            // 8+2t, 9+2t (n-tiles 0, 1); k 16+4t.. = n-tiles 2, 3. The V B fragments below use the same token order.
+            float const biasQ[2] = {bias[0] - log2PQuantScale, bias[1] - log2PQuantScale}; // 448 p
+            float pe[nbSTiles][4];
+#pragma unroll
+            for (uint32_t j = 0; j < nbSTiles; j++)
+            {
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++)
+                {
+                    pe[j][e] = exp2f(s[j][e] * log2e - biasQ[e / 2]);
+                }
+            }
+            uint32_t const pa0 = packE4m3(pe[0][0], pe[0][1], pe[1][0], pe[1][1]);
+            uint32_t const pa1 = packE4m3(pe[0][2], pe[0][3], pe[1][2], pe[1][3]);
+            uint32_t const pa2 = packE4m3(pe[2][0], pe[2][1], pe[3][0], pe[3][1]);
+            uint32_t const pa3 = packE4m3(pe[2][2], pe[2][3], pe[3][2], pe[3][3]);
+            float const pSum[2] = {sumE4m3x8(pa0, pa2), sumE4m3x8(pa1, pa3)};
+#else
             uint32_t p[nbSTiles][2];
             float pSum[2] = {0.F, 0.F};
 #pragma unroll
@@ -3619,6 +3833,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
                 p[j][0] = packBf16(exp2f(s[j][0] * log2e - bias[0]), exp2f(s[j][1] * log2e - bias[0]), pSum[0]);
                 p[j][1] = packBf16(exp2f(s[j][2] * log2e - bias[1]), exp2f(s[j][3] * log2e - bias[1]), pSum[1]);
             }
+#endif
 #pragma unroll
             for (uint32_t i = 0; i < 2; i++)
             {
@@ -3632,6 +3847,33 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
                 o[n][2] *= corr[1];
                 o[n][3] *= corr[1];
             }
+#if XQA_PFX_FP8
+            // O += P V as e4m3 m16n8k32 (one k step = the warp's 32 tokens). ldmatrix.trans on e4m3 pairs gives a lane
+            // keys (2t, 2t+1) x head dims (d+2g, d+2g+1) of an 8-token block; byte-permuting blocks (0-7, 8-15) gives
+            // the B word of keys (2t, 2t+1, 8+2t, 9+2t) for dim d+2g (even n-tile) and d+2g+1 (odd n-tile), and blocks
+            // (16-23, 24-31) the second B word. The accumulator layout matches the BF16 path's.
+            {
+                uint32_t const tok = 8 * (ldMat & 1U) + ldRow;
+#pragma unroll
+                for (uint32_t db = 0; db < 8; db++)
+                {
+                    uint32_t const grain = 2 * db + (ldMat >> 1);
+                    uint32_t va[4];
+                    uint32_t vb[4];
+                    ldsm4T(va, vBase + tok * cacheHeadBytes + ((grain ^ ldRow) * grainBytes));
+                    ldsm4T(vb, vBase + (16 + tok) * cacheHeadBytes + ((grain ^ ldRow) * grainBytes));
+#pragma unroll
+                    for (uint32_t hg = 0; hg < 2; hg++)
+                    {
+                        mmaE4m3(o[4 * db + 2 * hg], pa0, pa1, pa2, pa3, __byte_perm(va[2 * hg], va[2 * hg + 1], 0x6420),
+                            __byte_perm(vb[2 * hg], vb[2 * hg + 1], 0x6420));
+                        mmaE4m3(o[4 * db + 2 * hg + 1], pa0, pa1, pa2, pa3,
+                            __byte_perm(va[2 * hg], va[2 * hg + 1], 0x7531),
+                            __byte_perm(vb[2 * hg], vb[2 * hg + 1], 0x7531));
+                    }
+                }
+            }
+#else
             // O += P V. V fragments via ldmatrix.trans on e4m3 pairs: after the byte permute and conversion, a lane holds
             // keys (2t, 2t+1) of head dims d+2g (even n-tile) and d+2g+1 (odd n-tile).
 #pragma unroll
@@ -3658,6 +3900,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
                     mmaBf16(o[4 * db + 3], a0, a1, a2, a3, e2[1], e3[1]);
                 }
             }
+#endif
         }
         __syncthreads();
     }
@@ -3721,6 +3964,26 @@ CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mh
         rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 1);
         rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 2);
     }
+#if XQA_PFX_FP8
+    // back from 448 p to p, the units kernel_mha folds
+    {
+        constexpr float rcpPQuantScale = 1.F / pQuantScale;
+#pragma unroll
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            rowSum[i] *= rcpPQuantScale;
+        }
+#pragma unroll
+        for (uint32_t n = 0; n < 32; n++)
+        {
+#pragma unroll
+            for (uint32_t e = 0; e < 4; e++)
+            {
+                o[n][e] *= rcpPQuantScale;
+            }
+        }
+    }
+#endif
     float* const records = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(cascadeInfo) + cascadeFold::infoBytes);
 #pragma unroll
     for (uint32_t i = 0; i < 2; i++)
