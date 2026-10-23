@@ -552,6 +552,24 @@ _POST_ATTN_NVFP4_DECODE = os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_DECODE",
 _POST_ATTN_NVFP4_DECODE_MAX_ROWS = int(
     os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_DECODE_MAX_ROWS", "32"))
 
+# Rows above the decode band and below _POST_ATTN_NVFP4_MIN_ROWS also run the
+# CuTe-DSL NVFP4-epilogue norm (bitwise-equal), except (112, 128]. Measured in
+# the producer GEMM -> norm -> gate_up chain (16 layers, cold L2, CUDA graph +
+# PDL, SM120): -0.3..-0.77 us/layer at 33-112 rows, tie/+0.15..+0.38 at
+# 116-128, -1.2..-5.2 us at 160-2047 (experiments/ascent/norm_nvfp4_mid).
+# TRTLLM_GEMMA_NORM_NVFP4_MID=0 turns it off.
+_POST_ATTN_NVFP4_MID = os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_MID",
+                                      "1") != "0"
+_POST_ATTN_NVFP4_MID_SKIP = (112, 128)
+
+
+def _post_attn_cute_rows(rows: int) -> bool:
+    if _POST_ATTN_NVFP4_DECODE and 0 < rows <= _POST_ATTN_NVFP4_DECODE_MAX_ROWS:
+        return True
+    lo, hi = _POST_ATTN_NVFP4_MID_SKIP
+    return (_POST_ATTN_NVFP4_MID and rows > _POST_ATTN_NVFP4_DECODE_MAX_ROWS
+            and not lo < rows <= hi)
+
 
 def _post_attention_norm(layer, hidden_states, residual, lora_params):
     """post_attention_layernorm; on the fused path its output is the gate_up
@@ -572,8 +590,7 @@ def _post_attention_norm(layer, hidden_states, residual, lora_params):
                 hidden_states, residual, norm.weight, norm.variance_epsilon,
                 layer.mlp.mlp.gate_up_proj.input_scale)
             return Fp4QuantizedTensor(fp4, sf), residual
-        if (_POST_ATTN_NVFP4_DECODE
-                and 0 < rows <= _POST_ATTN_NVFP4_DECODE_MAX_ROWS):
+        if _post_attn_cute_rows(rows):
             fp4, sf = flashinfer_gemma_fused_add_rmsnorm_nvfp4(
                 hidden_states, residual, norm.weight, norm.variance_epsilon,
                 layer.mlp.mlp.gate_up_proj.input_scale)
