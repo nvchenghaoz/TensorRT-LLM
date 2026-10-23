@@ -11,6 +11,17 @@ if IS_FLASHINFER_AVAILABLE:
                                  gemma_fused_add_rmsnorm, gemma_rmsnorm,
                                  rmsnorm)
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+    from flashinfer.utils import device_support_pdl
+
+    _gemma_1row = None
+
+    def _get_gemma_1row():
+        # Lazy: avoids an import cycle through tensorrt_llm._torch.modules.
+        global _gemma_1row
+        if _gemma_1row is None:
+            from ..modules import gemma_add_rmsnorm_1row
+            _gemma_1row = gemma_add_rmsnorm_1row
+        return _gemma_1row
 
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
     @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
@@ -93,6 +104,20 @@ if IS_FLASHINFER_AVAILABLE:
                                            residual: torch.Tensor,
                                            weight: torch.Tensor,
                                            eps: float) -> None:
+        g1 = _get_gemma_1row()
+        if g1.use_1row(input, residual):
+            # Decode rows: exact 1-row-per-CTA geometry (bitwise to stock).
+            tpr, arm = g1.routed_tpr_arm()
+            enable_pdl = get_env_enable_pdl() and device_support_pdl(
+                input.device)
+            g1.gemma_fused_add_rmsnorm_1row(input,
+                                            residual,
+                                            weight,
+                                            eps,
+                                            enable_pdl,
+                                            tpr=tpr,
+                                            arm=arm)
+            return
         gemma_fused_add_rmsnorm(input,
                                 residual,
                                 weight,
