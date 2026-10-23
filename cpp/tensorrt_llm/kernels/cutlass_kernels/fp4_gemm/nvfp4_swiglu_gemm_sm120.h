@@ -66,6 +66,172 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/archCondition.h"
 
+namespace cutlass::gemm::collective
+{
+// SM120 block-scaled TMA mainloop (Base, from the CollectiveBuilder) whose mma()
+// issues only the MMAs of tiled-MMA M repeat 0 (CTA tile rows 0-63). For problems
+// with M <= 64 rows 64-127 are TMA zero fill and never stored, so the MMAs on them
+// are dead work: at decode M <= 64 they are half the tensor-pipe time of the
+// 128-row tile. Everything else is a verbatim copy of Base::mma(); every kept
+// accumulator sees the same k_block sequence, so the result is bitwise the same.
+// The skipped accumulators keep the zeros of clear(accum).
+template <class Base>
+struct Sm120BlockScaledLowerHalfM : Base
+{
+    using typename Base::SmemLayoutA;
+    using typename Base::SmemLayoutB;
+    using typename Base::SmemLayoutSFA;
+    using typename Base::SmemLayoutSFB;
+    using typename Base::TiledMma;
+    using typename Base::SmemCopyAtomA;
+    using typename Base::SmemCopyAtomB;
+    using typename Base::SmemCopyAtomSFA;
+    using typename Base::SmemCopyAtomSFB;
+    using typename Base::DispatchPolicy;
+    using typename Base::MainloopPipeline;
+    using typename Base::PipelineState;
+    using typename Base::TensorStorage;
+    using typename Base::Params;
+
+    template <class FrgTensorC>
+    CUTLASS_DEVICE void mma(MainloopPipeline pipeline, PipelineState smem_pipe_read, FrgTensorC& accum,
+        int k_tile_count, int thread_idx, TensorStorage& shared_tensors, [[maybe_unused]] Params const& params)
+    {
+        using namespace cute;
+
+        static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
+        static_assert(decltype(size<1>(accum))::value == 2, "lower-half mainloop needs MMA_M == 2 (128-row tile)");
+
+        clear(accum);
+
+        Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
+        Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
+        Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});
+        Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});
+
+        TiledMma tiled_mma;
+        auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+
+        Tensor tCrA = thread_mma.partition_fragment_A(sA(_, _, Int<0>{}));
+        Tensor tCrB = thread_mma.partition_fragment_B(sB(_, _, Int<0>{}));
+
+        Tensor tCrSFA = this->partition_fragment_SFA(sSFA(_, _, Int<0>{}), thread_mma);
+        Tensor tCrSFB = this->partition_fragment_SFB(sSFB(_, _, Int<0>{}), thread_mma);
+
+        auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+        auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(thread_idx);
+        Tensor tCsA = smem_thr_copy_A.partition_S(as_position_independent_swizzle_tensor(sA));
+        Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+
+        auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+        auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx);
+        Tensor tCsB = smem_thr_copy_B.partition_S(as_position_independent_swizzle_tensor(sB));
+        Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+
+        auto tile_shape_mnk = tile_shape(tiled_mma);
+        auto smem_tiled_copy_SFA = make_tiled_copy_impl(SmemCopyAtomSFA{}, this->get_layoutSFA_TV(tiled_mma),
+            make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+        auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
+        Tensor tCsSFA = smem_thr_copy_SFA.partition_S(as_position_independent_swizzle_tensor(sSFA));
+        Tensor tCrSFA_copy_view = smem_thr_copy_SFA.retile_D(tCrSFA);
+
+        auto smem_tiled_copy_SFB = make_tiled_copy_impl(SmemCopyAtomSFB{}, this->get_layoutSFB_TV(tiled_mma),
+            make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+        auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
+        Tensor tCsSFB = smem_thr_copy_SFB.partition_S(as_position_independent_swizzle_tensor(sSFB));
+        Tensor tCrSFB_copy_view = smem_thr_copy_SFB.retile_D(tCrSFB);
+
+        CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum));
+        CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(accum));
+        CUTE_STATIC_ASSERT_V(size<1>(tCrSFA) == size<1>(accum));
+        CUTE_STATIC_ASSERT_V(size<1>(tCrSFB) == size<2>(accum));
+        CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sA));
+
+        auto K_BLOCK_MAX = size<2>(tCrA);
+
+        int read_stage = smem_pipe_read.index();
+        auto tCsA_stage = tCsA(_, _, _, read_stage);
+        auto tCsB_stage = tCsB(_, _, _, read_stage);
+        auto tCsSFA_stage = tCsSFA(_, _, _, read_stage);
+        auto tCsSFB_stage = tCsSFB(_, _, _, read_stage);
+
+        auto copy_kblock = [&](auto k_block)
+        {
+            copy(smem_tiled_copy_A, tCsA_stage(_, _, k_block), tCrA_copy_view(_, _, k_block));
+            copy(smem_tiled_copy_B, tCsB_stage(_, _, k_block), tCrB_copy_view(_, _, k_block));
+            using MMAOp = typename TiledMma::MMA_Op;
+            fp4_shift_A(MMAOp{}, tCrA_copy_view(_, _, k_block));
+            fp4_shift_B(MMAOp{}, tCrB_copy_view(_, _, k_block));
+            copy(tCsSFA_stage(_, _, k_block), tCrSFA_copy_view(_, _, k_block));
+            copy(tCsSFB_stage(_, _, k_block), tCrSFB_copy_view(_, _, k_block));
+        };
+
+        auto gemm_kblock = [&](auto k_block)
+        {
+            // (V,M) x (V,N) => (V,M,N) restricted to M repeat 0: (V) x (V) => (V) per N repeat.
+            auto tA = make_zip_tensor(tCrA(_, _, k_block), tCrSFA(_, _, k_block));
+            auto tB = make_zip_tensor(tCrB(_, _, k_block), tCrSFB(_, _, k_block));
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < size<1>(tB); ++n)
+            {
+                auto acc_n = accum(_, 0, n);
+                cute::gemm(tiled_mma, tA(_, 0), tB(_, n), acc_n);
+            }
+        };
+
+        pipeline.consumer_wait(smem_pipe_read);
+
+        copy_kblock(_0{});
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (; k_tile_count > 1; --k_tile_count)
+        {
+            for_each(make_int_sequence<K_BLOCK_MAX>{},
+                [&](auto k_block)
+                {
+                    auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+
+                    if (k_block == K_BLOCK_MAX - 1)
+                    {
+                        cutlass::arch::NamedBarrier::sync(
+                            thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+                        pipeline.consumer_release(smem_pipe_read);
+                        ++smem_pipe_read;
+                        read_stage = smem_pipe_read.index();
+                        tCsA_stage = tCsA(_, _, _, read_stage);
+                        tCsB_stage = tCsB(_, _, _, read_stage);
+                        tCsSFA_stage = tCsSFA(_, _, _, read_stage);
+                        tCsSFB_stage = tCsSFB(_, _, _, read_stage);
+                        pipeline.consumer_wait(smem_pipe_read);
+                    }
+
+                    copy_kblock(k_block_next);
+                    gemm_kblock(k_block);
+                });
+        }
+
+        for_each(make_int_sequence<K_BLOCK_MAX>{},
+            [&](auto k_block)
+            {
+                auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+
+                if (k_block == K_BLOCK_MAX - 1)
+                {
+                    cutlass::arch::NamedBarrier::sync(
+                        thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+                    pipeline.consumer_release(smem_pipe_read);
+                    ++smem_pipe_read;
+                }
+
+                if (k_block_next > 0)
+                {
+                    copy_kblock(k_block_next);
+                }
+                gemm_kblock(k_block);
+            });
+    }
+};
+} // namespace cutlass::gemm::collective
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
@@ -325,7 +491,8 @@ private:
     Params params;
 };
 
-template <int TM, int TN, int TK>
+// LowerHalfM: mainloop skips the MMAs of tile rows 64-127 (valid only for M <= 64).
+template <int TM, int TN, int TK, bool LowerHalfM = false>
 struct SwigluNvfp4GemmSm120
 {
     using CTAShape = Shape<Int<TM>, Int<TN>, Int<TK>>;
@@ -342,12 +509,15 @@ struct SwigluNvfp4GemmSm120
     using StrideCD = cutlass::detail::TagToStrideC_t<cutlass::layout::RowMajor>;
     using EpiOp = SwigluNvfp4Epilogue<StrideCD, StrideCD>;
     using CollectiveEpilogue = cutlass::epilogue::collective::detail::Sm90TmaWarpSpecializedAdapter<EpiOp>;
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<Arch,
+    using BuiltMainloop = typename cutlass::gemm::collective::CollectiveBuilder<Arch,
         cutlass::arch::OpClassBlockScaledTensorOp, ElementPairA, LayoutA, AlignmentA, ElementPairB, LayoutB,
         AlignmentB, float, CTAShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
             sizeof(typename CollectiveEpilogue::SharedStorage))>,
         cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+    static_assert(!LowerHalfM || TM == 128, "LowerHalfM needs a 128-row CTA tile");
+    using CollectiveMainloop = cute::conditional_t<LowerHalfM,
+        cutlass::gemm::collective::Sm120BlockScaledLowerHalfM<BuiltMainloop>, BuiltMainloop>;
     using BaseKernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,
         CollectiveEpilogue, cutlass::gemm::StaticPersistentScheduler>;
 
@@ -377,12 +547,13 @@ struct SwigluNvfp4GemmSm120
 };
 
 // Returns the workspace size when A, B and fp4 are all null.
-template <int TM, int TN, int TK>
+template <int TM, int TN, int TK, bool LowerHalfM = false>
 size_t runSwigluNvfp4GemmSm120(void const* A, void const* B, void const* input_sf, void const* weight_sf,
     float const* alpha, float const* out_scale, uint8_t* fp4, uint8_t* sf, int m, int n, int k, char* workspace,
     size_t workspaceBytes, cudaStream_t stream, bool enablePdl)
 {
-    using G = SwigluNvfp4GemmSm120<TM, TN, TK>;
+    TLLM_CHECK_WITH_INFO(!LowerHalfM || m <= 64, "[SwiGLU NVFP4 GEMM] lower-half tile needs m <= 64, got %d", m);
+    using G = SwigluNvfp4GemmSm120<TM, TN, TK, LowerHalfM>;
     using Gemm = typename G::Gemm;
     using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
     int const d = n / 2;

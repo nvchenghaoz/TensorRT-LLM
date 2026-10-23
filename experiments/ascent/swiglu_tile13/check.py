@@ -56,7 +56,8 @@ def main():
 
         def fwd(i):
             if prefill:
-                q, s = torch.ops.trtllm.fused_gemma_add_rmsnorm_nvfp4(x, r, gamma, EPS, gs)
+                # the fused add+norm updates the residual in place: reset it per call
+                q, s = torch.ops.trtllm.fused_gemma_add_rmsnorm_nvfp4(x, r.clone(), gamma, EPS, gs)
                 return mlps[i](Fp4QuantizedTensor(q, s))
             return mlps[i](x)
 

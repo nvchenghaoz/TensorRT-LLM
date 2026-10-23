@@ -414,8 +414,12 @@ class GatedMLP(nn.Module):
         """CTA tile of the SwiGLU-epilogue GEMM: 0 = 256x128x128,
         1 = 128x128x256. Both are bitwise equal. Measured crossover: tie at
         384 rows, tile 0 faster from 512 (208.6 vs 231.7 us per MLP layer) and
-        at every prefill size incl. the 2048+d mixed tails."""
-        return 0 if m >= 448 else 1
+        at every prefill size incl. the 2048+d mixed tails. 2 = tile 1 with the
+        MMAs of tile rows 64-127 skipped (all-padding when m <= 64; bitwise
+        equal): 89.9 vs 93.1 us at M=64, 94.5 vs 97.5 at M=48 (cold L2, graph)."""
+        if m >= 448:
+            return 0
+        return 2 if m <= 64 else 1
 
     def _unpermute_gate_up_output(self, h1):
         """[gate | up] column order for consumers that are not index-aware."""
