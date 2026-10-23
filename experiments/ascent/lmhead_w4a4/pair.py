@@ -87,7 +87,7 @@ def main():
         if not eager:
             del gr
         torch.cuda.empty_cache()
-    cls = "mode_switch" if min_rows else "precision"
+    cls = "mode_switch" if min_rows else "exact"  # baseline arm = main's own lm_head
     print(json.dumps({"batch": res, "output": {
         "class": cls, "arm": arm, "w4a4_min_rows": min_rows,
         "note": "mode_switch: checkpoint lm_head quant entry NVFP4 group 16 with static "
