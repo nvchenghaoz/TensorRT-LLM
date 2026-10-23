@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 from torch.nn.parameter import Parameter
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -121,6 +122,19 @@ class LMHead(Linear):
             weight_shape = (self.out_features, self.in_features)
             self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
             self.register_parameter("bias", None)
+
+    def get_quant_method(self, quant_config=None):
+        from .linear import (MarlinNVFP4LinearMethod,
+                             MarlinW4A4NVFP4LMHeadMethod, lmhead_w4a4_min_rows)
+        method = super().get_quant_method(quant_config)
+        # SM120 Marlin lm_head: keep the checkpoint's NVFP4 W4A4 mode for
+        # large row counts (the copy is built only when the checkpoint has a
+        # static input_scale; see MarlinW4A4NVFP4LMHeadMethod).
+        if (type(method) is MarlinNVFP4LinearMethod
+                and get_sm_version() in (120, 121)
+                and lmhead_w4a4_min_rows() > 0):
+            return MarlinW4A4NVFP4LMHeadMethod()
+        return method
 
     @property
     def vocab_size_padded(self) -> int:

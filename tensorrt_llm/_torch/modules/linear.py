@@ -2877,6 +2877,125 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
             "MarlinNVFP4LinearMethod does not support apply_linear_allreduce")
 
 
+# SM120 lm_head of an NVFP4 W4A4 checkpoint (Qwen3.5/3.8 exports: E2M1 weight,
+# E4M3 group-16 scales, weight_scale_2 and a static input_scale): rows >= this
+# run the checkpoint's own W4A4 mode (fp4_quantize with the checkpoint's
+# input_scale + nvfp4_gemm, FP32 logits so LogitsProcessor's logits.float() is
+# a no-op); fewer rows stay on Marlin W4A16. Marlin covers M <= 64 with one
+# 64-row tile pass and streams the 715 MB weight twice above it. Measured on
+# SM120 (N=248320, K=5120, cold L2, both arms in one process; Marlin +
+# logits.float() vs W4A4 FP32 out, power-of-two tuning buckets), median ms:
+#   eager (host overhead included) M=48 0.561 vs 0.576, M=52 0.578 vs 0.574
+#   (inside the p10-p90 spread), M=56 0.583 vs 0.575, M=64 0.594 vs 0.576;
+#   graph M=48 0.542 vs 0.559, M=56 0.562 vs 0.532, M=64 0.573 vs 0.533,
+#   M=96 1.116 vs 0.547, M=128 1.150 vs 0.564, M=132 1.640 vs 0.591.
+# T = 56, the smallest row count where W4A4 wins beyond the spread in both
+# modes. Both copies are kept (+715 MB). Read at weight load:
+# TRTLLM_LMHEAD_W4A4_MIN_ROWS=<rows>; 0 builds no W4A4 copy.
+_LMHEAD_W4A4_MIN_ROWS = 56
+_LMHEAD_W4A4_ENV = "TRTLLM_LMHEAD_W4A4_MIN_ROWS"
+# The autotuner warmup calls the lm_head with few rows (one per warmup
+# sequence), so the W4A4 GEMM is tuned once with this many rows, which
+# profiles every power-of-two bucket up to it (decode/mixed lm_head rows are
+# at most max_batch_size + context chunks).
+_LMHEAD_W4A4_TUNE_ROWS = 256
+
+
+def lmhead_w4a4_min_rows() -> int:
+    try:
+        return max(0, int(os.environ.get(_LMHEAD_W4A4_ENV,
+                                         _LMHEAD_W4A4_MIN_ROWS)))
+    except ValueError:
+        return _LMHEAD_W4A4_MIN_ROWS
+
+
+class MarlinW4A4NVFP4LMHeadMethod(MarlinNVFP4LinearMethod):
+    """SM120 NVFP4 lm_head: Marlin W4A16 at few rows, the checkpoint's own
+    NVFP4 W4A4 mode (static input_scale) at >= ``_w4a4_min_rows`` rows."""
+
+    def process_weights_after_loading_vanilla(self, module: Linear):
+        # The weight-only parent drops the checkpoint's activation scale;
+        # keep it (and alpha) for the W4A4 rows.
+        input_scale, _, alpha = self._finalize_nvfp4_scales(module)
+        module._w4a4_input_scale = None
+        module._w4a4_alpha = None
+        if input_scale is not None and alpha is not None:
+            dev = module.weight.device
+            module._w4a4_input_scale = input_scale.to(
+                device=dev, dtype=torch.float32).reshape(1).contiguous()
+            module._w4a4_alpha = alpha.to(device=dev,
+                                          dtype=torch.float32).reshape(
+                                              1).contiguous()
+        super().process_weights_after_loading_vanilla(module)
+
+    def transform_weights(self, module: Linear) -> None:
+        min_rows = lmhead_w4a4_min_rows()
+        module._w4a4_min_rows = 0
+        module._w4a4_weight = None
+        module._w4a4_weight_scale = None
+        if (min_rows > 0
+                and module.__dict__.get("_w4a4_input_scale") is not None
+                and module.scaling_vector_size == fp4_utils.NVFP4_SF_VEC_SIZE
+                and module.bias is None
+                and module.weight.shape[0] == module.out_features):
+            # Checkpoint layout = the W4A4 GEMM's layout: packed E2M1
+            # [N, K/2] and swizzled E4M3 scales. Marlin repacks into new
+            # tensors, so these stay valid.
+            module._w4a4_weight = module.weight.data
+            module._w4a4_weight_scale = module.weight_scale.data
+            module._w4a4_min_rows = min_rows
+            logger.info(
+                f"[lm_head] NVFP4 W4A4 copy kept for rows >= {min_rows} "
+                f"(FP32 logits), Marlin W4A16 below; "
+                f"{module._w4a4_weight.numel() + module._w4a4_weight_scale.numel()} "
+                f"extra bytes; kill switch {_LMHEAD_W4A4_ENV}=0")
+        super().transform_weights(module)
+
+    def _w4a4(self, module: Linear, input: torch.Tensor) -> torch.Tensor:
+        act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+            input, module._w4a4_input_scale, module.scaling_vector_size,
+            False)
+        return torch.ops.trtllm.nvfp4_gemm(
+            act_fp4,
+            module._w4a4_weight,
+            act_sf,
+            module._w4a4_weight_scale,
+            module._w4a4_alpha,
+            torch.float32,
+            allowed_backends=",".join(module.nvfp4_allowed_backends))
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        min_rows = module.__dict__.get("_w4a4_min_rows", 0)
+        if (min_rows <= 0 or bias is not None
+                or isinstance(input, (Fp4QuantizedTensor, tuple))
+                or input.dtype != torch.bfloat16):
+            return super().apply(module, input, bias)
+        from ..autotuner import AutoTuner
+        if (AutoTuner.get().is_tuning_mode
+                and not module.__dict__.get("_w4a4_tuned", False)):
+            module._w4a4_tuned = True
+            self._w4a4(
+                module,
+                torch.randn(_LMHEAD_W4A4_TUNE_ROWS,
+                            input.shape[-1],
+                            dtype=input.dtype,
+                            device=input.device,
+                            generator=torch.Generator(
+                                device=input.device).manual_seed(0)))
+        original_shape = None
+        x = input
+        if x.dim() > 2:
+            original_shape = x.shape
+            x = x.reshape(-1, x.shape[-1])
+        if x.shape[0] < min_rows:
+            return super().apply(module, input, bias)
+        output = self._w4a4(module, x.contiguous())
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+        return output
+
+
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
 
     def get_tp_alignment(self, tp_mode, quant_config=None):
