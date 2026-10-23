@@ -88,7 +88,9 @@ def main():
             del gr
         torch.cuda.empty_cache()
     cls = "mode_switch" if min_rows else "exact"  # baseline arm = main's own lm_head
-    print(json.dumps({"batch": res, "output": {
+    batch = {k: v for k, v in res.items() if not k.startswith("eager")}
+    eager_rows = {k[5:]: v for k, v in res.items() if k.startswith("eager")}
+    print(json.dumps({"batch": batch, "eager_mixed_rows": eager_rows, "output": {
         "class": cls, "arm": arm, "w4a4_min_rows": min_rows,
         "note": "mode_switch: checkpoint lm_head quant entry NVFP4 group 16 with static "
                 "input_scale (W4A4) at rows >= min_rows; error vs FP64 reference in check.py"}}))
