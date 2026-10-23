@@ -275,9 +275,13 @@ public:
                 CUTLASS_PRAGMA_UNROLL
                 for (int k = 0; k < MMA_N; ++k)
                 {
-                    int const ck = get<1>(tCcD(0, im, k)) - get<1>(tCcD(0, im, 0));
-                    int const a_ = ck / 32;
-                    int const b_ = (ck % 32) / 8;
+                    // Column offset ck = 32a + 8b of MMA_N index k = 2a + b (the
+                    // 8-col atom repeat b is the fastest RestN mode, then the
+                    // 32-col permutation tile a). Compile-time after unrolling,
+                    // so hv[] stays in registers (reading ck from tCcD made the
+                    // indices runtime and put hv in local memory).
+                    int const a_ = k / 2;
+                    int const b_ = k % 2;
                     hv[a_ / 2][2 * (a_ % 2) + b_]
                         = swigluElem(alpha, accumulators(2 * r2, im, k), accumulators(2 * r2 + 1, im, k));
                 }
