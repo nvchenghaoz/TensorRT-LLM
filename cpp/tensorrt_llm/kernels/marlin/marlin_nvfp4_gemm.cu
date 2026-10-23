@@ -299,6 +299,52 @@ bool marlin_inproj_full_k_enabled()
     return !(v != nullptr && v[0] == '0' && v[1] == '\0');
 }
 
+// PDL launches prefetch the first pipeline stages' B / weight scales into L2 before
+// griddepcontrol.wait (kMarlinNvfp4PreWaitFlag): TRTLLM_MARLIN_PREWAIT_B, read per
+// call; "0" restores the wait-first prologue.
+bool marlin_prewait_b_enabled()
+{
+    char const* v = std::getenv("TRTLLM_MARLIN_PREWAIT_B");
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+}
+
+constexpr int kMarlinPrewaitDefaultDepth = 1;
+
+// Prefetch depth in units of (stages - 1) k-tiles: TRTLLM_MARLIN_PREWAIT_DEPTH=1..4,
+// read per call (sweeps); returns the 2-bit code (depth - 1).
+int marlin_prewait_depth_code()
+{
+    char const* v = std::getenv("TRTLLM_MARLIN_PREWAIT_DEPTH");
+    int d = kMarlinPrewaitDefaultDepth;
+    if (v != nullptr && v[0] >= '1' && v[0] <= '4' && v[1] == '\0')
+    {
+        d = v[0] - '0';
+    }
+    return (d - 1) & kMarlinNvfp4PreWaitDepthMask;
+}
+
+// Test-only negative control for PDL-live checks: TRTLLM_MARLIN_DEBUG_SKIP_WAIT=1
+// drops griddepcontrol.wait from PDL launches (the output then races its producer).
+bool marlin_debug_skip_wait()
+{
+    char const* v = std::getenv("TRTLLM_MARLIN_DEBUG_SKIP_WAIT");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+// The instances compiled with the pre-wait prefetch (marlin_prewait_instance in the
+// template: 128 threads, n tile 128, k tile 64, 6 stages, not full_k): the qkv / qkvz
+// decode kernels at rows <= 8 (full-K), 9-16 (kM16Table) and 17-32 (kM32Table).
+bool marlin_prewait_kernel(MarlinFuncPtr kernel)
+{
+    static_assert(marlin_prewait_instance<128, 8, 4, 6, false>(), "pre-wait instance set mismatch");
+    static_assert(!marlin_prewait_instance<128, 4, 8, 8, false>(), "(5120,6144) kM16Table must stay stock");
+    static_assert(!marlin_prewait_instance<128, 4, 8, 4, false>(), "(5120,6144) kM32Table must stay stock");
+    static_assert(!marlin_prewait_instance<128, 4, 8, 8, true>(), "(5120,6144) full_k must stay stock");
+    return kernel == Marlin<nv_bfloat16, 128, 1, 8, 4, true, 6, 1>
+        || kernel == Marlin<nv_bfloat16, 128, 1, 8, 4, false, 6, 1>
+        || kernel == Marlin<nv_bfloat16, 128, 2, 8, 4, false, 6, 1>;
+}
+
 // Largest number of split-K stripes the default `grid`-CTA launch gives one column.
 int full_k_max_stripes(int k_tiles, int n_tiles, int grid)
 {
@@ -337,6 +383,14 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
     if (prob_n <= 4096)
         max_par_val = 16 * 8;
     int max_shared_mem_new = max_shared_mem;
+    // Pre-wait flags (and the test-only skip-wait flag) go only to the pre-wait
+    // instances; every other launch gets exactly the stock flag word.
+    int const prewait_flags = enable_pdl
+        ? ((marlin_prewait_b_enabled()
+                   ? (kMarlinNvfp4PreWaitFlag | (marlin_prewait_depth_code() << kMarlinNvfp4PreWaitDepthShift))
+                   : 0)
+            | (marlin_debug_skip_wait() ? kMarlinNvfp4DebugSkipWaitFlag : 0))
+        : 0;
     int rest_m = prob_m;
     int max_thread_m_blocks = 4;
     int lda = prob_k;
@@ -469,10 +523,11 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
 
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new);
 
-        // The kernel starts with griddepcontrol.wait, so a PDL launch orders all of
-        // its memory accesses (A, scales, locks, C) after the predecessor grid; that
-        // also serializes the launches of this loop, which share `locks`. Only a PDL
-        // launch (flag in the last argument) triggers dependents early.
+        // A PDL launch orders its A, lock and C accesses after the predecessor grid
+        // (griddepcontrol.wait); that also serializes the launches of this loop, which
+        // share `locks`. Only L2 prefetches of the constant weights / weight scales of
+        // the first pipeline stages may be issued before the wait (kMarlinNvfp4PreWaitFlag).
+        // Only a PDL launch (flag in the last argument) triggers dependents early.
         int4 const* b_bias_null = nullptr;
         float const* a_scales_null = nullptr;
         int4 const* zp_null = nullptr;
@@ -489,7 +544,8 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
             num_groups, prob_m_split, prob_n, prob_k, lda, locks,
             false,  // has_bias
             false,  // use_atomic_add
-            use_fp32_reduce, max_shared_mem_new | full_k_flags | (enable_pdl ? kMarlinNvfp4PdlLaunchFlag : 0));
+            use_fp32_reduce, max_shared_mem_new | full_k_flags | (enable_pdl ? kMarlinNvfp4PdlLaunchFlag : 0)
+                | (marlin_prewait_kernel(kernel) ? prewait_flags : 0));
         // clang-format on
 
         A_ptr += prob_m_split * (lda / 8);

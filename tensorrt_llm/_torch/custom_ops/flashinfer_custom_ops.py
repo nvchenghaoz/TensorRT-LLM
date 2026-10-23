@@ -99,6 +99,37 @@ if IS_FLASHINFER_AVAILABLE:
                                 eps,
                                 enable_pdl=get_env_enable_pdl())
 
+    # Same math and outputs as flashinfer_gemma_fused_add_rmsnorm (bitwise); only
+    # the PDL trigger moves to right after the kernel's loads land, so its PDL
+    # dependent (e.g. a dense Marlin decode GEMM prefetching its weights before
+    # griddepcontrol.wait) launches while the norm computes. CuTe-DSL kernel in
+    # flashinfer/norm/kernels/fused_add_rmsnorm_early_trigger.py (a subclass of
+    # the pinned FusedAddRMSNormKernel); falls back to the stock op without PDL
+    # or on the CUDA-JIT norm path.
+    @torch.library.custom_op(
+        "trtllm::flashinfer_gemma_fused_add_rmsnorm_early_trigger",
+        mutates_args=("input", "residual"))
+    def flashinfer_gemma_fused_add_rmsnorm_early_trigger(
+            input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+            eps: float) -> None:
+        from flashinfer.norm import _use_cuda_norm
+        from flashinfer.utils import device_support_pdl
+        enable_pdl = get_env_enable_pdl() and device_support_pdl(input.device)
+        if not enable_pdl or _use_cuda_norm(input.device):
+            gemma_fused_add_rmsnorm(input,
+                                    residual,
+                                    weight,
+                                    eps,
+                                    enable_pdl=enable_pdl)
+            return
+        from flashinfer.norm.kernels.fused_add_rmsnorm_early_trigger import \
+            gemma_fused_add_rmsnorm_early_trigger
+        gemma_fused_add_rmsnorm_early_trigger(input,
+                                              residual,
+                                              weight,
+                                              eps,
+                                              enable_pdl=True)
+
     @torch.library.custom_op(
         "trtllm::flashinfer_apply_rope_with_cos_sin_cache_inplace",
         mutates_args=("query", "key"))

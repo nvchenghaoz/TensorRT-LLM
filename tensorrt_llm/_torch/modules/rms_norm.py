@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import os
 from types import EllipsisType  # https://stackoverflow.com/a/66636313
 from typing import Optional, Tuple, TypeAlias, Union, cast
 
@@ -35,6 +36,19 @@ _WS_MAX_N = 16384
 # Measured at N=7168 on GB200 (ws first overtakes at M=4096, ~6% faster;
 # M<=3072 favors reduce_fusion).
 _WS_M_THRESHOLD = 4096
+
+# Layer-boundary gemma add+RMSNorm instances marked early_pdl_trigger (e.g. the
+# next layer's input_layernorm in Qwen3-Next, whose consumers in_proj_qkvz /
+# qkv_proj run dense Marlin, which prefetches its weights into L2 before its
+# griddepcontrol.wait) issue their PDL trigger right after their loads land at
+# decode-size row counts. Measured in CUDA-graph chains on SM120 (RTX PRO 6000):
+# about -1.0 us per layer at 4-32 rows. Outputs are bitwise identical.
+# Kill switch: TRTLLM_NORM_EARLY_TRIGGER=0 (read per call).
+_EARLY_TRIGGER_MAX_ROWS = 32
+
+
+def _early_trigger_enabled() -> bool:
+    return os.environ.get("TRTLLM_NORM_EARLY_TRIGGER", "1") != "0"
 
 
 class RMSNorm(nn.Module):
@@ -179,6 +193,17 @@ class RMSNorm(nn.Module):
                     flashinfer_fused_add_rmsnorm(hidden_states, residual,
                                                  self.weight,
                                                  self.variance_epsilon)
+                elif (self.__dict__.get("early_pdl_trigger", False)
+                      and hidden_states.shape[0] <=
+                      _EARLY_TRIGGER_MAX_ROWS and _early_trigger_enabled()):
+                    # Decode-size rows into a marked layer-boundary norm (its
+                    # consumer prefetches weights before its PDL wait):
+                    # bitwise-identical kernel with an early PDL trigger.
+                    from ..custom_ops import \
+                        flashinfer_gemma_fused_add_rmsnorm_early_trigger
+                    flashinfer_gemma_fused_add_rmsnorm_early_trigger(
+                        hidden_states, residual, self.weight,
+                        self.variance_epsilon)
                 else:
                     flashinfer_gemma_fused_add_rmsnorm(hidden_states, residual,
                                                        self.weight,

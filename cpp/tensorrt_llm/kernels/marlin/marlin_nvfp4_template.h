@@ -67,7 +67,37 @@ constexpr int kMarlinNvfp4PdlLaunchFlag = 1 << 30;
 // end, so its output is bitwise equal to the default launch's.
 constexpr int kMarlinNvfp4FullKGridShift = 17;
 constexpr int kMarlinNvfp4FullKGridMask = (1 << 13) - 1;
+// Pre-wait weight prefetch is compiled only into the in_proj qkv/qkvz decode instances
+// (marlin_prewait_instance: 128 threads, 128-wide n tile, 64-deep k tile, 6 stages,
+// never full_k); every other instance compiles the stock wait-first prologue. The host
+// or-s the flags below in only when it launches such an instance, so the bits [27, 30)
+// and 31 never reach a full_k kernel's grid field.
+// Or-ed in (PDL launches only): before griddepcontrol.wait, every thread issues
+// prefetch.global.L2 for the B (weight) and weight-scale addresses of its first
+// pipeline stages, so the weight stream starts while the predecessor grid finishes.
+// B, the weight scales and the weight global scale are constant model weights,
+// never written by the predecessor; A, the locks, C and C_tmp are only touched
+// after the wait. A prefetch moves no data into the SM (shared memory, cp.async
+// groups and the arithmetic are unchanged), so the output is bitwise unchanged.
+// Depth: (code + 1) * (stages - 1) k-tiles, code in bits [27, 29).
+// Kill switch: TRTLLM_MARLIN_PREWAIT_B=0; depth TRTLLM_MARLIN_PREWAIT_DEPTH=1..4.
+constexpr int kMarlinNvfp4PreWaitFlag = 1 << 29;
+constexpr int kMarlinNvfp4PreWaitDepthShift = 27;
+constexpr int kMarlinNvfp4PreWaitDepthMask = 3;
+// Test-only negative control (TRTLLM_MARLIN_DEBUG_SKIP_WAIT=1): skip griddepcontrol.wait.
+// Never set in production; it exists so a PDL-live check can show it detects a missing wait.
+constexpr int kMarlinNvfp4DebugSkipWaitFlag = -2147483647 - 1; // bit 31
 constexpr int kMarlinNvfp4FullKMaxStripes = 4;
+
+// Instances that compile the pre-wait weight prefetch (kMarlinNvfp4PreWaitFlag): the
+// in_proj qkv (14336, 5120) / qkvz (16384, 5120) decode kernels, i.e. 128 threads, 128-wide
+// n tile, 64-deep k tile, 6 stages, not full_k (rows <= 8 full-K, kM16Table rows 9-16,
+// kM32Table rows 17-32). Must match marlin_prewait_kernel() on the host.
+template <int threads, int thread_n_blocks, int thread_k_blocks, int stages, bool full_k>
+constexpr bool marlin_prewait_instance()
+{
+    return threads == 128 && thread_n_blocks == 8 && thread_k_blocks == 4 && stages == 6 && !full_k;
+}
 
 // Empty kernel stub outside the architectures supported by dense Marlin.
 #if defined(__CUDA_ARCH__) && !MARLIN_NVFP4_DENSE_DEVICE_SUPPORTED
@@ -184,6 +214,28 @@ __device__ inline void scale_float(float* c, typename MarlinType<scalar_t>::Frag
     c[1] = __fmul_rn(c[1], MarlinType<scalar_t>::num2float(s_ptr[1]));
 }
 
+// L2 prefetch of the cache line holding `ptr` (no data returned to the SM).
+__device__ inline void prefetch_l2(void const* ptr)
+{
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(ptr));
+}
+
+// PDL wait (unless the test-only skip flag is set) and early trigger, for the pre-wait
+// instances only.
+__device__ __forceinline__ void marlin_prewait_pdl_wait_and_trigger(int flags)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (!(flags & kMarlinNvfp4DebugSkipWaitFlag))
+    {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    if (flags & kMarlinNvfp4PdlLaunchFlag)
+    {
+        asm volatile("griddepcontrol.launch_dependents;");
+    }
+#endif
+}
+
 // Wait until barrier reaches `count`, then lock for current threadblock.
 __device__ inline void barrier_acquire(int* lock, int count)
 {
@@ -280,20 +332,37 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     // kMarlinNvfp4PdlLaunchFlag or-ed in when the host launched it with PDL.
     int max_shared_mem)
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    // PDL: order every A / scale / lock read and every C write after the
-    // immediate predecessor grid (a no-op when launched without the
-    // programmatic-serialization attribute).
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    // Only a PDL launch triggers dependents early, so a non-PDL launch keeps the
-    // implicit trigger at grid completion. The grid is a single wave (one CTA per
-    // SM), so an early trigger cannot delay this kernel; dependents must issue
-    // their own griddepcontrol.wait before touching C or the lock workspace.
-    if (max_shared_mem & kMarlinNvfp4PdlLaunchFlag)
+    constexpr bool prewait_instance
+        = marlin_prewait_instance<threads, thread_n_blocks, thread_k_blocks, stages, full_k>();
+    if constexpr (!prewait_instance)
     {
-        asm volatile("griddepcontrol.launch_dependents;");
-    }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        // PDL: order every A / scale / lock read and every C write after the
+        // immediate predecessor grid (a no-op when launched without the
+        // programmatic-serialization attribute).
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+        // Only a PDL launch triggers dependents early, so a non-PDL launch keeps the
+        // implicit trigger at grid completion. The grid is a single wave (one CTA per
+        // SM), so an early trigger cannot delay this kernel; dependents must issue
+        // their own griddepcontrol.wait before touching C or the lock workspace.
+        if (max_shared_mem & kMarlinNvfp4PdlLaunchFlag)
+        {
+            asm volatile("griddepcontrol.launch_dependents;");
+        }
 #endif
+    }
+    // Pre-wait instances: with kMarlinNvfp4PreWaitFlag the wait moves below the L2
+    // prefetch of the first stages' weights (see pdl_prewait); nothing else moves.
+    // A, the locks, C and C_tmp are touched only after the wait.
+    [[maybe_unused]] bool const pdl_prewait
+        = prewait_instance && (max_shared_mem & kMarlinNvfp4PreWaitFlag) != 0 && !use_atomic_add;
+    if constexpr (prewait_instance)
+    {
+        if (!pdl_prewait)
+        {
+            marlin_prewait_pdl_wait_and_trigger(max_shared_mem);
+        }
+    }
     // Each threadblock processes one "stripe" of the B matrix with (roughly) the
     // same size, which might involve multiple column "slices" (of width 16 *
     // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -1876,6 +1945,55 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
             slice_k_start_shared_fetch += tb_k * (stages - 1);
         }
     };
+    // pdl_prewait: before griddepcontrol.wait, prefetch into L2 the B / weight-scale
+    // addresses that the first slice's first k-tiles will cp.async, using the same
+    // index math as fetch_to_shared on local copies of b_gl_rd / s_gl_rd (no state
+    // changes). Prefetches return no data to the SM, so the A copies issued after
+    // the wait do not queue behind weight traffic; the later B cp.asyncs hit L2.
+    // Compiled into the pre-wait instances only (marlin_prewait_instance).
+    if constexpr (prewait_instance)
+    {
+        if (pdl_prewait)
+        {
+            if constexpr (!has_act_order)
+            {
+                int const depth
+                    = (((max_shared_mem >> kMarlinNvfp4PreWaitDepthShift) & kMarlinNvfp4PreWaitDepthMask) + 1)
+                    * (stages - 1);
+                int const n_pref = slice_iters < depth ? slice_iters : depth;
+                int b_rd = b_gl_rd;
+                int s_rd = 0;
+                if constexpr (group_blocks != -1)
+                {
+                    s_rd = s_gl_rd;
+                }
+                for (int p = 0; p < n_pref; p++)
+                {
+#pragma unroll
+                    for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++)
+                    {
+                        constexpr int count = div_ceil(b_sh_stride, threads);
+                        int b_gl_idx = b_rd + (i % count) * threads
+                            + b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
+                        prefetch_l2(&B[b_gl_idx]);
+                    }
+                    b_rd += b_gl_rd_delta_o;
+                    if constexpr (group_blocks != -1)
+                    {
+                        if (p % div_ceil(group_blocks, thread_k_blocks) == 0)
+                        {
+                            if (s_sh_wr_pred)
+                            {
+                                prefetch_l2(&scales_ptr[s_rd]);
+                            }
+                            s_rd += s_gl_rd_delta * s_tb_groups;
+                        }
+                    }
+                }
+            }
+            marlin_prewait_pdl_wait_and_trigger(max_shared_mem);
+        }
+    }
     if (slice_iters)
     {
         start_pipes();
