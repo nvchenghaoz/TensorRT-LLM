@@ -2883,12 +2883,16 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
 # input_scale + nvfp4_gemm, FP32 logits so LogitsProcessor's logits.float() is
 # a no-op); fewer rows stay on Marlin W4A16. Marlin covers M <= 64 with one
 # 64-row tile pass and streams the 715 MB weight twice above it. Measured on
-# SM120 (N=248320, K=5120, cold L2, graph replay; Marlin + logits.float() vs
-# W4A4 FP32 out with power-of-two tuning buckets): M=48 0.542 vs 0.549 ms,
-# M=52 0.554 vs 0.530, M=64 0.567 vs 0.531, M=96 1.115 vs 0.549, M=128 1.154
-# vs 0.564. Both copies are kept (+715 MB). Read at weight load:
+# SM120 (N=248320, K=5120, cold L2, both arms in one process; Marlin +
+# logits.float() vs W4A4 FP32 out, power-of-two tuning buckets), median ms:
+#   eager (host overhead included) M=48 0.561 vs 0.576, M=52 0.578 vs 0.574
+#   (inside the p10-p90 spread), M=56 0.583 vs 0.575, M=64 0.594 vs 0.576;
+#   graph M=48 0.542 vs 0.559, M=56 0.562 vs 0.532, M=64 0.573 vs 0.533,
+#   M=96 1.116 vs 0.547, M=128 1.150 vs 0.564, M=132 1.640 vs 0.591.
+# T = 56, the smallest row count where W4A4 wins beyond the spread in both
+# modes. Both copies are kept (+715 MB). Read at weight load:
 # TRTLLM_LMHEAD_W4A4_MIN_ROWS=<rows>; 0 builds no W4A4 copy.
-_LMHEAD_W4A4_MIN_ROWS = 52
+_LMHEAD_W4A4_MIN_ROWS = 56
 _LMHEAD_W4A4_ENV = "TRTLLM_LMHEAD_W4A4_MIN_ROWS"
 # The autotuner warmup calls the lm_head with few rows (one per warmup
 # sequence), so the W4A4 GEMM is tuned once with this many rows, which
