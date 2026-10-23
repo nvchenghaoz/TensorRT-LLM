@@ -27,8 +27,10 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
 )
 from tensorrt_llm._torch.modules.fla.gdn_decode_t1 import (
     can_use_gdn_t1_decode,
+    fused_sigmoid_gating_delta_rule_update_t1,
     fused_sigmoid_gating_delta_rule_update_t1_norm,
 )
+from tensorrt_llm._torch.modules.fla.gdn_state_q8 import is_q8_state_pool
 from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -750,6 +752,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decodes = kwargs["num_decodes"]
 
         if is_target_verify:
+            if is_q8_state_pool(ssm_states):
+                raise NotImplementedError(
+                    "mamba_ssm_cache_dtype=int8 does not support speculative verify"
+                )
             draft_token_num = spec_metadata.runtime_draft_len + 1
             assert num_decodes > 0
             assert mixed_qkv.shape[0] == num_decodes * draft_token_num
@@ -1075,6 +1081,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         conv_states_to_use = conv_states
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
+        if is_q8_state_pool(ssm_states):
+            return self._forward_extend_q8(
+                conv_states,
+                ssm_states,
+                is_target_verify=is_target_verify,
+                output=output,
+                **kwargs,
+            )
         if not is_target_verify and gdn_prefill_onepass_enabled():
             # One pass: conv + SiLU + q/k/v split + q/k L2 norm + gates (bitwise
             # equal to the transpose/conv/fused_gdn_post_conv chain below).
@@ -1370,12 +1384,131 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         return core_attn_out
 
+    def _forward_extend_q8(
+        self,
+        conv_states,
+        ssm_states,
+        is_target_verify: bool = False,
+        output: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """Prefill / mixed step on the 8-bit state pool (mamba_ssm_cache_dtype=int8).
+
+        The decode riders of a mixed step run the T == 1 kernel (in-kernel
+        gating and q/k L2 norm, native 8-bit state I/O) on their convolved
+        rows and write output[:, num_prefill_tokens:]. Only the context
+        requests go through the one-pass front end and FlashInfer's chunk
+        kernel, whose wrapper dequantizes their states into fp32 scratch and
+        quantizes the final states back.
+        """
+        if is_target_verify:
+            raise NotImplementedError(
+                "mamba_ssm_cache_dtype=int8 does not support speculative verify"
+            )
+        if not (gdn_prefill_onepass_enabled() and _use_flashinfer_gdn_prefill()):
+            raise NotImplementedError(
+                "mamba_ssm_cache_dtype=int8 requires the GDN one-pass prefill "
+                "front end and FlashInfer GDN prefill"
+            )
+        mixed_qkv = kwargs["mixed_qkv"]
+        a = kwargs["a"]
+        b = kwargs["b"]
+        batch_size = kwargs["batch_size"]
+        has_initial_states = kwargs["has_initial_states"][:batch_size]
+        query_start_loc = kwargs["query_start_loc"]
+        query_start_loc_long = kwargs["query_start_loc_long"]
+        num_prefill_tokens = kwargs["num_prefill_tokens"]
+        num_decode_tokens = kwargs["num_decode_tokens"]
+        state_indices_p = kwargs["state_indices_p"]
+        state_indices_d = kwargs["state_indices_d"]
+        num_prefill = kwargs["num_prefill"]
+        num_decodes = kwargs["num_decodes"]
+        H, K = self.num_k_heads_per_tp, self.head_k_dim
+        HV, V = self.num_v_heads_per_tp, self.head_v_dim
+        num_tokens = num_prefill_tokens + num_decode_tokens
+        if output is None:
+            output = mixed_qkv.new_empty(1, num_tokens, HV, V)
+        assert output.is_contiguous() and output.shape == (1, num_tokens, HV, V)
+
+        mixed_qkv_p = mixed_qkv
+        if num_decode_tokens > 0:
+            assert num_decode_tokens == num_decodes
+            mixed_qkv_p, mixed_qkv_d = torch.split(
+                mixed_qkv, [num_prefill_tokens, num_decode_tokens], dim=0
+            )
+            mixed_qkv_d = causal_conv1d_update(
+                mixed_qkv_d,
+                conv_states,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                activation=self.activation,
+                conv_state_indices=state_indices_d,
+            )
+            kd = self.key_dim_per_tp
+            fused_sigmoid_gating_delta_rule_update_t1(
+                A_log=self.A_log,
+                a=a[num_prefill_tokens:],
+                dt_bias=self.dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=mixed_qkv_d[..., :kd].view(1, num_decode_tokens, H, K),
+                k=mixed_qkv_d[..., kd : 2 * kd].view(1, num_decode_tokens, H, K),
+                v=mixed_qkv_d[..., 2 * kd :].view(1, num_decode_tokens, HV, V),
+                b=b[num_prefill_tokens:],
+                initial_state_source=ssm_states,
+                initial_state_indices=state_indices_d,
+                scale=K**-0.5,
+                use_qk_l2norm_in_kernel=True,
+                output=output[0, num_prefill_tokens:],
+            )
+        if num_prefill > 0:
+            query, key, value, g, beta = gdn_prefill_onepass(
+                mixed_qkv_p,
+                None,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_states,
+                query_start_loc[: num_prefill + 1],
+                state_indices_p,
+                has_initial_states[:num_prefill],
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                H,
+                K,
+                HV,
+                V,
+                activation=self.activation,
+            )
+            chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                initial_state=ssm_states,
+                initial_state_indices=state_indices_p,
+                inplace_indexed_state_update=True,
+                output_final_state=False,
+                cu_seqlens=query_start_loc_long[: num_prefill + 1],
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+                output=output[:, :num_prefill_tokens],
+                num_long_seqs=num_prefill,
+            )
+        return output
+
     def _get_prefill_state_workspace(
         self, attn_metadata: AttentionMetadata, ssm_states: torch.Tensor
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Reserve maximum state scratch on first use and reuse it across layers."""
         # Blackwell uses indexed pool I/O directly, without state scratch.
         if not _use_flashinfer_gdn_prefill() or is_sm_100f():
+            return None
+        # The 8-bit pool's wrapper sizes its own fp32 scratch per call (only
+        # the context requests of a step, the riders run T1).
+        if is_q8_state_pool(ssm_states):
             return None
         # SM120 with in-place indexed pool I/O needs no fp32 state scratch either.
         from tensorrt_llm._torch.modules.fla.flashinfer_chunk import sm120_pool_io_eligible

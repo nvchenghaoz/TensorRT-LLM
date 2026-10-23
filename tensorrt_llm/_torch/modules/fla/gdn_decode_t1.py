@@ -20,7 +20,28 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.modules.fla.gdn_state_q8 import (
+    Q8_FORMAT,
+    is_q8_state_pool,
+    q8_load_rows,
+    q8_state_rows,
+    q8_store_rows,
+)
 from tensorrt_llm._torch.modules.fla.utils import custom_device_ctx
+
+
+def _pool_row_stride(initial_state_source: torch.Tensor, K: int, V: int) -> int:
+    """Asserts the [slots, HV, rows, K] pool layout; returns rows * K."""
+    rows = q8_state_rows(V, K) if is_q8_state_pool(initial_state_source) else V
+    s_h0_0, s_h0_1, s_h0_2, s_h0_3 = initial_state_source.stride()
+    assert s_h0_3 == 1, f"s_h0_3: {s_h0_3} is not 1"
+    assert s_h0_2 == K, f"s_h0_2: {s_h0_2} is not {K}"
+    assert s_h0_1 == rows * K, f"s_h0_1: {s_h0_1} is not {rows * K}"
+    if is_q8_state_pool(initial_state_source):
+        assert initial_state_source.shape[2] == rows
+        # fp32 row scales are read through the int8 base pointer.
+        assert s_h0_0 % 16 == 0 and initial_state_source.data_ptr() % 16 == 0
+    return s_h0_1
 
 # Escape hatch for A/B comparison against the generic Triton kernel.
 GDN_T1_DECODE_ENABLED = os.environ.get("TRTLLM_FLA_DISABLE_GDN_T1_DECODE",
@@ -55,6 +76,8 @@ def fused_sigmoid_gating_delta_rule_update_t1_kernel(
     V: tl.constexpr,
     BV: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    Q8: tl.constexpr = False,
+    Q8_FMT: tl.constexpr = 0,
 ):
     NV: tl.constexpr = V // BV
     pid = tl.program_id(0)
@@ -72,11 +95,16 @@ def fused_sigmoid_gating_delta_rule_update_t1_kernel(
     idx = tl.load(h0_indices + i_n).to(tl.int64)
     has_state = idx >= 0
     tl.device_assert(idx < h0_dim0, "idx out of bounds in h0_source access")
-    # Pool layout [slots, HV, V, K] with K innermost (stride 1); the tile is
-    # [BV, K] in the same order, so element [v, k] lives at v * K + k.
-    p_h0 = (h0_source + idx * s_h0_0 + i_hv * V * K + o_v[:, None] * K +
-            o_k[None, :])
-    b_h = tl.load(p_h0, mask=has_state, other=0).to(tl.float32)
+    if Q8:
+        # 8-bit pool [slots, HV, V + 4, K]: V int8 rows + V fp32 row scales.
+        p_head = h0_source + idx * s_h0_0 + i_hv * (V + (V * 4) // K) * K
+        b_h = q8_load_rows(p_head, o_v, o_k, has_state, K, V, Q8_FMT)
+    else:
+        # Pool layout [slots, HV, V, K] with K innermost (stride 1); the tile
+        # is [BV, K] in the same order, so element [v, k] lives at v * K + k.
+        p_h0 = (h0_source + idx * s_h0_0 + i_hv * V * K + o_v[:, None] * K +
+                o_k[None, :])
+        b_h = tl.load(p_h0, mask=has_state, other=0).to(tl.float32)
 
     b_q = tl.load(q + i_n * stride_q + i_h * K + o_k).to(tl.float32)
     b_k = tl.load(k + i_n * stride_k + i_h * K + o_k).to(tl.float32)
@@ -117,7 +145,10 @@ def fused_sigmoid_gating_delta_rule_update_t1_kernel(
 
     # o is allocated/kept contiguous by the wrapper: [1, N, HV, V].
     tl.store(o + (i_n * HV + i_hv) * V + o_v, b_o.to(o.dtype.element_ty))
-    tl.store(p_h0, b_h.to(h0_source.dtype.element_ty), mask=has_state)
+    if Q8:
+        q8_store_rows(p_head, o_v, o_k, b_h, has_state, K, V, Q8_FMT)
+    else:
+        tl.store(p_h0, b_h.to(h0_source.dtype.element_ty), mask=has_state)
 
 
 @triton.jit
@@ -181,6 +212,8 @@ def fused_sigmoid_gating_delta_rule_update_t1_norm_kernel(
     STORE_DEBUG: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     r_dbg=None,
+    Q8: tl.constexpr = False,
+    Q8_FMT: tl.constexpr = 0,
 ):
     """T == 1 decode with the GDN gated RMSNorm (silu gate, norm before gate)
     folded in: one program (4 or 8 warps) per (sequence, value head) owns the whole
@@ -205,9 +238,13 @@ def fused_sigmoid_gating_delta_rule_update_t1_norm_kernel(
     idx = tl.load(h0_indices + i_n).to(tl.int64)
     has_state = idx >= 0
     tl.device_assert(idx < h0_dim0, "idx out of bounds in h0_source access")
-    p_h0 = (h0_source + idx * s_h0_0 + i_hv * V * K + o_v[:, None] * K +
-            o_k[None, :])
-    b_h = tl.load(p_h0, mask=has_state, other=0).to(tl.float32)
+    if Q8:
+        p_head = h0_source + idx * s_h0_0 + i_hv * (V + (V * 4) // K) * K
+        b_h = q8_load_rows(p_head, o_v, o_k, has_state, K, V, Q8_FMT)
+    else:
+        p_h0 = (h0_source + idx * s_h0_0 + i_hv * V * K + o_v[:, None] * K +
+                o_k[None, :])
+        b_h = tl.load(p_h0, mask=has_state, other=0).to(tl.float32)
 
     b_q = tl.load(q + i_n * stride_q + i_h * K + o_k).to(tl.float32)
     b_k = tl.load(k + i_n * stride_k + i_h * K + o_k).to(tl.float32)
@@ -240,7 +277,10 @@ def fused_sigmoid_gating_delta_rule_update_t1_norm_kernel(
     b_h += b_k[None, :] * b_v[:, None]
     b_o = tl.sum(b_h * b_q[None, :], 1)
 
-    tl.store(p_h0, b_h.to(h0_source.dtype.element_ty), mask=has_state)
+    if Q8:
+        q8_store_rows(p_head, o_v, o_k, b_h, has_state, K, V, Q8_FMT)
+    else:
+        tl.store(p_h0, b_h.to(h0_source.dtype.element_ty), mask=has_state)
     b_o = b_o.to(y.dtype.element_ty)
     if STORE_DEBUG:
         tl.store(o_dbg + (i_n * HV + i_hv) * V + o_v, b_o)
@@ -287,8 +327,9 @@ def fused_sigmoid_gating_delta_rule_update_t1_norm(
     bf16 output (see the kernel docstring). Requires K == V == 128."""
     _, N, H, K = k.shape
     HV, V = v.shape[2], v.shape[3]
-    s_h0_0, s_h0_1, s_h0_2, s_h0_3 = initial_state_source.stride()
-    assert s_h0_3 == 1 and s_h0_2 == K and s_h0_1 == V * K
+    s_h0_0 = initial_state_source.stride(0)
+    _pool_row_stride(initial_state_source, K, V)
+    q8 = is_q8_state_pool(initial_state_source)
     assert z.stride(-1) == 1 and z.stride(-2) == V
     norm_weight = norm_weight.contiguous()
     y = output if output is not None else q.new_empty(N * HV, V)
@@ -332,6 +373,8 @@ def fused_sigmoid_gating_delta_rule_update_t1_norm(
             STORE_DEBUG=debug,
             USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
             r_dbg=rstd_debug if debug else None,
+            Q8=q8,
+            Q8_FMT=Q8_FORMAT,
             num_warps=num_warps,
             num_stages=1,
         )
@@ -352,6 +395,19 @@ def gdn_t1_decode_config(num_heads_total: int, V: int) -> Tuple[int, int]:
     """
     bv = 8 if num_heads_total <= 96 else 16
     return min(bv, V), 1
+
+
+# (BV, num_warps) of the T == 1 kernel on the 8-bit state pool, overridable
+# for sweeps as "BV,WARPS" (unset: same as the bf16 pool).
+_Q8_T1_CONFIG = os.environ.get("TRTLLM_GDN_T1_Q8_CONFIG", "")
+
+
+def gdn_t1_q8_decode_config(num_heads_total: int, V: int) -> Tuple[int, int]:
+    """(BV, num_warps) for the 8-bit state pool."""
+    if _Q8_T1_CONFIG:
+        bv, warps = (int(x) for x in _Q8_T1_CONFIG.split(","))
+        return min(bv, V), warps
+    return gdn_t1_decode_config(num_heads_total, V)
 
 
 def can_use_gdn_t1_decode(
@@ -401,16 +457,19 @@ def fused_sigmoid_gating_delta_rule_update_t1(
     """T == 1 decode launch; returns ``[1, N, HV, V]`` like the generic path."""
     _, N, H, K = k.shape
     HV, V = v.shape[2], v.shape[3]
-    cfg_bv, cfg_warps = gdn_t1_decode_config(N * HV, V)
+    q8 = is_q8_state_pool(initial_state_source)
+    if q8:
+        cfg_bv, cfg_warps = gdn_t1_q8_decode_config(N * HV, V)
+    else:
+        cfg_bv, cfg_warps = gdn_t1_decode_config(N * HV, V)
     BV = cfg_bv if BV is None else BV
     num_warps = cfg_warps if num_warps is None else num_warps
     assert V % BV == 0, f"V={V} must be a multiple of BV={BV}"
 
-    s_h0_0, s_h0_1, s_h0_2, s_h0_3 = initial_state_source.stride()
-    # Pool layout is [slots, HV, V, K] with K innermost (stride 1).
-    assert s_h0_3 == 1, f"s_h0_3: {s_h0_3} is not 1"
-    assert s_h0_2 == K, f"s_h0_2: {s_h0_2} is not {K}"
-    assert s_h0_1 == V * K, f"s_h0_1: {s_h0_1} is not {V * K}"
+    s_h0_0 = initial_state_source.stride(0)
+    # Pool layout is [slots, HV, V, K] (8-bit: [slots, HV, V + 4, K]) with K
+    # innermost (stride 1).
+    _pool_row_stride(initial_state_source, K, V)
 
     o = output.unsqueeze(0) if output is not None else q.new_empty(1, *v.shape)
     grid = (N * HV * (V // BV), )
@@ -442,6 +501,8 @@ def fused_sigmoid_gating_delta_rule_update_t1(
             V=V,
             BV=BV,
             USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+            Q8=q8,
+            Q8_FMT=Q8_FORMAT,
             num_warps=num_warps,
             num_stages=1,
         )

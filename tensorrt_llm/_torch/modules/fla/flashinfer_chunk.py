@@ -39,6 +39,11 @@ from tensorrt_llm._torch.modules.fla.fused_state_io import (
     cast_scatter_fp32_vk_to_vk,
     gather_cast_vk_to_fp32_vk,
 )
+from tensorrt_llm._torch.modules.fla.gdn_state_q8 import (
+    is_q8_state_pool,
+    q8_gather_dequant,
+    q8_quant_scatter,
+)
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
@@ -215,6 +220,37 @@ def chunk_gated_delta_rule(
             state_indices=slot_ids,
             **hint_kwargs,
         )
+        return out_packed.unsqueeze(0), None
+
+    # --- Step 4b: 8-bit state pool (mamba_ssm_cache_dtype=int8) ----------
+    # Dequantize the (few, long) prefill sequences' states into an fp32
+    # scratch, run the fp32-state kernel, then quantize the final states back
+    # into their pool slots (one rounding per state row, like T1 decode).
+    if is_q8_state_pool(initial_state):
+        assert inplace_indexed_state_update and initial_state_indices is not None, (
+            "the int8 GDN state pool supports only in-place indexed prefill"
+        )
+        slot_ids = initial_state_indices.contiguous()
+        num_seqs = cu_seqlens.shape[0] - 1
+        assert slot_ids.shape[0] == num_seqs
+        gathered = q8_gather_dequant(initial_state, slot_ids, v3.shape[2])
+        state_buf = torch.empty_like(gathered)
+        out_packed, out_state = flashinfer.chunk_gated_delta_rule(
+            q=q3,
+            k=k3,
+            v=v3,
+            g=g2,
+            beta=beta2,
+            scale=scale,
+            initial_state=gathered,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output=output_buf,
+            output_state=state_buf,
+            **hint_kwargs,
+        )
+        q8_quant_scatter(out_state, initial_state, slot_ids)
         return out_packed.unsqueeze(0), None
 
     # --- Step 4: gather initial state (+ cast dtype only when required) ---

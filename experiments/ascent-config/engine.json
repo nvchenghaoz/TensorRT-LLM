@@ -2,6 +2,7 @@
   "kv_cache_config": {
     "dtype": "fp8",
     "enable_block_reuse": true,
+    "mamba_ssm_cache_dtype": "int8",
     "mamba_state_config": {
       "additional_snapshot_offsets_from_start": [32768]
     }
