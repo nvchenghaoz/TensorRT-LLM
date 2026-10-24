@@ -517,6 +517,12 @@ def fused_sigmoid_gating_delta_rule_update(
             output=output,
         )
 
+    # The 8-bit state pool is read only by the T == 1 kernels.
+    if initial_state_source is not None and initial_state_source.dtype == torch.int8:
+        raise NotImplementedError(
+            "mamba_ssm_cache_dtype=int8 GDN state supports only pure T == 1 "
+            f"decode here (B={B}, T={T}, N={N})")
+
     # Fallback: Triton kernel path.
     # Accept native view layouts from forward_decode rather than forcing packed
     # copies through input_guard.

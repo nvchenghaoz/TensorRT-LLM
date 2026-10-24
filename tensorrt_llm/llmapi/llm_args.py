@@ -4691,10 +4691,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
-        "auto", "float16", "bfloat16", "float32"] = Field(
+        "auto", "float16", "bfloat16", "float32", "int8"] = Field(
             default="auto",
             description=
-            "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
+            "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config. "
+            "'int8' (GDN / Qwen3-Next-style models only, pure decode and chunked prefill without speculative decoding) "
+            "stores the recurrent state as 8-bit rows with one fp32 scale per row."
         )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.

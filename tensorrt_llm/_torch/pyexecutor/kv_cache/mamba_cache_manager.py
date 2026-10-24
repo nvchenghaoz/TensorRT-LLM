@@ -61,7 +61,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
 
 # Shared with the KV budget estimator so allocator and budgeting can never
 # diverge on the sharding rule (config_utils is import-cycle-free).
-from ..config_utils import mamba_effective_tp_size
+from ..config_utils import mamba_effective_tp_size, ssm_state_rows
 
 GB = 1 << 30
 
@@ -2366,6 +2366,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         conv_dim = conv_dim // tp_size
         nheads = nheads // tp_size
         self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
+        if self.ssm_state_dtype == torch.int8:
+            raise NotImplementedError(
+                "mamba_ssm_cache_dtype=int8 requires the V2 Mamba cache manager")
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
         self.conv_state_dtype = mamba_cache_dtype
 
@@ -3169,7 +3172,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             conv_dim = conv_dim // tp_size
             nheads = nheads // tp_size
             self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
-            self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
+            # The int8 GDN state appends its fp32 row scales as extra rows.
+            self.ssm_state_shape = [
+                nheads,
+                ssm_state_rows(mamba_head_dim, mamba_d_state,
+                               self.ssm_state_dtype), mamba_d_state
+            ]
+            if self.ssm_state_dtype == torch.int8 and (
+                    spec_config is not None or kwargs.get("is_disagg", False)
+                    or conv_state_layout == "x_b_c"):
+                raise NotImplementedError(
+                    "mamba_ssm_cache_dtype=int8 supports only GDN models "
+                    "without speculative decoding or disaggregated serving")
             # TP-mismatch disaggregated transfers must split the flat
             # convolution state at its true semantic boundaries. Mamba2 stores
             # [x | B | C], while GDN stores [Q | K | V]. The large section is
