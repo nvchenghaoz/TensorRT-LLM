@@ -132,6 +132,22 @@ def run(arm, ckpt, out_path):
     results["counts_run"] = dict(counts)
     results["replays_run"] = dict(replays)
     results["replays_33_64"] = sum(v for k, v in replays.items() if k.isdigit() and 33 <= int(k) <= 64)
+    # Phase 3, c64 steady-state decode: 64 retrieval prompts (cached prefixes) admitted at once,
+    # 256 forced output tokens each, so decode replays the batch-64 CUDA graph (qkv at 64 rows).
+    counts.clear()
+    replays.clear()
+    wave = [x for x in primes + prompts if x[1].startswith("ret")][:64]
+    sp_dec = SamplingParams(max_tokens=256, temperature=0.0, ignore_eos=True, logprobs=1)
+    t1 = time.time()
+    outs_w = llm.generate([x[0] for x in wave], [sp_dec] * len(wave))
+    log(f"[{arm}] c64 decode wave ({len(wave)} requests x 256) done {time.time() - t1:.1f}s; "
+        f"replays {dict(replays)}; qkv counts {dict(counts)}")
+    for (p, k, e, _), o in zip(wave, outs_w):
+        c = o.outputs[0]
+        results["items"]["dec64:" + k] = {"text": c.text, "ids": list(c.token_ids), "expect": e,
+                                          "ok": all(x in c.text for x in e), "lp": lp(c)}
+    results["replays_wave"] = dict(replays)
+    results["replays_wave_64"] = replays.get("64", 0)
     n_ok = sum(v["ok"] for k, v in results["items"].items() if not k.startswith("gen"))
     n = sum(1 for k in results["items"] if not k.startswith("gen"))
     log(f"[{arm}] correct {n_ok}/{n}; qkv counts {dict(counts)}; replays {dict(replays)}")
@@ -195,8 +211,21 @@ def compare(a_path, b_path):
     res["B_captures_marlin_33_64"] = any(k.startswith("qkv/marlin/capture/33-64") for k in wb)
     res["A_captures_w4a4_33_64"] = any(k.startswith("qkv/w4a4/capture/33-64") for k in wa)
     lpmax = res["logprob_absdiff_before_divergence"]["max"]
+    res["replays_wave_64_A"] = a.get("replays_wave_64")
+    res["replays_wave_64_B"] = b.get("replays_wave_64")
+    res["replays_wave_A"] = a.get("replays_wave")
+    res["replays_wave_B"] = b.get("replays_wave")
+    for tag in ("A", "B"):
+        it = (a if tag == "A" else b)["items"]
+        res[f"correct_dec64_{tag}"] = sum(v["ok"] for k, v in it.items() if k.startswith("dec64:"))
+        res[f"correct_main_{tag}"] = sum(v["ok"] for k, v in it.items()
+                                         if not k.startswith(("gen", "dec64:")))
+    # Gate: items lost within the 5% allowance, both arms took their route at 33-64 rows in the
+    # captured graphs, the c64 wave replayed the batch-64 graph in both arms, and logprobs before
+    # the first divergence stay within the protocol tolerance.
     res["passed"] = (len(lost) <= res["allowed_lost"] and res["B_captures_marlin_33_64"]
-                     and res["A_captures_w4a4_33_64"] and (b.get("replays_33_64") or 0) > 0
+                     and res["A_captures_w4a4_33_64"] and (b.get("replays_wave_64") or 0) > 0
+                     and (a.get("replays_wave_64") or 0) > 0
                      and (lpmax is None or lpmax <= 11.957))
     for k, d in firstdiv:
         log(f"diverge {k} at token {d}: A {ia[k]['text'][:100]!r} | B {ib[k]['text'][:100]!r}")
