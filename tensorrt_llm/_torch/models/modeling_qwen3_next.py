@@ -552,6 +552,27 @@ _POST_ATTN_NVFP4_DECODE = os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_DECODE",
 _POST_ATTN_NVFP4_DECODE_MAX_ROWS = int(
     os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_DECODE_MAX_ROWS", "32"))
 
+# Rows above the decode band (prefill and mixed steps included) run the
+# CuTe-DSL NVFP4-epilogue norm (bitwise-equal), except (112, 128] which keeps
+# main's BF16 norm + fp4_quantize. Measured in the producer GEMM -> norm ->
+# gate_up chain (16 layers, cold L2, CUDA graph + PDL, SM120) vs norm +
+# fp4_quantize: -0.3..-0.77 us/layer at 33-112 rows, tie/+0.15..+0.38 at
+# 116-128, -1.2..-5.2 us at 160-2048; vs the Triton fused kernel it replaces
+# from 2048 rows: -13 us at 2048, -20 us at 4096, -21 us at 8192
+# (experiments/ascent/norm_nvfp4_mid). TRTLLM_GEMMA_NORM_NVFP4_MID=0 restores
+# main's routing.
+_POST_ATTN_NVFP4_MID = os.environ.get("TRTLLM_GEMMA_NORM_NVFP4_MID",
+                                      "1") != "0"
+_POST_ATTN_NVFP4_MID_SKIP = (112, 128)
+
+
+def _post_attn_cute_rows(rows: int) -> bool:
+    if _POST_ATTN_NVFP4_DECODE and 0 < rows <= _POST_ATTN_NVFP4_DECODE_MAX_ROWS:
+        return True
+    lo, hi = _POST_ATTN_NVFP4_MID_SKIP
+    return (_POST_ATTN_NVFP4_MID and rows > _POST_ATTN_NVFP4_DECODE_MAX_ROWS
+            and not lo < rows <= hi)
+
 
 def _post_attention_norm(layer, hidden_states, residual, lora_params):
     """post_attention_layernorm; on the fused path its output is the gate_up
@@ -567,14 +588,13 @@ def _post_attention_norm(layer, hidden_states, residual, lora_params):
             and hidden_states.is_contiguous() and residual.is_contiguous()):
         rows = hidden_states.shape[0]
         norm = layer.post_attention_layernorm
-        if rows >= max(1, _POST_ATTN_NVFP4_MIN_ROWS):
-            fp4, sf = fused_gemma_add_rmsnorm_nvfp4(
+        if _post_attn_cute_rows(rows):
+            fp4, sf = flashinfer_gemma_fused_add_rmsnorm_nvfp4(
                 hidden_states, residual, norm.weight, norm.variance_epsilon,
                 layer.mlp.mlp.gate_up_proj.input_scale)
             return Fp4QuantizedTensor(fp4, sf), residual
-        if (_POST_ATTN_NVFP4_DECODE
-                and 0 < rows <= _POST_ATTN_NVFP4_DECODE_MAX_ROWS):
-            fp4, sf = flashinfer_gemma_fused_add_rmsnorm_nvfp4(
+        if rows >= max(1, _POST_ATTN_NVFP4_MIN_ROWS):
+            fp4, sf = fused_gemma_add_rmsnorm_nvfp4(
                 hidden_states, residual, norm.weight, norm.variance_epsilon,
                 layer.mlp.mlp.gate_up_proj.input_scale)
             return Fp4QuantizedTensor(fp4, sf), residual
