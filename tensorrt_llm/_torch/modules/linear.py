@@ -47,6 +47,7 @@ from ..locality_domain.policy import (DISABLED_PLAN, LinearPartitionPlan,
                                       LocalityDomainPolicy)
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import _copy_to_new_cuda_allocation
+from ..row_pin import pinned_rows as _pinned_rows
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, replace_parameter_and_save_metadata,
                      unswizzle_sf)
@@ -803,8 +804,10 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
         nvfp4_decode_weight = getattr(module, "_nvfp4_decode_weight", None)
         nvfp4_decode_gemv = module.__dict__.get("_nvfp4_decode_gemv")
+        # A row-sliced call routes by its unsliced row count (row_pin).
+        route_rows = _pinned_rows(input.shape[0])
         if (nvfp4_decode_gemv is not None and input.dtype == torch.bfloat16
-                and 0 < input.shape[0] <= module.__dict__.get(
+                and 0 < route_rows <= module.__dict__.get(
                     "_nvfp4_decode_gemv_max_rows", 0)):
             # Rows <= the per-shape cap: cuda-core W4A16 GEMV on the decode
             # copy's NVFP4 values. It reads x with 16-B loads, so an unaligned
@@ -818,7 +821,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                                             output.shape[-1])
                 return output
         if (nvfp4_decode_weight is not None and input.dtype == torch.bfloat16
-                and input.shape[0] <= module.__dict__.get(
+                and route_rows <= module.__dict__.get(
                     "_nvfp4_decode_max_rows", _FP8_NVFP4_DECODE_MAX_ROWS)):
             # Decode-only W4A16 NVFP4 copy of this FP8 weight (Marlin), up to
             # the per-(N, K) row cap (_FP8_NVFP4_DECODE_ROW_CAPS).

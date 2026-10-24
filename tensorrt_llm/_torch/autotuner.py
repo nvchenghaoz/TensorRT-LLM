@@ -32,6 +32,7 @@ import torch
 from cuda.bindings import driver
 
 import tensorrt_llm
+from tensorrt_llm._torch import row_pin as _row_pin
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
@@ -1152,6 +1153,10 @@ class AutoTuner:
             })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
+        # A row-sliced call looks up the tactic of its unsliced M (row_pin).
+        if _row_pin._PIN is not None and not self.is_tuning_mode:
+            input_shapes = _row_pin.pin_input_shapes(
+                input_shapes, tuning_config.dynamic_tensor_specs)
 
         # For ops opted out of the persistent cache (e.g. JIT-driven
         # kernels whose "tuning" triggers compilation as a side effect),

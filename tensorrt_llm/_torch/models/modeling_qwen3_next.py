@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import os
 from types import SimpleNamespace
@@ -60,13 +61,14 @@ from ..modules.low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..row_pin import pin_rows, pinned_rows
 from ..moe.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                              RenormalizeMoeRoutingMethod,
                              RenormalizeNaiveMoeRoutingMethod,
                              RoutingMethodType, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
-                     create_lm_head_tp_mapping)
+                     create_lm_head_tp_mapping, is_torch_compiling)
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
@@ -126,6 +128,15 @@ _LAST_LAYER_SKIP_FMHA_A = os.environ.get("TRTLLM_LAST_LAYER_SKIP_FMHA_A",
                                          "1") != "0"
 # The q-tile height of that FMHA (fmha_v2 e4m3 64x128 tiled, kStepQ).
 _FMHA_LAST_TILE_STEP_Q = 64
+
+# Final decoder layer at eager prefill / mixed steps: the output gate, o_proj,
+# post-attention norm, MLP and final norm run only on the rows LogitsProcessor
+# reads (Qwen3NextForCausalLM._final_layer_row_slice), pinned to the unsliced
+# call's routes and tactics. 0 restores main's path.
+_LAST_LAYER_ROW_SLICE = os.environ.get("TRTLLM_QWEN3_LAST_LAYER_ROW_SLICE",
+                                       "1") != "0"
+_LAST_LAYER_ROW_SLICE_MIN_ROWS = 2048
+_LAST_LAYER_ROW_SLICE_STATS = {"steps": 0}
 
 
 def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
@@ -565,7 +576,8 @@ def _post_attention_norm(layer, hidden_states, residual, lora_params):
             and residual is not None and residual.shape == hidden_states.shape
             and residual.dtype == torch.bfloat16
             and hidden_states.is_contiguous() and residual.is_contiguous()):
-        rows = hidden_states.shape[0]
+        # A row-sliced call routes by its unsliced rows (row_pin).
+        rows = pinned_rows(hidden_states.shape[0])
         norm = layer.post_attention_layernorm
         if rows >= max(1, _POST_ATTN_NVFP4_MIN_ROWS):
             fp4, sf = fused_gemma_add_rmsnorm_nvfp4(
@@ -758,6 +770,18 @@ class Qwen3NextAttention(Qwen3Attention):
                          use_gemma_rms_norm=True)
         self._fuse_qk_norm_rope_gate = True
 
+    def forward_impl(self, *args, output_gate=None, **kwargs):
+        # Final-layer row slice (Qwen3NextForCausalLM._final_layer_row_slice):
+        # the attention runs on every row; the output gate and o_proj only on
+        # the rows LogitsProcessor reads.
+        idx = self.__dict__.get("_row_slice_idx")
+        if idx is None or output_gate is None:
+            return super().forward_impl(*args,
+                                        output_gate=output_gate,
+                                        **kwargs)
+        output = super().forward_impl(*args, output_gate=None, **kwargs)
+        return self.apply_output_gate(output[idx], output_gate[idx])
+
 
 class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
 
@@ -867,6 +891,10 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             lora_params=lora_params,
             **kwargs,
         )
+        row_idx = self.__dict__.get("_row_slice_idx")
+        if row_idx is not None:
+            # self_attn already kept only these rows (Qwen3NextAttention).
+            residual = residual[row_idx]
 
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
@@ -1212,24 +1240,39 @@ class Qwen3NextModel(DecoderModel):
         # Set by Qwen3NextForCausalLM.forward when only each sequence's last
         # row of the final layer is read (see _final_layer_skip_fmha_a).
         skip_last_a = self.__dict__.get("_skip_last_fmha_a", False)
+        # Set by Qwen3NextForCausalLM.forward: the rows of the final layer
+        # that LogitsProcessor reads (see _final_layer_row_slice).
+        row_idx = self.__dict__.get("_row_slice_idx")
         last_idx = self.num_hidden_layers - 1
         for idx, decoder_layer in enumerate(
                 self.layers[:self.num_hidden_layers]):
             skip_a = skip_last_a and idx == last_idx
+            sliced = row_idx is not None and idx == last_idx
             if skip_a:
                 torch.ops.trtllm.fmha_set_last_tile_split_skip_a(True)
+            pin = contextlib.nullcontext()
+            if sliced:
+                decoder_layer._row_slice_idx = row_idx
+                decoder_layer.self_attn._row_slice_idx = row_idx
+                # Every row-count route after attention takes the unsliced
+                # call's route and tactic, so the kept rows stay bitwise.
+                pin = pin_rows(row_idx.shape[0], hidden_states.shape[0])
             try:
-                hidden_states, residual = decoder_layer(
-                    position_ids=position_ids,
-                    hidden_states=hidden_states,
-                    attn_metadata=attn_metadata,
-                    residual=residual,
-                    spec_metadata=spec_metadata,
-                    mamba_metadata=mamba_metadata,
-                    lora_params=lora_params)
+                with pin:
+                    hidden_states, residual = decoder_layer(
+                        position_ids=position_ids,
+                        hidden_states=hidden_states,
+                        attn_metadata=attn_metadata,
+                        residual=residual,
+                        spec_metadata=spec_metadata,
+                        mamba_metadata=mamba_metadata,
+                        lora_params=lora_params)
             finally:
                 if skip_a:
                     torch.ops.trtllm.fmha_set_last_tile_split_skip_a(False)
+                if sliced:
+                    decoder_layer._row_slice_idx = None
+                    decoder_layer.self_attn._row_slice_idx = None
         return hidden_states
 
 
@@ -1309,6 +1352,65 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         num_q_tiles = (max_len + step - 1) // step
         return num_q_tiles >= 2 and min_len > step * (num_q_tiles - 1)
 
+    def _final_layer_row_slice(self, attn_metadata, return_context_logits,
+                               spec_metadata, kwargs) -> bool:
+        """Whether the final layer may run its output gate, o_proj, post-attn
+        norm, MLP and the final norm only on the rows LogitsProcessor reads.
+
+        Without context logits LogitsProcessor gathers the final hidden state
+        at cumsum(seq_lens) - 1 (each context's last row and every generation
+        row), and every op after the final layer's attention is row-local.
+        The QKV projection, RoPE, KV append and attention still run on every
+        row. The sliced ops are pinned to the unsliced call's routes and
+        tactics (row_pin), so the read rows are bitwise main's. Eager
+        prefill / mixed steps of >= _LAST_LAYER_ROW_SLICE_MIN_ROWS rows only.
+        Kill switch: TRTLLM_QWEN3_LAST_LAYER_ROW_SLICE=0.
+        """
+        if not _LAST_LAYER_ROW_SLICE:
+            return False
+        if (return_context_logits or spec_metadata is not None
+                or getattr(self, "spec_worker", None) is not None
+                or getattr(self, "draft_model", None) is not None
+                or kwargs.get("lora_params") or kwargs.get("deepstack_embeds")
+                or kwargs.get("multimodal_params")):
+            return False
+        if (attn_metadata is None or attn_metadata.num_contexts <= 0
+                or attn_metadata.seq_lens is None
+                or getattr(attn_metadata, "seq_lens_cuda", None) is None
+                or getattr(attn_metadata, "padded_num_tokens",
+                           None) is not None
+                or getattr(attn_metadata, "csa2_remote_tail_mode",
+                           None) is not None):
+            return False
+        num_tokens = attn_metadata.num_tokens
+        if (num_tokens < _LAST_LAYER_ROW_SLICE_MIN_ROWS
+                or attn_metadata.num_seqs >= num_tokens):
+            return False
+        if torch.cuda.is_current_stream_capturing() or is_torch_compiling():
+            return False
+        from ..autotuner import AutoTuner
+        if AutoTuner.get().is_tuning_mode:
+            return False
+        mapping = self.model_config.mapping
+        if (mapping.cp_size != 1 or mapping.pp_size != 1
+                or mapping.tp_size != 1 or mapping.enable_attention_dp):
+            return False
+        layers = self.model.layers[:self.model.num_hidden_layers]
+        if not layers or not isinstance(layers[-1],
+                                        Qwen3NextFullAttentionDecoderLayer):
+            return False
+        last = layers[-1]
+        attn = last.self_attn
+        if (last.fusion_config.PRE_MOE_FUSION
+                or last.fusion_config.POST_MOE_FUSION
+                or not isinstance(last.mlp, _DenseMlpAdapter)
+                or last.next_layer_layernorm is None
+                or getattr(attn, "sparse_attn_hooks", None) is not None
+                or not getattr(attn, "attn_output_gate", False)
+                or attn._use_quantize_output()):
+            return False
+        return True
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1323,15 +1425,24 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         skip_a = self._final_layer_skip_fmha_a(attn_metadata,
                                                return_context_logits,
                                                spec_metadata, kwargs)
+        row_slice = self._final_layer_row_slice(attn_metadata,
+                                                return_context_logits,
+                                                spec_metadata, kwargs)
         if skip_a:
             self.model._skip_last_fmha_a = True
+        if row_slice:
+            # The exact rows LogitsProcessor would gather, in its order; the
+            # model then returns only them, so the logits are not re-gathered.
+            self.model._row_slice_idx = torch.cumsum(
+                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            _LAST_LAYER_ROW_SLICE_STATS["steps"] += 1
         try:
             return super().forward(
                 attn_metadata=attn_metadata,
                 input_ids=input_ids,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
-                return_context_logits=return_context_logits,
+                return_context_logits=return_context_logits or row_slice,
                 spec_metadata=spec_metadata,
                 resource_manager=resource_manager,
                 **kwargs,
@@ -1339,6 +1450,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         finally:
             if skip_a:
                 self.model._skip_last_fmha_a = False
+            if row_slice:
+                self.model._row_slice_idx = None
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
