@@ -31,8 +31,9 @@ from triton.language.extra import libdevice
 Q8_POOL_DTYPE = torch.int8
 # Extra K-wide rows per value head holding the V fp32 row scales.
 Q8_SCALE_ROWS = 4
-# 0: int8-row (default), 1: e4m3-row.
-Q8_FORMAT = 0
+# 0: int8-row, 1: e4m3-row (default; picked over int8-row by the in-branch
+# accuracy proxy, job 255: equal items lost, smaller teacher-forced |dlogprob|).
+Q8_FORMAT = 1
 
 
 def is_q8_state_pool(state: Optional[torch.Tensor]) -> bool:
