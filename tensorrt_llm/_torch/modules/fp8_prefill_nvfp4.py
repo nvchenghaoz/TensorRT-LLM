@@ -35,6 +35,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._torch.row_pin import pinned_rows as _pinned_rows
 from tensorrt_llm.logger import logger
 
 ENV_GDN_IN_PROJ_QKVZ = "TRTLLM_FP8_PREFILL_NVFP4_GDN"
@@ -163,7 +164,9 @@ def uses_prefill_nvfp4_copy(module: torch.nn.Module, rows: int):
     producers that emit NVFP4 for it (GDN gated norm, attention output gate).
     It mirrors apply's order: a module with a W4A16 decode copy keeps rows up
     to its decode cap there; the W4A4 copy takes rows > MAX_DECODE_ROWS.
+    A row-sliced call routes by its unsliced row count (row_pin).
     """
+    rows = _pinned_rows(rows)
     if rows <= MAX_DECODE_ROWS:
         return None
     copy = module.__dict__.get(_ATTR)

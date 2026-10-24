@@ -17,6 +17,7 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..row_pin import pinned_rows as _pinned_rows
 from ..utils import Fp4QuantizedTensor
 from .fused_silu_mul_nvfp4 import fused_silu_mul_nvfp4  # noqa: F401
 from .linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
@@ -439,7 +440,8 @@ class GatedMLP(nn.Module):
             x[0] if isinstance(x, tuple) else x)
         if torch.compiler.is_compiling() or t.dim() != 2:
             return None
-        m = t.shape[0]
+        # A row-sliced call routes (and tiles) by its unsliced rows (row_pin).
+        m = _pinned_rows(t.shape[0])
         if m < max(1, GatedMLP._SWIGLU_EPI_MIN_ROWS):
             return None
         # During AutoTuner warmup run main's gate_up nvfp4_gemm instead: its
