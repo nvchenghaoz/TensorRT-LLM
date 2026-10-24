@@ -12,6 +12,8 @@ CK = sys.argv[1]
 OUT = sys.argv[2] if len(sys.argv) > 2 else '/tmp/ll67'
 NT = int(sys.argv[3]) if len(sys.argv) > 3 else 6
 NW = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+# 'check': untimed correctness job only (no timing loop; base.pt optional, the kill-switch arm is main's path).
+CHECK_ONLY = len(sys.argv) > 5 and sys.argv[5] == 'check'
 os.makedirs(OUT, exist_ok=True)
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig, CudaGraphConfig
@@ -383,7 +385,7 @@ for mode in modes:
 LOADT = os.getloadavg()
 log('LOADAVG_TIMING_START', LOADT)
 for case, nreq, mt, base_seed in (('c1', N1, 24, 500), ('c2', N2, 40, 700)):
-    for it in range(NW + NT):
+    for it in range(0 if CHECK_ONLY else NW + NT):
         for mode in modes:
             set_mode(mode)
             TM['ev'] = []
@@ -489,12 +491,13 @@ if CAND:
         PASS['repeat_iter1_base_vs_off'] = r_off['bitwise']
     else:
         REP['error'] = 'base.pt not found at ' + bp
-        PASS['base_found'] = False
+        if not CHECK_ONLY:
+            PASS['base_found'] = False
 log('report', json.dumps(REP, default=str))
 log('pass', json.dumps(PASS))
 key = 'mTrue' if CAND else 'mNone'
 batch = dict()
-for b, case in (('64', 'c1'), ('128', 'c2')):
+for b, case in (() if CHECK_ONLY else (('64', 'c1'), ('128', 'c2'))):
     s = TS[key][case + '_win']
     f = TS[key][case + '_fw']
     batch[b] = dict(kernel_ms=s['median'], noise_floor=s['noise'], p10=s['p10'], p90=s['p90'], n=s['n'],
