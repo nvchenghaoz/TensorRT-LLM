@@ -38,7 +38,9 @@ import accuracy as acc  # noqa: E402  (FILLER / COLORS / ANIMALS)
 
 PREFIX, SUFFIX, OSL, NC = 32768, 2048, 40, 64
 N_RET, N_ARI = 96, 32
-ACC_TOKENS = 48
+# Job 212 used 48: the model often opens a <think> block first, so a 48-token
+# budget scored that near-tie (think vs answer) instead of retrieval.
+ACC_TOKENS = int(sys.argv[2]) if len(sys.argv) > 2 else 192
 TOL, TIE = 11.957, 23.915
 STORE = {}
 
@@ -159,6 +161,41 @@ def build_items(tok, seed=8128):
     return items
 
 
+def provenance(arm):
+    """Top-lead 17:22: tree identity and marker from inside the executor process
+    (TLLM_WORKER_USE_SINGLE_PROCESS=1, so this pid runs the executor), plus the
+    live GDN state pool's dtype/shape read from the cache manager object."""
+    import gc
+    import subprocess
+
+    import tensorrt_llm
+    root = os.path.dirname(os.path.dirname(os.path.abspath(tensorrt_llm.__file__)))
+    try:
+        sha = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True,
+                             text=True, timeout=30).stdout.strip()
+    except Exception as e:  # noqa: BLE001
+        sha = f"error {e}"
+    marker_file = os.path.join(os.path.dirname(tensorrt_llm.__file__), "_torch", "modules", "fla",
+                               "gdn_state_q8.py")
+    marker = None
+    if os.path.exists(marker_file):
+        marker = next((ln.strip() for ln in open(marker_file) if "8-bit GDN recurrent-state pool" in ln), None)
+    pools = []
+    for o in gc.get_objects():
+        try:
+            if type(o).__name__.startswith(("MambaHybridCacheManager", "CppMambaHybridCacheManager")) \
+                    and hasattr(o, "ssm_state_dtype"):
+                pools.append(dict(cls=type(o).__name__, ssm_state_dtype=str(o.ssm_state_dtype),
+                                  ssm_state_shape=list(getattr(o, "ssm_state_shape", []))))
+        except Exception:  # noqa: BLE001
+            continue
+    p = dict(pid=os.getpid(), tensorrt_llm_file=tensorrt_llm.__file__, git_sha=sha,
+             marker_file=marker_file, marker=marker, single_process=os.environ.get("TLLM_WORKER_USE_SINGLE_PROCESS"),
+             trtllm_env=sorted(k for k in os.environ if k.startswith("TRTLLM_")), pools=pools)
+    log(f"[{arm}] provenance", json.dumps(p))
+    return p
+
+
 def lifetime(ckpt, arm, cache, ref=None):
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
@@ -178,6 +215,7 @@ def lifetime(ckpt, arm, cache, ref=None):
               cuda_graph_config=CudaGraphConfig(max_batch_size=128),
               kv_cache_config=KvCacheConfig(**kvc))
     log("[%s] LLM ready in %.1fs" % (arm, time.time() - t0))
+    out = {"provenance": provenance(arm)}
     tok = llm.tokenizer
     if "items" not in cache:
         cache["items"] = build_items(tok)
@@ -210,7 +248,6 @@ def lifetime(ckpt, arm, cache, ref=None):
                                 cached=r["cached"])
                 for it, r in zip(items, res)}
 
-    out = {}
     ap = [it["ids"] for it in items]
     gen(ap[:1], "prime", 1, record=False)
     c128 = gen(ap, "acc_c128", ACC_TOKENS)
@@ -322,7 +359,9 @@ def main(ckpt):
                   "and c128@128 vs 11.957, flips vs near-tie margin 23.915; base b1 vs b64 alongside"),
         accuracy=accuracy, teacher_forced_int8_vs_base=tf,
         teacher_forced_base_b1_vs_base_b64=b1,
-        cached=dict(base=base["cached"], int8=cand["cached"]))
+        cached=dict(base=base["cached"], int8=cand["cached"]),
+        acc_max_tokens=ACC_TOKENS,
+        provenance=dict(base=base["provenance"], int8=cand["provenance"]))
     art = os.environ.get("AUTO_DEV_ARTIFACTS")
     if art:
         os.makedirs(art, exist_ok=True)
