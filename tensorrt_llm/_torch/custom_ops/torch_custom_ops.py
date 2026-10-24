@@ -1057,6 +1057,120 @@ class CudaCoreNVFP4Runner(TunableRunner):
         return result
 
 
+class FlashInferCutlassNVFP4Runner(TunableRunner):
+    """FlashInfer's SM120 CUTLASS NVFP4 GEMM (fp4_gemm_cutlass_sm120 JIT module).
+
+    Offered (inside the ``cutlass`` backend, in place of the other tactics)
+    on SM120/121 for the decode row buckets [MIN_M, MAX_M] when TRT-LLM's
+    128x128 CUTLASS grid would fill at most half the SMs. TRT-LLM's own SM120
+    CUTLASS FP4 runner has three 128-wide-N tiles and no swap-AB, so at 64/128
+    rows the N=5120 GEMMs (Qwen3.8 MLP down, GDN out_proj, attention o_proj)
+    get 40 CTAs on 188 SMs and the tuner falls back to cuBLASLt split-K plus a
+    separate splitKreduce, neither launched with PDL. FlashInfer's tiles
+    include 128x32 / 128x64 N tiles and swap-AB (the weight N runs on the
+    128-row MMA side), which fill the grid in one PDL kernel. Behind a real
+    producer (fp4_quantize -> GEMM, CUDA graph, cold L2) they are 1.4-2.6 us
+    per call faster at 64/128 rows; the shapes with >= 112 tiles tie.
+    Only the data-parallel (non stream-K) schedulers are offered: they need
+    no workspace and their reduction order is fixed (bitwise-repeatable).
+    The operand layouts (packed FP4, 128x4-swizzled UE4M3 scale factors,
+    scalar FP32 alpha) are the ones TRT-LLM already produces.
+    Kill switch: TRTLLM_NVFP4_FI_CUTLASS=0.
+    """
+
+    tuning_config = TuningConfig()
+
+    MIN_M = 64
+    MAX_M = 255
+    # FlashInfer tactic id = tile * 4 + {0: swap-AB DP, 1: DP, 2: swap-AB
+    # StreamK, 3: StreamK}; tiles 0-5 are 128x{32,64,128}x{128,256}.
+    TACTICS = tuple(t * 4 + s for t in range(6) for s in (0, 1))
+    _module = None
+    _module_failed = False
+    _workspace = {}
+
+    def __init__(self, output_dtype: torch.dtype):
+        super().__init__()
+        self.output_dtype = output_dtype
+
+    @classmethod
+    def get_module(cls):
+        if cls._module is None and not cls._module_failed:
+            try:
+                from flashinfer.jit.gemm.core import \
+                    gen_gemm_sm120_module_cutlass_fp4
+                cls._module = gen_gemm_sm120_module_cutlass_fp4(
+                ).build_and_load()
+            except Exception as e:  # noqa: BLE001
+                cls._module_failed = True
+                logger.warning(
+                    f"FlashInfer SM120 CUTLASS NVFP4 GEMM unavailable: {e}")
+        return cls._module
+
+    @classmethod
+    def is_supported(cls, act_fp4: torch.Tensor, weight: torch.Tensor,
+                     output_buffer_kind: int, output_dtype: torch.dtype,
+                     group, bias) -> bool:
+        if os.environ.get("TRTLLM_NVFP4_FI_CUTLASS", "1") == "0":
+            return False
+        if get_sm_version() not in (120, 121):
+            return False
+        if bias is not None or group is not None:
+            return False
+        if int(output_buffer_kind) != int(BufferKind.DEFAULT):
+            return False
+        if output_dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if act_fp4.dim() != 2 or weight.dim() != 2:
+            return False
+        m, n, k = act_fp4.shape[0], weight.shape[0], act_fp4.shape[1] * 2
+        if not cls.MIN_M <= m <= cls.MAX_M:
+            return False
+        # Shapes measured: N multiple of 128 (>= 1024), K multiple of 256.
+        if n < 1024 or n % 128 != 0 or k % 256 != 0:
+            return False
+        # Under-filled 128x128 grid only; elsewhere the existing tactics tie.
+        tiles = ((n + 127) // 128) * ((m + 127) // 128)
+        sm_count = torch.cuda.get_device_properties(
+            act_fp4.device).multi_processor_count
+        if 2 * tiles > sm_count:
+            return False
+        return cls.get_module() is not None
+
+    @classmethod
+    def _get_workspace(cls, device: torch.device) -> torch.Tensor:
+        # DP schedulers need no workspace; the FFI signature still takes one.
+        ws = cls._workspace.get(device)
+        if ws is None:
+            ws = torch.empty(1 << 20, dtype=torch.uint8, device=device)
+            cls._workspace[device] = ws
+        return ws
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return list(self.TACTICS)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        **kwargs,
+    ) -> torch.Tensor:
+        act_fp4, weight, act_sf, weight_scale, alpha = inputs
+        if tactic == -1:
+            tactic = self.TACTICS[0]
+        out = torch.empty((act_fp4.shape[0], weight.shape[0]),
+                          dtype=self.output_dtype,
+                          device=act_fp4.device)
+        self.get_module().fp4_gemm(act_fp4.view(torch.uint8),
+                                   weight.view(torch.uint8),
+                                   act_sf.view(torch.uint8),
+                                   weight_scale.view(torch.uint8), alpha, out,
+                                   self._get_workspace(act_fp4.device),
+                                   int(tactic))
+        return out
+
+
 class MarlinNVFP4Runner(TunableRunner):
     """Marlin-based NVFP4 GEMM for SM89 (Ada, e.g. L40S) and SM90 (Hopper).
 
@@ -1396,6 +1510,19 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         tactics = []
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
+        # SM120 decode rows on an under-filled grid (e.g. N=5120 at 64/128
+        # rows: 40 128x128 tiles on 188 SMs): FlashInfer's swap-AB / small-N
+        # CUTLASS tiles fill the grid in one PDL kernel. They are offered
+        # alone: the producer-less tuning graph ranks cuBLASLt split-K (no
+        # PDL, separate splitKreduce) ahead of them, while behind a real
+        # producer they are 3-7% faster (see FlashInferCutlassNVFP4Runner).
+        if self._is_backend_allowed(
+                "cutlass") and FlashInferCutlassNVFP4Runner.is_supported(
+                    act_fp4, weight, self.output_buffer_kind,
+                    self.output_dtype, self.group, kwargs.get("bias")):
+            return [("fi_cutlass", tactic)
+                    for tactic in FlashInferCutlassNVFP4Runner.TACTICS]
+
         # Add Marlin tactics (SM89 Ada / SM90 Hopper) — users must opt-in explicitly
         # by listing "marlin" in ``allowed_backends``.
         if self._is_backend_allowed("marlin"):
@@ -1551,6 +1678,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                  group=self.group)(inputs,
                                                    tactic=sub_tactic,
                                                    bias=bias)
+        elif backend == "fi_cutlass":
+            assert bias is None
+            return FlashInferCutlassNVFP4Runner(self.output_dtype)(
+                inputs, tactic=sub_tactic)
         elif backend == "cublaslt":
             return CublasLtFP4GemmRunner(self.output_buffer_kind,
                                          self.output_dtype,
