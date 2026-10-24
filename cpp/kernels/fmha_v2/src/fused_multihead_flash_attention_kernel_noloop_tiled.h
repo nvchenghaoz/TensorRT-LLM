@@ -293,9 +293,34 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     // every step does the same math in the same order as before (bitwise identical output).
     static constexpr bool PEEL_UNMASKED_KV_STEPS = Kernel_traits::STORE_O_FROM_REGS
         && !Kernel_traits::SLIDING_WINDOW_ATTENTION && !Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION;
+    // Leaner chunk loops in the peeled copy (FMHA_SM120_PEEL_SYNC_OPT, default 1; 0 is the kill switch and compiles
+    // to the previous code). A step has 8 granular chunks (4 Q/K column chunks into 2 K buffers, 4 V row chunks into
+    // 2 V buffers; Q is resident) and 14 barriers: one before each chunk (its data is visible) and one after each
+    // chunk of the two main loops ("done reading": the next chunk's load overwrites the buffer of the chunk before).
+    // With the option, the BMM1 and BMM2 main loops (3 chunks each) are fully unrolled, and the "done reading"
+    // barrier after the LAST main-loop chunk of each (K chunk 2, V chunk 2) is dropped: those buffers are next
+    // overwritten one phase later (the next step's K chunk 0, issued in the BMM2 tail; the next step's V chunk 0,
+    // issued in the BMM1 tail), after at least 4 pre-chunk barriers that every thread passes only once it is done
+    // with that chunk. 12 instead of 14 barriers per step; every load is issued where it was (same prefetch depth),
+    // into the same buffer, and the MMAs run in the same order (bitwise identical output).
+    // Measured (branch 30, b=5 mixed step): the unroll alone is ~4.3% faster, the 2 barriers ~0.5% more. One barrier
+    // per chunk (8 per step: wait for the chunk, barrier, then issue the next load) is bitwise identical too but
+    // 2.7% slower at b=5 and 5.3% slower at b=1: with 2 buffers only one load is then in flight.
+#ifndef FMHA_SM120_PEEL_SYNC_OPT
+#define FMHA_SM120_PEEL_SYNC_OPT 1
+#endif
+    static constexpr bool PEEL_SYNC_OPT = PEEL_UNMASKED_KV_STEPS && FMHA_SM120_PEEL_SYNC_OPT != 0;
     int kv_loop_resume = kv_loop_start;
     if constexpr (PEEL_UNMASKED_KV_STEPS)
     {
+        if constexpr (PEEL_SYNC_OPT)
+        {
+            // The buffer reuse distances above assume these.
+            static_assert(Kernel_traits::BUFFERS_PER_TILE_SMEM_K == 2 && Kernel_traits::BUFFERS_PER_TILE_SMEM_V == 2
+                    && !Kernel_traits::RELOAD_Q && !Kernel_traits::SHARE_SMEM_FOR_K_AND_V
+                    && !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY,
+                "FMHA_SM120_PEEL_SYNC_OPT needs 2 K and 2 V buffers, resident Q and register softmax");
+        }
         int const kv_hot_end
             = params.has_alibi ? kv_loop_start : max(kv_loop_start, min(kv_mask_loop_start, kv_loop_end));
         for (; kv_loop_resume < kv_hot_end; kv_loop_resume += Cta_tile_p::N)
@@ -310,6 +335,9 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
             fmha::Clear_accumulator<Acc_type_p, Cta_tile_p::WARPS_K>::apply(acc_p);
 
             // BMM1 main loop
+#if FMHA_SM120_PEEL_SYNC_OPT
+#pragma unroll
+#endif
             for (int bmm1_k = 0; bmm1_k < BMM1_MAIN_MMAS_K_BOUND; bmm1_k += Mma_tile_p::MMAS_K)
             {
 
@@ -351,8 +379,20 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
                     fmha::gemm(acc_p, frag_q[ki], frag_k[ki]);
                 }
 
-                // Make sure we are done reading the data (smem).
-                __syncthreads();
+                if constexpr (PEEL_SYNC_OPT)
+                {
+                    // Make sure we are done reading the data (smem), except after the last main-loop chunk (its
+                    // buffer is next overwritten by the next step's K chunk 0, after 4 more barriers).
+                    if (bmm1_k + Mma_tile_p::MMAS_K < BMM1_MAIN_MMAS_K_BOUND)
+                    {
+                        __syncthreads();
+                    }
+                }
+                else
+                {
+                    // Make sure we are done reading the data (smem).
+                    __syncthreads();
+                }
 
                 smem_q.move_to_next_read_buffer();
                 smem_k.move_to_next_read_buffer();
@@ -496,6 +536,9 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
             softmax.pack(frag_p);
 
             // BMM2 main loop
+#if FMHA_SM120_PEEL_SYNC_OPT
+#pragma unroll
+#endif
             for (int bmm2_k = 0; bmm2_k < BMM2_MAIN_MMAS_K_BOUND; bmm2_k += Mma_tile_o::MMAS_K)
             {
                 // Trigger the load for next V values
@@ -519,8 +562,20 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
                     fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
                 }
 
-                // Make sure we are done reading the data (smem).
-                __syncthreads();
+                if constexpr (PEEL_SYNC_OPT)
+                {
+                    // Make sure we are done reading the data (smem), except after the last main-loop chunk (its
+                    // buffer is next overwritten by the next step's V chunk 0, after 4 more barriers).
+                    if (bmm2_k + Mma_tile_o::MMAS_K < BMM2_MAIN_MMAS_K_BOUND)
+                    {
+                        __syncthreads();
+                    }
+                }
+                else
+                {
+                    // Make sure we are done reading the data (smem).
+                    __syncthreads();
+                }
 
                 smem_v.move_to_next_read_buffer();
             }
