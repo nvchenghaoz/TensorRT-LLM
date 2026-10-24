@@ -189,7 +189,14 @@ def provenance(arm):
                                   ssm_state_shape=list(getattr(o, "ssm_state_shape", []))))
         except Exception:  # noqa: BLE001
             continue
+    try:
+        import tensorrt_llm._torch.modules.fla.gdn_decode_t1 as t1m
+        import tensorrt_llm._torch.modules.fla.gdn_state_q8 as q8m
+        q8_format = dict(gdn_state_q8=q8m.Q8_FORMAT, gdn_decode_t1=t1m.Q8_FORMAT)
+    except Exception as e:  # noqa: BLE001
+        q8_format = f"unavailable: {e}"
     p = dict(pid=os.getpid(), tensorrt_llm_file=tensorrt_llm.__file__, git_sha=sha,
+             q8_format=q8_format,
              marker_file=marker_file, marker=marker, single_process=os.environ.get("TLLM_WORKER_USE_SINGLE_PROCESS"),
              trtllm_env=sorted(k for k in os.environ if k.startswith("TRTLLM_")), pools=pools)
     log(f"[{arm}] provenance", json.dumps(p))
