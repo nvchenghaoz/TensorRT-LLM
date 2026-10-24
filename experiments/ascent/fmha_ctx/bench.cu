@@ -393,6 +393,21 @@ static bool make_case(std::string const& name_in, Problem& p)
         p.q_lens = {2048, 2048, 2048}; // c4 serving's trio prefill: 3 x 32 x 24 = 2304 CTAs
         p.past_lens = {P, P, P};
     }
+    else if (name == "K0")
+    {
+        p.q_lens = {2048, 2048, 2048, 1984}; // b = 4 mixed-step context part
+        p.past_lens = {P, P, P, P};
+    }
+    else if (name == "K1")
+    {
+        p.q_lens = {2048, 2048, 2048, 1920, 64}; // c64 mixed step (t = 8128)
+        p.past_lens = {P, P, P, P, P};
+    }
+    else if (name == "K2")
+    {
+        p.q_lens = {2048, 2048, 2048, 1856, 64}; // c128 mixed step (t = 8064)
+        p.past_lens = {P, P, P, P, P};
+    }
     else if (name == "c1_1984")
     {
         p.q_lens = {1984}; // 31 x 24 = 744 CTAs (tail-wave probe)
