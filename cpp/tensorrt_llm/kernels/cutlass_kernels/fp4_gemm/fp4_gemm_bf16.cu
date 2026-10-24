@@ -100,6 +100,12 @@ size_t nvfp4SwigluGemmSm120(void const* A, void const* B, void const* inputSf, v
         return swiglu_nvfp4_sm120::runSwigluNvfp4GemmSm120<256, 128, 128>(A, B, inputSf, weightSf, alpha, outScale,
             fp4Out, sfOut, m, n, k, workspace, workspaceBytes, stream, enablePdl);
     }
+    if (tile == 2)
+    {
+        // 128x128x256 with the MMAs of tile rows 64-127 skipped (m <= 64 only).
+        return swiglu_nvfp4_sm120::runSwigluNvfp4GemmSm120<128, 128, 256, true>(A, B, inputSf, weightSf, alpha,
+            outScale, fp4Out, sfOut, m, n, k, workspace, workspaceBytes, stream, enablePdl);
+    }
     return swiglu_nvfp4_sm120::runSwigluNvfp4GemmSm120<128, 128, 256>(A, B, inputSf, weightSf, alpha, outScale,
         fp4Out, sfOut, m, n, k, workspace, workspaceBytes, stream, enablePdl);
 #endif
