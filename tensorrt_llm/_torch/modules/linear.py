@@ -2502,13 +2502,21 @@ _FP8_NVFP4_DECODE_ENV = "TRTLLM_GDN_INPROJ_NVFP4_DECODE"
 #  - (14336, 5120): gated-attention qkv_proj (x16);
 #  - (5120, 6144): GDN out_proj (x48) and gated-attention o_proj (x16);
 #  - (16384, 5120): GDN in_proj_qkvz (x48).
+# qkv_proj (14336, 5120) runs Marlin up to 64 rows (c64 decode, M=64): at rows
+# 33-64 Marlin (generic 3-4 m-block launch, FP32 reduce) is 51.2/54.7 us vs the
+# W4A4 Q+gate chain + K/V FP8 GEMM 62.5/63.0 us at rows 33/64 (cold-L2 graph,
+# PDL). The other shapes stay at 32: from 33 rows Marlin loses (qkvz 59.4 vs
+# 52.7 us at 64; (5120, 6144) 27.5 vs 22.9 us for the producer-quantized W4A4
+# GEMM). Rows > 64 need a second Marlin m pass and keep W4A4 (c128 unchanged).
 # Kill switch, read at weight load: TRTLLM_FP8_NVFP4_DECODE_WIDE=0 keeps every
-# shape at _FP8_NVFP4_DECODE_MAX_ROWS.
+# shape at _FP8_NVFP4_DECODE_MAX_ROWS; TRTLLM_FP8_NVFP4_DECODE_QKV64=0 keeps
+# qkv_proj at 32.
 _FP8_NVFP4_DECODE_ROW_CAPS = {
-    (14336, 5120): 32,
+    (14336, 5120): 64,
     (5120, 6144): 32,
     (16384, 5120): 32,
 }
+_FP8_NVFP4_DECODE_QKV64_ENV = "TRTLLM_FP8_NVFP4_DECODE_QKV64"
 _FP8_NVFP4_DECODE_WIDE_ENV = "TRTLLM_FP8_NVFP4_DECODE_WIDE"
 # Kill switch for in_proj_qkvz only, read at weight load:
 # TRTLLM_FP8_NVFP4_DECODE_WIDE_QKVZ=0 keeps (16384, 5120) at 16 rows (W4A4 above).
@@ -2527,6 +2535,9 @@ def _fp8_nvfp4_decode_row_cap(module: Linear) -> int:
     if key == (16384, 5120) and os.environ.get(
             _FP8_NVFP4_DECODE_WIDE_QKVZ_ENV, "1") == "0":
         return _FP8_NVFP4_DECODE_MAX_ROWS
+    if key == (14336, 5120) and os.environ.get(_FP8_NVFP4_DECODE_QKV64_ENV,
+                                               "1") == "0":
+        return 32
     return max(_FP8_NVFP4_DECODE_MAX_ROWS,
                _FP8_NVFP4_DECODE_ROW_CAPS.get(key, 0))
 
