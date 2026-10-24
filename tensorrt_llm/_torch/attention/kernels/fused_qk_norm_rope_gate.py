@@ -72,6 +72,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
     use_mrope: tl.constexpr,
     mrope_section1: tl.constexpr,
     mrope_section2: tl.constexpr,
+    store_gate: tl.constexpr = True,
 ):
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
@@ -157,11 +158,12 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
             mask=rotary_mask,
         )
 
-        if not is_k:
-            gate_input = input_base + head_dim
-            gate_output = gate_out_ptr + token * gate_out_stride_token + local_head * head_dim
-            gate = tl.load(gate_input + head_offsets, mask=head_mask, other=0.0)
-            tl.store(gate_output + head_offsets, gate, mask=head_mask)
+        if store_gate:
+            if not is_k:
+                gate_input = input_base + head_dim
+                gate_output = gate_out_ptr + token * gate_out_stride_token + local_head * head_dim
+                gate = tl.load(gate_input + head_offsets, mask=head_mask, other=0.0)
+                tl.store(gate_output + head_offsets, gate, mask=head_mask)
     else:
         local_head = head - num_q_heads - num_kv_heads
         head_offsets = tl.arange(0, head_block)
@@ -176,11 +178,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
         tl.store(output_base + head_offsets, value, mask=head_mask)
 
 
-@torch.library.custom_op(
-    "trtllm::fused_qkv_gemma_rmsnorm_rope_gate",
-    mutates_args=(),
-)
-def _fused_qkv_gemma_rmsnorm_rope_gate(
+def _launch_qkv_gemma_rmsnorm_rope_gate(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
@@ -194,7 +192,8 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
     use_mrope: bool,
     mrope_section1: int,
     mrope_section2: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    store_gate: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     assert qkv.dim() == 2 and qkv.stride(-1) == 1
     assert qkv.dtype in (torch.bfloat16, torch.float16)
     assert q_weight.shape == (head_dim,) and k_weight.shape == (head_dim,)
@@ -227,7 +226,15 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
     assert qkv.shape[1] == 2 * q_size + 2 * kv_size
 
     qkv_out = torch.empty((num_tokens, q_size + 2 * kv_size), dtype=qkv.dtype, device=qkv.device)
-    gate_out = torch.empty((num_tokens, num_q_heads, head_dim), dtype=qkv.dtype, device=qkv.device)
+    if store_gate:
+        gate_out = torch.empty(
+            (num_tokens, num_q_heads, head_dim), dtype=qkv.dtype, device=qkv.device
+        )
+        gate_arg, gate_stride = gate_out, gate_out.stride(0)
+    else:
+        # The kernel never touches gate_out_ptr when store_gate is False.
+        gate_out = None
+        gate_arg, gate_stride = qkv_out, num_q_heads * head_dim
     if num_tokens == 0:
         return qkv_out, gate_out
 
@@ -238,7 +245,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
     _fused_qkv_gemma_rmsnorm_rope_gate_kernel[grid](
         qkv,
         qkv_out,
-        gate_out,
+        gate_arg,
         q_weight,
         k_weight,
         cos_sin,
@@ -248,7 +255,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
         cos_sin.shape[0],
         qkv.stride(0),
         qkv_out.stride(0),
-        gate_out.stride(0),
+        gate_stride,
         cos_sin.stride(0),
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -263,9 +270,122 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
         use_mrope=use_mrope,
         mrope_section1=mrope_section1,
         mrope_section2=mrope_section2,
+        store_gate=store_gate,
         num_warps=4,
     )
     return qkv_out, gate_out
+
+
+@torch.library.custom_op(
+    "trtllm::fused_qkv_gemma_rmsnorm_rope_gate",
+    mutates_args=(),
+)
+def _fused_qkv_gemma_rmsnorm_rope_gate(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    use_mrope: bool,
+    mrope_section1: int,
+    mrope_section2: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _launch_qkv_gemma_rmsnorm_rope_gate(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        use_mrope,
+        mrope_section1,
+        mrope_section2,
+        True,
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::fused_qkv_gemma_rmsnorm_rope_nogate",
+    mutates_args=(),
+)
+def _fused_qkv_gemma_rmsnorm_rope_nogate(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    use_mrope: bool,
+    mrope_section1: int,
+    mrope_section2: int,
+) -> torch.Tensor:
+    """Packed QKV only; the gate is left in ``qkv`` (custom ops may not
+    return views of their inputs, so the caller builds the gate view)."""
+    qkv_out, _ = _launch_qkv_gemma_rmsnorm_rope_gate(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        use_mrope,
+        mrope_section1,
+        mrope_section2,
+        False,
+    )
+    return qkv_out
+
+
+@_fused_qkv_gemma_rmsnorm_rope_nogate.register_fake
+def _(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    use_mrope: bool,
+    mrope_section1: int,
+    mrope_section2: int,
+) -> torch.Tensor:
+    num_tokens = qkv.shape[0]
+    qkv_width = (num_q_heads + 2 * num_kv_heads) * head_dim
+    return qkv.new_empty((num_tokens, qkv_width))
+
+
+# TRTLLM_ROPE_GATE_VIEW=0 restores the gate copy into a separate
+# [num_tokens, num_q_heads, head_dim] buffer.
+_ROPE_GATE_VIEW = os.environ.get("TRTLLM_ROPE_GATE_VIEW", "1") != "0"
+
+
+def qkv_output_gate_view(qkv: torch.Tensor, num_q_heads: int,
+                         head_dim: int) -> torch.Tensor:
+    """Gate halves of the interleaved ``[q0, g0, q1, g1, ..., K, V]``
+    projection as a ``[num_tokens, num_q_heads, head_dim]`` strided view
+    (stride(-1) == 1, stride(1) == 2 * head_dim, stride(0) == qkv.stride(0))."""
+    q_size = num_q_heads * head_dim
+    return qkv[:, :2 * q_size].unflatten(1, (num_q_heads, 2 * head_dim))[:, :, head_dim:]
 
 
 @_fused_qkv_gemma_rmsnorm_rope_gate.register_fake
@@ -304,8 +424,13 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     head_dim: int,
     rotary_dim: int,
     mrope_section: Optional[Tuple[int, int, int]] = None,
+    gate_view: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Prepare packed QKV and gate with one Triton kernel.
+
+    With ``gate_view`` (default: TRTLLM_ROPE_GATE_VIEW, on) the gate is
+    returned as a strided view of ``qkv`` instead of being copied, so the
+    caller must keep ``qkv`` unmodified until the gate is consumed.
 
     Args:
         qkv: ``[num_tokens, 2 * q_size + 2 * kv_size]`` BF16/FP16 projection
@@ -336,6 +461,25 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     else:
         mrope_section1 = 0
         mrope_section2 = 0
+    if gate_view is None:
+        gate_view = _ROPE_GATE_VIEW
+    if gate_view:
+        qkv_out = _fused_qkv_gemma_rmsnorm_rope_nogate(
+            qkv,
+            q_weight,
+            k_weight,
+            cos_sin,
+            positions,
+            eps,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            use_mrope,
+            mrope_section1,
+            mrope_section2,
+        )
+        return qkv_out, qkv_output_gate_view(qkv, num_q_heads, head_dim)
     return _fused_qkv_gemma_rmsnorm_rope_gate(
         qkv,
         q_weight,
