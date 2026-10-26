@@ -30,6 +30,16 @@ l0_rtx_pro_6000:
   - unittest/_torch/kernels/parallel/test_weight_only_quant_gemm.py
   - unittest/_torch/kernels/parallel/test_w4a8_linear.py
   - unittest/_torch/modules/mamba/test_flashinfer_chunk_gdn.py
+  # The Qwen3.8-27B modeling_v2 target's ops, certified on sm_120, and the catalog
+  # entries it calls.
+  - unittest/_torch/modeling_v2/models/qwen3_5
+  - unittest/_torch/modeling_v2/activation/test_modeling_v2_fused_sigmoid_mul_inplace.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_gemma_rmsnorm.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_rms_norm_gated_token_major.py
+  - unittest/_torch/modeling_v2/quantization/test_modeling_v2_fp4_quantize.py
+  - unittest/_torch/modeling_v2/ssm/test_modeling_v2_reset_recurrent_state_rows.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B] # 3mins
@@ -60,6 +70,8 @@ l0_rtx_pro_6000:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False] # 8mins
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True] # 8 mins
   - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4_w4a16
+  - accuracy/modeling_v2/test_qwen3_5.py::TestModelingV2Qwen3827BNvfp4Sm120Tp1::test_gsm8k
+  - accuracy/modeling_v2/test_qwen3_5.py::TestModelingV2Qwen3827BNvfp4Sm120Tp1::test_shared_prefix_retrieval
 
 - condition:
     ranges:

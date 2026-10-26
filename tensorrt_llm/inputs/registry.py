@@ -214,12 +214,13 @@ class BaseMultimodalInputProcessor(ABC):
     def _encode_with_tokenization_cache(
             self, prompt: str,
             sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
-        if (self._prefix_token_cache is None or sampling_params is None
-                or sampling_params.add_special_tokens
+        cache = getattr(self, "_prefix_token_cache", None)
+        if (cache is None or sampling_params is None
+                or (sampling_params.add_special_tokens
+                    and not cache.serves_special_tokens)
                 or sampling_params.truncate_prompt_tokens is not None):
             return None
-        return self._prefix_token_cache.encode(
-            self._prefix_token_cache_tokenizer, prompt)
+        return cache.encode(self._prefix_token_cache_tokenizer, prompt)
 
     def attach_multimodal_embeddings(
         self,

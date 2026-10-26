@@ -69,6 +69,7 @@ struct AttentionContextWorkspaceSizes
     size_t sageKMeanSum{};
     size_t cpWorkspace{};
     size_t fmhaMultiCtasKvScratch{};
+    size_t contextFmhaSm120Target{};
 };
 
 struct AttentionContextWorkspaceLayout
@@ -102,6 +103,7 @@ struct AttentionContextWorkspaceLayout
     WorkspaceSlice sageKMeanSum{};
     WorkspaceSlice cpWorkspace{};
     WorkspaceSlice fmhaMultiCtasKvScratch{};
+    WorkspaceSlice contextFmhaSm120Target{};
     size_t totalSize{};
 };
 
@@ -139,6 +141,7 @@ struct AttentionContextWorkspaceViews
     T* gatherOutBuffer{};
     int* cuCpPartialSeqlens{};
     void* fmhaMultiCtasKvScratch{};
+    void* contextFmhaSm120Target{};
 };
 
 struct AttentionGenerationWorkspaceSizes
@@ -264,6 +267,7 @@ public:
         layout.sageKMeanSum = nextSlice(offset, sizes.sageKMeanSum, alignment);
         layout.cpWorkspace = nextSlice(offset, sizes.cpWorkspace, alignment);
         layout.fmhaMultiCtasKvScratch = nextSlice(offset, sizes.fmhaMultiCtasKvScratch, alignment);
+        layout.contextFmhaSm120Target = nextSlice(offset, sizes.contextFmhaSm120Target, alignment);
         layout.totalSize = offset;
         return layout;
     }
@@ -311,6 +315,7 @@ public:
             views.cuCpPartialSeqlens = reinterpret_cast<int*>(views.gatherOutBuffer + cpBufferElements);
         }
         views.fmhaMultiCtasKvScratch = ptr<void>(workspace, layout.fmhaMultiCtasKvScratch);
+        views.contextFmhaSm120Target = ptr<void>(workspace, layout.contextFmhaSm120Target);
         return views;
     }
 

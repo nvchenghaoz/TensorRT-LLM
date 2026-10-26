@@ -57,7 +57,14 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
 # ``thop.attention`` kwargs hard-wired to a literal at the call site (no
 # rich object owns them). Sync test enforces both the kwarg name and the
 # literal value.
-_THOP_LITERALS: dict = {}
+_THOP_LITERALS: dict = {
+    # SM120 kernel opt-ins of a modeling_v2 target's own attention call; this
+    # backend keeps the stock kernels.
+    "xqa_one_wave_multi_block": False,
+    "xqa_shared_prefix_min_batch": 0,
+    "context_fmha_sm120_target": False,
+    "context_fmha_skip_leading_q_tiles": False,
+}
 
 
 class FallbackFmha(Fmha):
@@ -420,6 +427,10 @@ class FallbackFmha(Fmha):
             skip_softmax_stat=attn.skip_softmax_stat,
             skip_correction_threshold=attn.skip_correction_threshold,
             uses_spcompress=attn.uses_spcompress,
+            xqa_one_wave_multi_block=False,
+            xqa_shared_prefix_min_batch=0,
+            context_fmha_sm120_target=False,
+            context_fmha_skip_leading_q_tiles=False,
             # --- Sparse runtime parameters ---
             sparse_kv_indices=forward_args.sparse_runtime_params.sparse_kv_indices,
             sparse_kv_offsets=forward_args.sparse_runtime_params.sparse_kv_offsets,

@@ -5540,11 +5540,13 @@ def _op_reference(
     e4m3: bool = False,
     layer: Optional[int] = None,
     nvfp4: bool = False,
+    skip_leading_q_tiles: bool = False,
 ) -> torch.Tensor:
     """`op.reference` over the history the env mirrored for these requests.
 
     nvfp4=True reads K and V as an NVFP4 pool returns them (the history
     through `_nvfp4_roundtrip`) before the e4m3 arithmetic `e4m3` selects.
+    skip_leading_q_tiles=True leaves the rows the op does not write NaN.
 
     Call it after the op call, so each history ends with this call's K/V:
     `reference`'s bottom-right alignment then puts this call's q rows at the
@@ -5572,6 +5574,7 @@ def _op_reference(
         causal=causal,
         e4m3_inputs=e4m3,
         e4m3_probabilities=e4m3,
+        context_fmha_skip_leading_q_tiles=skip_leading_q_tiles,
     )
 
 
@@ -7092,6 +7095,32 @@ def _seed(cell) -> None:
     torch.manual_seed(zlib.crc32(cell.why.encode()))
 
 
+def _fill_history(env, rids, lens, paged) -> None:
+    """One uncertified context call appending `lens` tokens to each of `rids`."""
+    env.call_op(
+        env.random_qkv(sum(lens)),
+        lens,
+        len(rids),
+        rids,
+        MASK_CAUSAL,
+        ctx_lens_override=lens,
+        use_paged_context_fmha=paged,
+    )
+
+
+def _share_prefix(env, rids, tokens) -> None:
+    """Point every sequence after the first at the first one's leading `tokens` (whole
+    pages) and mirror them into its history: one physical prefix in every page table,
+    as KV-cache block reuse leaves it."""
+    assert tokens % env.tokens_per_block == 0, "a shared prefix is whole pages"
+    first = rids[0]
+    k, v = torch.cat(env.k_history[first]), torch.cat(env.v_history[first])
+    for rid in rids[1:]:
+        env.pages[rid] = env.pages[first][: tokens // env.tokens_per_block]
+        env.k_history[rid] = [k[:tokens]]
+        env.v_history[rid] = [v[:tokens]]
+
+
 def _cell_paged(cell, arm) -> None:
     """A standard-configuration cell over a single-layer paged pool.
 
@@ -7100,6 +7129,11 @@ def _cell_paged(cell, arm) -> None:
     row) and is gated against `op.reference` over the history it should have
     attended. Over an fp8 or NVFP4 pool every operand that call reads went through
     e4m3, except on the packed context path, which never reads the pool.
+
+    With `shared_prefix`, the first sequence's history is filled first and its
+    leading pages become every other sequence's prefix, whose own tokens follow.
+    `opt_ins` are passed to the certified call only; with leading q-tiles
+    skipped, the rows `reference` leaves undefined are not compared.
     """
     spec = cell.spec
     arm(op)
@@ -7113,30 +7147,29 @@ def _cell_paged(cell, arm) -> None:
         tokens_per_block=spec["tokens_per_block"],
         num_blocks=spec["num_blocks"],
         max_batch=spec["max_num_requests"],
-        max_blocks_per_seq=16,
+        max_blocks_per_seq=spec.get("max_blocks_per_seq", 16),
         pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         quant_mode=spec["quant_mode"],
         kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
     )
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
     p, paged = spec["predicted_tokens_per_seq"], spec["use_paged_context_fmha"]
+    opt_ins = dict(spec.get("opt_ins", {}))
+    shared = spec.get("shared_prefix", 0)
     assert all(n == p for n in new[nc:]), "a generation row carries P q rows"
     assert paged or not any(cached[:nc]), "a cached prefix needs the paged-context path"
     rids = list(range(len(new)))
     for rid in rids:
         env.add_request(rid, cached[rid] + (new[rid] if rid < nc else 0))
-    prior = [rid for rid in rids if cached[rid]]
-    if prior:
-        hist = [cached[rid] for rid in prior]
-        env.call_op(
-            env.random_qkv(sum(hist)),
-            hist,
-            len(prior),
-            prior,
-            MASK_CAUSAL,
-            ctx_lens_override=hist,
-            use_paged_context_fmha=paged,
-        )
+    if shared:
+        assert paged and all(c > shared for c in cached), "every sequence extends the prefix"
+        _fill_history(env, rids[:1], [cached[0]], paged)
+        _share_prefix(env, rids, shared)
+        _fill_history(env, rids[1:], [cached[rid] - shared for rid in rids[1:]], paged)
+    else:
+        prior = [rid for rid in rids if cached[rid]]
+        if prior:
+            _fill_history(env, prior, [cached[rid] for rid in prior], paged)
     qkv = env.random_qkv(sum(new))
     out = env.call_op(
         qkv,
@@ -7147,6 +7180,7 @@ def _cell_paged(cell, arm) -> None:
         ctx_lens_override=[new[i] if i < nc else env.prompt_lens[i] for i in rids],
         use_paged_context_fmha=paged,
         predicted_tokens_per_seq=p,
+        op_overrides=opt_ins,
     )
     # One e4m3 flag covers the whole call: the packed path's context rows read
     # bf16, its generation rows e4m3, so a cell never mixes the two there.
@@ -7154,7 +7188,18 @@ def _cell_paged(cell, arm) -> None:
     assert not (nvfp4 and not paged), "an NVFP4 cell runs the paged-context path"
     e4m3 = (fp8 or nvfp4) and (paged or nc == 0)
     causal = spec["mask_type"] == MASK_CAUSAL
-    _compare(out, _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3, nvfp4=nvfp4))
+    ref = _op_reference(
+        env,
+        qkv,
+        list(new),
+        rids,
+        causal=causal,
+        e4m3=e4m3,
+        nvfp4=nvfp4,
+        skip_leading_q_tiles=opt_ins.get("context_fmha_skip_leading_q_tiles", False),
+    )
+    defined = ~ref.isnan().any(dim=1)
+    _compare(out[defined], ref[defined])
     for rid in rids:
         env.check_cache(rid)
     env.check_unwritten_pool_zero()

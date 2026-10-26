@@ -108,6 +108,12 @@ struct XQAParams
     bool cross_attention;
     int max_distance = 0;
     bool multi_block_mode;
+    // SM120/121 HMMA kernel_mha with head size 256: cap the multi-block sub-sequence count so that all CTAs of a call
+    // fit in one wave (SMs / (batch * kvHeads)). Not applied when TRTLLM_XQA_BLOCKS_PER_SEQUENCE is set.
+    bool one_wave_multi_block = false;
+    // SM120/121 HMMA kernel_mha with head size 256, FP8 KV cache and BF16 input: from this batch size on (at least 2),
+    // run the shared-prefix (cascade) pass kernel_mha_prefix before kernel_mha. 0 disables it.
+    int32_t shared_prefix_min_batch = 0;
     bool multi_query_tokens = false;
     bool is_spec_dec_tree
         = true; // by default, XQA spec-dec expect tree-based draft token, only affective when multi_query_tokens = true
@@ -211,6 +217,8 @@ struct XQAParams
            << "cross_attention: " << (cross_attention ? "true" : "false") << std::endl
            << "max_distance: " << max_distance << std::endl
            << "multi_block_mode: " << (multi_block_mode ? "true" : "false") << std::endl
+           << "one_wave_multi_block: " << (one_wave_multi_block ? "true" : "false") << std::endl
+           << "shared_prefix_min_batch: " << shared_prefix_min_batch << std::endl
            << "multi_query_tokens: " << (multi_query_tokens ? "true" : "false") << std::endl
            << "logn_scaling_ptr :" << logn_scaling_ptr << std ::endl
            << "total_num_input_tokens :" << total_num_input_tokens << std ::endl

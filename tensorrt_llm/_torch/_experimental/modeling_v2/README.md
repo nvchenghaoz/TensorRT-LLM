@@ -244,6 +244,37 @@ beyond the two allreduce and all-to-all rows above:
 | dense MLP (layers 0-2) at tp8 over two trays | split 4 ways inside a tray (`_compute_mlp_tp_size`) | split 8 ways, completed by the same allreduce |
 | fusions around the norms | NVFP4 quantization fused into the norm, MoE allreduce fused with the residual add | separate quantize and norm calls |
 
+`qwen3_8_27b_nvfp4__sm_120__tp1` (family `qwen3_5`, architecture
+`Qwen3_5ForConditionalGeneration`) is the dense Qwen3.5 Gated-DeltaNet hybrid on one
+RTX PRO 6000 Blackwell, tuned for long shared-prefix serving from concurrency 1 to 128.
+It claims the ModelOpt MIXED_PRECISION checkpoint (FP8 attention and Gated-DeltaNet
+projections, NVFP4 MLP and lm_head) with an fp8 KV cache
+(`kv_cache_config.dtype='fp8'`) and the 8-bit recurrent-state pool
+(`kv_cache_config.mamba_ssm_cache_dtype='int8'`, which only a target that claims the
+model may ask for), without speculative decoding and with eager prefill steps. The
+vision half of the composite checkpoint is not part of it: it serves text, and a request
+carrying images or video fails with an error that names `modeling_v2='off'`.
+
+Every projection is routed by the step's row count: the FP8 projections run load-time
+NVFP4 copies of their weights (a CUDA-core W4A16 GEMV at the fewest rows, W4A16 Marlin
+up to 32 or 64 rows, W4A4 above), and the producers before a W4A4 GEMM quantize in
+their own epilogue. Its CUDA kernels live in `cpp/tensorrt_llm/kernels/qwen35/` and
+`cpp/tensorrt_llm/thop/qwen35/`; the shared attention op and Marlin GEMM gained
+arguments, off by default, that only this target sets: the one-wave XQA multi-block
+cap, the shared-prefix (cascade) XQA decode, the target's SM120 context FMHA and
+Marlin's launch tables for this checkpoint's shapes.
+
+Where it differs from the built-in `Qwen3_5VLModel` at the same settings:
+
+| | built-in | this target |
+|---|---|---|
+| FP8 projections | FP8 x FP8 (static input scales) | NVFP4 copies: W4A16 at decode rows, W4A4 above |
+| lm_head | NVFP4 entry dequantized to a bf16 weight | the checkpoint's NVFP4: W4A16 Marlin below 56 rows, W4A4 (fp32 logits) from 56 |
+| recurrent state | bf16 | 8-bit rows with fp32 row scales |
+| context softmax | `expf` | base-2 `ex2.approx` |
+| shared-prefix decode | each request's KV walked alone | one prefix pass over all requests (FP8 Q/P), each suffix alone |
+| final layer of a long prefill step | every row | gate, o_proj, MLP and final norm on the read rows only |
+
 ### Why beside `_torch/models/`, not inside it
 
 Targets are not registered in the model zoo: `route` returns the class and the
@@ -284,7 +315,8 @@ Perf is measured, never gated.
 
 **Every entry the gpt-oss and deepseek default targets call is certified on
 sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp target
-and the entries it owns are certified on sm_103.
+and the entries it owns are certified on sm_103. The qwen3_5 target and the entries
+it owns are certified on sm_120.
 
 The default targets' 21 entries -- 20 shared, 1 (`fused_moe`) owned by deepseek's default target -- each drive
 their cells through `__call__` and `reference`. Where that runs depends on the

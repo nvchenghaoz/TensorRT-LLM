@@ -55,8 +55,10 @@ from tensorrt_llm._utils import (
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, KvCacheStats
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+    MAX_SNAPSHOT_COPY_POOLS,
     IndexMapper,
     copy_batch_block_offsets_to_device,
+    copy_batch_block_offsets_to_device_via_snapshot,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
 from tensorrt_llm.logger import logger
@@ -1448,6 +1450,13 @@ def _swa_branch_snapshot_point(
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
+    # Copy batch block offsets through a host-gathered pinned snapshot
+    # (_copy_batch_block_offsets_via_snapshot). Off unless the model opts in.
+    block_offset_snapshot_copy: bool = False
+    # Depth of the pinned snapshot ring. The overlap scheduler enqueues at most one
+    # step ahead, so a slot is long consumed by the time it comes around again; the
+    # slot's event makes that a guarantee, not an assumption.
+    _BLOCK_OFFSET_SNAPSHOT_RING = 3
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -7626,6 +7635,10 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
+        if self._can_copy_block_offsets_via_snapshot(dst_tensor):
+            self._copy_batch_block_offsets_via_snapshot(dst_tensor, copy_idx)
+            return
+
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,
@@ -7634,6 +7647,65 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_offset,
             self._stream.cuda_stream,
         )
+
+    def _can_copy_block_offsets_via_snapshot(self, dst_tensor: torch.Tensor) -> bool:
+        return (
+            self.block_offset_snapshot_copy
+            and dst_tensor.is_cuda
+            and not self.host_kv_cache_block_offsets.is_cuda
+            and self.host_kv_cache_block_offsets.shape[0] <= MAX_SNAPSHOT_COPY_POOLS
+            and dst_tensor.shape[-1] == self.host_kv_cache_block_offsets.shape[-1]
+            and prefer_pinned()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _copy_batch_block_offsets_via_snapshot(
+        self, dst_tensor: torch.Tensor, copy_idx: torch.Tensor
+    ) -> None:
+        """Same destination as ``copy_batch_block_offsets_to_device``, bitwise.
+
+        The stock kernel reads the page table, the copy index and the per-pool
+        scales and offsets zero-copy from pinned host memory when it runs. Here the
+        scheduled rows' K planes are gathered on the host at enqueue time into a
+        private pinned snapshot and the scales and offsets travel as kernel
+        parameters, so the kernel only streams the snapshot, and the queued copy no
+        longer depends on the host page table or copy index, which the overlap
+        scheduler may rewrite for the next batch while the copy is still queued.
+        """
+        host = self.host_kv_cache_block_offsets
+        num_pools, num_rows, _, num_blocks = host.shape
+        num_seqs = copy_idx.shape[0]
+        needed = num_pools * num_seqs * num_blocks
+        ring = getattr(self, "_block_offset_snapshots", None)
+        if ring is None or ring[0][0].numel() < needed:
+            if ring is not None:
+                for _, event in ring:
+                    event.synchronize()
+            capacity = num_pools * max(num_rows, num_seqs) * num_blocks
+            ring = [
+                (
+                    torch.empty(capacity, dtype=torch.int32, device="cpu", pin_memory=True),
+                    torch.cuda.Event(),
+                )
+                for _ in range(self._BLOCK_OFFSET_SNAPSHOT_RING)
+            ]
+            self._block_offset_snapshots = ring
+            self._block_offset_snapshot_next = 0
+        slot = self._block_offset_snapshot_next
+        self._block_offset_snapshot_next = (slot + 1) % len(ring)
+        snapshot, event = ring[slot]
+        # The slot's previous copy must have consumed its snapshot before it is overwritten.
+        event.synchronize()
+        copy_batch_block_offsets_to_device_via_snapshot(
+            host,
+            snapshot,
+            dst_tensor,
+            copy_idx,
+            self.index_scales,
+            self.kv_offset,
+            self._stream.cuda_stream,
+        )
+        event.record(self._stream)
 
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> str | None:

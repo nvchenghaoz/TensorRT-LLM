@@ -7,9 +7,11 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: The hyper-connection residual: hc_count 4 streams of hidden 2560, row stride 10240.
+from .._op import Arch, Cell, OpWrapper
+
+#: qwen3.8-flash-next's hyper-connection residual: hc_count 4 streams of hidden 2560, row
+#: stride 10240.
 _STREAM = dict(row_width=10240, dtype=torch.bfloat16, eps=1e-6)
 
 
@@ -22,15 +24,18 @@ class FlashinferGemmaRmsnorm(OpWrapper):
     kernel), normalized over the last dim; `x` is not mutated.
 
     Fusion boundary: normalization and the biased weight only. No residual add
-    (`flashinfer_gemma_fused_add_rmsnorm` exists for that), no quantization; the
-    plain-`w` form is `flashinfer_rmsnorm`.
+    (the trtllm op `flashinfer_gemma_fused_add_rmsnorm` does that), no quantization;
+    the plain-`w` form is `flashinfer_rmsnorm`.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_120})
 
-    # The target's grouped norm is one call per 2560-wide stream of the
-    # 10240-wide residual, each a column slice at row stride 10240 -- that, not
-    # a contiguous row, is what the strided-kernel cells below certify.
+    # qwen3.8-flash-next (qwen4_exp, sm_103): the grouped norm is one call per
+    # 2560-wide stream of the 10240-wide residual, each a column slice at row stride
+    # 10240 -- that, not a contiguous row, is what the strided-kernel cells certify --
+    # plus the MTP pre_e_norm. qwen3.8-27b (qwen3_5, sm_120): the first layer's
+    # input_layernorm, which has no residual to add, on the contiguous [T, 5120]
+    # embedding output.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode batch 33: stream 1, row stride 10240 > width 2560",
@@ -44,6 +49,14 @@ class FlashinferGemmaRmsnorm(OpWrapper):
             why="MTP pre_e_norm: the contiguous [T, 2560] embedding",
             spec=dict(shape=(4, 2560), dtype=torch.bfloat16, eps=1e-6),
         ),
+        Cell(
+            why="qwen3.8-27b layer-0 input norm, decode 1 token: contiguous [1, 5120]",
+            spec=dict(shape=(1, 5120), dtype=torch.bfloat16, eps=1e-6),
+        ),
+        Cell(
+            why="qwen3.8-27b layer-0 input norm, prefill 8192 tokens: contiguous [8192, 5120]",
+            spec=dict(shape=(8192, 5120), dtype=torch.bfloat16, eps=1e-6),
+        ),
     )
 
     note = """
@@ -51,8 +64,9 @@ class FlashinferGemmaRmsnorm(OpWrapper):
     Certified path: flashinfer's CuTe DSL `rmsnorm_cute` kernel for 2-D bf16
     `x` (`weight_bias=1.0`) at hidden 2560: a stream slice at the residual's
     10240 row stride (33 and 2048 rows; a strided row selects a strided kernel
-    variant) and a contiguous `[4, 2560]` (MTP `pre_e_norm`). Not certified: a
-    single strided row, other widths, other row counts, the 3-D per-head kernel
+    variant) and a contiguous `[4, 2560]` (MTP `pre_e_norm`); at hidden 5120 a
+    contiguous `[1, 5120]` and `[8192, 5120]`. Not certified: a single strided
+    row, other widths, other row counts, the 3-D per-head kernel
     (`qk_rmsnorm_cute`) and fp16/fp32 operands. The CUDA-JIT fallback (`FLASHINFER_USE_CUDA_NORM=1`,
     or a DSL that cannot target the device) is a different implementation and
     is not certified. PDL (`TRTLLM_ENABLE_PDL`, default on) changes scheduling,

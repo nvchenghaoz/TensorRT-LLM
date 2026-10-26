@@ -648,15 +648,15 @@ class DecoderInputPreparer:
 
         # Gather this step's input tokens from the previous iteration's device
         # sample buffer; the seq-slot indices in previous_batch_indices_cuda
-        # are unchanged since the last full pass.
-        previous_slots = self._buffers.previous_batch_indices_cuda[:num_requests]
-        torch.index_select(
-            new_tensors_device.new_tokens[0, :, : self._config.max_beam_width],
+        # are unchanged since the last full pass. torch.gather with the int64
+        # (N, 1) slot index cached when the fast path was recorded (beam width
+        # 1 there) always launches the elementwise gather kernel; index_select
+        # picks the latency-bound indexSelectSmallIndex kernel for <= 16 rows.
+        torch.gather(
+            new_tensors_device.new_tokens[0, :, :1],
             0,
-            previous_slots,
-            out=self._buffers.input_ids_cuda[: num_requests * self._config.max_beam_width].view(
-                num_requests, self._config.max_beam_width
-            ),
+            cache["previous_slots_i64"],
+            out=self._buffers.input_ids_cuda[:num_requests].view(num_requests, 1),
         )
 
         if not attn_metadata.is_cuda_graph:
@@ -2349,6 +2349,11 @@ class DecoderInputPreparer:
                 "prompt_lens": host.lists.prompt_lengths,
                 "seq_lens_ones": maybe_pin_memory(torch.ones(host.n_gen, dtype=torch.int)),
                 "use_mrope": host.use_mrope,
+                # The seq-slot indices this pass wrote to previous_batch_indices_cuda
+                # (stream-ordered), cast once so the fast path adds no per-step cast.
+                "previous_slots_i64": self._buffers.previous_batch_indices_cuda[: host.n_gen]
+                .to(torch.int64)
+                .view(host.n_gen, 1),
             }
 
     def _get_remote_tail_decode_rank_tokens(

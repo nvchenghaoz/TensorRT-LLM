@@ -18,14 +18,20 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.mamba import recurrent_state_cache as _recurrent_state_cache
 
-#: This checkpoint's per-layer pool rows: a [48, 128, 128] recurrent state and a
-#: [conv_dim, d_conv - 1] = [10240, 3] convolution window.
+#: The per-layer pool rows both callers' checkpoints share: a [48, 128, 128] recurrent
+#: state and a [conv_dim, d_conv - 1] = [10240, 3] convolution window.
 REC_SHAPE = (48, 128, 128)
 CONV_SHAPE = (10240, 3)
-#: A slot count of a full-size engine run, shared by the recurrent and conv pools. The
-#: kernel addresses a slot by its index alone, so a pool of another size (a bf16 recurrent
-#: pool holds more slots in the same memory) takes the same path. The target hands both
-#: pools over unsliced.
+#: qwen3.8-27b's 8-bit recurrent state (`mamba_ssm_cache_dtype="int8"`): per value head
+#: 128 e4m3 rows and 4 rows holding the 128 fp32 row scales.
+Q8_REC_SHAPE = (48, 132, 128)
+#: GDN layers whose same-size states the KV cache manager v2 coalesces into one slot
+#: page (qwen3.8-27b): a layer's pool view has a slot stride of 48 layers' states.
+Q8_COALESCED_LAYERS = 48
+#: A slot count of a full-size qwen3.8-flash-next engine run, shared by the recurrent
+#: and conv pools. The kernel addresses a slot by its index alone, so a pool of another
+#: size (a bf16 recurrent pool holds more slots in the same memory) takes the same path.
+#: The targets hand both pools over unsliced.
 ENGINE_SLOTS = 461
 
 
@@ -57,11 +63,14 @@ class ResetRecurrentStateRows(OpWrapper):
     written in place (`conv_states` is `None` when not passed).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_120})
 
     # spec: slots (pool rows), indices (int32), flags (bool), rec_dtype (fp32),
-    # layout: "plain" | "layer_view" (pool[1] of a [3, slots, ...] allocation).
-    # Both pools are passed throughout.
+    # rec_shape (REC_SHAPE), layout: "plain" | "layer_view" (pool[1] of a
+    # [3, slots, ...] allocation) | "coalesced" (layer 0 of a [slots,
+    # Q8_COALESCED_LAYERS, ...] allocation, both pools). Both pools are passed
+    # throughout. qwen3.8-flash-next (qwen4_exp, sm_103): fp32 / bf16 pools.
+    # qwen3.8-27b (qwen3_5, sm_120): the int8 pool, coalesced.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="engine pool 461, 32 requests, slot 460 reset",
@@ -75,6 +84,17 @@ class ResetRecurrentStateRows(OpWrapper):
             why="pool[layer] of a [layers, slots, ...] allocation",
             spec=dict(slots=4, indices=(2, 0), flags=(False, True), layout="layer_view"),
         ),
+        Cell(
+            why="qwen3.8-27b int8 e4m3-row pool [S, 48, 132, 128], coalesced: zero bytes = zero state",
+            spec=dict(
+                slots=16,
+                indices=(3, 15, 0, 7),
+                flags=(False, True, False, False),
+                rec_dtype=torch.int8,
+                rec_shape=Q8_REC_SHAPE,
+                layout="coalesced",
+            ),
+        ),
     )
 
     note = """
@@ -82,9 +102,12 @@ class ResetRecurrentStateRows(OpWrapper):
     `has_initial_states` are the context prefix of `Mamba2Metadata`'s int32 /
     bool buffers, and the pools are the layer's views of the cache manager's
     `[layers, slots, ...]` allocations, passed unsliced. Certified at 461 slots
-    over an fp32 and a bf16 recurrent pool, and at 4 slots over one layer's view
-    of a 3-layer allocation. Not certified: negative or out-of-range slots,
-    rows with padding between them, `conv_states=None`.
+    over an fp32 and a bf16 recurrent pool, at 4 slots over one layer's view
+    of a 3-layer allocation, and over qwen3.8-27b's int8 pool `[S, 48, 132, 128]`
+    as the cache manager v2 hands it (layer 0 of 48 coalesced per slot, both pools):
+    zero bytes are a zero e4m3 code and a zero fp32 row scale, i.e. an exact zero
+    state; the 47 other layers between its rows stay bitwise. Not certified:
+    negative or out-of-range slots, `conv_states=None`.
 
     Loud, from the callable itself (ValueError): an empty recurrent pool, conv
     and recurrent slot counts differing (the in-range test uses the recurrent

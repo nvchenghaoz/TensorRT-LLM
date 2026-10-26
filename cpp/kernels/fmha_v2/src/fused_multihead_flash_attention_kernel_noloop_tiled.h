@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -142,8 +142,10 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     // Allocate the shared memory tile loader for V.
     Smem_tile_v smem_v(&smem_[Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE], tidx);
 
-    // Allocate the global memory tile loader for O.
-    Gmem_tile_o gmem_o(
+    // Allocate the global memory tile loader for O (it stores straight from the accumulators if STORE_O_FROM_REGS).
+    using Gmem_tile_o_store = std::conditional_t<Kernel_traits::STORE_O_FROM_REGS,
+        typename Kernel_traits::Gmem_tile_o_from_regs, Gmem_tile_o>;
+    Gmem_tile_o_store gmem_o(
         params, binfo, tidx, q_loop * Gmem_tile_o::ROWS, o_part * Cta_tile_o::N * Gmem_tile_o::BYTES_PER_ELEMENT);
     // Allocate the shared memory tile loader for O. We use the same as K so be careful!!!
     Smem_tile_o smem_o(&smem_[Kernel_traits::NO_LOOP ? 0 : Smem_tile_q::BYTES_PER_TILE], tidx);
@@ -235,6 +237,9 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
     static_assert(!Softmax::USE_SHARED_MEMORY, "");
 
+    // The base-2 softmax of the SM120 e4m3 kernels that ask for it (see fmha/softmax.h): row max in raw units.
+    static constexpr bool USE_EXP2 = fmha::Softmax_uses_exp2<Softmax>::VALUE;
+
     // Prefetch next kv buffer to share memory
     static constexpr int PREFETCH_K_BUFFER_TO_SMEM = !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY;
 
@@ -280,7 +285,329 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     constexpr int BMM2_TAIL_MMAS_K_BOUND = Mma_tile_o::MMAS_K;
     constexpr int BMM2_MAIN_MMAS_K_BOUND = Kernel_traits::TOTAL_BMM2_MMAS_K - BMM2_TAIL_MMAS_K_BOUND;
 
-    for (int kv_loop = kv_loop_start; kv_loop < kv_loop_end; kv_loop += Cta_tile_p::N)
+    // Peel of the unmasked KV steps (only the register-direct O kernels, i.e. the SM120 FP8 head-256 ones, without
+    // sliding windows). The steps before kv_mask_loop_start never apply the mask (apply_mask in the loop below is
+    // false for them), so they run first in a copy of the loop body that has no mask path; the loop below then runs
+    // the remaining steps from where the copy stopped (on the same step grid). first_step, the V-move test and the
+    // K-prefetch test use the global bounds in both copies, so the cp.async pipeline crosses the seam unchanged and
+    // every step does the same math in the same order as in the loop below (bitwise identical output).
+    static constexpr bool PEEL_UNMASKED_KV_STEPS = Kernel_traits::STORE_O_FROM_REGS
+        && !Kernel_traits::SLIDING_WINDOW_ATTENTION && !Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION;
+    // The peeled copy has leaner chunk loops. A step has 8 granular chunks (4 Q/K column chunks into 2 K buffers, 4 V
+    // row chunks into 2 V buffers; Q is resident). The BMM1 and BMM2 main loops (3 chunks each) are fully unrolled,
+    // there is a barrier before each chunk (its data is visible) and one after each main-loop chunk ("done reading":
+    // the next chunk's load overwrites the buffer of the chunk before) except the LAST main-loop chunk of each (K
+    // chunk 2, V chunk 2): those buffers are next overwritten one phase later (the next step's K chunk 0, issued in
+    // the BMM2 tail; the next step's V chunk 0, issued in the BMM1 tail), after at least 4 pre-chunk barriers that
+    // every thread passes only once it is done with that chunk. That is 12 barriers per step; every load is issued
+    // where the loop below issues it (same prefetch depth), into the same buffer, and the MMAs run in the same order
+    // (bitwise identical output).
+    int kv_loop_resume = kv_loop_start;
+    if constexpr (PEEL_UNMASKED_KV_STEPS)
+    {
+        // The buffer reuse distances above assume these.
+        static_assert(Kernel_traits::BUFFERS_PER_TILE_SMEM_K == 2 && Kernel_traits::BUFFERS_PER_TILE_SMEM_V == 2
+                && !Kernel_traits::RELOAD_Q && !Kernel_traits::SHARE_SMEM_FOR_K_AND_V
+                && !Kernel_traits::LIMIT_QK_FRAGMENTS && !Softmax::USE_SHARED_MEMORY,
+            "The peeled KV steps need 2 K and 2 V buffers, resident Q and register softmax");
+        int const kv_hot_end
+            = params.has_alibi ? kv_loop_start : max(kv_loop_start, min(kv_mask_loop_start, kv_loop_end));
+        for (; kv_loop_resume < kv_hot_end; kv_loop_resume += Cta_tile_p::N)
+        {
+            int const kv_loop = kv_loop_resume;
+
+            bool const first_step = (kv_loop == kv_loop_start);
+
+            // Declare the accumulators for the 1st gemm.
+            fmha::Fragment_accumulator<Traits_p> acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
+            using Acc_type_p = typename Traits_p::Accumulator_type;
+            fmha::Clear_accumulator<Acc_type_p, Cta_tile_p::WARPS_K>::apply(acc_p);
+
+            // BMM1 main loop
+#pragma unroll
+            for (int bmm1_k = 0; bmm1_k < BMM1_MAIN_MMAS_K_BOUND; bmm1_k += Mma_tile_p::MMAS_K)
+            {
+
+                // Trigger the load for the next Q/K values
+                if (Kernel_traits::RELOAD_Q || first_step)
+                {
+                    gmem_q.move_col();
+                    smem_q.move_to_next_write_buffer();
+                    gmem_q.load(smem_q);
+                }
+
+                gmem_k.move_col();
+                smem_k.move_to_next_write_buffer();
+                gmem_k.load(smem_k);
+
+                // Push the LDGDEPBAR instruction after the loads for QK.
+                fmha::ldgdepbar<USE_LDGSTS>();
+
+                if (Kernel_traits::RELOAD_Q || first_step)
+                {
+                    gmem_q.commit(smem_q);
+                }
+                gmem_k.commit(smem_k);
+
+                // Double SMEM buffer: make sure we are done writing the data from last stage (smem).
+                // Leave 1 outstanding batch loadings
+                fmha::depbar_<USE_LDGSTS, 1>();
+                __syncthreads();
+
+// Do this part of P^T = (Q * K^T)^T.
+#pragma unroll
+                for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki)
+                {
+                    // Load the fragments for Q/K inner tile
+                    smem_q.load(frag_q[ki], ki);
+                    smem_k.load(frag_k[ki], ki);
+
+                    // Do the math for the values already in registers.
+                    fmha::gemm(acc_p, frag_q[ki], frag_k[ki]);
+                }
+
+                // Make sure we are done reading the data (smem), except after the last main-loop chunk (its buffer
+                // is next overwritten by the next step's K chunk 0, after 4 more barriers).
+                if (bmm1_k + Mma_tile_p::MMAS_K < BMM1_MAIN_MMAS_K_BOUND)
+                {
+                    __syncthreads();
+                }
+
+                smem_q.move_to_next_read_buffer();
+                smem_k.move_to_next_read_buffer();
+            }
+
+            // BMM1 tail loop
+            {
+                // Trigger the load for next V values
+                if (kv_loop > kv_loop_start)
+                {
+                    gmem_v.move();
+                    smem_v.move_to_next_write_buffer();
+                }
+                gmem_v.load(smem_v);
+
+                fmha::ldgdepbar<USE_LDGSTS>();
+
+                gmem_v.commit(smem_v);
+
+                // Wait for Q/K to finish loading
+                fmha::depbar_<USE_LDGSTS, 1>();
+                __syncthreads();
+
+// Do this part of P^T = (Q * K^T)^T.
+#pragma unroll
+                for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki)
+                {
+                    // Load the fragments for Q/K inner tile
+                    smem_q.load(frag_q[ki], ki);
+                    smem_k.load(frag_k[ki], ki);
+
+                    // Do the math for the values already in registers.
+                    if (Cta_tile_p::VALID_K % Cta_tile_p::K == 0 || ki < BMM1_TAIL_MMAS_K_BOUND)
+                    {
+                        fmha::gemm(acc_p, frag_q[ki], frag_k[ki]);
+                    }
+                }
+                smem_q.move_to_next_read_buffer();
+                smem_k.move_to_next_read_buffer();
+            } // end BMM1 tail loop
+
+              // Store the P matrix.
+#if defined(STORE_P)
+            gmem_p.store(acc_p);
+#endif
+
+            // Convert from the accumulator type to FP32 for Softmax.
+            softmax.unpack(acc_p);
+
+            // No mask: these steps are all before kv_mask_loop_start (and there is no ALiBi).
+
+            // Make sure we are done reading the data (smem_v).
+            if ((Kernel_traits::SHARE_SMEM_FOR_K_AND_V || Kernel_traits::LIMIT_QK_FRAGMENTS)
+                && Softmax::USE_SHARED_MEMORY)
+            {
+                __syncthreads();
+            }
+
+            // First step of the flash attention
+            if (first_step)
+            {
+                // Compute the max.
+                softmax.template reduce<fmha::Max_>(global_max);
+
+                if (Softmax::USE_SHARED_MEMORY)
+                {
+                    // Make sure we are done reading shared memory.
+                    __syncthreads();
+                }
+
+                // It is possible that all elts are -FLT_MAX with sliding_window_causal or custom_mask.
+                softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
+
+                // Compute the sum.
+                softmax.template reduce<fmha::Sum_>(global_sum);
+            }
+            else
+            {
+                float tmp[Softmax::ROWS_PER_THREAD];
+
+#pragma unroll
+                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                {
+                    tmp[i] = global_max[i];
+                }
+
+                // Compute the max.
+                softmax.template reduce<fmha::Max_>(global_max);
+
+                if (Softmax::USE_SHARED_MEMORY)
+                {
+                    // Make sure we are done reading shared memory.
+                    __syncthreads();
+                }
+
+                // Update last step's acc_o.
+                if constexpr (USE_EXP2)
+                {
+                    fmha::exp2_update_o(acc_o, global_max, tmp, global_sum, softmax.s2_);
+                }
+                else
+                {
+                    acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+                }
+                // Apply expf of softmax.
+                // It is possible that all elts are -FLT_MAX with sliding_window_causal or custom_mask.
+                softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
+
+// Update the global sum.
+#pragma unroll
+                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                {
+                    tmp[i] = global_sum[i];
+                    global_sum[i] = 0.f;
+                }
+
+                // Compute the sum.
+                softmax.template reduce<fmha::Sum_>(global_sum);
+
+#pragma unroll
+                for (int i = 0; i < Softmax::ROWS_PER_THREAD; i++)
+                {
+                    global_sum[i] += tmp[i];
+                }
+            }
+
+            // Store the P matrix.
+#if defined(STORE_S)
+            softmax.store(gmem_s);
+#endif
+
+#if defined(STORE_P)
+            gmem_p.move_n();
+#endif
+
+#if defined(STORE_S)
+            gmem_s.move();
+#endif
+            // Repack for the next BMM.
+            fmha::Fragment_a<Traits_p, fmha::Row> frag_p[Kernel_traits::TOTAL_BMM2_MMAS_K][Mma_tile_o::MMAS_M];
+            softmax.pack(frag_p);
+
+            // BMM2 main loop
+#pragma unroll
+            for (int bmm2_k = 0; bmm2_k < BMM2_MAIN_MMAS_K_BOUND; bmm2_k += Mma_tile_o::MMAS_K)
+            {
+                // Trigger the load for next V values
+                gmem_v.move();
+                smem_v.move_to_next_write_buffer();
+                gmem_v.load(smem_v);
+
+                // Push the LDGDEPBAR instruction after the loads for K.
+                fmha::ldgdepbar<USE_LDGSTS>();
+                gmem_v.commit(smem_v);
+
+                // Leave 1 outstanding batch loadings
+                fmha::depbar_<USE_LDGSTS, 1>();
+                __syncthreads();
+
+#pragma unroll
+                for (int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki)
+                {
+                    int p_ki = bmm2_k + ki;
+                    smem_v.load(frag_v[ki], ki);
+                    fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+                }
+
+                // Make sure we are done reading the data (smem), except after the last main-loop chunk (its buffer
+                // is next overwritten by the next step's V chunk 0, after 4 more barriers).
+                if (bmm2_k + Mma_tile_o::MMAS_K < BMM2_MAIN_MMAS_K_BOUND)
+                {
+                    __syncthreads();
+                }
+
+                smem_v.move_to_next_read_buffer();
+            }
+
+            // BMM2 tail loop
+            {
+                if (kv_loop + Cta_tile_p::N < kv_loop_end)
+                {
+
+                    // Trigger the load for the next Q/K values
+                    // Advance K rows and rewind QK cols
+                    int col_steps = fmha::div_up((int) Kernel_traits::VALID_D, (int) Kernel_traits::CTA_P_TILE_K);
+                    // Enforce warp-uniform value. Removing this one line can contribute to 10% perf drop
+                    // due to register spills
+                    col_steps = __shfl_sync(0xffffffff, col_steps, 0);
+
+                    if constexpr (Kernel_traits::RELOAD_Q)
+                    {
+                        gmem_q.move_col();
+                        gmem_q.rewind_col(col_steps);
+                        smem_q.move_to_next_write_buffer();
+                        gmem_q.load(smem_q);
+                    }
+                    gmem_k.move();
+                    gmem_k.move_col();
+                    gmem_k.rewind_col(col_steps);
+                    smem_k.move_to_next_write_buffer();
+                    gmem_k.load(smem_k);
+
+                    // Push the LDGDEPBAR instruction after the loads for K.
+                    fmha::ldgdepbar<USE_LDGSTS>();
+
+                    if constexpr (Kernel_traits::RELOAD_Q)
+                    {
+                        gmem_q.commit(smem_q);
+                    }
+                    gmem_k.commit(smem_k);
+
+                    // Wait for V to finish loading
+                    fmha::depbar_<USE_LDGSTS, 1>();
+                    __syncthreads();
+                }
+                else
+                {
+                    fmha::depbar_<USE_LDGSTS, 0>();
+                    __syncthreads();
+                }
+
+// Do this part of O = P^T * V^T.
+#pragma unroll
+                for (int ki = 0; ki < BMM2_TAIL_MMAS_K_BOUND; ++ki)
+                {
+                    int p_ki = BMM2_MAIN_MMAS_K_BOUND + ki;
+                    smem_v.load(frag_v[ki], ki);
+                    fmha::gemm(acc_o, frag_p[p_ki], frag_v[ki]);
+                }
+
+                smem_v.move_to_next_read_buffer();
+            } // end BMM2 tail loop
+        }     // Peeled loop over the unmasked KV steps.
+    }
+
+    for (int kv_loop = kv_loop_resume; kv_loop < kv_loop_end; kv_loop += Cta_tile_p::N)
     {
 
         bool const first_step = (kv_loop == kv_loop_start);
@@ -450,7 +777,14 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
             }
 
             // Update last step's acc_o.
-            acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+            if constexpr (USE_EXP2)
+            {
+                fmha::exp2_update_o(acc_o, global_max, tmp, global_sum, softmax.s2_);
+            }
+            else
+            {
+                acc_o_normalizer.update(acc_o, global_max, tmp, global_sum);
+            }
             // Apply expf of softmax.
             // It is possible that all elts are -FLT_MAX with sliding_window_causal or custom_mask.
             softmax.template apply_exp_with_mask<CHECK_NEG_INF>(global_max);
@@ -579,7 +913,22 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     }     // Inner loop over the key/value sequence length.
 
     // Update the sum if attention sinks are used.
-    acc_o_normalizer.update_sum(global_max, global_sum);
+    if constexpr (USE_EXP2)
+    {
+        // The base-2 row sums carry scale_softmax (folded into the exponent): back to the expf path's units.
+        float const to_base = softmax.sum_to_base_units();
+#pragma unroll
+        for (int i = 0; i < Softmax::ROWS_PER_THREAD; ++i)
+        {
+            global_sum[i] *= to_base;
+        }
+        fmha::exp2_update_sum(acc_o_normalizer.attention_sink_value_, global_max, global_sum,
+            reinterpret_cast<float const&>(softmax.params_scale_bmm1_), Traits_p::SOFTMAX_FP_QUANT_SCALE);
+    }
+    else
+    {
+        acc_o_normalizer.update_sum(global_max, global_sum);
+    }
     // Update acc_o of flash attention
     acc_o_normalizer.final_update(acc_o, global_sum);
 
@@ -588,37 +937,56 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     {
         fmha::depbar_<USE_LDGSTS, 0>();
     }
-    // Wait for last round of LDS K/V to finish
-    __syncthreads();
+
+    if constexpr (Kernel_traits::STORE_O_FROM_REGS)
+    {
+        // O does not go through shared memory: write each thread's accumulators to the same (row, col)
+        // that the shared-memory round trip below would give them (bitwise identical output).
+        gmem_o.store(acc_o);
+    }
+    else
+    {
+        // Wait for last round of LDS K/V to finish
+        __syncthreads();
 
 // Loop over MMAS_M.
 #pragma unroll
-    for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii)
-    {
-
-        // Swizzle the elements and do the final reduction.
-        smem_o.store(acc_o, ii);
-
-        // Make sure the data is in shared memory.
-        __syncthreads();
-
-        // Load from shared memory.
-        uint4 out[Gmem_tile_o::STGS_PER_LOOP];
-        smem_o.load(out);
-
-        // Make sure the data was read from shared memory.
-        if (ii < Gmem_tile_o::LOOPS - 1)
+        for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii)
         {
-            __syncthreads();
-        }
 
-        // Output the values.
-        gmem_o.store(out, ii);
+            // Swizzle the elements and do the final reduction.
+            smem_o.store(acc_o, ii);
+
+            // Make sure the data is in shared memory.
+            __syncthreads();
+
+            // Load from shared memory.
+            uint4 out[Gmem_tile_o::STGS_PER_LOOP];
+            smem_o.load(out);
+
+            // Make sure the data was read from shared memory.
+            if (ii < Gmem_tile_o::LOOPS - 1)
+            {
+                __syncthreads();
+            }
+
+            // Output the values.
+            gmem_o.store(out, ii);
+        }
     }
     if (params.softmax_stats_ptr != nullptr)
     {
         using Mma_tile = typename Traits_p::template Mma_tile<Cta_tile_o>;
         fmha::Softmax_saver<Cta_tile_o, Mma_tile> saver(params, binfo);
+        if constexpr (USE_EXP2)
+        {
+            // Save the row max in the scaled units of the expf path.
+#pragma unroll
+            for (int i = 0; i < Softmax::ROWS_PER_THREAD; ++i)
+            {
+                global_max[i] *= reinterpret_cast<float const&>(softmax.params_scale_bmm1_);
+            }
+        }
         saver.store(q_loop, global_sum, global_max);
     }
 } // device_flash_attention_1xN

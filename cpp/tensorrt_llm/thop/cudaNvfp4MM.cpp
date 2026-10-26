@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (out) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +36,8 @@ namespace
 using tensorrt_llm::common::check;
 
 void cuda_core_nvfp4_gemm_caller(Tensor& out, Tensor const& a, Tensor const& b, Tensor const& scale_a,
-    Tensor const& scale_b, Tensor const& alpha, std::optional<at::Tensor> const& bias, bool fast_acc = false)
+    Tensor const& scale_b, Tensor const& alpha, std::optional<at::Tensor> const& bias, bool fast_acc = false,
+    bool act_sf_swizzled = false)
 {
     int32_t m = a.sizes()[0];
     int32_t n = b.sizes()[0];
@@ -83,6 +84,7 @@ void cuda_core_nvfp4_gemm_caller(Tensor& out, Tensor const& a, Tensor const& b, 
     tensorrt_llm::kernels::cuda_core_gemm_nvfp4::Params params(a_ptr, b_ptr, out_ptr, m, n, k,
         reinterpret_cast<__nv_fp8_e4m3 const*>(a_scale), reinterpret_cast<__nv_fp8_e4m3 const*>(b_scale), aType,
         outType, reinterpret_cast<float const*>(alpha_ptr), bias_ptr);
+    params.act_sf_swizzled = act_sf_swizzled;
     bool dispatched = tensorrt_llm::kernels::cuda_core_gemm_nvfp4::cudaCoreGemmDispatcher(params, stream);
     TORCH_CHECK(dispatched, "Failed to dispatch cudaCoreGemmLauncher");
 }
@@ -90,7 +92,7 @@ void cuda_core_nvfp4_gemm_caller(Tensor& out, Tensor const& a, Tensor const& b, 
 } // namespace
 
 Tensor& cuda_core_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    Tensor const& alpha, std::optional<at::Tensor> const& bias, Tensor& out)
+    Tensor const& alpha, std::optional<at::Tensor> const& bias, Tensor& out, bool act_sf_swizzled = false)
 {
     CHECK_TH_CUDA(mat_a);
     CHECK_TH_CUDA(mat_b);
@@ -110,7 +112,18 @@ Tensor& cuda_core_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, Tenso
     TORCH_CHECK(scale_a.dtype() == SF_DTYPE);
     TORCH_CHECK(scale_b.dtype() == SF_DTYPE);
 
-    cuda_core_nvfp4_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, alpha, bias, true);
+    if (act_sf_swizzled)
+    {
+        // The swizzled layout pads rows to 128 and SF columns to 4.
+        int64_t const m = mat_a.sizes()[0];
+        int64_t const num_sf_cols = mat_a.sizes()[1] * 2 / 16;
+        int64_t const min_numel = (m + 127) / 128 * 128 * ((num_sf_cols + 3) / 4 * 4);
+        TORCH_CHECK(scale_a.is_contiguous(), "swizzled scale_a must be contiguous");
+        TORCH_CHECK(scale_a.numel() >= min_numel, "swizzled scale_a has ", scale_a.numel(),
+            " elements, the 128x4 layout needs ", min_numel);
+    }
+
+    cuda_core_nvfp4_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, alpha, bias, true, act_sf_swizzled);
     return out;
 }
 
@@ -121,9 +134,12 @@ Tensor& cuda_core_nvfp4_gemm_out(Tensor const& mat_a, Tensor const& mat_b, Tenso
 // scale_b: ceil(N / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 // bias: fp16/bf16/fp32
 // out_dtype: fp16/bf16/fp32
+// act_sf_swizzled: false = scale_a is linear [M, K / 16] (block_scale_interleave_reverse output);
+//                  true = scale_a is the 128x4 swizzled layout from fp4_quantize, read in place.
 Tensor cuda_core_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
     Tensor const& alpha, std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype,
-    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt,
+    bool act_sf_swizzled = false)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
@@ -133,7 +149,7 @@ Tensor cuda_core_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, Tensor con
     auto [out, _] = torch_ext::allocate_output(
         output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
-    return cuda_core_nvfp4_gemm_out(mat_a, mat_b, scale_a, scale_b, alpha, bias, out);
+    return cuda_core_nvfp4_gemm_out(mat_a, mat_b, scale_a, scale_b, alpha, bias, out, act_sf_swizzled);
 }
 
 } // namespace torch_ext
@@ -144,7 +160,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "cuda_core_nvfp4_gemm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor alpha, Tensor? bias,"
-        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None)"
+        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None, bool act_sf_swizzled=False)"
         " -> (Tensor out)");
 }
 

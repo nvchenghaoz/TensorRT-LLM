@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the reset_recurrent_state_rows entry."""
+"""GPU test for the reset_recurrent_state_rows catalog entry."""
 
 import zlib
 from typing import Optional
@@ -8,15 +8,16 @@ from typing import Optional
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.reset_recurrent_state_rows import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.reset_recurrent_state_rows import (
     CONV_SHAPE,
+    Q8_COALESCED_LAYERS,
     REC_SHAPE,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.reset_recurrent_state_rows import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.reset_recurrent_state_rows import (
     reset_recurrent_state_rows as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "reset_recurrent_state_rows requires a CUDA device"
@@ -51,18 +52,26 @@ def _build(spec, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
     slots = spec["slots"]
     rec_dtype = spec.get("rec_dtype", torch.float32)
-    layer_view = spec.get("layout", "plain") == "layer_view"
+    rec_shape = spec.get("rec_shape", REC_SHAPE)
+    layout = spec.get("layout", "plain")
 
     def randn(*shape, dtype):
+        if dtype == torch.int8:  # random bytes: e4m3 codes and fp32 scale bits alike
+            return torch.randint(-128, 128, shape, generator=g, device=DEV, dtype=dtype)
         return torch.randn(*shape, generator=g, device=DEV).to(dtype)
 
     backing = {}
-    if layer_view:
-        backing["rec"] = randn(_LAYERS, slots, *REC_SHAPE, dtype=rec_dtype)
+    if layout == "layer_view":
+        backing["rec"] = randn(_LAYERS, slots, *rec_shape, dtype=rec_dtype)
         backing["conv"] = randn(_LAYERS, slots, *CONV_SHAPE, dtype=torch.bfloat16)
         rec, conv = backing["rec"][1], backing["conv"][1]
+    elif layout == "coalesced":
+        # The cache manager v2's view: every GDN layer's state of a slot in one page.
+        backing["rec"] = randn(slots, Q8_COALESCED_LAYERS, *rec_shape, dtype=rec_dtype)
+        backing["conv"] = randn(slots, Q8_COALESCED_LAYERS, *CONV_SHAPE, dtype=torch.bfloat16)
+        rec, conv = backing["rec"][:, 0], backing["conv"][:, 0]
     else:
-        rec = randn(slots, *REC_SHAPE, dtype=rec_dtype)
+        rec = randn(slots, *rec_shape, dtype=rec_dtype)
         conv = randn(slots, *CONV_SHAPE, dtype=torch.bfloat16)
 
     indices = torch.tensor(spec["indices"], dtype=torch.int32, device=DEV)
@@ -96,6 +105,11 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         for name in backing:
             for other in (0, 2):
                 assert torch.equal(backing[name][other], before[name][other]), (name, other)
+    if spec.get("layout") == "coalesced":
+        # The other layers' states between this layer's rows stay bitwise.
+        for name in backing:
+            assert torch.equal(backing[name][:, 1:], before[name][:, 1:]), name
+        assert reset, "the cell resets at least one row"
 
 
 def _pools():

@@ -1431,6 +1431,118 @@ __device__ inline void smemFp16ArraySum(
     }
 }
 
+// Multi-block merge: SM120 and newer stream the partial results through a deeper pipeline and merge only the valid
+// row slices; older architectures keep the two-stage merge.
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+#define XQA_PIPELINED_MULTI_BLOCK_MERGE 1
+#else
+#define XQA_PIPELINED_MULTI_BLOCK_MERGE 0
+#endif
+
+#if XQA_PIPELINED_MULTI_BLOCK_MERGE
+// Multi-block mode: the CTA that finishes last merges the partial results of all CTAs of the sequence. Only the 8-row
+// slices of a warp tile that hold valid rows are merged; the other slices only pad the tile to the MMA M size and are
+// never written to the output.
+constexpr uint32_t nbMergeRowSlices = divUp(nbValidRows, 8U);
+static_assert(nbMergeRowSlices <= WarpAcc::rows * InstAcc::rows && InstAcc::cols == 2);
+// The valid row slices of a swizzled partial result tile, as copied from the multi-block scratch buffer.
+using MergeTileSMemBuffer = Array2D<LdGrain, 8 * nbMergeRowSlices, SharedMem::XSmemBuffer::cols>;
+
+__device__ inline void accumulateScaledWord(InstAcc& dst, uint32_t i, uint32_t word, float scale)
+{
+#if INPUT_FP16
+    float2 const val = __half22float2(reinterpret_cast<InputElem2 const&>(word));
+#else
+    float2 const val = __bfloat1622float2(reinterpret_cast<InputElem2 const&>(word));
+#endif
+    dst(i, 0) += val.x * scale;
+    dst(i, 1) += val.y * scale;
+}
+
+// acc += tile * rowScales[row] for the valid row slices of one partial result tile. Per element, this is the same
+// arithmetic as rescaleAcc(tile) followed by acc = acc + tile.
+__device__ inline void accumulateRescaledMergeTile(
+    Warp const& warp, WarpAcc& acc, MergeTileSMemBuffer const& src, SMemWarpRowMax const& rowScales)
+{
+    uint32_t const lane = laneId();
+#pragma unroll
+    for (uint32_t s = 0; s < nbMergeRowSlices; s++)
+    {
+        uint32_t const m = s / InstAcc::rows;
+        uint32_t const i = s % InstAcc::rows;
+        float const scale = rowScales[8 * s + lane / 4];
+        constexpr uint32_t nbMatsPerLd = 4; // 8x8 b16 matrices loaded by one ldmatrix.x4, along the columns
+#pragma unroll
+        for (uint32_t n = 0; n < exactDiv(WarpAcc::cols, nbMatsPerLd); n++)
+        {
+            LdGrain const data
+                = ldmatrix_4x<false>(warp, &src.template at<true>(8 * s + lane % 8, nbMatsPerLd * n + lane / 8));
+#pragma unroll
+            for (uint32_t j = 0; j < nbMatsPerLd; j++)
+            {
+                accumulateScaledWord(acc(m, nbMatsPerLd * n + j), i, data[j], scale);
+            }
+        }
+    }
+}
+
+// Shared memory of the multi-block merge. It reuses the shared memory of the main loop: a ring of nbTileBuffers
+// async-copy stages per warp for the partial result tiles, and the scaled row sums of a chunk of sub-sequences.
+template <uint32_t nbTileBuffers_, uint32_t chunkSize_>
+struct MultiBlockMergeSMemT
+{
+    static constexpr uint32_t nbTileBuffers = nbTileBuffers_;
+    static constexpr uint32_t chunkSize = chunkSize_;
+
+    bool isLastCta;
+
+    struct MBBuf
+    {
+        MergeTileSMemBuffer tiles[gemm1NbWarpGrps][gemm1WarpsPerGrp][nbTileBuffers];
+        SMemWarpRowMax tileRowScales[chunkSize];
+        SMemWarpRowMax partialRowMax[ctaShapeInWarps.x];
+        SMemWarpRowMax mergedRowSum[gemm1NbWarpGrps];
+    };
+
+    MBBuf storage[ctaShapeInWarps.y];
+};
+
+template <uint32_t nbTileBuffers, uint32_t chunkSize>
+HOST_DEVICE_FUNC constexpr bool multiBlockMergeSMemFits()
+{
+    return sizeof(MultiBlockMergeSMemT<nbTileBuffers, chunkSize>) <= sizeof(SharedMem);
+}
+
+template <uint32_t chunkSize>
+HOST_DEVICE_FUNC constexpr uint32_t selectMultiBlockMergeChunkSize()
+{
+    if constexpr (chunkSize <= ctaShapeInWarps.x || multiBlockMergeSMemFits<2, chunkSize>())
+    {
+        return chunkSize;
+    }
+    else
+    {
+        return selectMultiBlockMergeChunkSize<chunkSize / 2>();
+    }
+}
+
+template <uint32_t nbTileBuffers, uint32_t chunkSize>
+HOST_DEVICE_FUNC constexpr uint32_t selectMultiBlockMergeNbTileBuffers()
+{
+    if constexpr (nbTileBuffers <= 2 || multiBlockMergeSMemFits<nbTileBuffers, chunkSize>())
+    {
+        return nbTileBuffers;
+    }
+    else
+    {
+        return selectMultiBlockMergeNbTileBuffers<nbTileBuffers - 1, chunkSize>();
+    }
+}
+
+constexpr uint32_t multiBlockMergeChunkSize = selectMultiBlockMergeChunkSize<64>();
+using MultiBlockMergeSMem
+    = MultiBlockMergeSMemT<selectMultiBlockMergeNbTileBuffers<4, multiBlockMergeChunkSize>(), multiBlockMergeChunkSize>;
+#else
 template <uint32_t nbBuffers>
 __device__ inline ThrdRegRowMax mergeRowMax(
     Warp const& warp, TinyPtr<SMemWarpRowMax> const rowMaxBuffers, uint32_t nbSubSeqPerSeq)
@@ -1471,6 +1583,7 @@ __device__ inline ThrdRegRowMax mergeRowMax(
     }
     return mergedRowMax;
 }
+#endif // XQA_PIPELINED_MULTI_BLOCK_MERGE
 
 __device__ inline void addAttentionSinks(
     ThrdRegRowMax& globalRowSum, ThrdRegRowMax const globalRowMax, float const* attentionSinks)
@@ -1493,6 +1606,149 @@ __device__ inline void addAttentionSinks(
         }
     }
 }
+
+// Shared-prefix (cascade) decode, see kernel_mha_prefix. The prefix pass leaves, after the cascadeInfo words, one FP32
+// record per (request, KV head, prefix chunk): the unnormalized output O = sum(p * V) (V not yet scaled by the KV
+// scale), then the row max and the row sum of p, in the same units as kernel_mha's accumulator. kernel_mha folds them
+// in FP32 (into its accumulator with one sub-sequence, into the multi-block merge otherwise), so the output is rounded
+// to the IO type at the same points as without the cascade.
+namespace cascadeFold
+{
+constexpr uint32_t infoBytes = 4096;
+constexpr uint32_t statStride = roundUp(headGrpSize, 4U);
+constexpr uint32_t recFloats = headGrpSize * validElemsPerHead + 2 * statStride;
+
+__device__ inline float const* record(uint32_t const* cascadeInfo, uint32_t nbParts, uint32_t idxSeq, uint32_t idxPart)
+{
+    return reinterpret_cast<float const*>(reinterpret_cast<char const*>(cascadeInfo) + infoBytes)
+        + size_t(idxSeq * nbParts + idxPart) * recFloats;
+}
+
+// The fold works in the MMA quad layout: lane l handles head row l / 4 (rows of the first 8-row slice; the cascade is
+// only enabled for head groups of <= 8 rows), while ThrdRegRowMax holds row l in lane l.
+constexpr bool supported = !SPEC_DEC && headGrpSize <= 8 && warpTile.y == 16 && WarpAcc::rows == 1;
+constexpr uint32_t batch = 4; // records whose loads are issued together
+
+__device__ inline float toQuad(ThrdRegRowMax const& v)
+{
+    return __shfl_sync(~0U, v[0], laneId() / 4);
+}
+
+// Value of row l (held by quad l) moved to lane l; lanes >= 8 keep their own value.
+__device__ inline float fromQuad(float q, float own)
+{
+    float const v = __shfl_sync(~0U, q, 4 * (laneId() % 8));
+    return laneId() < 8 ? v : own;
+}
+
+// Max of this lane's quad row over prefix records [cBeg, cEnd) (safeInitRowMax for rows beyond the head group).
+__device__ inline float quadPrefixMax(
+    uint32_t const* cascadeInfo, uint32_t nbParts, uint32_t idxSeq, uint32_t cBeg, uint32_t cEnd)
+{
+    uint32_t const row = laneId() / 4;
+    float mx = safeInitRowMax;
+    if (row < headGrpSize)
+    {
+        float const* const base = record(cascadeInfo, nbParts, idxSeq, 0) + headGrpSize * validElemsPerHead + row;
+#pragma unroll 8
+        for (uint32_t c = cBeg; c < cEnd; c++)
+        {
+            mx = fmaxf(mx, base[size_t(c) * recFloats]);
+        }
+    }
+    return mx;
+}
+
+// Adds sum_c O_c * exp(m_c - rowMaxQ) to acc over records [cBeg, cEnd), in order, and returns
+// sum_c l_c * exp(m_c - rowMaxQ) for this lane's quad row (rowMaxQ already includes those m_c). colBase: first head
+// dim of this warp's accumulator columns. outReordered: acc columns are in kernel_mha's e4m3-V conversion order (a lane
+// holds 4 consecutive dims across n-tiles 2n, 2n+1), else in natural order.
+template <bool outReordered>
+__device__ inline float addPrefix(WarpAcc& acc, float rowMaxQ, uint32_t const* cascadeInfo, uint32_t nbParts,
+    uint32_t idxSeq, uint32_t cBeg, uint32_t cEnd, uint32_t colBase)
+{
+    uint32_t const lane = laneId();
+    uint32_t const row = lane / 4;
+    float sum = 0.F;
+    if (row >= headGrpSize)
+    {
+        return sum;
+    }
+    constexpr uint32_t nbVecs = outReordered ? WarpAcc::cols / 2 : WarpAcc::cols;
+    using Vec4 = float4;
+    float const* const base = record(cascadeInfo, nbParts, idxSeq, 0);
+    for (uint32_t c0 = cBeg; c0 < cEnd; c0 += batch)
+    {
+        float m[batch];
+        float l[batch];
+        Vec4 v[batch][outReordered ? nbVecs : nbVecs / 2];
+#pragma unroll
+        for (uint32_t k = 0; k < batch; k++)
+        {
+            uint32_t const c = mha::min(c0 + k, cEnd - 1);
+            float const* const rec = base + size_t(c) * recFloats;
+            m[k] = rec[headGrpSize * validElemsPerHead + row];
+            l[k] = rec[headGrpSize * validElemsPerHead + statStride + row];
+            float const* const src = rec + row * validElemsPerHead + colBase;
+            if constexpr (outReordered)
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs; n++)
+                {
+                    v[k][n] = reinterpret_cast<Vec4 const&>(src[16 * n + 4 * (lane % 4)]);
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs / 2; n++)
+                {
+                    float2 const a = reinterpret_cast<float2 const&>(src[16 * n + 2 * (lane % 4)]);
+                    float2 const b = reinterpret_cast<float2 const&>(src[16 * n + 8 + 2 * (lane % 4)]);
+                    v[k][n] = make_float4(a.x, a.y, b.x, b.y);
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < batch; k++)
+        {
+            if (c0 + k >= cEnd)
+            {
+                break;
+            }
+            float const so = expf(m[k] - rowMaxQ);
+            sum += l[k] * so;
+            if constexpr (outReordered)
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs; n++)
+                {
+                    acc(0, 2 * n)(0, 0) += so * v[k][n].x;
+                    acc(0, 2 * n + 1)(0, 0) += so * v[k][n].y;
+                    acc(0, 2 * n)(0, 1) += so * v[k][n].z;
+                    acc(0, 2 * n + 1)(0, 1) += so * v[k][n].w;
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (uint32_t n = 0; n < nbVecs / 2; n++)
+                {
+                    acc(0, 2 * n)(0, 0) += so * v[k][n].x;
+                    acc(0, 2 * n)(0, 1) += so * v[k][n].y;
+                    acc(0, 2 * n + 1)(0, 0) += so * v[k][n].z;
+                    acc(0, 2 * n + 1)(0, 1) += so * v[k][n].w;
+                }
+            }
+        }
+    }
+    return sum;
+}
+} // namespace cascadeFold
+
+// With PDL, issue the first K/V tile loads of a sub-sequence before griddepcontrol.wait when that tile cannot hold the
+// token the preceding RoPE/KV-append kernel writes (see earlyKV in kernel_mha_impl). Q always waits.
+#define XQA_PDL_EARLY_KV (ENABLE_PDL == 2 && !SPEC_DEC && BEAM_WIDTH == 1 && USE_PAGED_KV_CACHE)
 
 #ifdef NDEBUG
 __device__ __forceinline__
@@ -1535,7 +1791,10 @@ CUBIN_EXPORT __global__
         uint32_t const batchSize,
         float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
                                                 // int8/fp8 KV cache.
-        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
+        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr,
+        // Shared-prefix (cascade) decode, see kernel_mha_prefix: cascadeInfo[0] = shared prefix tokens P (multiple of
+        // ctaTile.x), cascadeInfo[1 + c] != 0 if prefix chunk c failed page verification. nullptr: disabled.
+        uint32_t const* __restrict__ cascadeInfo = nullptr, uint32_t nbPrefixParts = 0)
 {
     assert(allowMultiBlockMode || gridDim.x == 1);
     bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
@@ -1652,7 +1911,15 @@ CUBIN_EXPORT __global__
 
 #if ENABLE_PDL
     preExit();
+#if !XQA_PDL_EARLY_KV
     acqBulk();
+#else
+    if (cascadeInfo != nullptr)
+    {
+        // cascadeInfo is written by the preceding kernel_mha_prefix: wait before reading it.
+        acqBulk();
+    }
+#endif
 #endif
 
     constexpr bool qkSwizzle = true;
@@ -1694,7 +1961,8 @@ CUBIN_EXPORT __global__
         ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
     }
 #else
-    if (warpIdx.z == 0)
+    // Issued by the gemm0 warps: here, or with XQA_PDL_EARLY_KV after the first K tile prefetch and the PDL wait.
+    auto const loadQ = [&]()
     {
         // map from idxQHead to idxHead in q input.
         auto const localQHeadIdxMap = [nbQHeads, idxReq, idxHeadGrp](uint32_t idxHeadLocal) -> uint32_t
@@ -1723,23 +1991,48 @@ CUBIN_EXPORT __global__
         copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, isFullTile, warpTile.y>(
             warpIdx.x, smem.q[warpIdx.y][0], src, nbValidRows, localQHeadIdxMap);
         ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
+    };
+#if !XQA_PDL_EARLY_KV
+    if (warpIdx.z == 0)
+    {
+        loadQ();
     }
+#endif
 #endif
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
+    // Shared-prefix (cascade) mode: kernel_mha_prefix already attended the leading cascadeTokens (shared by every
+    // request) and wrote nbPrefixParts partial results after this CTA's own nbSubSeqPerSeq slots; this kernel walks
+    // only the suffix [cascadeTokens, cacheSeqLen) and the merging CTA folds the prefix partials in.
+    uint32_t cascadeTokens = 0;
+    if (cascadeFold::supported && cascadeInfo != nullptr && nbPrefixParts != 0)
+    {
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < nbPrefixParts; i++)
+        {
+            bad |= cascadeInfo[1 + i];
+        }
+        cascadeTokens = (bad != 0) ? 0U : cascadeInfo[0];
+        assert(cascadeTokens % ctaTile.x == 0 && cascadeTokens < cacheSeqLen);
+    }
 #if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
     uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1;
     int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
     uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
     bool const rtIsReallySliding = (cacheSeqLen + actualQSeqLen > slidingWinSize);
+    bool const cascadeActive = false;
 #elif SLIDING_WINDOW
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
     assert(!SPEC_DEC || !rtIsReallySliding);
-    uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
+    bool const cascadeActive = !SPEC_DEC && !rtIsReallySliding && cascadeTokens != 0;
+    uint32_t const nbTotalSkipTokens
+        = rtIsReallySliding ? cacheSeqLen - slidingWinSize : (cascadeActive ? cascadeTokens : 0U);
 #else
     constexpr bool rtIsReallySliding = false;
-    constexpr uint32_t nbTotalSkipTokens = 0;
+    bool const cascadeActive = !SPEC_DEC && cascadeTokens != 0;
+    uint32_t const nbTotalSkipTokens = cascadeActive ? cascadeTokens : 0U;
 #endif
+
 #if USE_PAGED_KV_CACHE
     uint32_t const nbSkipLeadingPages = nbTotalSkipTokens / tokensPerPage;
 #endif
@@ -1772,6 +2065,17 @@ CUBIN_EXPORT __global__
         return seqIter < nbCtxCtaTiles;
 #endif
     };
+#if XQA_PDL_EARLY_KV
+    // PDL overlap with the preceding RoPE/KV-append kernel, which writes Q and the new token's K/V at position
+    // cacheSeqLen - 1. When this sub-sequence's first CTA tile ends before that token (and no cyclic window can wrap
+    // the write onto it), its pages were written by earlier steps, so its first K part and V tile are loaded before
+    // the PDL wait; Q and every later tile are loaded after it. Otherwise wait first.
+    bool const earlyKV = !rtIsReallySliding && (ctaTile.x * (seqIterInit + 1) < cacheSeqLen);
+    if (!earlyKV)
+    {
+        acqBulk();
+    }
+#endif
     if (warpIdx.z == 0)
     {
         float const qkScale = qScale * (isKVCacheQuantized ? kvCacheScale[0] : 1.f)
@@ -1912,6 +2216,13 @@ CUBIN_EXPORT __global__
         __syncwarp();
 #endif
         loadKTilePart(seqIterInit, 0, 0);
+#if XQA_PDL_EARLY_KV
+        if (earlyKV)
+        {
+            acqBulk();
+        }
+        loadQ();
+#endif
         ldgsts::commitGroup(); // @fixme: do prefetch for next iter tile if last part
         idxCurrSMemKBuf++;
 
@@ -2331,6 +2642,12 @@ CUBIN_EXPORT __global__
 
         loadVTilePart(seqIterInit, 0, 0, 0);
         commitVTileLoad(idxCurrSMemVBuf.next());
+#if XQA_PDL_EARLY_KV
+        if (earlyKV)
+        {
+            acqBulk();
+        }
+#endif
         idxCurrSMemVBuf++;
         ParityOrNone<grpLoadV> vBarParity{};
         // @fixme: do prefetch for next iter tile if last part
@@ -2541,8 +2858,37 @@ CUBIN_EXPORT __global__
             }
         }
 
+        // Shared-prefix cascade: sub-sequence i folds prefix records [i*C/m, (i+1)*C/m) into its FP32 accumulator, so
+        // the output is rounded exactly where it is without the cascade (once with m = 1, per partial then merged with
+        // m > 1).
+        bool cascadeFolded = false;
+        if constexpr (cascadeFold::supported)
+        {
+            uint32_t const cBeg = nbPrefixParts * idxSubSeqInSeq / nbSubSeqPerSeq;
+            uint32_t const cEnd = nbPrefixParts * (idxSubSeqInSeq + 1) / nbSubSeqPerSeq;
+            if (cascadeActive && cBeg < cEnd)
+            {
+                cascadeFolded = true;
+                uint32_t const idxSeq = nbKHeads * idxReq + idxHeadGrp;
+                float const newMaxQ = fmaxf(cascadeFold::toQuad(globalRowMax),
+                    cascadeFold::quadPrefixMax(cascadeInfo, nbPrefixParts, idxSeq, cBeg, cEnd));
+                ThrdRegRowMax newRowMax = globalRowMax;
+                newRowMax[0] = cascadeFold::fromQuad(newMaxQ, globalRowMax[0]);
+                ThrdRegRowMax selfScale;
+                selfScale[0] = expf(globalRowMax[0] - newRowMax[0]);
+                globalRowSum[0] = globalRowSum[0] * selfScale[0];
+                rescaleAcc(warp, acc, fullRescaleMask, selfScale);
+                globalRowMax = newRowMax;
+                float const sumQ = cascadeFold::addPrefix < inputElemSize == 2
+                    && cacheElemSize
+                        == 1
+                            > (acc, newMaxQ, cascadeInfo, nbPrefixParts, idxSeq, cBeg, cEnd, warpTile.x * warpIdxInGrp);
+                float const sumRow = cascadeFold::fromQuad(sumQ, 0.F);
+                globalRowSum[0] += laneId() < headGrpSize ? sumRow : 0.F;
+            }
+        }
         float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
-        if (seqIterInit < nbSeqIters)
+        if (seqIterInit < nbSeqIters || cascadeFolded)
         {
             // In multi-block mode, assign the virtual sink token to exactly one partial CTA.
             if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
@@ -2632,6 +2978,12 @@ CUBIN_EXPORT __global__
             copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
                 warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp](0, 0), &(*smemOutTile)(0, 0));
             __syncthreads();
+#if XQA_PIPELINED_MULTI_BLOCK_MERGE
+            using MultiBlockSMem = MultiBlockMergeSMem;
+            constexpr uint32_t nbTileBuffers = MultiBlockSMem::nbTileBuffers;
+            constexpr uint32_t mergeChunkSize = MultiBlockSMem::chunkSize;
+            static_assert(mergeChunkSize % gemm1NbWarpGrps == 0);
+#else
             constexpr uint32_t nbTileBuffers = 2;
 
             struct MultiBlockSMem
@@ -2650,7 +3002,7 @@ CUBIN_EXPORT __global__
 
                 MBBuf storage[ctaShapeInWarps.y];
             };
-
+#endif
             static_assert(sizeof(MultiBlockSMem) <= smemSize);
             MultiBlockSMem& mbsmem = reinterpret_cast<MultiBlockSMem&>(smem);
             // increase the semaphore by 1
@@ -2673,6 +3025,131 @@ CUBIN_EXPORT __global__
             __syncthreads();
             if (isLastCta)
             {
+#if XQA_PIPELINED_MULTI_BLOCK_MERGE
+                MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
+                // Each warp streams its partial result tiles through a ring of nbTileBuffers async-copy stages. The
+                // first loads do not depend on the row statistics below, so they are issued first.
+                auto loadBufAsync = [&](uint32_t n)
+                {
+                    uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
+                    copyGrains<true, sizeof(ScratchBuf) / grainBytes, 1, true>(0,
+                        &mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d](0, 0),
+                        &scratchBuffers[idxBufBase + n][warpIdxInGrp](0, 0));
+                };
+#pragma unroll
+                for (uint32_t i = 0; i + 1 < nbTileBuffers; i++)
+                {
+                    uint32_t const n = warpGrpIdx + gemm1NbWarpGrps * i;
+                    if (n < nbSubSeqPerSeq)
+                    {
+                        loadBufAsync(n);
+                    }
+                    ldgsts::commitGroup();
+                }
+
+                // Row max and row sum of the partial results of a chunk of sub-sequences: warp w loads sub-sequences
+                // w, w + nbMergeWarps, ... of the chunk, all loads in flight together.
+                constexpr uint32_t nbMergeWarps = ctaShapeInWarps.x;
+                constexpr uint32_t nbStatsPerWarp = exactDiv(mergeChunkSize, nbMergeWarps);
+                ThrdRegRowMax chunkRowMax[nbStatsPerWarp];
+                ThrdRegRowMax chunkRowSum[nbStatsPerWarp];
+                auto loadChunkRowStats = [&](uint32_t chunkBeg, uint32_t chunkEnd)
+                {
+#pragma unroll
+                    for (uint32_t k = 0; k < nbStatsPerWarp; k++)
+                    {
+                        uint32_t const n = chunkBeg + nbMergeWarps * k + warpIdx.x;
+                        if (n < chunkEnd)
+                        {
+                            chunkRowMax[k] = rowMaxBuffers[idxBufBase + n].loadToReg<false>(warp);
+                            chunkRowSum[k] = rowSumBuffers[idxBufBase + n].loadToReg<false>(warp);
+                        }
+                    }
+                };
+                uint32_t const chunk0End = mha::min(mergeChunkSize, nbSubSeqPerSeq);
+                loadChunkRowStats(0, chunk0End);
+
+                // get row max. Max is exact, so splitting the sub-sequences among warps does not change the result.
+                if (warpIdx.x < nbSubSeqPerSeq)
+                {
+                    ThrdRegRowMax warpRowMax = chunkRowMax[0];
+#pragma unroll
+                    for (uint32_t k = 1; k < nbStatsPerWarp; k++)
+                    {
+                        if (nbMergeWarps * k + warpIdx.x < chunk0End)
+                        {
+                            warpRowMax = fmaxf(warpRowMax, chunkRowMax[k]);
+                        }
+                    }
+                    for (uint32_t n = mergeChunkSize + warpIdx.x; n < nbSubSeqPerSeq; n += nbMergeWarps)
+                    {
+                        warpRowMax = fmaxf(warpRowMax, rowMaxBuffers[idxBufBase + n].loadToReg<false>(warp));
+                    }
+                    mbbuf.partialRowMax[warpIdx.x].storeFromReg<false>(warp, warpRowMax);
+                }
+                __syncthreads();
+                ThrdRegRowMax mergedRowMax = mbbuf.partialRowMax[0].loadToReg<false>(warp);
+                for (uint32_t w = 1; w < mha::min(nbMergeWarps, nbSubSeqPerSeq); w++)
+                {
+                    mergedRowMax = fmaxf(mergedRowMax, mbbuf.partialRowMax[w].loadToReg<false>(warp));
+                }
+
+                // Scaled row sum of each partial result of a chunk: its weight in the merged output.
+                auto storeChunkTileRowScales = [&](uint32_t chunkBeg, uint32_t chunkEnd)
+                {
+#pragma unroll
+                    for (uint32_t k = 0; k < nbStatsPerWarp; k++)
+                    {
+                        uint32_t const n = chunkBeg + nbMergeWarps * k + warpIdx.x;
+                        if (n < chunkEnd)
+                        {
+                            ThrdRegRowMax const tileRowScales = expf(chunkRowMax[k] - mergedRowMax);
+                            ThrdRegRowMax const scaledTileRowSum = chunkRowSum[k] * tileRowScales;
+                            mbbuf.tileRowScales[n - chunkBeg].storeFromReg<false>(warp, scaledTileRowSum);
+                        }
+                    }
+                };
+                storeChunkTileRowScales(0, chunk0End);
+                __syncthreads();
+
+                // rescale and accumulate, in the order of the sub-sequences
+                WarpAcc sumAcc{};
+                ThrdRegRowMax partialMergedRowSum{};
+                for (uint32_t chunkBeg = 0; chunkBeg < nbSubSeqPerSeq; chunkBeg += mergeChunkSize)
+                {
+                    uint32_t const chunkEnd = mha::min(chunkBeg + mergeChunkSize, nbSubSeqPerSeq);
+                    if (chunkBeg != 0)
+                    {
+                        loadChunkRowStats(chunkBeg, chunkEnd);
+                        // All warps must be done with the row scales of the previous chunk before they are overwritten.
+                        __syncthreads();
+                        storeChunkTileRowScales(chunkBeg, chunkEnd);
+                        __syncthreads();
+                    }
+                    for (uint32_t n = chunkBeg + warpGrpIdx; n < chunkEnd; n += gemm1NbWarpGrps)
+                    {
+                        uint32_t const nPrefetch = n + gemm1NbWarpGrps * (nbTileBuffers - 1);
+                        if (nPrefetch < nbSubSeqPerSeq)
+                        {
+                            loadBufAsync(nPrefetch);
+                        }
+                        ldgsts::commitGroup();
+                        ldgsts::waitGroup<nbTileBuffers - 1>();
+                        // Each lane waits only for its own async-copy groups; synchronize before consuming the merge
+                        // tile.
+                        __syncwarp();
+                        uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
+                        SMemWarpRowMax const& scaledTileRowSum = mbbuf.tileRowScales[n - chunkBeg];
+                        partialMergedRowSum = partialMergedRowSum + scaledTileRowSum.loadToReg<false>(warp);
+                        assert(std::isfinite(partialMergedRowSum[0]));
+                        accumulateRescaledMergeTile(
+                            warp, sumAcc, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d], scaledTileRowSum);
+                        // The merge tiles form a circular buffer. Make every lane finish the current ldmatrix reads
+                        // before any lane advances far enough to overwrite this slot.
+                        __syncwarp();
+                    }
+                }
+#else
                 MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
                 SMemWarpRowMax& smemRowMax = reinterpret_cast<SMemWarpRowMax&>(smem);
                 // get row max.
@@ -2731,6 +3208,7 @@ CUBIN_EXPORT __global__
                     // ldmatrix/row-stat reads before any lane advances far enough to overwrite this slot.
                     __syncwarp();
                 }
+#endif
 
                 ThrdRegRowMax mergedRowSum{};
                 if (gemm1NbWarpGrps == 1)
@@ -2791,6 +3269,748 @@ constexpr uint32_t nbCtaPerSM = 1;
 
 CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMPERE_WARP_SPECIALIZED;
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Shared-prefix (cascade) decode pass for kernel_mha.
+//
+// When every request of a decode batch starts with the same KV pages (block reuse of a common prompt prefix),
+// kernel_mha_prefix attends all requests' query rows of one KV head against those shared tokens together: rows are
+// (request, q head in group) pairs, 64 rows per CTA (4 row blocks of 16 MMA rows, each split over 2 warps by key
+// halves), so each prefix K/V tile is read once per 64 rows instead of once per request, and the MMA rows are filled.
+// Grid: {nbChunks, nbRowGroups, nbKHeads}; chunk c attends a contiguous range of the shared prefix. Each CTA writes
+// FP32 records (unnormalized O, row max, row sum; see cascadeFold) after the cascadeInfo words, and kernel_mha
+// (launched next with cascadeInfo and nbPrefixParts = nbChunks) walks only the suffix and folds the records into its
+// FP32 accumulator or multi-block merge in a fixed order, so the output is rounded once as without the cascade.
+//
+// The shared length is found on the device (CUDA-graph safe): P = the leading 256-token tiles whose last page is the
+// same K and V page for every request, capped so that every request keeps >= 1 suffix token. Each chunk verifies all
+// pages of its own range for every request and flags a mismatch; kernel_mha then falls back to P = 0 (the plain
+// path, partials ignored). P is published in cascadeInfo[0], the flags in cascadeInfo[1 + c].
+// ---------------------------------------------------------------------------------------------------------------------
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200) && !SPEC_DEC && BEAM_WIDTH == 1 && USE_PAGED_KV_CACHE           \
+    && PAGED_KV_CACHE_LAYOUT == 0 && !USE_INPUT_KV && !LOW_PREC_OUTPUT && CACHE_ELEM_ENUM == 2 && !INPUT_FP16          \
+    && HEAD_ELEMS == 256 && !IS_MLA && HEAD_GRP_SIZE <= 8                                                              \
+    && (TOKENS_PER_PAGE == 16 || TOKENS_PER_PAGE == 32 || TOKENS_PER_PAGE == 64)
+#define XQA_CASCADE_PREFIX 1
+#else
+#define XQA_CASCADE_PREFIX 0
+#endif
+
+#if XQA_CASCADE_PREFIX
+// FP8 math for the prefix pass (MathElem = CacheElem, as mla_sm120 does): S = Q K^T and O += P V run as
+// m16n8k32 e4m3 MMAs on the stored e4m3 K/V words (no K/V conversion). Q is split into two e4m3 terms with a per-row
+// power-of-two scale (hi = e4m3(q s), lo = e4m3(q s - hi), about BF16 precision). P is quantized to e4m3 as 448 p (the
+// row sum adds the quantized values).
+namespace cascade
+{
+constexpr uint32_t nbRowWarps = 4; // each owns 16 rows
+constexpr uint32_t nbTokSplit = 2; // warps per row block, each on its own half of every tile
+constexpr uint32_t nbWarps = nbRowWarps * nbTokSplit;
+constexpr uint32_t ctaThreads = nbWarps * 32;
+constexpr uint32_t ctaRows = nbRowWarps * 16;       // rows = (request, q head in group) pairs
+constexpr uint32_t tokTile = 64;                    // tokens per pipeline stage
+constexpr uint32_t warpToks = tokTile / nbTokSplit; // 32
+constexpr uint32_t cacheHeadBytes = 256;            // e4m3 head of 256 elements
+// e4m3 Q term rows of 256 B + 16 B pad (conflict-free ldmatrix); bytes 256..259 of a hi-term row hold the row's 1/s.
+constexpr uint32_t qTermRowBytes = 256 + 16;
+constexpr uint32_t qTermBytes = ctaRows * qTermRowBytes;   // 17408
+constexpr uint32_t qBytes = 2 * qTermBytes;                // 34816 (hi terms, then lo terms)
+constexpr float pQuantScale = 448.F;                       // P -> e4m3 as 448 p (kE4M3_MAX, as mha_sm90 / mla_sm120)
+constexpr float log2PQuantScale = 8.807354922057604F;      // log2(448)
+constexpr uint32_t kvTileBytes = tokTile * cacheHeadBytes; // 16384
+constexpr uint32_t kOffset = qBytes;
+constexpr uint32_t vOffset = kOffset + 2 * kvTileBytes;
+constexpr uint32_t miscOffset = vOffset + 2 * kvTileBytes;
+constexpr uint32_t smemBytes = miscOffset + 64;
+static_assert(tokensPerPage <= tokTile && tokTile % tokensPerPage == 0 && 256 % tokTile == 0);
+static_assert(sizeof(GMemCacheHead) == cacheHeadBytes && sizeof(IOHead) == 512);
+static_assert(gemm1WarpsPerGrp == 4 && gemm1NbWarpGrps == 1 && SharedMem::XSmemBuffer::cols == 8);
+static_assert(cascadeFold::supported, "kernel_mha must be able to fold the prefix records");
+// end-of-kernel exchange of the second token-half warps' state: [rowWarp][128 O + 2 max + 2 sum][lane] floats
+constexpr uint32_t xchgFloats = 132;
+static_assert(nbRowWarps * xchgFloats * 32 * sizeof(float) <= miscOffset);
+constexpr uint32_t kvGrainsPerThread = kvTileBytes / grainBytes / ctaThreads; // 4
+
+__device__ inline void cpAsync16(uint32_t dst, void const* src)
+{
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+}
+
+__device__ inline void cpAsyncCommit()
+{
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <uint32_t n>
+__device__ inline void cpAsyncWait()
+{
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(n) : "memory");
+}
+
+__device__ inline void ldsm4(uint32_t (&r)[4], uint32_t addr)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr)
+                 : "memory");
+}
+
+__device__ inline void ldsm4T(uint32_t (&r)[4], uint32_t addr)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr)
+                 : "memory");
+}
+
+__device__ inline void mmaE4m3(
+    float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1)
+{
+    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// 4 floats -> 4 e4m3 bytes (x0 in the lowest byte), round to nearest even, saturating to +-448.
+__device__ inline uint32_t packE4m3(float x0, float x1, float x2, float x3)
+{
+    uint32_t r;
+    asm("{\n"
+        ".reg .b16 lo, hi;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+        "mov.b32 %0, {lo, hi};\n"
+        "}\n"
+        : "=r"(r)
+        : "f"(x0), "f"(x1), "f"(x2), "f"(x3));
+    return r;
+}
+
+// 4 e4m3 bytes -> two half2 (exact): {bytes 0, 1} and {bytes 2, 3}.
+__device__ inline void unpackE4m3(uint32_t w, uint32_t& h01, uint32_t& h23)
+{
+    asm("{\n"
+        ".reg .b16 lo, hi;\n"
+        "mov.b32 {lo, hi}, %2;\n"
+        "cvt.rn.f16x2.e4m3x2 %0, lo;\n"
+        "cvt.rn.f16x2.e4m3x2 %1, hi;\n"
+        "}\n"
+        : "=r"(h01), "=r"(h23)
+        : "r"(w));
+}
+
+__device__ inline float2 half2ToFloat2(uint32_t h)
+{
+    return __half22float2(reinterpret_cast<__half2 const&>(h));
+}
+
+// Sum of the 8 e4m3 values of words w0 and w1 (pairs added in FP16, which holds them to 11 bits, then FP32).
+__device__ inline float sumE4m3x8(uint32_t w0, uint32_t w1)
+{
+    uint32_t a, b, c, d;
+    unpackE4m3(w0, a, b);
+    unpackE4m3(w1, c, d);
+    __half2 const s = __hadd2(__hadd2(reinterpret_cast<__half2 const&>(a), reinterpret_cast<__half2 const&>(b)),
+        __hadd2(reinterpret_cast<__half2 const&>(c), reinterpret_cast<__half2 const&>(d)));
+    float2 const f = __half22float2(s);
+    return f.x + f.y;
+}
+} // namespace cascade
+
+CUBIN_EXPORT __device__ constexpr uint32_t prefixSmemSize = cascade::smemBytes;
+CUBIN_EXPORT __device__ constexpr uint32_t prefixCtaSize = cascade::ctaThreads;
+
+CUBIN_EXPORT __global__ __launch_bounds__(cascade::ctaThreads, 1) void kernel_mha_prefix(uint32_t const nbKHeads,
+    float const qScale, IOHead const* __restrict__ const q, KVCacheList<usePagedKVCache> const cacheList,
+    uint32_t const batchSize, float const* __restrict__ kvCacheScale, uint32_t* __restrict__ const cascadeInfo)
+{
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+    using namespace cascade;
+    extern __shared__ __align__(128) uint8_t pfxSmem[];
+    uint32_t const tid = threadIdx.x;
+    uint32_t const lane = tid % warp_size;
+    uint32_t const warpRank = tid / warp_size;
+    uint32_t const nbChunks = gridDim.x;
+    uint32_t const idxChunk = blockIdx.x;
+    uint32_t const idxRowGrp = blockIdx.y;
+    uint32_t const idxHeadGrp = blockIdx.z;
+    uint32_t const maxPages = cacheList.maxNbPagesPerSeq;
+    KVCachePageIndex const* const pageList = cacheList.kvCachePageList;
+    auto const kPage = [&](uint32_t r, uint32_t j) { return pageList[2 * maxPages * r + j]; };
+    auto const vPage = [&](uint32_t r, uint32_t j) { return pageList[2 * maxPages * r + maxPages + j]; };
+    uint32_t* const misc = reinterpret_cast<uint32_t*>(pfxSmem + miscOffset);
+
+    // 1. Shared prefix length and this chunk's page verification. Page tables and sequence lengths are ready before
+    // the preceding RoPE/KV-append kernel, and only old prefix pages are read here, so this runs before the PDL wait.
+    // Both page-table scans batch their loads (all loads of an unrolled group are issued before any compare) and
+    // reduce locally (min / OR) with one shared-memory update per thread, so a thread waits on one L2 round trip per
+    // group instead of one per pair. The results equal a pair-by-pair scan: P = min(maxTiles, first mismatching
+    // tile), flag = any mismatching page of the chunk.
+    uint32_t const nbOther = batchSize - 1;
+    // P search over (tile k, request r >= 1) pairs, k-major (a warp's row-0 loads mostly broadcast). The tile range is
+    // bounded by the page table (kCap >= maxTiles) so the first group of loads is issued before the sequence-length
+    // reduction; pairs with k >= maxTiles are loaded (in bounds: j < maxPages) but ignored.
+    constexpr uint32_t pScanUnroll = 18;
+    uint32_t const kCap = maxPages * tokensPerPage / 256U;
+    uint32_t const nbPScan = kCap * nbOther;
+    // Every CTA scans the same pairs (and the CTAs of one chunk the same pages); each starts at its own warp-aligned
+    // offset and wraps, so the CTAs do not all request the same L2 lines at the same moment. Same pairs, same result.
+    uint32_t const ctaLinear = (idxHeadGrp * gridDim.y + idxRowGrp) * nbChunks + idxChunk;
+    uint32_t const nbCtas = nbChunks * gridDim.y * gridDim.z;
+    auto const rotation
+        = [&](uint32_t n, uint32_t rank, uint32_t nbRanks) { return uint32_t(uint64_t(n) * rank / nbRanks) & ~31U; };
+    auto const rotate
+        = [](uint32_t idx, uint32_t rot, uint32_t n) { return idx + rot < n ? idx + rot : idx + rot - n; };
+    uint32_t const pRot = rotation(nbPScan, ctaLinear, nbCtas);
+    KVCachePageIndex pScanK[pScanUnroll];
+    KVCachePageIndex pScanV[pScanUnroll];
+    KVCachePageIndex pScanK0[pScanUnroll];
+    KVCachePageIndex pScanV0[pScanUnroll];
+    auto const loadPScan = [&](uint32_t idx0)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < pScanUnroll; i++)
+        {
+            uint32_t const idxRaw = idx0 + ctaThreads * i;
+            if (idxRaw < nbPScan)
+            {
+                uint32_t const idx = rotate(idxRaw, pRot, nbPScan);
+                uint32_t const k = idx / nbOther;
+                uint32_t const r = 1 + idx % nbOther;
+                uint32_t const j = (256 * (k + 1) - 1) / tokensPerPage;
+                pScanK[i] = kPage(r, j);
+                pScanV[i] = vPage(r, j);
+                pScanK0[i] = kPage(0, j);
+                pScanV0[i] = vPage(0, j);
+            }
+        }
+    };
+    auto const cmpPScan = [&](uint32_t idx0, uint32_t maxTiles, uint32_t& firstBad)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < pScanUnroll; i++)
+        {
+            uint32_t const idxRaw = idx0 + ctaThreads * i;
+            if (idxRaw < nbPScan)
+            {
+                uint32_t const k = rotate(idxRaw, pRot, nbPScan) / nbOther;
+                if (k < maxTiles && (pScanK[i] != pScanK0[i] || pScanV[i] != pScanV0[i]))
+                {
+                    firstBad = mha::min(firstBad, k);
+                }
+            }
+        }
+    };
+    if (tid == 0)
+    {
+        misc[0] = ~0U;
+        misc[1] = ~0U;
+        misc[2] = 0U;
+    }
+    loadPScan(tid);
+    __syncthreads();
+    for (uint32_t r = tid; r < batchSize; r += ctaThreads)
+    {
+        atomicMin(&misc[0], uint32_t(cacheList.seqLenList[r]));
+    }
+    __syncthreads();
+    uint32_t const minLen = misc[0];
+    uint32_t const maxTiles = mha::min(minLen == 0 ? 0U : (minLen - 1) / 256U, kCap);
+    {
+        uint32_t firstBad = ~0U;
+        cmpPScan(tid, maxTiles, firstBad);
+        for (uint32_t idx0 = tid + ctaThreads * pScanUnroll; idx0 < nbPScan; idx0 += ctaThreads * pScanUnroll)
+        {
+            loadPScan(idx0);
+            cmpPScan(idx0, maxTiles, firstBad);
+        }
+        if (firstBad != ~0U)
+        {
+            atomicMin(&misc[1], firstBad);
+        }
+    }
+    __syncthreads();
+    uint32_t const nbPfxTiles = mha::min(misc[1], maxTiles);
+    uint32_t const nbSub = nbPfxTiles * (256 / tokTile);
+    uint32_t const subBeg = nbSub * idxChunk / nbChunks;
+    uint32_t const subEnd = nbSub * (idxChunk + 1) / nbChunks;
+    if (nbOther != 0)
+    {
+        // This chunk's pages for every request r >= 1, r-major and j-minor: a warp reads consecutive page indices of
+        // one row (coalesced), and row 0's matching loads are the same lines for every r.
+        constexpr uint32_t vScanUnroll = 12;
+        uint32_t const pageBeg = subBeg * tokTile / tokensPerPage;
+        uint32_t const nbChkPages = (subEnd - subBeg) * tokTile / tokensPerPage;
+        uint32_t const nbVScan = nbChkPages * nbOther;
+        // the CTAs sharing this chunk: gridDim.y row groups x gridDim.z KV heads
+        uint32_t const vRot = rotation(nbVScan, idxHeadGrp * gridDim.y + idxRowGrp, gridDim.y * gridDim.z);
+        bool bad = false;
+        for (uint32_t idx0 = tid; idx0 < nbVScan; idx0 += ctaThreads * vScanUnroll)
+        {
+            KVCachePageIndex vsK[vScanUnroll];
+            KVCachePageIndex vsV[vScanUnroll];
+            KVCachePageIndex vsK0[vScanUnroll];
+            KVCachePageIndex vsV0[vScanUnroll];
+#pragma unroll
+            for (uint32_t i = 0; i < vScanUnroll; i++)
+            {
+                uint32_t const idxRaw = idx0 + ctaThreads * i;
+                if (idxRaw < nbVScan)
+                {
+                    uint32_t const idx = rotate(idxRaw, vRot, nbVScan);
+                    uint32_t const r = 1 + idx / nbChkPages;
+                    uint32_t const j = pageBeg + idx % nbChkPages;
+                    vsK[i] = kPage(r, j);
+                    vsV[i] = vPage(r, j);
+                    vsK0[i] = kPage(0, j);
+                    vsV0[i] = vPage(0, j);
+                }
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < vScanUnroll; i++)
+            {
+                if (idx0 + ctaThreads * i < nbVScan)
+                {
+                    bad |= (vsK[i] != vsK0[i]) || (vsV[i] != vsV0[i]);
+                }
+            }
+        }
+        if (bad)
+        {
+            misc[2] = 1U;
+        }
+    }
+    __syncthreads();
+    uint32_t const chunkBad = misc[2];
+    // cascadeInfo and the records are written only after the PDL wait (no earlier kernel can still read them).
+    auto const publishInfo = [&]()
+    {
+        if (idxRowGrp == 0 && idxHeadGrp == 0 && tid == 0)
+        {
+            cascadeInfo[1 + idxChunk] = chunkBad;
+            if (idxChunk == 0)
+            {
+                cascadeInfo[0] = nbPfxTiles * 256;
+            }
+        }
+    };
+    if (nbSub == 0)
+    {
+        // kernel_mha ignores the records when P == 0. Still wait: kernel_mha's own wait must imply the RoPE kernel.
+        acqBulk();
+        publishInfo();
+        return;
+    }
+
+    uint8_t const* const poolBytes = reinterpret_cast<uint8_t const*>(cacheList.pool);
+    uint32_t const smemBase = static_cast<uint32_t>(__cvta_generic_to_shared(pfxSmem));
+    // K and V of 64 prefix tokens (request 0's pages) -> smem, 16-byte grain c of token t at grain c ^ (t % 8). The
+    // page indices of a tile are fetched one tile ahead, so the cp.async issue does not wait on them.
+    uint32_t const ldTok0 = tid / 16;
+    uint32_t const ldGrain = tid % 16;
+    uint32_t pgK[kvGrainsPerThread];
+    uint32_t pgV[kvGrainsPerThread];
+    auto const fetchPages = [&](uint32_t sub)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < kvGrainsPerThread; i++)
+        {
+            uint32_t const page = (tokTile * sub + ldTok0 + 16 * i) / tokensPerPage;
+            pgK[i] = uint32_t(kPage(0, page));
+            pgV[i] = uint32_t(vPage(0, page));
+        }
+    };
+    auto const issueKV = [&](uint32_t sub, uint32_t buf)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < kvGrainsPerThread; i++)
+        {
+            uint32_t const tok = ldTok0 + 16 * i;
+            uint32_t const inPage = (tokTile * sub + tok) % tokensPerPage;
+            uint32_t const dstOff = tok * cacheHeadBytes + ((ldGrain ^ (tok % 8)) * grainBytes);
+            uint64_t const kHead = (uint64_t(pgK[i]) * nbKHeads + idxHeadGrp) * tokensPerPage + inPage;
+            uint64_t const vHead = (uint64_t(pgV[i]) * nbKHeads + idxHeadGrp) * tokensPerPage + inPage;
+            cpAsync16(smemBase + kOffset + buf * kvTileBytes + dstOff,
+                poolBytes + kHead * cacheHeadBytes + ldGrain * grainBytes);
+            cpAsync16(smemBase + vOffset + buf * kvTileBytes + dstOff,
+                poolBytes + vHead * cacheHeadBytes + ldGrain * grainBytes);
+        }
+    };
+    if (subBeg < subEnd)
+    {
+        fetchPages(subBeg);
+        issueKV(subBeg, 0);
+        if (subBeg + 1 < subEnd)
+        {
+            fetchPages(subBeg + 1);
+        }
+    }
+    cpAsyncCommit();
+
+    // 2. Q (written by the preceding RoPE kernel).
+    acqBulk();
+    publishInfo();
+    uint32_t const nbQHeads = nbKHeads * headGrpSize;
+    uint32_t const nbRows = batchSize * headGrpSize;
+    // One warp per row (lane = 16-byte grain of 8 BF16 elements). s = 2^(7 - floor(log2 max|q|)), so |q s| < 256 and
+    // the scaling is exact; hi = e4m3(q s), lo = e4m3(q s - hi). Rows past nbRows are zero.
+#pragma unroll 2
+    for (uint32_t i = 0; i < ctaRows * 32 / ctaThreads; i++)
+    {
+        uint32_t const idx = tid + ctaThreads * i;
+        uint32_t const row = idx / 32;
+        uint32_t const grain = idx % 32;
+        uint32_t const rho = ctaRows * idxRowGrp + row;
+        LdGrain v = {0U, 0U, 0U, 0U};
+        if (rho < nbRows)
+        {
+            uint32_t const req = rho / headGrpSize;
+            uint32_t const jh = rho % headGrpSize;
+            v = reinterpret_cast<LdGrain const*>(&q[nbQHeads * req + headGrpSize * idxHeadGrp + jh])[grain];
+        }
+        float x[8];
+#pragma unroll
+        for (uint32_t k = 0; k < 4; k++)
+        {
+            float2 const f = __bfloat1622float2(reinterpret_cast<__nv_bfloat162 const&>(v[k]));
+            x[2 * k] = f.x;
+            x[2 * k + 1] = f.y;
+        }
+        float amax = 0.F;
+#pragma unroll
+        for (uint32_t e = 0; e < 8; e++)
+        {
+            amax = fmaxf(amax, fabsf(x[e]));
+        }
+#pragma unroll
+        for (uint32_t m = 16; m >= 1; m /= 2)
+        {
+            amax = fmaxf(amax, __shfl_xor_sync(~0U, amax, m));
+        }
+        uint32_t const ex = mha::min(mha::max(__float_as_uint(amax) >> 23, 8U), 254U); // biased exponent of max|q|
+        float const sc = __uint_as_float((261U - ex) << 23);
+        float const rcpSc = __uint_as_float((ex - 7U) << 23);
+        uint32_t hi[2];
+        uint32_t lo[2];
+#pragma unroll
+        for (uint32_t k = 0; k < 2; k++)
+        {
+            float y[4];
+#pragma unroll
+            for (uint32_t e = 0; e < 4; e++)
+            {
+                y[e] = x[4 * k + e] * sc;
+            }
+            hi[k] = packE4m3(y[0], y[1], y[2], y[3]);
+            uint32_t h01, h23;
+            unpackE4m3(hi[k], h01, h23);
+            float2 const f01 = half2ToFloat2(h01);
+            float2 const f23 = half2ToFloat2(h23);
+            lo[k] = packE4m3(y[0] - f01.x, y[1] - f01.y, y[2] - f23.x, y[3] - f23.y);
+        }
+        uint8_t* const hiRow = pfxSmem + row * qTermRowBytes;
+        *reinterpret_cast<uint2*>(hiRow + grain * 8) = uint2{hi[0], hi[1]};
+        *reinterpret_cast<uint2*>(hiRow + qTermBytes + grain * 8) = uint2{lo[0], lo[1]};
+        if (grain == 0)
+        {
+            *reinterpret_cast<float*>(hiRow + 256) = rcpSc;
+        }
+    }
+    __syncthreads();
+
+    // 3. Flash attention over the chunk. Warp (rowWarp, tokHalf) owns 16 rows and tokens [32 tokHalf, 32 tokHalf + 32)
+    // of every 64-token tile; the two halves are merged at the end.
+    uint32_t const rowWarp = warpRank % nbRowWarps;
+    uint32_t const tokHalf = warpRank / nbRowWarps;
+    uint32_t const rowBase = ctaRows * idxRowGrp + 16 * rowWarp;
+    bool const warpActive = rowBase < nbRows;
+    uint32_t const g = lane / 4;
+    uint32_t const t = lane % 4;
+    float const qkScale = qScale * kvCacheScale[0] * rsqrtf(validElemsPerHead);
+    float o[32][4];
+#pragma unroll
+    for (uint32_t n = 0; n < 32; n++)
+    {
+#pragma unroll
+        for (uint32_t e = 0; e < 4; e++)
+        {
+            o[n][e] = 0.F;
+        }
+    }
+    float rowMax[2] = {safeInitRowMax, safeInitRowMax};
+    float rowSum[2] = {0.F, 0.F}; // per-thread partial sums of the rounded probabilities
+    uint32_t const ldRow = lane % 8;
+    uint32_t const ldMat = lane / 8;
+    // ldmatrix x4 of a Q term gives one m16n8k32 A fragment: matrices (rows 0-7 | 8-15) x (bytes 0-15 | 16-31).
+    uint32_t const qLdAddr = smemBase + (16 * rowWarp + 8 * (ldMat & 1U) + ldRow) * qTermRowBytes + 16 * (ldMat >> 1);
+    // per-row logit scale, with the row's 1/s
+    float rowQkScale[2];
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        rowQkScale[i]
+            = qkScale * *reinterpret_cast<float const*>(pfxSmem + (16 * rowWarp + g + 8 * i) * qTermRowBytes + 256);
+    }
+    constexpr uint32_t nbSTiles = warpToks / 8; // 4 n-tiles of 8 keys
+    for (uint32_t sub = subBeg; sub < subEnd; sub++)
+    {
+        uint32_t const buf = (sub - subBeg) & 1U;
+        if (sub + 1 < subEnd)
+        {
+            issueKV(sub + 1, buf ^ 1U);
+            if (sub + 2 < subEnd)
+            {
+                fetchPages(sub + 2);
+            }
+        }
+        cpAsyncCommit();
+        cpAsyncWait<1>();
+        __syncthreads();
+        if (warpActive)
+        {
+            uint32_t const kBase = smemBase + kOffset + buf * kvTileBytes + warpToks * tokHalf * cacheHeadBytes;
+            uint32_t const vBase = smemBase + vOffset + buf * kvTileBytes + warpToks * tokHalf * cacheHeadBytes;
+            // S = Q K^T. Within each 16-element k step the head dims are permuted identically for Q and K: a lane's
+            // fragment holds physical dims 4t..4t+3 (one e4m3 word of K, as ldmatrix delivers it).
+            float s[nbSTiles][4];
+#pragma unroll
+            for (uint32_t j = 0; j < nbSTiles; j++)
+            {
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++)
+                {
+                    s[j][e] = 0.F;
+                }
+            }
+            // S = Q K^T as e4m3 m16n8k32: a K ldmatrix word is (token 8j+g, dims 4t..4t+3 of a 16-dim grain), which is
+            // the B fragment as stored; k step h of group kg covers dims 64 kg + 32 h + [0, 32).
+#pragma unroll
+            for (uint32_t kg = 0; kg < 4; kg++)
+            {
+                uint32_t qh[2][4];
+                uint32_t ql[2][4];
+#pragma unroll
+                for (uint32_t h = 0; h < 2; h++)
+                {
+                    ldsm4(qh[h], qLdAddr + 32 * (2 * kg + h));
+                    ldsm4(ql[h], qLdAddr + qTermBytes + 32 * (2 * kg + h));
+                }
+#pragma unroll
+                for (uint32_t j = 0; j < nbSTiles; j++)
+                {
+                    uint32_t kr[4];
+                    ldsm4(kr, kBase + (8 * j + ldRow) * cacheHeadBytes + (((4 * kg + ldMat) ^ ldRow) * grainBytes));
+#pragma unroll
+                    for (uint32_t h = 0; h < 2; h++)
+                    {
+                        mmaE4m3(s[j], qh[h][0], qh[h][1], qh[h][2], qh[h][3], kr[2 * h], kr[2 * h + 1]);
+                        mmaE4m3(s[j], ql[h][0], ql[h][1], ql[h][2], ql[h][3], kr[2 * h], kr[2 * h + 1]);
+                    }
+                }
+            }
+            // online softmax (base-2 exponent of the scaled logits, like kernel_mha)
+            float tileMax[2] = {rowMax[0], rowMax[1]};
+#pragma unroll
+            for (uint32_t j = 0; j < nbSTiles; j++)
+            {
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++)
+                {
+                    s[j][e] *= rowQkScale[e / 2];
+                }
+                tileMax[0] = fmaxf(tileMax[0], fmaxf(s[j][0], s[j][1]));
+                tileMax[1] = fmaxf(tileMax[1], fmaxf(s[j][2], s[j][3]));
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < 2; i++)
+            {
+                tileMax[i] = fmaxf(tileMax[i], __shfl_xor_sync(~0U, tileMax[i], 1));
+                tileMax[i] = fmaxf(tileMax[i], __shfl_xor_sync(~0U, tileMax[i], 2));
+            }
+            float corr[2];
+            float bias[2];
+#pragma unroll
+            for (uint32_t i = 0; i < 2; i++)
+            {
+                corr[i] = expf(rowMax[i] - tileMax[i]);
+                rowMax[i] = tileMax[i];
+                bias[i] = tileMax[i] * log2e;
+            }
+            // P as e4m3 A fragments of one k32 step over the warp's 32 tokens. Logical k 4t..4t+3 = tokens 2t, 2t+1,
+            // 8+2t, 9+2t (n-tiles 0, 1); k 16+4t.. = n-tiles 2, 3. The V B fragments below use the same token order.
+            float const biasQ[2] = {bias[0] - log2PQuantScale, bias[1] - log2PQuantScale}; // 448 p
+            float pe[nbSTiles][4];
+#pragma unroll
+            for (uint32_t j = 0; j < nbSTiles; j++)
+            {
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++)
+                {
+                    pe[j][e] = exp2f(s[j][e] * log2e - biasQ[e / 2]);
+                }
+            }
+            uint32_t const pa0 = packE4m3(pe[0][0], pe[0][1], pe[1][0], pe[1][1]);
+            uint32_t const pa1 = packE4m3(pe[0][2], pe[0][3], pe[1][2], pe[1][3]);
+            uint32_t const pa2 = packE4m3(pe[2][0], pe[2][1], pe[3][0], pe[3][1]);
+            uint32_t const pa3 = packE4m3(pe[2][2], pe[2][3], pe[3][2], pe[3][3]);
+            float const pSum[2] = {sumE4m3x8(pa0, pa2), sumE4m3x8(pa1, pa3)};
+#pragma unroll
+            for (uint32_t i = 0; i < 2; i++)
+            {
+                rowSum[i] = rowSum[i] * corr[i] + pSum[i];
+            }
+#pragma unroll
+            for (uint32_t n = 0; n < 32; n++)
+            {
+                o[n][0] *= corr[0];
+                o[n][1] *= corr[0];
+                o[n][2] *= corr[1];
+                o[n][3] *= corr[1];
+            }
+            // O += P V as e4m3 m16n8k32 (one k step = the warp's 32 tokens). ldmatrix.trans on e4m3 pairs gives a lane
+            // keys (2t, 2t+1) x head dims (d+2g, d+2g+1) of an 8-token block; byte-permuting blocks (0-7, 8-15) gives
+            // the B word of keys (2t, 2t+1, 8+2t, 9+2t) for dim d+2g (even n-tile) and d+2g+1 (odd n-tile), and blocks
+            // (16-23, 24-31) the second B word. The accumulator layout matches the BF16 path's.
+            {
+                uint32_t const tok = 8 * (ldMat & 1U) + ldRow;
+#pragma unroll
+                for (uint32_t db = 0; db < 8; db++)
+                {
+                    uint32_t const grain = 2 * db + (ldMat >> 1);
+                    uint32_t va[4];
+                    uint32_t vb[4];
+                    ldsm4T(va, vBase + tok * cacheHeadBytes + ((grain ^ ldRow) * grainBytes));
+                    ldsm4T(vb, vBase + (16 + tok) * cacheHeadBytes + ((grain ^ ldRow) * grainBytes));
+#pragma unroll
+                    for (uint32_t hg = 0; hg < 2; hg++)
+                    {
+                        mmaE4m3(o[4 * db + 2 * hg], pa0, pa1, pa2, pa3, __byte_perm(va[2 * hg], va[2 * hg + 1], 0x6420),
+                            __byte_perm(vb[2 * hg], vb[2 * hg + 1], 0x6420));
+                        mmaE4m3(o[4 * db + 2 * hg + 1], pa0, pa1, pa2, pa3,
+                            __byte_perm(va[2 * hg], va[2 * hg + 1], 0x7531),
+                            __byte_perm(vb[2 * hg], vb[2 * hg + 1], 0x7531));
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    cpAsyncWait<0>();
+    preExit();
+
+    // Merge the two token halves of each row block (same lane <-> same rows and columns in both warps).
+    float* const xchg = reinterpret_cast<float*>(pfxSmem) + rowWarp * xchgFloats * warp_size + lane;
+    if (tokHalf == 1)
+    {
+        if (warpActive)
+        {
+#pragma unroll
+            for (uint32_t n = 0; n < 32; n++)
+            {
+#pragma unroll
+                for (uint32_t e = 0; e < 4; e++)
+                {
+                    xchg[(4 * n + e) * warp_size] = o[n][e];
+                }
+            }
+            xchg[128 * warp_size] = rowMax[0];
+            xchg[129 * warp_size] = rowMax[1];
+            xchg[130 * warp_size] = rowSum[0];
+            xchg[131 * warp_size] = rowSum[1];
+        }
+    }
+    __syncthreads();
+    if (tokHalf == 1 || !warpActive)
+    {
+        return;
+    }
+    {
+        float s0[2];
+        float s1[2];
+#pragma unroll
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            float const otherMax = xchg[(128 + i) * warp_size];
+            float const m = fmaxf(rowMax[i], otherMax);
+            s0[i] = expf(rowMax[i] - m);
+            s1[i] = expf(otherMax - m);
+            rowMax[i] = m;
+            rowSum[i] = rowSum[i] * s0[i] + xchg[(130 + i) * warp_size] * s1[i];
+        }
+#pragma unroll
+        for (uint32_t n = 0; n < 32; n++)
+        {
+#pragma unroll
+            for (uint32_t e = 0; e < 4; e++)
+            {
+                o[n][e] = o[n][e] * s0[e / 2] + xchg[(4 * n + e) * warp_size] * s1[e / 2];
+            }
+        }
+    }
+
+    // 4. FP32 partial record of chunk idxChunk for each (request, KV head) row: unnormalized O, row max, row sum.
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 1);
+        rowSum[i] += __shfl_xor_sync(~0U, rowSum[i], 2);
+    }
+    // back from 448 p to p, the units kernel_mha folds
+    {
+        constexpr float rcpPQuantScale = 1.F / pQuantScale;
+#pragma unroll
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            rowSum[i] *= rcpPQuantScale;
+        }
+#pragma unroll
+        for (uint32_t n = 0; n < 32; n++)
+        {
+#pragma unroll
+            for (uint32_t e = 0; e < 4; e++)
+            {
+                o[n][e] *= rcpPQuantScale;
+            }
+        }
+    }
+    float* const records = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(cascadeInfo) + cascadeFold::infoBytes);
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        uint32_t const rho = rowBase + g + 8 * i;
+        if (rho >= nbRows)
+        {
+            continue;
+        }
+        uint32_t const req = rho / headGrpSize;
+        uint32_t const jh = rho % headGrpSize;
+        float* const rec
+            = records + size_t((nbKHeads * req + idxHeadGrp) * nbChunks + idxChunk) * cascadeFold::recFloats;
+        if (t == 0)
+        {
+            rec[headGrpSize * validElemsPerHead + jh] = rowMax[i];
+            rec[headGrpSize * validElemsPerHead + cascadeFold::statStride + jh] = rowSum[i];
+        }
+#pragma unroll
+        for (uint32_t db = 0; db < 8; db++)
+        {
+#pragma unroll
+            for (uint32_t half = 0; half < 2; half++)
+            {
+                // even n-tile: dims d + 4t, d + 4t + 2; odd n-tile: d + 4t + 1, d + 4t + 3
+                float const(&ev)[4] = o[4 * db + 2 * half];
+                float const(&od)[4] = o[4 * db + 2 * half + 1];
+                reinterpret_cast<float4&>(rec[jh * validElemsPerHead + 32 * db + 16 * half + 4 * t])
+                    = make_float4(ev[2 * i], od[2 * i], ev[2 * i + 1], od[2 * i + 1]);
+            }
+        }
+    }
+#else
+    asm volatile("trap;\n");
+#endif
+}
+#endif // XQA_CASCADE_PREFIX
+
 #ifdef NDEBUG
 CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if SPEC_DEC
@@ -2819,7 +4039,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     uint32_t const batchSize,
     float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
                                             // int8/fp8 KV cache.
-    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
+    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr,
+    uint32_t const* __restrict__ cascadeInfo = nullptr, uint32_t nbPrefixParts = 0)
 {
 #if SPEC_DEC
     kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
@@ -2841,7 +4062,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kvCacheScale, semaphores, scratch, cascadeInfo, nbPrefixParts);
 }
 #else
 static constexpr auto kernel_mha = kernel_mha_impl;
@@ -2971,7 +4192,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kvCacheScale, semaphores, scratch, static_cast<uint32_t const*>(nullptr), 0U);
 #else
     KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
 #ifndef NDEBUG
@@ -2999,7 +4220,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kvCacheScale, semaphores, scratch, static_cast<uint32_t const*>(nullptr), 0U);
 #endif
     checkCuda(cudaPeekAtLastError());
 #endif // USE_INPUT_KV

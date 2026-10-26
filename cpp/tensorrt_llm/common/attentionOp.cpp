@@ -29,6 +29,7 @@
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/qwen35/qwen35ContextFmhaSm120.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -215,6 +216,8 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.cross_attention = mCrossAttention;
     xqaParams.max_distance = mMaxDistance;
     xqaParams.multi_block_mode = common::getEnvForceDeterministicAttention() ? false : mMultiBlockMode;
+    xqaParams.one_wave_multi_block = mXqaOneWaveMultiBlock;
+    xqaParams.shared_prefix_min_batch = mXqaSharedPrefixMinBatch;
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
@@ -920,6 +923,8 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
         : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads) + cu_seqlens_size);
 
     size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize() : 0;
+    size_t const context_fmha_sm120_target_size
+        = mEnableContextFMHA && useContextFmhaSm120Target() ? qwen35::kContextFmhaSm120WorkspaceBytes : 0;
 
     AttentionContextWorkspaceSizes workspaceSizes{};
     workspaceSizes.attentionMask = attention_mask_size;
@@ -950,6 +955,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
     workspaceSizes.sageKMeanSum = sage_k_mean_sum_buffer_size;
     workspaceSizes.cpWorkspace = cpWorkspaceSize;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
+    workspaceSizes.contextFmhaSm120Target = context_fmha_sm120_target_size;
     context_workspace_size = AttentionWorkspaceManager::buildContextLayout(workspaceSizes).totalSize;
 
     return context_workspace_size;
@@ -1649,6 +1655,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         = mCpSize == 1 ? 0 : 2 * sizeof(T) * cpMaxPadedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
 
     size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize() : 0;
+    size_t const context_fmha_sm120_target_size
+        = mEnableContextFMHA && useContextFmhaSm120Target() ? qwen35::kContextFmhaSm120WorkspaceBytes : 0;
 
     bool const is_qk_buf_float_ = true;
 
@@ -1681,6 +1689,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     workspaceSizes.sageKMeanSum = sage_k_mean_sum_buffer_size;
     workspaceSizes.cpWorkspace = cpWorkspaceSize;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
+    workspaceSizes.contextFmhaSm120Target = context_fmha_sm120_target_size;
     auto const workspaceLayout = AttentionWorkspaceManager::buildContextLayout(workspaceSizes);
     auto const workspaceViews = AttentionWorkspaceManager::materializeContext<T>(
         params.workspace, workspaceLayout, cpMaxPadedSequenceLength, getHeadSize(), mNumHeads, mNumKVHeads);
@@ -2195,6 +2204,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (mAttentionChunkSize)
         {
             fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
+        }
+
+        // The SM120 target launcher of the e4m3 head-256 causal paged-KV kernel.
+        if (useContextFmhaSm120Target())
+        {
+            fmhaParams.sm120TargetFmha = true;
+            fmhaParams.sm120TargetFmhaWorkspace = workspaceViews.contextFmhaSm120Target;
+            fmhaParams.skipLeadingQTiles = params.context_fmha_skip_leading_q_tiles;
         }
 
         // Run the fmha kernel.

@@ -170,6 +170,10 @@ public:
         int32_t const* cu_q_seqlens = nullptr;
         int32_t const* cu_kv_seqlens = nullptr;
 
+        // With mContextFmhaSm120Target: when the last q-tile KV split runs, leave the output rows of the q-tiles
+        // before the last one unwritten (the caller reads only each sequence's last row, all in the last q-tile).
+        bool context_fmha_skip_leading_q_tiles = false;
+
         std::string enqueueContextParamsToString() const
         {
             // variables from the params coming from the runtime
@@ -582,6 +586,14 @@ public:
     float mSkipCorrectionThreshold = 0;
     // Use spcompress (context phase, SM107 only).
     bool mUsesSpcompress = false;
+    // SM120/121 XQA HMMA decode with head size 256: cap the multi-block sub-sequence count at one CTA wave.
+    bool mXqaOneWaveMultiBlock = false;
+    // SM120/121 XQA HMMA decode with head size 256: run the shared-prefix (cascade) pass from this batch size on
+    // (0 disables it).
+    int32_t mXqaSharedPrefixMinBatch = 0;
+    // SM120/121 FP8 context FMHA with head size 256: run the e4m3 causal paged-KV kernel through the Qwen3.5-family
+    // target's launcher (kernels/qwen35: base-2 softmax, last q-tile KV split).
+    bool mContextFmhaSm120Target = false;
     // Optional SageAttention block sizes, in tokens per scale for q/k and channels per scale for v.
     int mSageAttnNumEltsPerBlkQ = 0;
     int mSageAttnNumEltsPerBlkK = 0;
@@ -613,8 +625,17 @@ public:
             mSkipAttn, mFuseFp4Quant, mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores,
             mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
             mSkipSoftmaxThresholdScaleFactorDecode, mSkipCorrectionThreshold, mUsesSpcompress, mSageAttnNumEltsPerBlkQ,
-            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8, mSageAttnSmoothK);
+            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8, mSageAttnSmoothK, mXqaOneWaveMultiBlock,
+            mXqaSharedPrefixMinBatch, mContextFmhaSm120Target);
     };
+
+    // Whether the context FMHA runs through the SM120 target launcher (see mContextFmhaSm120Target), which needs its
+    // last q-tile split workspace in the context workspace.
+    [[nodiscard]] bool useContextFmhaSm120Target() const
+    {
+        return mContextFmhaSm120Target && (mSM == 120 || mSM == 121) && mFP8ContextFMHA && !mIsMLAEnabled
+            && mHeadSize == 256;
+    }
 
 private:
     static constexpr int kReservedMaxSeqLenTilePerSeq = 64;

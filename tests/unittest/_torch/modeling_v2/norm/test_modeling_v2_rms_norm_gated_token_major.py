@@ -1,23 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the rms_norm_gated_token_major entry."""
+"""GPU test for the rms_norm_gated_token_major catalog entry."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (
     rms_norm_gated_token_major as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "rms_norm_gated_token_major requires a CUDA device"
 
 
-#: The target's concatenated GDN input projection: [q k v | z | a | b] = 10240 | 6144 | 48 | 48.
+#: qwen3.8-flash-next's concatenated GDN input projection: [q k v | z | a | b] = 10240 |
+#: 6144 | 48 | 48 (a cell's `in_proj_width` overrides it: qwen3.8-27b's in_proj_qkvz is
+#: [q k v | z], 16384 wide). z starts at column 10240 in both.
 _IN_PROJ_WIDTH, _Z_OFFSET = 16480, 10240
 
 
@@ -41,7 +43,8 @@ def _build(spec, seed):
 
     layout = spec.get("z", "packed")
     if layout == "in_proj":
-        z = randn(t, _IN_PROJ_WIDTH)[:, _Z_OFFSET : _Z_OFFSET + heads * n].view(t, heads, n)
+        width = spec.get("in_proj_width", _IN_PROJ_WIDTH)
+        z = randn(t, width)[:, _Z_OFFSET : _Z_OFFSET + heads * n].view(t, heads, n)
     else:
         assert layout == "packed", layout
         z = randn(t, heads, n)
@@ -55,7 +58,10 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     certifying(op)
     args = _build(cell.spec, seed=_seed(cell.why))
     x, z, weight = args[:3]
-    assert z.stride() == (_IN_PROJ_WIDTH, cell.spec["width"], 1) and not z.is_contiguous()
+    width = cell.spec.get("in_proj_width", _IN_PROJ_WIDTH)
+    assert z.stride()[1:] == (cell.spec["width"], 1)
+    # A single token's view is contiguous by torch's rule (size-1 dims are skipped).
+    assert cell.spec["tokens"] == 1 or (z.stride(0) == width and not z.is_contiguous())
     before = [x.clone(), z.clone(), weight.clone()]
 
     out = op(*args)

@@ -45,7 +45,7 @@ class Fp4Quantize(OpWrapper):
     is something a consumer has to be told, not something its shape shows.
     """
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_120})
 
     # deepseek-r1 reaches this op from both layouts: the swizzled one feeding
     # nvfp4_gemm in the dense and shared-expert MLPs, the linear one feeding the
@@ -91,6 +91,20 @@ class Fp4Quantize(OpWrapper):
         Cell(
             why="qwen3.8 prefill at max_num_tokens 8192, hidden 2560, linear",
             spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        # qwen3_5 (Qwen3.8-27B) quantizes its hidden-5120 activations for the W4A4
+        # projections, the MLP and lm_head, swizzled, at every step size.
+        Cell(
+            why="qwen3.8-27b decode: 1 token, hidden 5120, swizzled",
+            spec=dict(shape=(1, 5120), dtype=torch.bfloat16, vec=16, swizzled=True),
+        ),
+        Cell(
+            why="qwen3.8-27b, 41 rows at hidden 5120: a partial 128-row swizzle tile",
+            spec=dict(shape=(41, 5120), dtype=torch.bfloat16, vec=16, swizzled=True),
+        ),
+        Cell(
+            why="qwen3.8-27b prefill at max_num_tokens 8192, hidden 5120, swizzled",
+            spec=dict(shape=(8192, 5120), dtype=torch.bfloat16, vec=16, swizzled=True),
         ),
     )
 

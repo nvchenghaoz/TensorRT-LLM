@@ -18,7 +18,7 @@ class CublasMm(OpWrapper):
     is -- the targets pass `weight.t()` and no transpose kernel runs.
     """
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_120})
 
     # Both targets use this for every dense projection, so the cells are the
     # three argument shapes that differ in kind rather than in size: fused bias
@@ -74,6 +74,16 @@ class CublasMm(OpWrapper):
         Cell(
             why="deepseek MTP shared expert down at attention TP8: 256 -> hidden 7168",
             spec=dict(m=16, k=256, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        # qwen3_5 (Qwen3.8-27B) runs its Gated-DeltaNet in_proj_ba here above the
+        # small-N GEMV's 16 rows: hidden 5120 -> [b | a], 2 x 48 value heads.
+        Cell(
+            why="qwen3.8-27b in_proj_ba, 17 rows: hidden 5120 -> 96",
+            spec=dict(m=17, k=5120, n=96, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="qwen3.8-27b in_proj_ba, a prefill step of 8192 rows: hidden 5120 -> 96",
+            spec=dict(m=8192, k=5120, n=96, dtype=torch.bfloat16, bias=False, out_dtype=None),
         ),
     )
 

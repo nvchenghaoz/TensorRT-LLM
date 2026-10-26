@@ -264,7 +264,9 @@ void initBindings(nb::module_& m)
         nb::arg("enable_dsv4_epilogue_fusion") = false, nb::arg("force_prepare_spec_dec_tree_mask") = false,
         nb::arg("max_num_sequences") = std::nullopt, nb::arg("kv_norm_weight") = std::nullopt,
         nb::arg("kv_norm_eps") = 1e-6, nb::arg("skip_correction_threshold") = 0.0,
-        nb::arg("uses_spcompress") = std::nullopt, "Multi-head attention operation",
+        nb::arg("uses_spcompress") = std::nullopt, nb::arg("xqa_one_wave_multi_block") = false,
+        nb::arg("xqa_shared_prefix_min_batch") = 0, nb::arg("context_fmha_sm120_target") = false,
+        nb::arg("context_fmha_skip_leading_q_tiles") = false, "Multi-head attention operation",
         nb::call_guard<nb::gil_scoped_release>());
 
     m.def(

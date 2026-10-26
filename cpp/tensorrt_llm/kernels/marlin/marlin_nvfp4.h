@@ -38,9 +38,20 @@ inline bool isMarlinNvfp4DenseSmSupported(int sm)
 void dequantFp4Activations(
     void const* act_fp4, void const* act_sf, float const* alpha, void* act_bf16, int m, int k, cudaStream_t stream);
 
+// launch_hint of marlinNvfp4Gemm: the stock launch configuration.
+constexpr int kMarlinNvfp4LaunchHintDefault = 0;
+// launch_hint of marlinNvfp4Gemm: the launch tables of the Qwen3.8 decode GEMMs. One full-K CTA per column for
+// (N, K) = (5120, 6144) (bitwise equal to the split-K launch) and (16384 or 14336, 5120) at rows <= 8, per-(N, K)
+// launches at rows 9-16 and, with use_fp32_reduce, 17-32 on 188-SM GPUs, and with PDL an L2 prefetch of the first
+// pipeline stages' weights before the grid-dependency wait of the in_proj instances.
+constexpr int kMarlinNvfp4LaunchHintQwen38 = 1;
+
+// enable_pdl: launch with programmatic stream serialization (the kernel waits on
+// its predecessor with griddepcontrol.wait before any global memory access).
 void marlinNvfp4Gemm(void const* act_bf16, void const* weight, void* output, void* C_tmp, void const* weight_sf,
     void const* global_scale_bf16, int m, int n, int k, int* workspace, int num_groups, int group_size,
-    bool use_fp32_reduce, cudaStream_t stream);
+    bool use_fp32_reduce, cudaStream_t stream, bool enable_pdl = false,
+    int launch_hint = kMarlinNvfp4LaunchHintDefault);
 
 void marlinNvfp4MoeGemmDispatcher(void const* A, void const* B, void* C, void* C_tmp, void const* b_scales,
     void const* global_scale, void const* sorted_token_ids, void const* expert_ids, void const* num_tokens_past_padded,

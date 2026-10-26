@@ -33,6 +33,8 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
     MultimodalItemPartition, MultimodalParams)
+from tensorrt_llm.inputs.prefix_token_cache import \
+    tokenizer_adds_no_special_tokens
 
 from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -145,11 +147,16 @@ def _prepare_qwen_vl_mrope_config(
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
+    # Text-only prompts are tokenized by the tokenizer alone (see
+    # `call_with_text_prompt`), so they can use the prefix token cache.
+    supports_tokenization_cache = True
+
     def __init__(self,
                  model_path: str,
                  config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True,
+                 enable_tokenization_cache: bool = False,
                  **kwargs):
         _install_processor_output_validation_filter()
         super().__init__(model_path=model_path,
@@ -165,6 +172,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             model_path,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
+        # The text-only path tokenizes with the tokenizer's default
+        # add_special_tokens=True and the cache with False, so the cache is only
+        # used when the tokenizer adds no special tokens (true for Qwen).
+        if (enable_tokenization_cache
+                and not tokenizer_adds_no_special_tokens(self._tokenizer)):
+            logger.warning(
+                "enable_tokenization_cache is ignored: the tokenizer adds "
+                "special tokens, so cached ids would differ from the text-only "
+                "tokenization.")
+            enable_tokenization_cache = False
+        self._init_tokenization_cache(enable_tokenization_cache,
+                                      self._tokenizer)
 
         # temporal patch size for video frames
         self.temporal_patch_size = getattr(self.config.vision_config,
@@ -1284,6 +1303,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # serving the prefill worker re-registers that tensor as a CUDA IPC
         # handle no one ever consumes.
         if not mm_data:
+            # Same ids as the tokenizer call below (see __init__).
+            cached_ids = (self._encode_with_tokenization_cache(
+                text_prompt, sampling_params) if isinstance(
+                    text_prompt, str) else None)
+            if cached_ids is not None:
+                return cached_ids, None
             input_ids = self.tokenizer(text_prompt,
                                        return_tensors="pt").input_ids
             return input_ids[0].to(torch.int32).tolist(), None

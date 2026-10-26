@@ -97,4 +97,16 @@ private:
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
     ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;
 
+//! Pool limit of copyBatchBlockOffsetsToDeviceViaSnapshot (scales and offsets travel as kernel parameters).
+constexpr uint32_t kMaxSnapshotCopyPools = 64;
+
+//! Same destination as copyBatchBlockOffsetsToDevice, bitwise. At call time it gathers the K plane of the rows
+//! selected by copyIndex from the host page table into `snapshot` (pinned host, >= numPools * numSeqs *
+//! numBlocksPerSeq int32, laid out [numPools, numSeqs, numBlocksPerSeq]) and reads the per-pool scales and offsets on
+//! the host, then launches a kernel that reads only the snapshot. The launched copy therefore no longer depends on
+//! the host page table or the copy index after this call returns; the caller must keep `snapshot` untouched until
+//! the kernel has run on `stream`.
+void copyBatchBlockOffsetsToDeviceViaSnapshot(ITensor const& input, ITensor& snapshot, ITensor& output,
+    ITensor const& copyIndex, ITensor const& indexScales, ITensor const& kvOffset, CUstream stream);
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -10,9 +10,10 @@ import torch
 # tensorrt_llm._torch.custom_ops` alone, torch.ops.trtllm has no
 # `fused_sigmoid_mul_inplace` (measured).
 import tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate  # noqa: F401
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: The checkpoint's gated attention: 24 q heads of 256, q projection [T, 24, 512].
+from .._op import Arch, Cell, OpWrapper
+
+#: qwen3.8-flash-next's gated attention: 24 q heads of 256, q projection [T, 24, 512].
 _CKPT = dict(heads=24, head_dim=256, dtype=torch.bfloat16, gate="interleaved")
 
 
@@ -30,8 +31,12 @@ class FusedSigmoidMulInplace(OpWrapper):
     operands and everything downstream (the o projection). `gate` is read-only.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_120})
 
+    # qwen3.8-flash-next (qwen4_exp, sm_103): the 2-D gate window of its fused input
+    # projection row, and the MTP layer's strided q_proj half. qwen3.8-27b (qwen3_5,
+    # sm_120): at decode rows up to 32 the gate is the 3-D view the rope-gate prologue
+    # hands back -- the g_i halves of the interleaved [T, 14336] qkv projection.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode 128 tokens: 2-D gate off the fused projection row (stride 14080)",
@@ -44,6 +49,14 @@ class FusedSigmoidMulInplace(OpWrapper):
         Cell(
             why="MTP decode: 1 token, 24x256 gate as the strided half of q_proj",
             spec=dict(tokens=1, **_CKPT),
+        ),
+        Cell(
+            why="qwen3.8-27b decode 1 token: gate the [1, 24, 256] view of the qkv projection",
+            spec=dict(tokens=1, heads=24, head_dim=256, dtype=torch.bfloat16, gate="qkv_view"),
+        ),
+        Cell(
+            why="qwen3.8-27b decode 32 tokens: token stride 14336, head stride 512",
+            spec=dict(tokens=32, heads=24, head_dim=256, dtype=torch.bfloat16, gate="qkv_view"),
         ),
     )
 
@@ -68,18 +81,22 @@ class FusedSigmoidMulInplace(OpWrapper):
     result by ~2.15 max abs at [17, 6144] (measured), so the per-head indexing
     is under test.
 
-    Certified: bf16 operands at the checkpoint's hidden 6144, a compact
+    Certified: bf16 operands at hidden 6144 (both checkpoints), a compact
     `attention_output`; the 2-D window of the fused projection row at 128
     tokens (decode, 1024-wide blocks) and 8192 tokens (prefill, 2048-wide
-    blocks), and the strided q_proj half (MTP) at 1 token.
+    blocks), the strided q_proj half (MTP) at 1 token, and the 3-D gate view of
+    the interleaved `[T, 14336]` qkv projection at 1 and 32 tokens.
 
     Hard limits
       T * row stride  token offset computed in int64  boundary 2^63  not probed
       (largest run 8192 rows)
 
+    CUDA-graph replay is certified for the qkv view at 32 tokens (the replay reads
+    the operands' contents at replay time).
+
     Not certified: 0 tokens, the strided q_proj half above 1 token, a strided
     `attention_output`, a gate dtype other than `attention_output.dtype`,
-    fp16/fp32 operands, other hidden sizes, CUDA-graph capture, torch.compile.
+    fp16/fp32 operands, other hidden sizes, torch.compile.
     """
 
     def __call__(self, attention_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:

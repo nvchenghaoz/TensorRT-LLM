@@ -16,8 +16,19 @@ import triton
 import tensorrt_llm._torch.modules.mamba.layernorm_gated as _layernorm_gated
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: The checkpoint's GDN epilogue: 48 value heads of 128, `output_gate_type: sigmoid`.
+#: qwen3.8-flash-next's GDN epilogue: 48 value heads of 128, `output_gate_type: sigmoid`,
+#: z a column view of its [T, 16480] input projection.
 _CKPT = dict(heads=48, width=128, dtype=torch.bfloat16, eps=1e-6, gate_activation="sigmoid")
+#: qwen3.8-27b's: 48 value heads of 128, the GDN's silu gate, z the columns [10240, 16384)
+#: of its [T, 16384] in_proj_qkvz output.
+_QWEN38_27B = dict(
+    heads=48,
+    width=128,
+    dtype=torch.bfloat16,
+    eps=1e-6,
+    gate_activation="silu",
+    in_proj_width=16384,
+)
 #: Prefill-sized launches (at least this many rows, i.e. 683 tokens of 48 heads) run
 #: the multi-row kernel at `_PREFILL_ROWS` rows a program: at 16384 tokens 94 vs 143
 #: us on GB300 (traffic roofline ~81 us), where 4 rows a program leave 196608 small
@@ -68,14 +79,16 @@ class RmsNormGatedTokenMajor(OpWrapper):
     `x.dtype`, multiplied by `1 / fp8_scale[0]` and saturated at +-448 --
     byte-identical to the unfused norm -> static-quantize pair.
 
-    Call site: `z` is the `[T, 6144]` column view of the GDN layer's one
-    `[T, 16480]` input-projection output, reshaped `[T, 48, 128]`.
+    Call sites: `z` is the `[T, 6144]` column view of the GDN layer's input
+    projection, reshaped `[T, 48, 128]` -- qwen3.8-flash-next's one `[T, 16480]`
+    output (sigmoid gate), qwen3.8-27b's `[T, 16384]` in_proj_qkvz output (silu gate,
+    `fp8_scale` None, at decode rows 1..4 and steps with context rows up to 32 rows).
 
     Fusion boundary: norm, weight, gate and the optional quantize. The caller
     owns both projections producing `x` and `z`, and every reshape.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_120})
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -89,6 +102,18 @@ class RmsNormGatedTokenMajor(OpWrapper):
         Cell(
             why="683 tokens: the first launch at 8 rows a program",
             spec=dict(tokens=683, z="in_proj", **_CKPT),
+        ),
+        Cell(
+            why="qwen3.8-27b decode 1 token, silu gate: 12 programs, PDL",
+            spec=dict(tokens=1, z="in_proj", **_QWEN38_27B),
+        ),
+        Cell(
+            why="qwen3.8-27b decode 4 tokens, silu gate: the largest bf16 decode step",
+            spec=dict(tokens=4, z="in_proj", **_QWEN38_27B),
+        ),
+        Cell(
+            why="qwen3.8-27b 32-token step with context rows, silu: 384 programs, no PDL",
+            spec=dict(tokens=32, z="in_proj", **_QWEN38_27B),
         ),
     )
 
@@ -115,9 +140,11 @@ class RmsNormGatedTokenMajor(OpWrapper):
 
     Certified: bf16 `x` with the sigmoid gate over the in_proj column view of
     `z` (48 heads of N = 128): 128 tokens on the 4-row kernel, 683 tokens (the
-    first 8-row launch) and 16384 tokens on the 8-row kernel. Not certified:
-    fp8 output, the silu gate, the generic fallback kernel, fp16/fp32
-    operands, a strided `x`.
+    first 8-row launch) and 16384 tokens on the 8-row kernel; bf16 `x` with the
+    silu gate over qwen3.8-27b's in_proj_qkvz column view (token stride 16384) at
+    1, 4 and 32 tokens on the 4-row kernel (with PDL at 1 and 4 tokens: a grid
+    below the SM count). Not certified: fp8 output, the generic fallback kernel,
+    fp16/fp32 operands, a strided `x`.
 
     Numerics: bf16 inside the default tolerance against the fp32 reference,
     with one-ulp differences on ~1e-5 of elements at prefill row counts. fp8

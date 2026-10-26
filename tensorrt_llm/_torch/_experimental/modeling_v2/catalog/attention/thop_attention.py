@@ -110,25 +110,41 @@ _FP8_24_4_256 = dict(
     max_num_requests=4,
 )
 
+#: qwen3_5's full-attention call (Qwen3.8-27B on sm_120): `_FP8_24_4_256` on the
+#: paged-context path with the SM120 opt-ins its decode and prefill steps pass. Pools
+#: sized for 2048-token histories and contexts; `max_blocks_per_seq` is a test-side
+#: page-table width.
+_QWEN35 = dict(
+    _FP8_24_4_256,
+    use_paged_context_fmha=True,
+    num_blocks=256,
+    max_num_requests=8,
+    max_blocks_per_seq=96,
+)
+_QWEN35_DECODE = dict(xqa_one_wave_multi_block=True, xqa_shared_prefix_min_batch=8)
+_QWEN35_PREFILL = dict(_QWEN35_DECODE, context_fmha_sm120_target=True)
+_QWEN35_LAST_LAYER = dict(_QWEN35_PREFILL, context_fmha_skip_leading_q_tiles=True)
+
 
 class ThopAttention(OpWrapper):
     """Append this step's K/V to the paged cache, then attend over it.
 
     The most load-bearing entry in the catalog and the only one wrapping a
-    pybind binding rather than a registered torch op. Three targets go through
+    pybind binding rather than a registered torch op. Four targets go through
     it, by different paths: gpt-oss on the standard path with attention sinks
     and an alternating sliding window, deepseek on MLA's two phases, and
     qwen4_exp on the standard path twice over -- its full-attention layers and
     MTP module (GQA 24/2/256 over a bf16 or an fp8-e4m3 pool, a P-token draft
     block per generation sequence, a two-pool hybrid mapping), and its vision
-    tower with no KV cache at all.
+    tower with no KV cache at all. qwen3_5 runs GQA 24/4/256 over an fp8-e4m3
+    pool on the paged-context path with the SM120 opt-ins.
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
     without allocating.
     """
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_120})
 
     # gpt-oss alternates its two window classes inside one engine, so both of
     # its cells are live every step; deepseek runs context and generation
@@ -765,6 +781,134 @@ class ThopAttention(OpWrapper):
                 predicted_tokens_per_seq=4,
             ),
         ),
+        # qwen3_5 (Qwen3.8-27B) on sm_120: 24/4/256 over an fp8 pool with the SM120 opt-ins.
+        # `opt_ins` are the call's extra arguments; `shared_prefix` tokens (whole pages) are
+        # one physical copy in every sequence's page table, as block reuse leaves them.
+        Cell(
+            why="qwen3_5 decode, one sequence over 2047 keys: the one-wave multi-block cap",
+            spec=dict(
+                _QWEN35,
+                cached=(2047,),
+                new=(1,),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_DECODE,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 decode, 4 sequences over 1500 to 31 keys: multi-block per sequence",
+            spec=dict(
+                _QWEN35,
+                cached=(1500, 900, 300, 31),
+                new=(1, 1, 1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_DECODE,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 decode batch 8 sharing a 512-token prefix: the shared-prefix pass "
+            "over two 256-token tiles, then each sequence's own suffix",
+            spec=dict(
+                _QWEN35,
+                shared_prefix=512,
+                cached=(552, 612, 519, 576, 513, 712, 545, 640),
+                new=(1,) * 8,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_DECODE,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 decode batch 8 with nothing shared: the plain decode after the "
+            "shared-prefix scan",
+            spec=dict(
+                _QWEN35,
+                cached=(64, 300, 31, 128, 512, 7, 200, 96),
+                new=(1,) * 8,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_DECODE,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 prefill, one fresh 2048-row context: the target context FMHA",
+            spec=dict(
+                _QWEN35,
+                cached=(0,),
+                new=(2048,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_PREFILL,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 prefill, a 1024-row chunk over a 1024-token cached prefix",
+            spec=dict(
+                _QWEN35,
+                cached=(1024,),
+                new=(1024,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_PREFILL,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 prefill, three contexts of 1024, 1000 and 970 rows",
+            spec=dict(
+                _QWEN35,
+                cached=(0, 0, 0),
+                new=(1024, 1000, 970),
+                num_contexts=3,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_PREFILL,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 mixed step: a 700-row context ahead of two decode rows",
+            spec=dict(
+                _QWEN35,
+                cached=(0, 300, 200),
+                new=(700, 1, 1),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_PREFILL,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 last layer, one 2048-row context: leading q-tiles skipped",
+            spec=dict(
+                _QWEN35,
+                cached=(0,),
+                new=(2048,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_LAST_LAYER,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 last layer, three contexts ending in one q-tile: leading q-tiles skipped",
+            spec=dict(
+                _QWEN35,
+                cached=(0, 0, 0),
+                new=(1024, 1000, 970),
+                num_contexts=3,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_LAST_LAYER,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 last layer, a mixed step: contexts of 130 and 150 rows over a "
+            "cached 64 and a decode row, leading q-tiles skipped",
+            spec=dict(
+                _QWEN35,
+                cached=(0, 64, 300),
+                new=(130, 150, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_LAST_LAYER,
+            ),
+        ),
     )
 
     note = """
@@ -854,6 +998,25 @@ class ThopAttention(OpWrapper):
     tensorrt_llm`: a `pip` on PATH that cannot see the install fails every
     generation call, and the first failure poisons the process ("Jitify fatal
     error: Uninitialized").
+
+    Four SM120/121 kernel opt-ins default to the stock kernels and are inert on
+    every other GPU and configuration. `xqa_one_wave_multi_block` caps the HMMA
+    XQA decode's multi-block sub-sequence count at one CTA wave (SMs / (batch x
+    kv heads)) at head size 256: a different merge partition, so a different
+    rounding. `xqa_shared_prefix_min_batch` (0 = off) runs XQA's shared-prefix
+    pass from that decode batch on (at least 2) at head size 256 over an
+    fp8-e4m3 pool with bf16 q and at most 8 q heads per kv head: the leading
+    256-token tiles whose pages every request shares are attended once for all
+    requests with e4m3 Q (two terms) and e4m3 probabilities (448 p), then folded
+    into each request's suffix pass; with nothing shared it is the plain path
+    plus one scan launch. `context_fmha_sm120_target` runs the e4m3 head-256
+    causal paged-context kernel with a base-2 softmax (ex2.approx) and, for 1
+    to 3 contexts whose last q-tile would make a tail wave, splits that q-tile
+    along KV with a fixed-order merge; it reserves 25 952 256 bytes of context
+    workspace. `context_fmha_skip_leading_q_tiles` (needs the previous one)
+    leaves every output row before the last 64-row q-tile unwritten whenever
+    that split runs: only for a caller that reads each context's last row and
+    whose contexts all end in the same q-tile.
     """
 
     def __call__(
@@ -976,6 +1139,10 @@ class ThopAttention(OpWrapper):
         kv_norm_weight: Optional[torch.Tensor] = None,
         kv_norm_eps: float = 1e-6,
         skip_correction_threshold: float = 0.0,
+        xqa_one_wave_multi_block: bool = False,
+        xqa_shared_prefix_min_batch: int = 0,
+        context_fmha_sm120_target: bool = False,
+        context_fmha_skip_leading_q_tiles: bool = False,
     ) -> torch.Tensor:
         """Writes `output` in place and returns it -- the op destroys its
         prior contents in rows `[:num_tokens]`, so a caller that wants them
@@ -1096,6 +1263,10 @@ class ThopAttention(OpWrapper):
             kv_norm_weight=kv_norm_weight,
             kv_norm_eps=kv_norm_eps,
             skip_correction_threshold=skip_correction_threshold,
+            xqa_one_wave_multi_block=xqa_one_wave_multi_block,
+            xqa_shared_prefix_min_batch=xqa_shared_prefix_min_batch,
+            context_fmha_sm120_target=context_fmha_sm120_target,
+            context_fmha_skip_leading_q_tiles=context_fmha_skip_leading_q_tiles,
         )
         return output
 
@@ -1117,6 +1288,10 @@ class ThopAttention(OpWrapper):
         e4m3_inputs: bool = False,
         out_scale: float = 1.0,
         e4m3_probabilities: bool = False,
+        xqa_one_wave_multi_block: bool = False,
+        xqa_shared_prefix_min_batch: int = 0,
+        context_fmha_sm120_target: bool = False,
+        context_fmha_skip_leading_q_tiles: bool = False,
     ) -> torch.Tensor:
         """Masked softmax attention over explicit per-sequence K/V, in fp32.
 
@@ -1156,6 +1331,12 @@ class ThopAttention(OpWrapper):
         rounded unscaled. At kv scale 2.0 it is bitwise exact on a one-tile
         decode; at 1.5 nothing tried fits (4.2 ulp RMS at best). Not modelled
         with sinks.
+
+        The SM120 opt-ins (`xqa_one_wave_multi_block`, `xqa_shared_prefix_min_batch`,
+        `context_fmha_sm120_target`) change where the kernels round, not what
+        they compute, so the fp32 result is the same. With
+        `context_fmha_skip_leading_q_tiles` only each context's last row is
+        defined; the rows before its last 64-row q-tile are returned NaN here.
         """
         rep = num_heads // num_kv_heads
         total_q = sum(q_lens)
@@ -1202,6 +1383,8 @@ class ThopAttention(OpWrapper):
             out[q_start : q_start + q_len] = (
                 torch.einsum("hij,jhd->ihd", probs, v_seq).reshape(q_len, -1) * out_scale
             )
+            if context_fmha_skip_leading_q_tiles and q_len > 1:
+                out[q_start : q_start + 64 * ((q_len - 1) // 64)] = float("nan")
             q_start += q_len
             kv_start += kv_len
         return out.to(q.dtype)
@@ -1274,6 +1457,12 @@ class ThopAttention(OpWrapper):
         num_heads: int,
         num_kv_heads: int,
         attention_sinks: Optional[torch.Tensor] = None,
+        host_context_lengths: Optional[torch.Tensor] = None,
+        num_contexts: int = 0,
+        xqa_one_wave_multi_block: bool = False,
+        xqa_shared_prefix_min_batch: int = 0,
+        context_fmha_sm120_target: bool = False,
+        context_fmha_skip_leading_q_tiles: bool = False,
         **unused_kwargs: object,
     ) -> None:
         """Keyword-only, because every call site passes keywords.
@@ -1306,6 +1495,20 @@ class ThopAttention(OpWrapper):
                 f"({num_heads}) elements, got shape "
                 f"{tuple(attention_sinks.shape)} contiguous="
                 f"{attention_sinks.is_contiguous()}"
+            )
+        # Skipping the leading q-tiles leaves those output rows unwritten, so
+        # every context's last row must lie in the last 64-row q-tile of the
+        # longest context; the op cannot check what the caller reads.
+        if (
+            context_fmha_skip_leading_q_tiles
+            and host_context_lengths is not None
+            and num_contexts > 0
+        ):
+            ctx_lens = [int(n) for n in host_context_lengths[:num_contexts].tolist()]
+            last_tile_start = 64 * ((max(ctx_lens) - 1) // 64)
+            assert min(ctx_lens) > last_tile_start, (
+                f"context_fmha_skip_leading_q_tiles needs every context to end in the "
+                f"last 64-row q-tile (lengths > {last_tile_start}), got {ctx_lens}"
             )
 
 

@@ -1557,7 +1557,8 @@ def _register_fake():
           bias: Optional[torch.Tensor],
           out_dtype: Optional[torch.dtype],
           output_buffer_kind: int = 0,
-          group: Optional[List[int]] = None):
+          group: Optional[List[int]] = None,
+          act_sf_swizzled: bool = False):
         # mat_a: [M, K/2], mat_b: [N, K/2]
         # Output should be [M, N] with dtype=out_dtype
         m = mat_a.shape[0]
@@ -1576,7 +1577,9 @@ def _register_fake():
           size_n: int,
           size_k: int,
           output_buffer_kind: int = 0,
-          group: Optional[List[int]] = None):
+          group: Optional[List[int]] = None,
+          workspace_mode: int = 0,
+          launch_hint: int = 0):
         # mat_a: [M, K/2] FP4 packed (or BF16 when W4A16)
         # mat_b: Marlin-packed weights
         # Output: [M, size_n] with dtype=out_dtype

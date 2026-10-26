@@ -399,6 +399,12 @@
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
 /cpp/tensorrt_llm/kernels/glmMoeDsa @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
 /cpp/tensorrt_llm/thop/glmMoeDsa/ @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
+# The Qwen3.5 (Qwen3.8-27B) target and its target-only kernels and ops: co-owned with
+# each parent path's owners.
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/qwen3_5 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @nvchenghaoz
+/tests/unittest/_torch/modeling_v2/models/qwen3_5 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @nvchenghaoz
+/cpp/tensorrt_llm/kernels/qwen35 @NVIDIA/trt-llm-kernels-devs @nvchenghaoz
+/cpp/tensorrt_llm/thop/qwen35/ @NVIDIA/trt-llm-kernels-devs @nvchenghaoz
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners

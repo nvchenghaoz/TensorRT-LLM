@@ -841,6 +841,11 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     int const head_idx = blockIdx.y;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+    if (params.early_pdl_trigger)
+    {
+        // The dependent still waits for this grid's completion before reading Q or the new token's K/V.
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
 
     // Variable sequence length.
@@ -1183,7 +1188,10 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
+    if (!params.early_pdl_trigger)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
 }
 

@@ -395,7 +395,7 @@ public:
         std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
         std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt,
         bool enable_dsv4_epilogue_fusion = false, std::optional<torch::Tensor> kv_norm_weight = std::nullopt,
-        double kv_norm_eps = 1e-6) const
+        double kv_norm_eps = 1e-6, bool context_fmha_skip_leading_q_tiles = false) const
         = 0;
 };
 
@@ -468,7 +468,8 @@ public:
         std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
         std::optional<torch::Tensor> relative_attention_bias, std::optional<torch::Tensor> quant_scale_qkv,
         std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-        std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps) const override
+        std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
+        bool context_fmha_skip_leading_q_tiles) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -950,6 +951,7 @@ public:
             enqueue_params.batch_size = num_seqs;
             enqueue_params.k_ptr = k_ptr;
             enqueue_params.v_ptr = v_ptr;
+            enqueue_params.context_fmha_skip_leading_q_tiles = context_fmha_skip_leading_q_tiles;
             if (cu_q_seqlens.has_value())
             {
                 TORCH_CHECK(cu_q_seqlens->dim() == 1, "cu_q_seqlens must be a 1-D tensor.");
@@ -1249,7 +1251,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> quant_scale_qkv, std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache,
     bool enable_dsv4_epilogue_fusion, bool const force_prepare_spec_dec_tree_mask,
     std::optional<int64_t> const max_num_sequences, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
-    double skip_correction_threshold, std::optional<bool> uses_spcompress)
+    double skip_correction_threshold, std::optional<bool> uses_spcompress, bool xqa_one_wave_multi_block,
+    int64_t xqa_shared_prefix_min_batch, bool context_fmha_sm120_target, bool context_fmha_skip_leading_q_tiles)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1494,6 +1497,15 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             op->mFP8ContextFMHA || op->mFP8ContextMLA, "uses_spcompress requires FP8 context FMHA or FP8 context MLA.");
     }
 
+    // SM120/121 opt-ins of the Qwen3.5-family staircase target; the defaults keep the stock kernels.
+    TORCH_CHECK(xqa_shared_prefix_min_batch >= 0, "xqa_shared_prefix_min_batch must be >= 0 (0 disables it), got ",
+        xqa_shared_prefix_min_batch);
+    TORCH_CHECK(!context_fmha_skip_leading_q_tiles || context_fmha_sm120_target,
+        "context_fmha_skip_leading_q_tiles requires context_fmha_sm120_target.");
+    op->mXqaOneWaveMultiBlock = xqa_one_wave_multi_block;
+    op->mXqaSharedPrefixMinBatch = static_cast<int32_t>(xqa_shared_prefix_min_batch);
+    op->mContextFmhaSm120Target = context_fmha_sm120_target;
+
     op = get_attention_op(runner, op, local_layer_idx);
 
     int32_t const num_seqs = host_context_lengths.size(0);
@@ -1598,7 +1610,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias, quant_scale_qkv,
-            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, kv_norm_weight, kv_norm_eps);
+            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, kv_norm_weight, kv_norm_eps,
+            context_fmha_skip_leading_q_tiles);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
