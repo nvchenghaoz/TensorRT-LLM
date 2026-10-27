@@ -19,6 +19,8 @@ Usage: python vae_decode_bench.py <checkpoint_root> <mode>
          every iteration is compared with iteration 0 (bitwise) and with the
          eager reference (declared tolerance), and the input is checked unchanged.
   profile one warm decode between cudaProfilerStart/Stop (for nsys/ncu region capture).
+  kernels launch-count census of one warm decode (torch.profiler), incl.
+         RowwiseMomentsCUDAKernel and cuDNN nchwToNhwcKernel.
 Env: VAE_COMPILE=0 forces eager; WARMUP, ITERS override counts.
 """
 
@@ -151,6 +153,36 @@ elif mode == "profile":
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
     print(json.dumps({"profiled": True, "compiled": is_compiled}))
+
+elif mode == "kernels":
+    # Kernel census of one warm decode (torch.profiler / CUPTI): launch counts per kernel name.
+    from collections import Counter
+
+    from torch.profiler import ProfilerActivity, profile
+
+    vae, is_compiled = build(True)
+    warm(vae, "K")
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        decode(vae, z0)
+        torch.cuda.synchronize()
+    cnt, dur = Counter(), Counter()
+    for ev in prof.events():
+        if ev.device_type == torch.autograd.DeviceType.CUDA:
+            cnt[ev.name] += 1
+            dur[ev.name] += ev.device_time_total
+    def match(s):
+        keys = [k for k in cnt if s in k]
+        return {"launches": sum(cnt[k] for k in keys), "total_ms": sum(dur[k] for k in keys) / 1e3}
+    print(json.dumps({
+        "compiled": is_compiled,
+        "total_launches": sum(cnt.values()),
+        "RowwiseMoments": match("RowwiseMoments"),
+        "nchwToNhwc": match("nchwToNhwc"),
+        "group_norm_aten": match("group_norm"),
+        "triton": match("triton_"),
+        "top": [(k[:120], cnt[k], round(dur[k] / 1e3, 3)) for k, _ in dur.most_common(12)],
+    }))
 
 elif mode == "check":
     import torch._dynamo.utils as dyn_utils
