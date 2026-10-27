@@ -485,6 +485,73 @@ def _resolve_media_dir() -> Path:
         return Path(tempfile.mkdtemp(prefix=f"trtllm_generated-{stamp}-"))
 
 
+class _B64JsonSplicer:
+    """Render a JSON response whose base64 payloads are spliced in as bytes.
+
+    ``JSONResponse(model_dump())`` copies and scans every multi-megabyte
+    base64 string in ``json.dumps`` and again in ``.encode()``. Instead, each
+    payload is represented in the model by a unique placeholder string, the
+    (small) model is rendered with Starlette's exact ``JSONResponse.render``
+    arguments, and the raw ``base64.b64encode`` bytes replace each quoted
+    placeholder. Base64 output is pure ASCII from ``[A-Za-z0-9+/=]``, which
+    ``json.dumps`` never escapes, so the body is byte-identical to
+    ``JSONResponse(content=model_dump()).body``.
+    """
+
+    def __init__(self) -> None:
+        self._prefix = f"trtllm-b64-{uuid.uuid4().hex}-"
+        self._payloads: List[bytes] = []
+
+    def placeholder(self, b64: bytes) -> str:
+        token = f"{self._prefix}{len(self._payloads)}"
+        self._payloads.append(b64)
+        return token
+
+    @staticmethod
+    def _dumps(content: Any) -> bytes:
+        # Same arguments as starlette.responses.JSONResponse.render.
+        return json.dumps(content,
+                          ensure_ascii=False,
+                          allow_nan=False,
+                          indent=None,
+                          separators=(",", ":")).encode("utf-8")
+
+    def render(self, content: Any) -> Optional[bytes]:
+        """Return the spliced body, or None if a placeholder is ambiguous."""
+        body = self._dumps(content)
+        parts = []
+        pos = 0
+        for i, payload in enumerate(self._payloads):
+            marker = f'"{self._prefix}{i}"'.encode("ascii")
+            idx = body.find(marker, pos)
+            if idx < 0 or body.count(marker) != 1:
+                return None
+            # Keep the opening quote, drop the placeholder text, keep the
+            # closing quote with the next part.
+            parts.append(body[pos:idx + 1])
+            parts.append(payload)
+            pos = idx + len(marker) - 1
+        parts.append(body[pos:])
+        return b"".join(parts)
+
+    def restore(self, content: Any) -> Any:
+        """Replace placeholders in a model_dump() with the decoded payloads."""
+        for item in content.get("data", []):
+            token = item.get("b64_json")
+            if isinstance(token, str) and token.startswith(self._prefix):
+                item["b64_json"] = self._payloads[int(
+                    token[len(self._prefix):])].decode("ascii")
+        return content
+
+    def response(self, content: Any, headers) -> Response:
+        body = self.render(content)
+        if body is None:
+            return JSONResponse(content=self.restore(content), headers=headers)
+        return Response(content=body,
+                        media_type="application/json",
+                        headers=headers)
+
+
 def _normalize_image_output(image) -> list:
     """Normalize image output to a list of individual images.
 
@@ -3644,6 +3711,7 @@ class OpenAIServer(_VideoRoutesMixin):
         (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
         request_received = raw_request.state.server_arrival_time
+        b64_splicer = None
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
@@ -3727,11 +3795,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 pil_format = request.format.upper()
                 ext = f".{request.format}"
                 if request.response_format == "b64_json":
+                    b64_splicer = _B64JsonSplicer()
                     data = [
                         ImageObject(
-                            b64_json=base64.b64encode(
-                                image_to_bytes(
-                                    image, format=pil_format)).decode("utf-8"),
+                            b64_json=b64_splicer.placeholder(
+                                base64.b64encode(
+                                    image_to_bytes(image, format=pil_format))),
                             revised_prompt=request.prompt,
                         ) for image in output_images
                     ]
@@ -3762,6 +3831,8 @@ class OpenAIServer(_VideoRoutesMixin):
             headers = build_visual_gen_timing_headers(
                 build_visual_gen_server_timings(metrics, total=total))
 
+            if b64_splicer is not None:
+                return b64_splicer.response(response.model_dump(), headers)
             return JSONResponse(content=response.model_dump(), headers=headers)
 
         except Exception as e:
