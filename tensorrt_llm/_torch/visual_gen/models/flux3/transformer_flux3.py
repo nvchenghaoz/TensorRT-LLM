@@ -55,8 +55,10 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     original_input,
     prepare_fp8_block,
     prepare_nvfp4_block,
+    prepare_sm120_fp8_excluded_block,
     separate_qkv_forward,
     shared_nvfp4_input,
+    sm120_fp8_shared_input,
     verify_nvfp4_coverage,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
@@ -71,6 +73,7 @@ from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -585,6 +588,9 @@ def _flux3_shared_fp8_input(
     nvfp4 = shared_nvfp4_input(attn, mlp_in, x)
     if nvfp4 is not None:
         return nvfp4
+    fp8_excluded = sm120_fp8_shared_input(attn, mlp_in, x)
+    if fp8_excluded is not None:
+        return fp8_excluded
     qkv = getattr(attn, "qkv_proj", None)
     if not all(
         isinstance(layer, Linear) and isinstance(layer.quant_method, FP8RowwiseLinearMethod)
@@ -1462,3 +1468,13 @@ class Flux3Model(BaseDiffusionModel):
         )
         blocks.extend((f"single_blocks.{i}", block) for i, block in enumerate(self.single_blocks))
         verify_nvfp4_coverage(blocks)
+        quant = self.model_config.quant_config
+        if quant is not None and quant.quant_algo == QuantAlgo.NVFP4:
+            # BF16 checkpoint-excluded image/joint blocks run with the fp8r recipe on SM120.
+            switched = [name for name, block in blocks if prepare_sm120_fp8_excluded_block(block)]
+            if switched:
+                logger.info(
+                    "FLUX.3 SM120 FP8R for BF16 checkpoint-excluded blocks "
+                    "(QKV, attn_out, MLP-up+SwiGLU, MLP-down; per-channel weights "
+                    f"bitwise equal to variants/fp8r): {switched}"
+                )

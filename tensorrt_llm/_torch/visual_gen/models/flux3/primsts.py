@@ -16,7 +16,9 @@ from tensorrt_llm._torch.modules.linear import (
     Linear,
     NVFP4LinearMethod,
     TensorParallelMode,
+    UnquantizedLinearMethod,
 )
+from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._torch.utils import unswizzle_sf
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
     fp8_linear,
@@ -371,6 +373,9 @@ def shared_nvfp4_input(attn: nn.Module, mlp_in: Linear, x: torch.Tensor) -> NVFP
 
 
 def separate_qkv_forward(attn: nn.Module, x: PrimsTSInput) -> tuple[torch.Tensor, ...] | None:
+    fused = getattr(attn, "_flux3_sm120_fp8_qkv", None)
+    if fused is not None and fused.can_run(original_input(x)):
+        return tuple(fused(x).split(fused.weight.shape[0] // 3, dim=-1))
     layers = [attn.to_q, attn.to_k, attn.to_v]
     if not any(getattr(layer, "_flux3_primsts_nvfp4", None) is not None for layer in layers):
         return None
@@ -449,6 +454,115 @@ class PreparedFP8(nn.Module):
         op = fp8_linear_swiglu if self.swiglu else fp8_linear
         output = op(data, self.weight, scales, self.scale)
         return output.reshape(*original.shape[:-1], output.shape[-1])
+
+
+def _sm120_fp8_excluded_enabled() -> bool:
+    return _enabled() and os.environ.get("TRTLLM_FLUX3_SM120_FP8_EXCLUDED", "1") != "0"
+
+
+def quantize_fp8r_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-channel E4M3 weights with FP32 amax/448 scales.
+
+    Bitwise identical to the BFL fp8r package variant (variants/fp8r) for the layers
+    the NVFP4 variant keeps in BF16.
+    """
+    w = weight.detach().float()
+    scale = torch.clamp(w.abs().amax(dim=1) / 448.0, min=1e-12)
+    data = (w / scale[:, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return data.contiguous(), scale.contiguous()
+
+
+class PreparedFP8Sm120(PreparedFP8):
+    """FP8R (per-token x per-channel E4M3) execution of a BF16 checkpoint-excluded linear on SM120.
+
+    Activations are quantized with the fp8r recipe (quantize_fp8r) and the GEMM runs
+    through cuBLASLt rowwise-scaled FP8 (torch._scaled_mm) with FP32 accumulation.
+    With swiglu the output is SwiGLU over the native [gate | up] layout.
+    """
+
+    def __init__(self, weight: torch.Tensor, *, swiglu: bool = False):
+        data, scale = quantize_fp8r_weight(weight)
+        super().__init__(data, scale, swiglu=False, fp32_scales=True)
+        self.swiglu = swiglu
+
+    def forward(self, x: torch.Tensor | Fp8RowwiseQuantizedTensor) -> torch.Tensor:
+        original = x.original if isinstance(x, Fp8RowwiseQuantizedTensor) else x
+        data, scales = self.activation(x)
+        output = torch._scaled_mm(
+            data,
+            self.weight.t(),
+            scale_a=scales.reshape(-1, 1),
+            scale_b=self.scale.reshape(1, -1),
+            out_dtype=torch.bfloat16,
+        )
+        if self.swiglu:
+            output = swiglu(output)
+        return output.reshape(*original.shape[:-1], output.shape[-1])
+
+
+def _excluded_bf16(layer: nn.Module) -> bool:
+    return (
+        isinstance(layer, Linear)
+        and type(layer.quant_method) is UnquantizedLinearMethod
+        and layer.weight.is_cuda
+        and is_sm120(layer.weight.device)
+        and layer.weight.dtype == torch.bfloat16
+        and layer.bias is None
+        and _local_projection(layer)
+        and layer.weight.shape[1] % 16 == 0
+        and layer.weight.shape[0] % 16 == 0
+        and layer.dtype in (None, torch.bfloat16)
+    )
+
+
+def prepare_sm120_fp8_excluded_block(block: nn.Module) -> bool:
+    """Run a BF16 checkpoint-excluded image/joint block of an NVFP4 package as FP8R on SM120.
+
+    Returns True when the block's QKV, attn_out, MLP-up and MLP-down were switched.
+    """
+    attn = block.attn
+    attn._flux3_sm120_fp8_qkv = None
+    if block._fuse_proj_out or not _sm120_fp8_excluded_enabled():
+        return False
+    projections = [getattr(attn, name, None) for name in ("to_q", "to_k", "to_v")]
+    layers = [*projections, block.attn_out, block.ff.gate_up_proj, block.ff.down_proj]
+    if not all(_excluded_bf16(layer) for layer in layers):
+        return False
+    if any(
+        getattr(layer, "_flux3_primsts_fp8", None) is not None
+        or getattr(layer, "_flux3_primsts_nvfp4", None) is not None
+        for layer in layers
+    ):
+        return False
+    if not (
+        block.ff.activation is torch.nn.functional.silu
+        and block.ff._is_plain_swiglu()
+        and block.ff.swiglu_limit is None
+    ):
+        return False
+    with torch.no_grad():
+        attn._flux3_sm120_fp8_qkv = PreparedFP8Sm120(
+            torch.cat([layer.weight for layer in projections], dim=0)
+        )
+        block.attn_out._flux3_primsts_fp8 = PreparedFP8Sm120(block.attn_out.weight)
+        block.ff.gate_up_proj._flux3_primsts_fp8 = PreparedFP8Sm120(
+            block.ff.gate_up_proj.weight, swiglu=True
+        )
+        block.ff.down_proj._flux3_primsts_fp8 = PreparedFP8Sm120(block.ff.down_proj.weight)
+    return True
+
+
+def sm120_fp8_shared_input(
+    attn: nn.Module, mlp_in: Linear, x: torch.Tensor
+) -> Fp8RowwiseQuantizedTensor | None:
+    qkv = getattr(attn, "_flux3_sm120_fp8_qkv", None)
+    up = getattr(mlp_in, "_flux3_primsts_fp8", None)
+    if not (isinstance(qkv, PreparedFP8Sm120) and isinstance(up, PreparedFP8Sm120)):
+        return None
+    if not (qkv.can_run(x) and up.can_run(x)):
+        return None
+    data, scales = quantize_fp8r(x.reshape(-1, x.shape[-1]))
+    return Fp8RowwiseQuantizedTensor(x, data, scales)
 
 
 def _eligible_fp8(layer: Linear) -> bool:
