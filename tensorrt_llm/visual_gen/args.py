@@ -216,7 +216,10 @@ class AttentionConfig(StrictBaseModel):
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "fp8", (0, 0, 1)),
         }
+        # ("fp8", "fp8") is per-tensor E4M3 Q/K/V on SM120/SM121 (fmha_v2 kernel); the
+        # backend rejects it on other architectures.
         FLASHINFER_RECIPES = {
+            ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "nvfp4", (0, 0, 0)),

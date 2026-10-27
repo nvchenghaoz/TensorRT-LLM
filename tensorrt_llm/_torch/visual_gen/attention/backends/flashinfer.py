@@ -3,10 +3,12 @@
 """FlashInfer attention backend for visual generation models."""
 
 import math
+import os
 from typing import Any, Literal
 
 import flashinfer
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
@@ -15,6 +17,10 @@ from .interface import AttentionBackend, AttentionTensorLayout
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 _BlockScaledQKMode = Literal["mxfp8", "nvfp4"]
+# Below this sequence length the per-tensor quantize passes cost more than the FP8
+# kernel saves (S=512: BF16 SDPA 0.053 ms vs FP8 0.161 ms with quantize), so short
+# calls run unquantized BF16 SDPA.
+_FP8_MIN_SEQ_LEN = 1024
 
 
 class FlashInferAttention(AttentionBackend):
@@ -51,13 +57,33 @@ class FlashInferAttention(AttentionBackend):
 
         self._single_prefill = flashinfer.single_prefill_with_kv_cache
         self._batch_prefill_cls = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
-        if quant_attention_config is not None and quant_attention_config.qk_dtype not in (
+        self._fp8_sm12x = (
+            quant_attention_config is not None
+            and quant_attention_config.qk_dtype == "fp8"
+            and quant_attention_config.v_dtype == "fp8"
+        )
+        if self._fp8_sm12x:
+            capability = torch.cuda.get_device_capability()
+            if capability not in ((12, 0), (12, 1)):
+                raise ValueError(
+                    "FlashInfer per-tensor FP8 attention (qk_dtype='fp8', v_dtype='fp8') "
+                    f"runs on SM120/SM121 only, got SM{capability[0]}{capability[1]}."
+                )
+            if self.num_heads != self.num_kv_heads or head_dim not in (64, 128):
+                raise ValueError(
+                    "FlashInfer SM120/SM121 FP8 attention requires equal Q/K/V head counts "
+                    "and head_dim=64 or 128."
+                )
+            self._fp8_min_seq_len = int(
+                os.environ.get("TRTLLM_VISUAL_GEN_FP8_ATTN_MIN_SEQ", _FP8_MIN_SEQ_LEN)
+            )
+        elif quant_attention_config is not None and quant_attention_config.qk_dtype not in (
             "mxfp8",
             "nvfp4",
         ):
             raise ValueError(
                 "FlashInfer quantized attention supports qk_dtype='mxfp8' or 'nvfp4', "
-                f"got {quant_attention_config.qk_dtype!r}."
+                f"or 'fp8' with v_dtype='fp8' on SM120/SM121, got {quant_attention_config.qk_dtype!r}."
             )
 
     def _validate_inputs(
@@ -334,6 +360,84 @@ class FlashInferAttention(AttentionBackend):
         output = output[:, :, :sequence_length].transpose(1, 2).contiguous()
         return output, lse[:, :, :sequence_length]
 
+    @staticmethod
+    def _quantize_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-tensor E4M3 quantize (fused amax + cast); descale stays on device."""
+        x_q, descale = torch.ops.trtllm.quantize_e4m3_per_tensor(x.contiguous())
+        return x_q, descale.float().reshape(1)
+
+    @torch.compiler.disable
+    def _run_fp8_sm12x(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        is_causal: bool,
+        return_lse: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Per-tensor FP8 E4M3 Q/K/V attention with BF16 output (fmha_v2 SM120 kernel).
+
+        Short sequences, where the quantize passes cost more than FP8 saves, run
+        unquantized BF16 attention instead.
+        """
+        if q.shape != k.shape or q.shape != v.shape:
+            raise ValueError("FlashInfer SM120/SM121 FP8 attention supports self-attention only.")
+        batch_size, sequence_length = q.shape[:2]
+        if sequence_length < self._fp8_min_seq_len or q.dtype != torch.bfloat16:
+            if return_lse:
+                if batch_size == 1:
+                    return self._run_single_prefill(
+                        q, k, v, is_causal=is_causal, key_padding_mask=None
+                    )
+                return self._run_batch_prefill(q, k, v, is_causal=is_causal, key_padding_mask=None)
+            output = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                is_causal=is_causal,
+                scale=self.scale,
+            )
+            return output.transpose(1, 2), None
+
+        q_fp8, q_descale = self._quantize_e4m3(q)
+        k_fp8, k_descale = self._quantize_e4m3(k)
+        v_fp8, v_descale = self._quantize_e4m3(v)
+        # scale_bmm1 folds both descales and the softmax scale; scale_bmm2 is V's descale.
+        scale_bmm1 = (q_descale * k_descale).mul_(self.scale)
+        output = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+        stats = None
+        if return_lse:
+            stats = torch.empty(
+                (batch_size, sequence_length, self.num_heads, 2),
+                dtype=torch.float32,
+                device=q.device,
+            )
+        from flashinfer.prefill import fmha_v2_prefill_sm120
+
+        fmha_v2_prefill_sm120(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            output,
+            self.num_heads,
+            self.head_dim,
+            sequence_length,
+            scale_softmax=1.0,
+            scale_bmm1=1.0,
+            scale_bmm2=1.0,
+            scale_bmm1_d=scale_bmm1,
+            scale_bmm2_d=v_descale,
+            causal=is_causal,
+            return_lse=return_lse,
+            lse=stats,
+        )
+        lse = None
+        if stats is not None:
+            # fmha_v2 stores (row max, row sum of P scaled by 256 for E4M3).
+            lse = (stats[..., 0] + torch.log(stats[..., 1] / 256.0)).transpose(1, 2).contiguous()
+        return output, lse
+
     def forward(
         self,
         q: torch.Tensor,
@@ -344,6 +448,20 @@ class FlashInferAttention(AttentionBackend):
         key_padding_mask: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
+        if self._fp8_sm12x:
+            self._validate_inputs(q, k, v, key_padding_mask)
+            if key_padding_mask is not None:
+                raise ValueError(
+                    "FlashInfer quantized attention does not support key padding masks."
+                )
+            output, _ = self._run_fp8_sm12x(
+                q,
+                k,
+                v,
+                is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+                return_lse=False,
+            )
+            return output
         output, _ = self.forward_with_lse(
             q,
             k,
@@ -411,6 +529,8 @@ class FlashInferAttention(AttentionBackend):
             and quant_config.v_dtype == "nvfp4"
         ):
             return self._run_nvfp4_sm12x(q, k, v, is_causal=is_causal)
+        if self._fp8_sm12x:
+            return self._run_fp8_sm12x(q, k, v, is_causal=is_causal, return_lse=True)
         raise RuntimeError(
             "Unsupported FlashInfer quantized attention recipe for "
             f"SM{capability[0]}{capability[1]}: qk_dtype={qk_dtype!r}, "
