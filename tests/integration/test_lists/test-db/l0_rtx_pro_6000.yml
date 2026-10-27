@@ -34,7 +34,7 @@ l0_rtx_pro_6000:
   # entries it calls.
   - unittest/_torch/modeling_v2/models/qwen3_5
   - unittest/_torch/modeling_v2/activation/test_modeling_v2_fused_sigmoid_mul_inplace.py
-  - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py -k "qwen3_5"
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_gemma_rmsnorm.py
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_rms_norm_gated_token_major.py

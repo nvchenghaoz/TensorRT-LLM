@@ -401,6 +401,25 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
 
+#: The longest history `_compare` holds an e4m3 call to; see `_compare_fp8_long_history`.
+FP8_ROW_MAX_MODEL_KEYS = 256
+
+
+def _compare_fp8_long_history(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """An e4m3 call attending over more than `FP8_ROW_MAX_MODEL_KEYS` keys.
+
+    The kernels round the softmax probabilities to e4m3 against each KV tile's running
+    max; `reference(e4m3_probabilities=True)` rounds against the row's max, which
+    reproduces that within one tile and drifts as tiles accumulate. Measured on sm_120
+    over the qwen3_5 cells (histories of 300 to 2047 keys, decode and paged-context
+    prefill): up to 16.8 ulp element-wise and 10.4 ulp relative RMS, the stock kernels
+    and the SM120 opt-ins alike (the opt-ins move neither gate by more than 1 ulp RMS).
+    24 and 14 ulp keep that headroom; a misaddressed page or a wrong merge partition is
+    off by the values themselves, hundreds of ulp.
+    """
+    assert_within_ulp(out, ref, element_ulp=24.0, rms_ulp=14.0, ulp=ULP[torch.bfloat16])
+
+
 def _compare_fp8_mla(out: torch.Tensor, ref: torch.Tensor) -> None:
     """The MLA context cells' band: the fp8 MLA band per element, and
     `_compare`'s 4 ulp of relative RMS in aggregate.
@@ -7199,7 +7218,9 @@ def _cell_paged(cell, arm) -> None:
         skip_leading_q_tiles=opt_ins.get("context_fmha_skip_leading_q_tiles", False),
     )
     defined = ~ref.isnan().any(dim=1)
-    _compare(out[defined], ref[defined])
+    longest = max(c + n for c, n in zip(cached, new))
+    long_e4m3 = e4m3 and longest > FP8_ROW_MAX_MODEL_KEYS
+    (_compare_fp8_long_history if long_e4m3 else _compare)(out[defined], ref[defined])
     for rid in rids:
         env.check_cache(rid)
     env.check_unwritten_pool_zero()

@@ -10,8 +10,8 @@ per-rank slicing. Storage is HF `[out, in]`.
 The checkpoint is ModelOpt MIXED_PRECISION: the gated-attention q/k/v/o and the
 Gated-DeltaNet in_proj_qkv / in_proj_z / out_proj are FP8 with per-tensor weight and
 static input scales; the dense MLP and lm_head are NVFP4 (group 16); in_proj_a/b,
-norms, conv, A_log, dt_bias and the embedding are bf16. The MTP module is not loaded
-(no speculative decoding) and the vision tower is the shell's.
+norms, conv, A_log, dt_bias and the embedding are bf16. Neither the MTP module (no
+speculative decoding) nor the vision tower (the target serves text) is loaded.
 
 Load-time transforms reproduce the built-in loader bit for bit, because every copy
 `derive` builds is a function of these bytes:
@@ -469,8 +469,8 @@ class Qwen3827BTp1Weights:
         )
 
     def expected_unconsumed(self, weights) -> set:
-        """The MTP module (no speculative decoding) and the vision tower, which the
-        shell's encoder loads itself."""
+        """The MTP module (no speculative decoding) and the vision tower (the target serves
+        text)."""
         return {k for k in weights if k.startswith((f"{_MTP}.", f"{_VISUAL}."))}
 
     def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
@@ -480,7 +480,7 @@ class Qwen3827BTp1Weights:
             dtype = entry.dtype or d.dtype
             for key, _, _ in self._targets(entry, d):
                 w[key] = nn.Parameter(
-                    torch.empty(*entry.shape(d), dtype=dtype), requires_grad=False
+                    torch.empty(tuple(entry.shape(d)), dtype=dtype), requires_grad=False
                 )
         return w
 

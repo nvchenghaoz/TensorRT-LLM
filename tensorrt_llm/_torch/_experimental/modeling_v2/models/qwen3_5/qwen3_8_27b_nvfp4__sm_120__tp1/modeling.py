@@ -400,9 +400,16 @@ class Qwen3827BTp1ModelingV2(DecoderModel):
         self._cos_sin: torch.Tensor | None = None
         self.kv_scale_orig_quant: torch.Tensor | None = None
         self.kv_scale_quant_orig: torch.Tensor | None = None
+        self._derived = False
 
     def post_load_weights(self) -> None:
-        """Derive what the targets read, then build them, now that the weights are real."""
+        """Derive what the targets read, then build them, now that the weights are real.
+
+        Runs once: the loader calls every module's hook and the shell calls this one too,
+        and `derive` frees the FP8 bytes it reads."""
+        if self._derived:
+            return
+        self._derived = True
         _weights.MODEL_WEIGHTS.derive(self)
         device = self.w["embed"].device
         self._cos_sin = (
@@ -691,8 +698,15 @@ def _split_gdn(core, proj: torch.Tensor, ba: torch.Tensor):
 
 
 def _qkv_views(core, mixed_qkv: torch.Tensor):
+    """q, k `[1, T, H, K]` and v `[1, T, HV, V]`: views of the conv output's columns, heads
+    packed, the projection's row stride kept."""
+    t = mixed_qkv.shape[0]
     q, k, v = torch.split(mixed_qkv, [core.key_dim, core.key_dim, core.value_dim], 1)
-    return q, k, v
+    return (
+        q.view(1, t, core.num_k_heads, core.head_k_dim),
+        k.view(1, t, core.num_k_heads, core.head_k_dim),
+        v.view(1, t, core.num_v_heads, core.head_v_dim),
+    )
 
 
 # ---------------------------------------------------------------- prefill ---

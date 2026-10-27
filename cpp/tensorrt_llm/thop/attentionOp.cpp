@@ -1497,7 +1497,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             op->mFP8ContextFMHA || op->mFP8ContextMLA, "uses_spcompress requires FP8 context FMHA or FP8 context MLA.");
     }
 
-    // SM120/121 opt-ins of the Qwen3.5-family staircase target; the defaults keep the stock kernels.
+    // SM120/121 opt-ins of the qwen3_5 modeling_v2 target; the defaults keep the stock kernels.
     TORCH_CHECK(xqa_shared_prefix_min_batch >= 0, "xqa_shared_prefix_min_batch must be >= 0 (0 disables it), got ",
         xqa_shared_prefix_min_batch);
     TORCH_CHECK(!context_fmha_skip_leading_q_tiles || context_fmha_sm120_target,

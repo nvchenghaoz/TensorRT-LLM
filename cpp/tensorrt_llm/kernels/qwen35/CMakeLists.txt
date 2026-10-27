@@ -15,10 +15,10 @@
 # the License.
 #
 
-# Qwen3.5-family staircase target kernels. They run on SM120/121 only, so they
-# are built for the sm_120 family (placeholder kernels without it). The context
-# FMHA launcher (qwen35ContextFmhaSm120.cu) is built with the generated FMHA
-# kernels instead, see contextFusedMultiHeadAttention/CMakeLists.txt.
+# qwen3_5 modeling_v2 target kernels. They run on SM120/121 only, so they are
+# built for the sm_120 family (placeholder kernels without it). The context FMHA
+# launcher (qwen35ContextFmhaSm120.cu) is built with the generated FMHA kernels
+# instead, see contextFusedMultiHeadAttention/CMakeLists.txt.
 add_library(qwen35_kernels_src OBJECT qwen35Nvfp4W4a16Gemv.cu
                                       qwen35Nvfp4GateUpSwigluSm120.cu)
 set_property(TARGET qwen35_kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)

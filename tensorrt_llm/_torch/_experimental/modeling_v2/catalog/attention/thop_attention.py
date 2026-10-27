@@ -1017,6 +1017,12 @@ class ThopAttention(OpWrapper):
     leaves every output row before the last 64-row q-tile unwritten whenever
     that split runs: only for a caller that reads each context's last row and
     whose contexts all end in the same q-tile.
+
+    On sm_120 the qwen3_5 cells are the ones driven (24/4/256 over an fp8 pool, decode
+    and paged-context prefill, with and without the opt-ins). The others were measured
+    on sm_100 / sm_103 and are not claimed there: on sm_120 the packed fp8 prefill finds
+    no FMHA kernel, and the fp8 verify blocks (P > 1) leave `reference` by hundreds of
+    ulp.
     """
 
     def __call__(

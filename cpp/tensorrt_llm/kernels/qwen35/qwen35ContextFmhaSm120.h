@@ -28,7 +28,7 @@ namespace kernels
 namespace qwen35
 {
 
-// Context FMHA of the Qwen3.5-family staircase target on SM120/121: the e4m3-input, BF16-output, head-256, causal,
+// Context FMHA of the qwen3_5 modeling_v2 target on SM120/121: the e4m3-input, BF16-output, head-256, causal,
 // Q_PAGED_KV tiled flash kernel (64-row q-tiles, 128-key KV tiles), compiled with the base-2 softmax
 // (Kernel_traits::USE_EXP2_SOFTMAX). When dropping the last q-tile from its grid saves a whole wave (1 to
 // kContextFmhaSm120MaxBatch sequences), the last q-tile runs split along KV in pieces plus a fixed-order merge. The
