@@ -336,6 +336,24 @@ class Flux3ImageVAE(nn.Module):
         z = self.normalize(z)
         return z
 
+    def compile_decoder(self) -> None:
+        """torch.compile the decoder in place (state_dict keys are unchanged).
+
+        Inductor lowers each GroupNorm into split reductions and fuses the
+        GN apply, swish and residual adds into pointwise kernels around the
+        extern cuDNN convolutions. Shapes are static: the served resolution is
+        compiled during pipeline warmup. Compilation is lazy (first decode).
+
+        layout_optimization is off: channels_last convs measured 126.5 ms per
+        1024^2 fp32 decode on SM120 versus 95.6 ms with NCHW (eager 169.4 ms).
+        """
+        dtype = next(self.decoder.parameters()).dtype
+        options = {"layout_optimization": False}
+        if dtype != torch.float32:
+            # Keep low-precision intermediate rounding identical to eager casts.
+            options["emulate_precision_casts"] = True
+        self.decoder.compile(dynamic=False, options=options)
+
     def decode(self, z: Tensor) -> Tensor:
         z = self.inv_normalize(z)
         z = rearrange(

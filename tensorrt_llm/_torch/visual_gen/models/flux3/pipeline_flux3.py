@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from io import BytesIO
 from typing import Callable, List, Optional, Tuple
 
@@ -345,6 +346,10 @@ class Flux3Pipeline(BasePipeline):
             self.vae = Flux3ImageVAE(Flux3ImageVAEConfig())
             self.vae.load_state_dict(load_file(str(package.asset(config["path"]))))
             self.vae = self.vae.to(device=device, dtype=getattr(torch, config["dtype"])).eval()
+            # Independent of the transformer compile flag; compiled lazily at warmup decode.
+            if os.environ.get("TLLM_FLUX3_VAE_COMPILE", "1") != "0":
+                logger.info("torch.compile: vae.decoder (whole module, dynamic=False)")
+                self.vae.compile_decoder()
 
     def load_transformer_weights(self, checkpoint_dir: str) -> dict:
         package = self.pipeline_config.extra_attrs["flux3_checkpoint"]
