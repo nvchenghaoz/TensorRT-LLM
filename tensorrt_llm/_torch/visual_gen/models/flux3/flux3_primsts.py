@@ -36,6 +36,58 @@ def is_sm120(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1))
 
 
+# SM120 plain NVFP4 linears (attn_out, down) run TRT-LLM's CUTLASS SM120 block-scaled GEMM
+# (fp4_gemm, CtaShape128x128x128B = config 0) instead of the CuTe DSL kernel: same 128x4 scale
+# layouts, same FP32 k=64 block-scaled accumulation and BF16(acc * alpha) epilogue, so outputs are
+# bitwise identical, ~40% faster at M=4096+T. The tactic is pinned (M-independent, no autotuning
+# or heuristic query inside a request). TRTLLM_FLUX3_SM120_LINEAR=cute restores the CuTe kernel.
+_SM120_LINEAR_CUTLASS_TACTIC = 0
+
+
+@lru_cache(maxsize=1)
+def _sm120_linear_backend() -> str:
+    import os
+
+    backend = os.environ.get("TRTLLM_FLUX3_SM120_LINEAR", "cutlass").strip().lower()
+    if backend not in ("cutlass", "cute"):
+        raise ValueError(f"TRTLLM_FLUX3_SM120_LINEAR must be 'cutlass' or 'cute', got {backend!r}")
+    return backend
+
+
+@lru_cache(maxsize=1)
+def _sm120_fp4_gemm_runner():
+    import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+
+    return torch.classes.trtllm.FP4GemmRunner(
+        torch.bfloat16, int(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4)
+    )
+
+
+def _sm120_cutlass_linear(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_global_scale: float,
+    weight_global_scale: float,
+) -> torch.Tensor:
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_nvfp4 import _scalar
+
+    # Cached device scalar (CUDA-graph safe), the same value the CuTe epilogue multiplies by.
+    alpha = _scalar(activation.device, input_global_scale * weight_global_scale)
+    return _sm120_fp4_gemm_runner().run_gemm(
+        activation.detach(),
+        weight.detach(),
+        activation_scale.detach(),
+        weight_scale.detach(),
+        alpha,
+        0,  # BufferKind.DEFAULT
+        _SM120_LINEAR_CUTLASS_TACTIC,
+        None,
+        None,
+    )
+
+
 @lru_cache(maxsize=32)
 def _token_positions(rows: int, device: torch.device) -> torch.Tensor:
     """Cache identity RoPE indices across blocks and denoising steps."""
@@ -413,6 +465,15 @@ def nvfp4_linear(
     weight_global_scale: float,
 ) -> torch.Tensor:
     if is_sm120(activation.device):
+        if _sm120_linear_backend() == "cutlass":
+            return _sm120_cutlass_linear(
+                activation,
+                weight,
+                activation_scale,
+                weight_scale,
+                input_global_scale,
+                weight_global_scale,
+            )
         from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120 import flux3_sm120_nvfp4
 
         return flux3_sm120_nvfp4.run(
