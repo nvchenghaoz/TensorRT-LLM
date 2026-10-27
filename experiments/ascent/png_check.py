@@ -115,6 +115,68 @@ check("real_L_odd", np.asarray(Image.fromarray(real[0]).convert("L"))[:1001, :77
 rgba = np.concatenate([real[1], real[2][..., :1]], axis=2)[:999, :1023].copy()
 check("real_RGBA_odd", rgba)
 
+# production layout: exactly Flux3 pipeline _to_uint8_image on a float BCHW
+# tensor in [-1, 1] -> non-contiguous (B, H, W, C) uint8 view; also t[0] and
+# a .clone() (the server's to_tensor keeps the permuted strides).
+prod_layout = {}
+for idx, src in enumerate(real[:4]):
+    x = torch.from_numpy(src).cuda().float().div(127.5).sub(1.0).permute(2, 0, 1).unsqueeze(0)
+    x = x.contiguous()  # BCHW float like the VAE output
+    t = ((x / 2 + 0.5).clamp(0, 1).permute(0, 2, 3, 1) * 255).round().to(torch.uint8)
+    assert not t.is_contiguous(), "expected the production non-contiguous layout"
+    host = t[0].cpu().numpy()  # main's _to_pil_image does t[0].cpu().numpy()
+    ref = main_png(host)
+    clone = t.clone()
+    for name, inp in (("bhwc", t), ("hwc", t[0]), ("clone_bhwc", clone), ("clone_hwc", clone[0])):
+        key = f"prod_{idx}_{name}"
+        new = enc.image_to_bytes(inp, format="PNG")
+        ok = {
+            "noncontiguous": not inp.is_contiguous(),
+            "decoded_equal": same_decode(new, ref),
+            "filtered_equal": filtered(new) == filtered(ref),
+            "deterministic": all(enc.image_to_bytes(inp, format="PNG") == new for _ in range(3)),
+        }
+        results[key] = dict(ok, strides=list(inp.stride()), ref_bytes=len(ref), new_bytes=len(new),
+                            ratio=round(len(new) / len(ref), 4))
+        if not all(ok.values()):
+            failures.append(key)
+        print(key, json.dumps(results[key]), flush=True)
+    prod_layout[idx] = t
+
+# step time once on the production layout: fast path vs TRTLLM_FAST_PNG=0
+# (main's Pillow path), interleaved A/B in one process, b64 included.
+import time  # noqa: E402
+
+tprod = prod_layout[0]
+
+
+def _step():
+    return base64.b64encode(enc.image_to_bytes(tprod, format="PNG")).decode("utf-8")
+
+
+def _timed(fast):
+    if fast:
+        os.environ.pop("TRTLLM_FAST_PNG", None)
+    else:
+        os.environ["TRTLLM_FAST_PNG"] = "0"
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    _step()
+    dt = (time.perf_counter() - t0) * 1e3
+    os.environ.pop("TRTLLM_FAST_PNG", None)
+    return dt
+
+
+for _ in range(3):
+    _timed(True), _timed(False)
+tf, tb = [], []
+for i in range(30):
+    tf.append(_timed(True))
+    tb.append(_timed(False))
+med = lambda v: sorted(v)[len(v) // 2]  # noqa: E731
+results["prod_layout_step_ms"] = {"fast": round(med(tf), 3), "pillow_main_path": round(med(tb), 3)}
+print("prod_layout_step_ms", json.dumps(results["prod_layout_step_ms"]), flush=True)
+
 # untimed copy of the timed sequence (5 warmup + 60 iterations, same op)
 arr = real[0]
 g = torch.from_numpy(arr).cuda()
