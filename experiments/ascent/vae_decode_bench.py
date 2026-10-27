@@ -19,6 +19,7 @@ modes:
   check    compiled vs eager decoder of this tree, in one process (declared
            tolerance: max abs <= 1e-2 and uint8 max diff <= 2), plus the repeat
            sequence and dynamo frame counters before/after the timed-length run.
+  profile  one warm decode between cudaProfilerStart/Stop (nsys capture=region).
   kernels  launch-count census of one warm decode (torch.profiler), including
            RowwiseMomentsCUDAKernel and cuDNN nchwToNhwcKernel.
 Run from the tree root (imports experiments/ascent/gn_check.py).
@@ -216,6 +217,17 @@ elif args.mode == "check":
                     "compiled": comp, **d, "repeat_bitwise": rep, "eager_repeat_bitwise": ref_rep,
                     "inputs_unchanged": inp, "no_recompile_after_warmup": f0 == f1,
                     "frames_before": f0, "frames_after": f1}))
+
+elif args.mode == "profile":
+    # One warm decode between cudaProfilerStart/Stop (nsys/ncu capture=region).
+    vae, comp = build()
+    warm(vae, "P")
+    torch.cuda.synchronize()
+    torch.cuda.profiler.start()
+    decode(vae)
+    torch.cuda.synchronize()
+    torch.cuda.profiler.stop()
+    log(json.dumps({"profiled": True, "compiled": comp}))
 
 elif args.mode == "kernels":
     from collections import Counter
