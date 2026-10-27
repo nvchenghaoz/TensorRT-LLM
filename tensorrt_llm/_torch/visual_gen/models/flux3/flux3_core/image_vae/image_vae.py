@@ -33,15 +33,27 @@ class Flux3GroupNorm(nn.GroupNorm):
     """nn.GroupNorm with a split-group fused Triton path (same parameter names).
 
     ``forward_silu(x)`` computes ``swish(GroupNorm(x))`` in one apply pass.
+
+    Under torch.compile the Triton kernels are opaque to Inductor, so by default the
+    traced graph uses aten GroupNorm, which Inductor lowers into split reductions fused
+    with the neighbouring residual adds, upsampling and swish.
     """
 
+    # Per instance: True keeps the Triton kernels inside a compiled graph (as extern calls).
+    triton_under_compile = False
+
+    def _fused(self, x: Tensor) -> bool:
+        if torch.compiler.is_compiling() and not self.triton_under_compile:
+            return False
+        return can_use_fused_gn(x, self)
+
     def forward(self, x: Tensor) -> Tensor:
-        if can_use_fused_gn(x, self):
+        if self._fused(x):
             return fused_group_norm(x, self.num_groups, self.weight, self.bias, self.eps, False)
         return super().forward(x)
 
     def forward_silu(self, x: Tensor) -> Tensor:
-        if can_use_fused_gn(x, self):
+        if self._fused(x):
             return fused_group_norm(x, self.num_groups, self.weight, self.bias, self.eps, True)
         return swish(super().forward(x))
 
@@ -336,17 +348,21 @@ class Flux3ImageVAE(nn.Module):
         z = self.normalize(z)
         return z
 
-    def compile_decoder(self) -> None:
+    def compile_decoder(self, triton_group_norm: bool = False) -> None:
         """torch.compile the decoder in place (state_dict keys are unchanged).
 
         Inductor lowers each GroupNorm into split reductions and fuses the
         GN apply, swish and residual adds into pointwise kernels around the
         extern cuDNN convolutions. Shapes are static: the served resolution is
         compiled during pipeline warmup. Compilation is lazy (first decode).
+        triton_group_norm=True keeps Flux3GroupNorm's Triton kernels in the graph.
 
         layout_optimization is off: channels_last convs measured 126.5 ms per
         1024^2 fp32 decode on SM120 versus 95.6 ms with NCHW (eager 169.4 ms).
         """
+        for m in self.decoder.modules():
+            if isinstance(m, Flux3GroupNorm):
+                m.triton_under_compile = triton_group_norm
         dtype = next(self.decoder.parameters()).dtype
         options = {"layout_optimization": False}
         if dtype != torch.float32:

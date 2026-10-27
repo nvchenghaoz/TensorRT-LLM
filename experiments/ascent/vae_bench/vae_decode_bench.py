@@ -12,9 +12,10 @@ Usage: python vae_decode_bench.py <checkpoint_root> <mode>
   time   one arm, for run_gpu_pair: this tree's decoder (compiled when the tree
          provides Flux3ImageVAE.compile_decoder and VAE_COMPILE!=0). CUDA events,
          median of ITERS after WARMUP. Last line: pair evidence JSON.
-  ab     in-process interleaved A/B/A': A = eager decoder, B = this tree's decoder,
-         A' = a second eager instance (A/A noise). Same weights, same input,
-         arms rotated every iteration.
+  ab     in-process interleaved A/B/(C)/A': A = this tree's eager decoder, B = this
+         tree's decoder (compiled if supported), C = compiled with Flux3GroupNorm's
+         Triton kernels kept as extern calls (when supported), A' = a second eager
+         instance (A/A noise). Same weights, same input, arms rotated every iteration.
   check  untimed repeated-execution pass with the same WARMUP/ITERS as timing:
          every iteration is compared with iteration 0 (bitwise) and with the
          eager reference (declared tolerance), and the input is checked unchanged.
@@ -51,15 +52,22 @@ STATE = {k: v.clone() for k, v in _proto.state_dict().items()}
 del _proto
 
 
-def build(compiled: bool):
+def build(compiled: bool, **compile_kwargs):
     vae = Flux3ImageVAE(Flux3ImageVAEConfig())
     vae.load_state_dict(STATE)
     vae = vae.to(device="cuda", dtype=dtype).eval()
     is_compiled = False
     if compiled and hasattr(vae, "compile_decoder") and os.environ.get("VAE_COMPILE", "1") != "0":
-        vae.compile_decoder()
+        vae.compile_decoder(**compile_kwargs)
         is_compiled = True
     return vae, is_compiled
+
+
+def _supports_triton_gn_kwarg():
+    import inspect
+
+    fn = getattr(Flux3ImageVAE, "compile_decoder", None)
+    return fn is not None and "triton_group_norm" in inspect.signature(fn).parameters
 
 
 gen = torch.Generator(device="cuda").manual_seed(1234)
@@ -124,12 +132,16 @@ elif mode == "ab":
     arms = {}
     arms["A"], _ = build(False)
     arms["B"], b_compiled = build(True)
+    if _supports_triton_gn_kwarg():
+        # C = compiled decoder keeping Flux3GroupNorm's Triton kernels as extern calls.
+        arms["C"], _ = build(True, triton_group_norm=True)
     arms["A2"], _ = build(False)
     warm_s = {k: warm(v, k) for k, v in arms.items()}
-    order = ["A", "B", "A2"]
+    order = list(arms)
     ts = {k: [] for k in order}
     for i in range(ITERS):
-        rot = order[i % 3:] + order[:i % 3]
+        r = i % len(order)
+        rot = order[r:] + order[:r]
         for k in rot:
             ts[k].append(timed(arms[k]))
         if i % 10 == 0:
@@ -141,6 +153,7 @@ elif mode == "ab":
         "output": {"class": "reordered" if b_compiled else "exact"},
         "interleaved": True, "b_compiled": b_compiled, "arms": st,
         "speedup_A_over_B": a / b, "saving_ms": a - b, "aa_rel_diff": abs(a2 - a) / a,
+        "C_triton_gn_compiled_ms": st["C"]["median_ms"] if "C" in st else None,
         "compile_warmup_s": warm_s["B"], "eager_warmup_s": warm_s["A"],
     }))
 
