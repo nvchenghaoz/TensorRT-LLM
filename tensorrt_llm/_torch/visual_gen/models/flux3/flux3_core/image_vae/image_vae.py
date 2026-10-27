@@ -10,6 +10,9 @@ import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
 
+from .group_norm_triton import can_use_fused as can_use_fused_gn
+from .group_norm_triton import fused_group_norm
+
 
 @dataclass
 class Flux3ImageVAEConfig:
@@ -26,12 +29,29 @@ def swish(x: Tensor) -> Tensor:
     return x * torch.sigmoid(x)
 
 
+class Flux3GroupNorm(nn.GroupNorm):
+    """nn.GroupNorm with a split-group fused Triton path (same parameter names).
+
+    ``forward_silu(x)`` computes ``swish(GroupNorm(x))`` in one apply pass.
+    """
+
+    def forward(self, x: Tensor) -> Tensor:
+        if can_use_fused_gn(x, self):
+            return fused_group_norm(x, self.num_groups, self.weight, self.bias, self.eps, False)
+        return super().forward(x)
+
+    def forward_silu(self, x: Tensor) -> Tensor:
+        if can_use_fused_gn(x, self):
+            return fused_group_norm(x, self.num_groups, self.weight, self.bias, self.eps, True)
+        return swish(super().forward(x))
+
+
 class Flux3ImageAttnBlock(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()
         self.in_channels = in_channels
 
-        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = Flux3GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
 
         self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1)
@@ -62,9 +82,9 @@ class Flux3ImageResnetBlock(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm1 = Flux3GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_channels, eps=1e-6, affine=True)
+        self.norm2 = Flux3GroupNorm(num_groups=32, num_channels=out_channels, eps=1e-6, affine=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         if self.in_channels != self.out_channels:
             self.nin_shortcut = nn.Conv2d(
@@ -72,13 +92,10 @@ class Flux3ImageResnetBlock(nn.Module):
             )
 
     def forward(self, x: Tensor) -> Tensor:
-        h = x
-        h = self.norm1(h)
-        h = swish(h)
+        h = self.norm1.forward_silu(x)
         h = self.conv1(h)
 
-        h = self.norm2(h)
-        h = swish(h)
+        h = self.norm2.forward_silu(h)
         h = self.conv2(h)
 
         if self.in_channels != self.out_channels:
@@ -153,7 +170,7 @@ class Flux3ImageEncoder(nn.Module):
         self.mid.attn_1 = Flux3ImageAttnBlock(block_in)
         self.mid.block_2 = Flux3ImageResnetBlock(in_channels=block_in, out_channels=block_in)
 
-        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
+        self.norm_out = Flux3GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
         self.conv_out = nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -171,8 +188,7 @@ class Flux3ImageEncoder(nn.Module):
         h = self.mid.block_1(h)
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h)
-        h = self.norm_out(h)
-        h = swish(h)
+        h = self.norm_out.forward_silu(h)
         h = self.conv_out(h)
         h = self.quant_conv(h)
         return h
@@ -228,7 +244,7 @@ class Flux3ImageDecoder(nn.Module):
                 up.upsample = Flux3ImageUpsample(block_in)
             self.up.insert(0, up)
 
-        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
+        self.norm_out = Flux3GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
 
     def forward(self, z: Tensor) -> Tensor:
@@ -251,8 +267,7 @@ class Flux3ImageDecoder(nn.Module):
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
-        h = self.norm_out(h)
-        h = swish(h)
+        h = self.norm_out.forward_silu(h)
         h = self.conv_out(h)
         return h
 
