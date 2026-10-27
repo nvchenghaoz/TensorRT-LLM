@@ -100,6 +100,10 @@ class Flux3Sm120Nvfp4Kernel:
         self.epilogue = epilogue
         self.scratch_dtype = cutlass.BFloat16 if epilogue == QKV else cutlass.Float32
         self.scratch_shape = (128, 128 if epilogue == QKV else 64)
+        # Row stride of the scratch in elements. PACKED pads the fp32 rows by 4 (272 B):
+        # the C-fragment stores (8 rows x 4 consecutive columns per warp) and the 16-byte
+        # row reads (8 rows x 4 scale blocks) are then bank-conflict free.
+        self.scratch_row_stride = self.scratch_shape[1] + (4 if epilogue == PACKED_SWIGLU else 0)
         self.acc_dtype = acc_dtype
         self.sf_vec_size = sf_vec_size
         self.cluster_shape_mnk = (1, 1, 1)
@@ -347,7 +351,9 @@ class Flux3Sm120Nvfp4Kernel:
                 self.buffer_align_bytes,
             ]
             sScratch: cute.struct.Align[
-                cute.struct.MemRange[self.scratch_dtype, cute.size(self.scratch_shape)],
+                cute.struct.MemRange[
+                    self.scratch_dtype, self.scratch_shape[0] * self.scratch_row_stride
+                ],
                 16,
             ]
 
@@ -516,7 +522,7 @@ class Flux3Sm120Nvfp4Kernel:
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
         sScratch = storage.sScratch.get_tensor(
-            cute.make_layout(self.scratch_shape, stride=(self.scratch_shape[1], 1))
+            cute.make_layout(self.scratch_shape, stride=(self.scratch_row_stride, 1))
         )
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
@@ -1002,6 +1008,11 @@ class Flux3Sm120Nvfp4Kernel:
                                 ).load()
                             output[(row, col, 0)] = cutlass.BFloat16(value)
                 elif cutlass.const_expr(self.epilogue == PACKED_SWIGLU):
+                    # 64-bit view of the packed FP4 output (row stride columns // 4 bytes).
+                    output_words = cute.make_tensor(
+                        cute.recast_ptr(output.iterator, dtype=cutlass.Int64),
+                        cute.make_layout(cute.size(output) // 8),
+                    )
                     factor = global_scale.load()
                     for pair_idx in cutlass.range_constexpr(cute.size(accumulators) // 2):
                         gate = accumulators[2 * pair_idx] * factor
@@ -1029,13 +1040,18 @@ class Flux3Sm120Nvfp4Kernel:
                             encoded_scale.to(cutlass.Float32), cutlass.Float32(1.0e-12)
                         )
                         global_row = tile_m * 128 + row
-                        global_col = tile_n * 64 + first_column
+                        # Assemble the block's 8 packed bytes (16 FP4 values) in registers and
+                        # write them with one 64-bit store: byte pair_idx lands at byte column
+                        # tile_n * 32 + scale_column * 8 + pair_idx, as before.
+                        packed_bytes = cute.make_rmem_tensor((8,), cutlass.Int8)
                         for pair_idx in cutlass.range_constexpr(8):
                             low = sScratch[(row, first_column + 2 * pair_idx)] * multiplier
                             high = sScratch[(row, first_column + 2 * pair_idx + 1)] * multiplier
-                            output[(global_row, global_col // 2 + pair_idx, 0)] = _pack_pair(
-                                high, low
-                            )
+                            packed_bytes[pair_idx] = _pack_pair(high, low)
+                        packed_words = cute.recast_tensor(packed_bytes, cutlass.Int64)
+                        output_words[
+                            global_row * (self.columns // 32) + tile_n * 4 + scale_column
+                        ] = packed_words[0]
                         scale_col = tile_n * 4 + scale_column
                         output_columns = self.columns // 2
                         scale_index = (
