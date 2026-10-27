@@ -125,6 +125,38 @@ def decoder(root, n_lat=3):
 
 
 @torch.inference_mode()
+def repeat(root, warmup=5, iters=60):
+    """Untimed sequence matching the timed microbenchmark: same warmup and iteration
+    count, no resets needed (decode has no mutable state). Every iteration must be
+    bitwise equal to iteration 0, within tolerance of the aten reference, and the
+    input latent must be unchanged."""
+    vae, dt = build_vae(root)
+    dtype = next(vae.parameters()).dtype
+    z = torch.randn(1, 128, 64, 64, device="cuda", generator=torch.Generator(device="cuda").manual_seed(0)).to(dtype)
+    z0 = z.clone()
+    gnt.set_enabled(False)
+    ref_u8 = to_u8(vae.decode(z))
+    gnt.set_enabled(True)
+    for _ in range(warmup):
+        vae.decode(z)
+    first = None
+    ok = True
+    worst_u8 = 0
+    for i in range(iters):
+        out = vae.decode(z)
+        if first is None:
+            first = out.clone()
+        same = torch.equal(out, first)
+        du = (to_u8(out).int() - ref_u8.int()).abs().max().item()
+        worst_u8 = max(worst_u8, du)
+        inp = torch.equal(z, z0)
+        ok &= same and inp and du <= 2
+        if i % 10 == 0:
+            log(i, same, du, inp)
+    return {"passed": bool(ok), "check": f"{warmup} warmup + {iters} fused decodes: all bitwise == iter 0, uint8 max diff vs aten ref <= 2, input unchanged", "u8_max_diff_vs_aten": worst_u8, "vae_dtype": dt}
+
+
+@torch.inference_mode()
 def bench(root, iters=20):
     vae, dt = build_vae(root)
     dtype = next(vae.parameters()).dtype
@@ -164,5 +196,8 @@ if __name__ == "__main__":
     elif mode == "all":
         out = {"unit": unit(), "decoder": decoder(sys.argv[2]), "bench": bench(sys.argv[2])}
         out["passed"] = out["unit"]["passed"] and out["decoder"]["passed"]
+    elif mode == "check":
+        out = {"unit": unit(), "decoder": decoder(sys.argv[2]), "repeat": repeat(sys.argv[2])}
+        out["passed"] = all(out[k]["passed"] for k in ("unit", "decoder", "repeat"))
     out["elapsed_s"] = time.time() - t0
     print(json.dumps(out))
