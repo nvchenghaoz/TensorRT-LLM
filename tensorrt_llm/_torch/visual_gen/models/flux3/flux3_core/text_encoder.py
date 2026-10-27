@@ -5,11 +5,15 @@
 # FLUX.3 text encoder: Qwen3-VL stacking hidden states across selected layers.
 
 import math
+import os
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
 from torch import Tensor
+
+from tensorrt_llm.logger import logger
 
 
 @torch.library.custom_op("trtllm::flux3_text_rms_norm", mutates_args=())
@@ -45,6 +49,14 @@ class Qwen3VLEmbedderParams:
     max_length: int = 8192
     pad_multiple: int = 80
     use_compile: bool = False
+    # Compiled path only: replay one CUDA graph per pre-warmed padded-length
+    # bucket (kill switch TRTLLM_FLUX3_TEXT_GRAPH=0). Must be off when the
+    # encoder is offloaded, since graphs bake in device weight pointers.
+    use_cuda_graph: bool = True
+    # Compiled path only: buckets k * pad_multiple for k = 1..warmup_buckets are
+    # compiled and captured at warmup (T=80 covers the served prompts). Other
+    # buckets compile on first use as before and never capture a graph.
+    warmup_buckets: int = 1
 
 
 class Qwen3VLEmbedder(torch.nn.Module):
@@ -98,30 +110,129 @@ class Qwen3VLEmbedder(torch.nn.Module):
                 dynamic=False,
                 options={"emulate_precision_casts": True, "triton.cudagraphs": False},
             )
+        # Compiled path state: per-bucket graphs (T -> (graph, ids, mask, out)),
+        # set once at warmup and never extended afterwards.
+        self._graphs: dict[int, tuple] = {}
+        self._graph_pool = None
+        self._warm_lengths: set[int] = set()
+        self._sealed = False
+
+    def _tokenize(self, prompt: str) -> tuple[Tensor, Tensor]:
+        """One tokenizer call, right-padded to the next pad_multiple bucket.
+
+        Equal to tokenizing once for the real length and again with
+        padding="max_length" to the bucket (right padding, pad_token_id, mask 0).
+        """
+        text = self.processor.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
+        )
+        tokenizer = self.processor.tokenizer
+        ids = tokenizer(text, truncation=True, max_length=self.max_length)["input_ids"]
+        real = len(ids)
+        length = min(
+            math.ceil(real / self.params.pad_multiple) * self.params.pad_multiple,
+            self.max_length,
+        )
+        pad = length - real
+        input_ids = torch.tensor([ids + [tokenizer.pad_token_id] * pad], dtype=torch.long)
+        attention_mask = torch.tensor([[1] * real + [0] * pad], dtype=torch.long)
+        return input_ids, attention_mask
+
+    def _graphs_enabled(self) -> bool:
+        return (
+            self.params.use_compile
+            and self.params.use_cuda_graph
+            and os.environ.get("TRTLLM_FLUX3_TEXT_GRAPH", "1") != "0"
+            and self.model.device.type == "cuda"
+        )
+
+    def _capture(self, input_ids: Tensor, attention_mask: Tensor) -> None:
+        """Capture the compiled forward for one bucket on static device inputs.
+
+        The compiled region has no host reads (text-only: positions are an
+        arange, the 4D mask is built on device), so the graph is data-independent.
+        All buckets share one pool: replays never overlap, and each replay's
+        output is cloned before any other replay is enqueued.
+        """
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            self._forward_tensors(input_ids, attention_mask)
+        torch.cuda.current_stream().wait_stream(stream)
+        if self._graph_pool is None:
+            self._graph_pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._graph_pool, capture_error_mode="thread_local"):
+            out = self._forward_tensors(input_ids, attention_mask)
+        torch.cuda.synchronize()
+        self._graphs[input_ids.shape[1]] = (graph, input_ids, attention_mask, out)
+
+    @torch.inference_mode()
+    def warmup_buckets(self) -> None:
+        """Compile and capture every bucket k * pad_multiple, k = 1..warmup_buckets.
+
+        Graphs are captured only here; a later bucket outside this set compiles on
+        first use (as without graphs) and runs the compiled code without a graph.
+        """
+        if not self.params.use_compile or self._sealed:
+            return
+        device = self.model.device
+        pm = self.params.pad_multiple
+        lengths = sorted(
+            {min(k * pm, self.max_length) for k in range(1, self.params.warmup_buckets + 1)}
+        )
+        ids, mask = self._tokenize("warmup")
+        real = int(mask.sum())
+        use_graph = self._graphs_enabled()
+        for length in lengths:
+            t0 = time.time()
+            n = min(real, length)
+            input_ids = torch.full((1, length), self.processor.tokenizer.pad_token_id)
+            input_ids[:, :n] = ids[:, :n]
+            attention_mask = torch.zeros((1, length), dtype=torch.long)
+            attention_mask[:, :n] = 1
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            for _ in range(2):
+                self._forward_tensors(input_ids, attention_mask)
+            if use_graph:
+                self._capture(input_ids, attention_mask)
+            torch.cuda.synchronize()
+            self._warm_lengths.add(length)
+            logger.info(
+                f"FLUX.3 text encoder: warmed bucket T={length} "
+                f"({'graph' if use_graph else 'compiled'}) in {time.time() - t0:.1f}s"
+            )
+        self._sealed = True
+
+    def _run(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
+        length = input_ids.shape[1]
+        entry = self._graphs.get(length)
+        if entry is not None:
+            graph, static_ids, static_mask, out = entry
+            static_ids.copy_(input_ids, non_blocking=True)
+            static_mask.copy_(attention_mask, non_blocking=True)
+            graph.replay()
+            return out.clone()
+        if self._sealed and length not in self._warm_lengths:
+            self._warm_lengths.add(length)
+            logger.info(f"FLUX.3 text encoder: bucket T={length} not pre-warmed; compiles on use")
+        device = self.model.device
+        return self._forward_tensors(input_ids.to(device), attention_mask.to(device)).clone()
 
     @torch.no_grad()
     def _forward_hidden(self, prompts: list[str]) -> list[Tensor]:
         contexts = []
         for prompt in prompts:
-            text = self.processor.apply_chat_template(
-                [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-            )
-            tokenizer = self.processor.tokenizer
-            real = tokenizer(
-                text, return_tensors="pt", truncation=True, max_length=self.max_length
-            )["input_ids"].shape[1]
-            length = min(
-                math.ceil(real / self.params.pad_multiple) * self.params.pad_multiple,
-                self.max_length,
-            )
-            tokens = tokenizer(
-                text, return_tensors="pt", padding="max_length", truncation=True, max_length=length
-            )
-            ctx = self._forward_tensors(
-                tokens["input_ids"].to(self.model.device),
-                tokens["attention_mask"].to(self.model.device),
-            )
-            contexts.append(ctx.clone() if self.params.use_compile else ctx)
+            input_ids, attention_mask = self._tokenize(prompt)
+            if self.params.use_compile:
+                contexts.append(self._run(input_ids, attention_mask))
+            else:
+                contexts.append(
+                    self._forward_tensors(
+                        input_ids.to(self.model.device), attention_mask.to(self.model.device)
+                    )
+                )
         return contexts
 
     def _forward_tensors(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
