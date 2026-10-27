@@ -73,8 +73,9 @@ def check(name, arr, reps=3):
         "decoded_equal": same_decode(new, ref),
         "filtered_equal": filtered(new) == filtered(ref),
         "deterministic": all(enc.image_to_bytes(t, format="PNG") == new for _ in range(reps)),
-        "batched_input_equal": enc.image_to_bytes(t.unsqueeze(0), format="png") == new,
     }
+    if arr.ndim == 3:  # (1, H, W, C) batched form; main only unbatches 4-D inputs
+        ok["batched_input_equal"] = enc.image_to_bytes(t.unsqueeze(0), format="png") == new
     results[name] = dict(ok, ref_bytes=len(ref), new_bytes=len(new), ratio=round(len(new) / len(ref), 4))
     if not all(ok.values()):
         failures.append(name)
