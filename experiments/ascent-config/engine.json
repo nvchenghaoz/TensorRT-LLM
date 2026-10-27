@@ -1,0 +1,9 @@
+{
+  "attention_config": {
+    "backend": "FLASHINFER",
+    "quant_attention_config": {
+      "qk_dtype": "fp8",
+      "v_dtype": "fp8"
+    }
+  }
+}
