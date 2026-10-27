@@ -7,8 +7,11 @@ import shutil
 import struct
 import subprocess  # nosec B404
 import tempfile
+import threading
 import wave
+import zlib
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
@@ -424,6 +427,177 @@ def _to_pil_image(image: torch.Tensor) -> Image.Image:
     return Image.fromarray(image_np)
 
 
+# ---------------------------------------------------------------------------
+# Fast exact PNG writer (uint8 L/RGB/RGBA CUDA tensors)
+# ---------------------------------------------------------------------------
+#
+# Produces a PNG whose decoded pixels are bitwise identical to Pillow's PNG
+# output for the same array (and whose filtered scanline stream is identical
+# to Pillow's). Per-row filters are chosen with Pillow's own heuristic
+# (ZipEncode.c: None, Up, Sub, Paeth in that order, keep a filter only when
+# its sum of min(v, 256 - v) is strictly smaller), computed with tensor ops on
+# the GPU, so only the filtered scanlines cross to the host. Set
+# TRTLLM_FAST_PNG=0 to use Pillow instead. The filtered stream is then
+# deflated in fixed-size row strips on a thread pool (zlib releases the GIL);
+# each strip is primed with the previous 32 KiB as a preset dictionary and
+# ends with a sync flush, the last with Z_FINISH, so the strips concatenate
+# into one valid zlib stream. Strip boundaries depend only on the image
+# height, so output bytes are deterministic regardless of the core count.
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# channels -> PNG color type (L, RGB, RGBA)
+_PNG_COLOR_TYPES = {1: 0, 3: 2, 4: 6}
+_PNG_STRIP_ROWS = 64
+_PNG_WINDOW = 32768
+_PNG_POOL = None
+_PNG_POOL_LOCK = threading.Lock()
+
+
+def _fast_png_enabled() -> bool:
+    return os.environ.get("TRTLLM_FAST_PNG", "1") != "0"
+
+
+def _png_pool():
+    global _PNG_POOL
+    if _PNG_POOL is None:
+        with _PNG_POOL_LOCK:
+            if _PNG_POOL is None:
+                try:
+                    ncpu = len(os.sched_getaffinity(0))
+                except (AttributeError, OSError):
+                    ncpu = os.cpu_count() or 1
+                workers = max(1, min(16, ncpu))
+                _PNG_POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="png_enc")
+    return _PNG_POOL
+
+
+def _png_filter_scanlines(img: torch.Tensor) -> torch.Tensor:
+    """Filter a uint8 ``(H, W, C)`` image into PNG scanlines ``(H, 1 + W*C)``.
+
+    Each row gets the filter Pillow's encoder would pick for it.
+    """
+    h, w, c = img.shape
+    x = img.reshape(h, w * c).to(torch.int16)
+    up = torch.zeros_like(x)
+    up[1:] = x[:-1]
+    left = torch.zeros_like(x)
+    left[:, c:] = x[:, :-c]
+    upleft = torch.zeros_like(x)
+    upleft[1:, c:] = x[:-1, :-c]
+
+    pa = (up - upleft).abs()
+    pb = (left - upleft).abs()
+    pc = (left + up - 2 * upleft).abs()
+    paeth_pred = torch.where((pa <= pb) & (pa <= pc), left, torch.where(pb <= pc, up, upleft))
+    del pa, pb, pc
+
+    # Candidate order matches Pillow's evaluation order: None, Up, Sub, Paeth.
+    cand = torch.stack((x, x - up, x - left, x - paeth_pred)).bitwise_and_(0xFF)
+    del up, left, upleft, paeth_pred
+    cost = torch.minimum(cand, 256 - cand).sum(dim=2, dtype=torch.int32)  # (4, H)
+
+    # Sequential strict-less selection == Pillow's tie-breaking.
+    best_cost = cost[0]
+    choice = torch.zeros(h, dtype=torch.int64, device=x.device)
+    for k in (1, 2, 3):
+        better = cost[k] < best_cost
+        choice = torch.where(better, torch.full_like(choice, k), choice)
+        best_cost = torch.where(better, cost[k], best_cost)
+
+    rows = cand.gather(0, choice.view(1, h, 1).expand(1, h, w * c))[0]
+    codes = torch.tensor([0, 2, 1, 4], dtype=torch.int16, device=x.device)[choice]
+    out = torch.empty((h, 1 + w * c), dtype=torch.uint8, device=x.device)
+    out[:, 0] = codes.to(torch.uint8)
+    out[:, 1:] = rows.to(torch.uint8)
+    return out
+
+
+def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(payload))
+        + tag
+        + payload
+        + struct.pack(">I", zlib.crc32(payload, zlib.crc32(tag)))
+    )
+
+
+def _encode_png_tensor(image: Any, compress_level: int = 1) -> Optional[bytes]:
+    """Encode a uint8 L/RGB/RGBA image tensor as PNG; None when not eligible."""
+    if not _fast_png_enabled() or not isinstance(image, torch.Tensor):
+        return None
+    # The filter step is a handful of device kernels on CUDA; on CPU tensors
+    # torch's elementwise ops are slower than Pillow's C filter loop, so
+    # host tensors keep the Pillow path.
+    if not image.is_cuda:
+        return None
+    if image.dim() == 4:
+        image = image[0]
+    if image.dtype != torch.uint8:
+        return None
+    if image.dim() == 2:
+        image = image.unsqueeze(-1)
+    if image.dim() != 3:
+        return None
+    h, w, c = image.shape
+    if c not in _PNG_COLOR_TYPES or h == 0 or w == 0:
+        return None
+
+    scan = _png_filter_scanlines(image).cpu().numpy()
+    data = memoryview(scan.reshape(-1))
+    row_bytes = 1 + w * c
+
+    bounds = []
+    for r0 in range(0, h, _PNG_STRIP_ROWS):
+        r1 = min(h, r0 + _PNG_STRIP_ROWS)
+        bounds.append((r0 * row_bytes, r1 * row_bytes))
+    last = len(bounds) - 1
+
+    def _deflate(i: int):
+        start, end = bounds[i]
+        if start > 0:
+            comp = zlib.compressobj(
+                compress_level,
+                zlib.DEFLATED,
+                -15,
+                9,
+                zlib.Z_FILTERED,
+                bytes(data[max(0, start - _PNG_WINDOW) : start]),
+            )
+        else:
+            comp = zlib.compressobj(compress_level, zlib.DEFLATED, -15, 9, zlib.Z_FILTERED)
+        out = comp.compress(data[start:end])
+        out += comp.flush(zlib.Z_FINISH if i == last else zlib.Z_SYNC_FLUSH)
+        if i == 0:
+            # zlib header for a 32 KiB window; FLEVEL as zlib writes it.
+            flevel = 0 if compress_level < 2 else (1 if compress_level < 6 else
+                                                   (2 if compress_level == 6 else 3))
+            cmf = 0x78
+            flg = flevel << 6
+            flg += 31 - ((cmf * 256 + flg) % 31)
+            out = bytes((cmf, flg)) + out
+        if i == last:
+            return out, None
+        return out, zlib.crc32(out, zlib.crc32(b"IDAT"))
+
+    pool = _png_pool()
+    adler_future = pool.submit(zlib.adler32, data)
+    futures = [pool.submit(_deflate, i) for i in range(len(bounds))]
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, _PNG_COLOR_TYPES[c], 0, 0, 0)
+    parts = [_PNG_SIGNATURE, _png_chunk(b"IHDR", ihdr)]
+    for i, fut in enumerate(futures):
+        payload, crc = fut.result()
+        if i == last:
+            payload += struct.pack(">I", adler_future.result())
+            crc = zlib.crc32(payload, zlib.crc32(b"IDAT"))
+        parts.append(struct.pack(">I", len(payload)))
+        parts.append(b"IDAT")
+        parts.append(payload)
+        parts.append(struct.pack(">I", crc))
+    parts.append(_png_chunk(b"IEND", b""))
+    return b"".join(parts)
+
+
 def _save_pil_image(
     pil_image: Image.Image,
     output: Any,
@@ -515,8 +689,6 @@ def save_image(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    pil_image = _to_pil_image(image)
-
     if format is None:
         ext = os.path.splitext(output_path)[1].lower()
         if ext == ".png":
@@ -530,13 +702,25 @@ def save_image(
             format = "PNG"
             output_path = output_path.rsplit(".", 1)[0] + ".png"
 
-    _save_pil_image(pil_image, output_path, format, quality)
+    png_bytes = None
+    if format.upper() not in ("JPEG", "JPG", "WEBP"):
+        png_bytes = _encode_png_tensor(image)
+    if png_bytes is not None:
+        with open(output_path, "wb") as f:
+            f.write(png_bytes)
+    else:
+        _save_pil_image(_to_pil_image(image), output_path, format, quality)
     logger.info(f"Saved image to {output_path} (format={format})")
     return output_path
 
 
 def image_to_bytes(image: torch.Tensor, format: str = "PNG", quality: int = 95) -> bytes:
     """Encode an image tensor to in-memory bytes."""
+    if format.upper() not in ("JPEG", "JPG", "WEBP"):
+        # Same branch as _save_pil_image's PNG default.
+        data = _encode_png_tensor(image)
+        if data is not None:
+            return data
     pil_image = _to_pil_image(image)
     buffer = BytesIO()
     _save_pil_image(pil_image, buffer, format, quality)
