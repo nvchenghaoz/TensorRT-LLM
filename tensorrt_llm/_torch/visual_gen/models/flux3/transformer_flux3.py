@@ -646,7 +646,9 @@ def _flux3_gated_mlp_forward(
 
 # Broadcast adaLN modulation (compact, single-segment streams): mode blocks take [1, 1, D]
 # shift/scale/gate rows and single blocks take [1, 2, D] tables plus a [1, S, 1] text-row
-# select mask, so no per-token [1, S, D] modulation is materialized. Same values, same ops.
+# select mask, so no per-token [1, S, D] modulation is materialized. Same values and math;
+# Inductor picks another reduction config for the single-block LN+modulate kernel, so the
+# LayerNorm sums are reordered (mode blocks stay bitwise).
 FLUX3_BROADCAST_ADALN = True
 
 
