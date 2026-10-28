@@ -1359,6 +1359,12 @@ def _sm120_qkv_planar_gemms(
     segment_scale = weight_scale.numel() // 3
     out = torch.empty((rows, columns), device=activation.device, dtype=torch.bfloat16)
 
+    if strided.batched():
+        # Idea 82: the three planes as ONE batched (L=3) Pingpong launch on the current stream
+        # (no side-stream fork), bitwise equal to the per-plane launches below.
+        strided.gemm_qkv3(activation, weight, activation_scale, weight_scale, qkv_scale, out)
+        return out
+
     def gemm_plane(i: int) -> None:
         strided.gemm_into(
             activation,

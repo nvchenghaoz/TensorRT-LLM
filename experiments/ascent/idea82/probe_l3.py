@@ -284,6 +284,64 @@ def main():
         log(json.dumps({f"M{M}": bw}))
         results["bitwise"][f"M{M}"] = bw
 
+        # post-landing-54 served op: nvfp4_qkv_rope_fp8_impl (planar GEMMs -> qknorm_rope_fp8),
+        # candidate (batched) vs main (per-plane 3-stream), outputs (qkv8, scales, gemm).
+        fp8_ok = hasattr(fp, "nvfp4_qkv_rope_fp8_impl")
+        if fp8_ok:
+            sm_scale = 1.0 / (128 ** 0.5)
+
+            def fp8op(batched):
+                def run():
+                    strided.batched = (lambda: True) if batched else (lambda: False)
+                    try:
+                        return fp.nvfp4_qkv_rope_fp8_impl(a, wq, a_sf, wq_sf, q_norm, k_norm,
+                                                          cos_sin, positions, qkv_scale, sm_scale)
+                    finally:
+                        strided.batched = orig_batched
+                return run
+
+            def as_bits(t):
+                return t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else (
+                    t.view(torch.int16) if t.dtype == torch.bfloat16 else t.view(torch.int32))
+
+            ref8 = [t.clone() for t in fp8op(False)()]
+            torch.cuda.synchronize()
+            first8 = None
+            ok8 = okf8 = okin8 = True
+            for call in range(4):
+                junk = torch.empty((M, 3 * W), dtype=torch.bfloat16, device=DEV)
+                junk.view(torch.int16).fill_(-1)
+                del junk
+                got = [t.clone() for t in fp8op(True)()]
+                torch.cuda.synchronize()
+                ok8 &= all(torch.equal(as_bits(x), as_bits(y)) for x, y in zip(got, ref8))
+                if first8 is None:
+                    first8 = got
+                else:
+                    okf8 &= all(torch.equal(as_bits(x), as_bits(y)) for x, y in zip(got, first8))
+                okin8 &= inputs_ok()
+            # graph capture + 3 replays of the candidate fp8 op
+            c8 = fp8op(True)
+            c8()
+            torch.cuda.synchronize()
+            g8 = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g8):
+                gout8 = c8()
+            torch.cuda.synchronize()
+            rep8 = True
+            for r in range(3):
+                for t in gout8:
+                    as_bits(t).fill_(0x7F if t.dtype == torch.float8_e4m3fn else -1)
+                g8.replay()
+                torch.cuda.synchronize()
+                rep8 &= all(torch.equal(as_bits(x), as_bits(y)) for x, y in zip(gout8, ref8))
+            del g8, gout8
+            bw["fp8_op"] = {"bitwise_vs_main_qkv8_scales_gemm": bool(ok8),
+                            "calls_vs_call0": bool(okf8), "inputs_unchanged": bool(okin8),
+                            "graph_3_replays_bitwise_vs_eager": bool(rep8), "calls": 4}
+            all_ok &= bool(ok8 and okf8 and okin8 and rep8)
+            log(json.dumps({f"M{M}_fp8_op": bw["fp8_op"]}))
+
         # CUDA graph capture + 3 replays (candidate composed op)
         ws_keys = sorted(strided._WORKSPACES.keys())
         ws_ptrs = [strided._WORKSPACES[k].data_ptr() for k in ws_keys]
@@ -319,6 +377,9 @@ def main():
             "composed_main": composed(False), "composed_main_AA": composed(False),
             "composed_cand": composed(True),
         }
+        if fp8_ok:
+            arms.update({"fp8op_main": fp8op(False), "fp8op_main_AA": fp8op(False),
+                         "fp8op_cand": fp8op(True)})
         tm = time_graphs(arms)
         tm["derived"] = {
             "main3_minus_l3_us": round(tm["main3_pp"]["med"] - tm["l3_pp"]["med"], 2),
@@ -328,6 +389,11 @@ def main():
                 tm["composed_main"]["med"] - tm["composed_cand"]["med"], 2),
             "composed_AA_us": round(tm["composed_main_AA"]["med"] - tm["composed_main"]["med"], 2),
         }
+        if fp8_ok:
+            tm["derived"]["fp8op_main_minus_cand_us"] = round(
+                tm["fp8op_main"]["med"] - tm["fp8op_cand"]["med"], 2)
+            tm["derived"]["fp8op_AA_us"] = round(
+                tm["fp8op_main_AA"]["med"] - tm["fp8op_main"]["med"], 2)
         log(json.dumps({f"M{M}": tm}))
         results["timing"][f"M{M}"] = tm
         del a, a_sf, out, out_p1, refs, ref_main, ref_c
@@ -335,8 +401,9 @@ def main():
 
     results["passed"] = bool(all_ok)
     m = results["timing"].get("M4176") or next(iter(results["timing"].values()))
-    results["batch"] = {"1": {"kernel_ms": m["composed_cand"]["med"] / 1000.0,
-                              "noise_floor": m["composed_cand"]["noise"]}}
+    key = "fp8op_cand" if "fp8op_cand" in m else "composed_cand"
+    results["batch"] = {"1": {"kernel_ms": m[key]["med"] / 1000.0,
+                              "noise_floor": m[key]["noise"]}}
     results["output"] = {"class": "exact"}
     log(json.dumps(results))
 
