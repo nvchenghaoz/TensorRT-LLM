@@ -8,7 +8,9 @@ RoPE run eagerly / under Inductor in FP32 with several BF16 roundings. Here the 
 qknorm_rope pass (flux3_sm120_qknorm_rope.py, the same pass the NVFP4 CUTLASS QKV path uses)
 normalizes and rotates q and k in place in the packed [M, 3*W] GEMM output (copy_v False):
 one op, one extra launch, no FP32 intermediates. Q/K are reordered (FP32 math rounded once to
-BF16); V and the GEMM are bit-identical.
+BF16); V and the GEMM are bit-identical. With _FP8R_QKV_PLANAR (default) the pass instead writes
+q, k, v as three contiguous [M, W] planes of a fresh buffer (planar=True, v copied in the pass),
+so attention gets contiguous q/k/v without three extra copies; values are the same bitwise.
 
 primsts.prepare_sm120_fp8_excluded_block sets attn._flux3_sm120_fp8r_qknorm_rope at prepare
 time; primsts.qkv_forward returns _sm120_fp8r_qkv_forward(...) when the flag is set.
@@ -60,9 +62,13 @@ def fp8r_qkv_qknorm_rope(
     q_norm: torch.Tensor,
     k_norm: torch.Tensor,
     cos_sin: torch.Tensor,
+    planar: bool = False,
 ) -> torch.Tensor:
-    """BF16 [M, 3*W] packed q|k|v rows: rowwise FP8 GEMM, then QK-RMSNorm+RoPE of q/k in place.
+    """BF16 [M, 3*W]: rowwise FP8 GEMM, then QK-RMSNorm+RoPE of q/k.
 
+    planar=False: packed q|k|v rows, q/k normed in place in the GEMM output.
+    planar=True: a fresh contiguous buffer holding three contiguous [M, W] planes q, k, v
+    (``out.view(3, M, W)``); same q/k values, v copied by the pass.
     activation E4M3 [M, K], activation_scale FP32 [M]; weight E4M3 [3*W, K], weight_scale FP32
     [3*W]; cos_sin FP32 [M, 128] indexed by the row's token position (identity).
     """
@@ -81,21 +87,23 @@ def fp8r_qkv_qknorm_rope(
     )
     width = out.shape[1] // 3
     positions = _token_positions(out.shape[0], out.device)
+    dst = torch.empty_like(out) if planar else out
     return qknorm_rope(
         out[:, :width],
         out[:, width:2 * width],
         out[:, 2 * width:],
-        out,
+        dst,
         q_norm.detach(),
         k_norm.detach(),
         cos_sin.detach(),
         positions,
+        planar=planar,
     )
 
 
 @fp8r_qkv_qknorm_rope.register_fake
 def _fp8r_qkv_qknorm_rope_fake(
-    activation, weight, activation_scale, weight_scale, q_norm, k_norm, cos_sin
+    activation, weight, activation_scale, weight_scale, q_norm, k_norm, cos_sin, planar=False
 ):
     return activation.new_empty((activation.shape[0], weight.shape[0]), dtype=torch.bfloat16)
 
@@ -130,11 +138,15 @@ def _sm120_fp8r_qkv_forward(
         attn.norm_q.weight.contiguous(),
         attn.norm_k.weight.contiguous(),
         cos_sin.float().contiguous(),
+        _FP8R_QKV_PLANAR,
     )
     width = output.shape[-1] // 3
-    q, k, v = output.split(width, -1)
-    if _FP8R_QKV_CONTIGUOUS:
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    if _FP8R_QKV_PLANAR:
+        q, k, v = output.view(3, output.shape[0], width).unbind(0)
+    else:
+        q, k, v = output.split(width, -1)
+        if _FP8R_QKV_CONTIGUOUS:
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     return tuple(t.reshape(*original.shape[:-1], width) for t in (q, k, v))
 
 
@@ -142,3 +154,7 @@ def _sm120_fp8r_qkv_forward(
 # packed row-stride-3W views made served T=80 images differ after a T=160 request (job 829: A/B/A
 # not bitwise; job 837: same tree with this op off is bitwise). Module-level for A/B.
 _FP8R_QKV_CONTIGUOUS = True
+# Planar: the qknorm_rope pass writes q, k, v as three contiguous [M, W] planes of a fresh buffer
+# (v copied inside the pass), so the three .contiguous() copies above go. Same values (bitwise).
+# Takes precedence over _FP8R_QKV_CONTIGUOUS; module-level for A/B in one process.
+_FP8R_QKV_PLANAR = True
