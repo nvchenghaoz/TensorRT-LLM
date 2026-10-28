@@ -301,6 +301,66 @@ def analyze(sqlite_path, outdir, arm):
     return summ, pairs
 
 
+def analyze_fork(sqlite_path, arm, succ_prefix="triton_poi_fused_add_mul_view"):
+    """Per tail pair: wall from the image/single FMHA kernel's end (the fork's only predecessor,
+    fact 1205) to the start of the residual add after the join, and every kernel/memset in
+    between (start offset and duration). Only windows that end in that residual add and contain a
+    CUTLASS GEMM are kept (the 28 NVFP4 tail pairs per step)."""
+    con = sqlite3.connect(sqlite_path)
+    cur = con.cursor()
+    strings = dict(cur.execute("SELECT id, value FROM StringIds"))
+    rows = []
+    for start, end, name_id in cur.execute(
+            "SELECT start, end, demangledName FROM CUPTI_ACTIVITY_KIND_KERNEL"):
+        rows.append((start, end, strings.get(name_id, "?")))
+    try:
+        for start, end in cur.execute("SELECT start, end FROM CUPTI_ACTIVITY_KIND_MEMSET"):
+            rows.append((start, end, "memset"))
+    except sqlite3.Error:
+        pass
+    rows.sort()
+    fmha = [i for i, r in enumerate(rows) if "fmha" in r[2].lower()]
+    out = []
+    for fi in fmha:
+        f_end = rows[fi][1]
+        inside = []
+        succ = None
+        for r in rows[fi + 1:fi + 60]:
+            if r[1] <= f_end:
+                continue
+            if r[2].startswith(succ_prefix):
+                succ = r
+                break
+            if "fmha" in r[2].lower():
+                break
+            inside.append(r)
+        if succ is None or not any("cutlass" in r[2] for r in inside):
+            continue
+        gemms = [r for r in inside if "cutlass" in r[2] and r[0] >= f_end]
+        out.append({
+            "wall_us": (succ[0] - f_end) / 1e3,
+            "first_gemm_start_us": (min(r[0] for r in gemms) - f_end) / 1e3 if gemms else None,
+            "last_gemm_end_us": (max(r[1] for r in gemms) - f_end) / 1e3 if gemms else None,
+            "parts": [(r[2][:48], round((r[0] - f_end) / 1e3, 1), round((r[1] - r[0]) / 1e3, 1))
+                      for r in inside],
+        })
+    walls = sorted(p["wall_us"] for p in out)
+    n = len(walls)
+    summ = {"arm": arm, "pairs": n}
+    if n:
+        fg = sorted(p["first_gemm_start_us"] for p in out)
+        lg = sorted(p["last_gemm_end_us"] for p in out)
+        summ.update({"wall_us_median": walls[n // 2], "wall_us_mean": sum(walls) / n,
+                     "wall_us_p10": walls[n // 10], "wall_us_p90": walls[(9 * n) // 10],
+                     "first_gemm_start_us_median": fg[n // 2],
+                     "last_gemm_end_us_median": lg[n // 2],
+                     "examples": [out[0], out[n // 2]]})
+        # wall split by the GEMM grid's M (single 4176 vs image 4096) is not in the sqlite rows
+        # read here; the two populations show up as the bimodal p10/p90.
+    log(f"[fork {arm}] " + json.dumps(summ))
+    return summ
+
+
 def nsys_parent(arm, ckpt, outdir):
     os.makedirs(outdir, exist_ok=True)
     rep = os.path.join(outdir, f"pair_{arm}")
@@ -313,7 +373,8 @@ def nsys_parent(arm, ckpt, outdir):
     subprocess.run(["nsys", "export", "--type", "sqlite", "--force-overwrite=true", "-o",
                     rep + ".sqlite", rep + ".nsys-rep"], check=True)
     summ, pairs = analyze(rep + ".sqlite", outdir, arm)
-    print(json.dumps({"passed": True, "summary": summ}))
+    fork = analyze_fork(rep + ".sqlite", arm)
+    print(json.dumps({"passed": True, "summary": summ, "fork": fork}))
 
 
 if __name__ == "__main__":
@@ -328,3 +389,6 @@ if __name__ == "__main__":
         nsys_child(sys.argv[2], sys.argv[3])
     elif mode == "analyze":
         analyze(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif mode == "fork":
+        res = {arm: analyze_fork(path, arm) for arm, path in zip(sys.argv[2::2], sys.argv[3::2])}
+        print(json.dumps({"passed": True, "fork": res}))
