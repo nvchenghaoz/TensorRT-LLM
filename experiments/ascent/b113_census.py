@@ -11,10 +11,19 @@ Last stdout line: JSON.
 
 import json
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 
-import torch
+DUMP = os.environ.get("B113_CODE") == "1"
+if DUMP:
+    ART = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp/b113")
+    os.makedirs(ART, exist_ok=True)
+    LOG = os.path.join(ART, "output_code.txt")
+    os.environ["TORCH_LOGS"] = "output_code"
+    os.environ["TORCH_LOGS_OUT"] = LOG
+
+import torch  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.getcwd(), "experiments", "ascent"))
 import gn_check  # noqa: E402
@@ -87,6 +96,27 @@ for k in range(10, 0, -1):
     tail.append({"pos": per - k, "name": evs[per - k].name[:120], "ms": round(sum(ts_k) / NDEC, 4)})
 for t in tail:
     log(f"  {t['pos']:4d} {t['ms']:8.4f}  {t['name']}")
+if DUMP:
+    txt = open(LOG).read()
+    src = {m.group(1): m.group(2) for m in re.finditer(r"async_compile\.triton\('(\w+)', '''(.*?)'''", txt, re.S)}
+    pat = re.compile(r"(size_hints|xnumel =|rnumel|r0_numel|tl\.load|tl\.store|def triton_)")
+    for t in tail:
+        body = src.get(t["name"])
+        if body is None:
+            continue
+        log(f"==== {t['name']} ({t['ms']} ms)")
+        for line in body.splitlines():
+            if pat.search(line):
+                log("   " + line.strip()[:220])
+    # the call sequence around the custom op in the wrapper
+    j = txt.rfind("def call(")
+    if j >= 0:
+        seg = txt[j:]
+        log("==== wrapper tail")
+        lines = seg.splitlines()
+        k = max((n for n, l in enumerate(lines) if "_conv3x3_to3_kernel" in l), default=len(lines))
+        for line in lines[max(0, k - 60): k + 5]:
+            log("   " + line[:220])
 gpu_sum = sum(dur[n] for n in set(ev.name for ev in evs[-per:]))
 fr = f_end.get("frames", {})
 dyn = {"frames_after_warmup": f_warm, "frames_after_timed_and_profiled": f_end,

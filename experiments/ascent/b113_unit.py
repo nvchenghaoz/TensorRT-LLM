@@ -100,6 +100,39 @@ def unit():
         ok_all &= bool(ok)
         del outs, mod, r64, a64, a, xm, main_like
         torch.cuda.empty_cache()
+    # ---- full tail: GroupNorm(32, eps 1e-6) stats -> fused affine+swish+conv (M3 as wired
+    # in Flux3ImageDecoder) vs main's math (bf16 GN apply+swish, fp32 cast, cuDNN conv)
+    # and vs fp64 GroupNorm -> swish -> conv.
+    from tensorrt_llm._torch.visual_gen.models.flux3.flux3_core.image_vae import image_vae as iv
+
+    for (C, H, W), cl in itertools.product([(128, 1024, 1024), (128, 40, 56)], [True, False]):
+        xs, _, _, w, b, _ = make(C, H, W, cl, seed=7)
+        rr = make(C, H, W, cl, seed=8)[0]
+        g = torch.Generator(device="cuda").manual_seed(11)
+        gw = (1 + 0.1 * torch.randn(C, device="cuda", generator=g)).to(torch.bfloat16)
+        gb = (0.1 * torch.randn(C, device="cuda", generator=g)).to(torch.bfloat16)
+        rb = (0.1 * torch.randn(C, device="cuda", generator=g)).to(torch.bfloat16)
+        raw = xs + (rr + rb.view(1, -1, 1, 1))  # conv2 bias add, then residual add (bf16)
+        sc, sh = dt.group_norm_channel_affine(raw, 32, gw, gb, 1e-6)
+        o = dt.add_norm_swish_conv_out_3x3(xs, rr, rb, sc, sh, w, b)
+        o_nores = dt.norm_swish_conv_out_3x3(raw, sc, sh, w, b)
+        res_bitwise = torch.equal(o, o_nores)
+        y = iv.group_norm_channel_stats(raw, 32, gw, gb, 1e-6)
+        main_like = F.conv2d((y * torch.sigmoid(y)).float(), w, b, padding=1)
+        y64 = F.group_norm(raw.double(), 32, gw.double(), gb.double(), 1e-6)
+        r64 = F.conv2d(y64 * torch.sigmoid(y64), w.double(), b.double(), padding=1)
+        k64, m64 = err(o, r64), err(main_like, r64)
+        ok = (k64["max_abs"] <= 1e-3 and k64["mean_abs"] <= m64["mean_abs"] and o.stride() == main_like.stride()
+              and res_bitwise)
+        rec = {"op": "M3 full tail (x + r, GN stats, fused add+affine+swish+conv kernel)", "shape": [1, C, H, W],
+               "nhwc": cl, "residual_op_bitwise_eq_materialized_sum_op": res_bitwise,
+               "kernel_vs_fp64": k64, "main_math_vs_fp64": m64,
+               "kernel_vs_main_math": err(o, main_like.double()), "ok": bool(ok)}
+        log(json.dumps(rec))
+        cases.append(rec)
+        ok_all &= bool(ok)
+        del raw, xs, rr, o, o_nores, y, main_like, y64, r64
+        torch.cuda.empty_cache()
     return {"passed": bool(ok_all), "n_cases": len(cases),
             "check": "decoder_tail_triton M2/M3 vs module path (cuDNN TF32) and fp64 reference"}
 
@@ -134,25 +167,30 @@ def sweep():
         log(prec, json.dumps(res[f"err_{prec}_vs_fp64"]))
     res["err_module_vs_fp64"] = err(F.conv2d(x, w, b, padding=1), r64)
     del r64
-    space = [("tf32x3",) + c for c in itertools.product([64, 128, 256], [8, 16, 32], [32, 64], [4, 8], [1, 2])]
-    space += [("ieee", 128, 16, 32, 4, 1)]
-    for prec, BW, R, BC, nw, ns in space:
-        if BW * BC > 16384:
+    rr = make(128, 1024, 1024, True, seed=8)[0]
+    b0 = torch.zeros(128, device="cuda", dtype=torch.bfloat16)
+    space = [("tf32x3",) + c for c in itertools.product([True, False], [64, 128], [8, 16, 32], [32, 64], [4, 8])]
+    for prec, ga, BW, R, BC, nw in space:
+        ns = 2
+        if BW * BC > 16384 or (not ga and nw == 8):
             continue
         dt._PRECISION, dt._BW, dt._R, dt._BC, dt._NUM_WARPS, dt._NUM_STAGES = prec, BW, R, BC, nw, ns
-        key = f"{prec}_BW{BW}_R{R}_BC{BC}_w{nw}_s{ns}"
+        dt._GATHER = ga
+        key = f"{prec}_{'gather' if ga else 'shift'}_BW{BW}_R{R}_BC{BC}_w{nw}_s{ns}"
         try:
             t2 = bench(lambda: dt.conv_out_3x3(x, w, b), iters=20, warm=2)["median"]
             t3 = bench(lambda: dt.norm_swish_conv_out_3x3(raw, scale, shift, w, b), iters=20, warm=2)["median"]
+            t3r = bench(lambda: dt.add_norm_swish_conv_out_3x3(raw, rr, b0, scale, shift, w, b), iters=20,
+                        warm=2)["median"]
         except Exception as ex:  # noqa: BLE001
             log(key, "failed", repr(ex)[:200])
             continue
-        res[key] = {"M2": t2, "M3": t3}
-        log(key, f"M2 {t2:.4f} ms  M3 {t3:.4f} ms")
+        res[key] = {"M2": t2, "M3": t3, "M3r": t3r}
+        log(key, f"M2 {t2:.4f} ms  M3 {t3:.4f} ms  M3r {t3r:.4f} ms")
     cfgs = [k for k in res if k.startswith(("tf32", "ieee"))]
-    best["M2"] = min(cfgs, key=lambda k: res[k]["M2"])
-    best["M3"] = min(cfgs, key=lambda k: res[k]["M3"])
-    return {"sweep": res, "best": best, "best_M2_ms": res[best["M2"]]["M2"], "best_M3_ms": res[best["M3"]]["M3"]}
+    for m in ("M2", "M3", "M3r"):
+        best[m] = min(cfgs, key=lambda k: res[k][m])
+    return {"sweep": res, "best": best, **{f"best_{m}_ms": res[best[m]][m] for m in best}}
 
 
 if __name__ == "__main__":

@@ -69,7 +69,9 @@ if rc != 0 or res is None:
     sys.exit(1)
 res["arm"] = ARM
 res["output"]["class"] = "reordered"
-res["output"]["note"] = "both arms bf16 trunk; cand conv_out = Triton tf32x3 (fp32-level) vs cuDNN TF32"
+res["output"]["note"] = ("both arms bf16 trunk; cand tail = one Triton kernel (conv2 bias + residual add, "
+                         "norm_out affine + swish in fp32, conv_out tf32x3 fp32-level) vs main's bf16 apply "
+                         "+ cuDNN TF32 conv_out")
 rc2, cen = run([sys.executable, "experiments/ascent/b113_census.py", ROOT])
 res["census"] = cen if rc2 == 0 else {"error": f"census rc={rc2}"}
 ok = bool(res.get("passed")) and rc2 == 0 and bool(cen and cen.get("passed"))

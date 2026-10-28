@@ -10,7 +10,14 @@ import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
 
-from .decoder_tail_triton import can_use_conv_out_kernel, conv_out_3x3
+from . import decoder_tail_triton as _tail
+from .decoder_tail_triton import (
+    add_norm_swish_conv_out_3x3,
+    can_use_conv_out_kernel,
+    can_use_fused_tail,
+    conv_out_3x3,
+    group_norm_channel_affine,
+)
 from .group_norm_triton import can_use_fused as can_use_fused_gn
 from .group_norm_triton import fused_group_norm
 
@@ -185,6 +192,25 @@ class Flux3ImageResnetBlock(nn.Module):
             x = self.nin_shortcut(x)
 
         return x + h
+
+    def forward_parts(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """(shortcut, conv2 output WITHOUT its bias, conv2 bias).
+
+        forward(x) == shortcut + (conv2_nobias + bias). Used by the decoder's fused tail,
+        which applies the bias and residual add as it loads the conv2 output (under
+        torch.compile the bias add is a separate pointwise op either way).
+        """
+        h = self.norm1.forward_silu(x)
+        h = self.conv1(h)
+
+        h = self.norm2.forward_silu(h)
+        c2 = self.conv2
+        h = nn.functional.conv2d(h, c2.weight, None, c2.stride, c2.padding, c2.dilation, c2.groups)
+
+        if self.in_channels != self.out_channels:
+            x = self.nin_shortcut(x)
+
+        return x, h, c2.bias
 
 
 class Flux3ImageDownsample(nn.Module):
@@ -410,19 +436,48 @@ class Flux3ImageDecoder(nn.Module):
         h = self.mid.block_2(h)
 
         h = h.to(upscale_dtype)
+        # Fused tail: the last ResnetBlock's residual add, norm_out, swish and conv_out
+        # run as one kernel (the sum x + r is never stored).
+        last = self.up[0].block[self.num_res_blocks]
+        fuse_tail = _tail.FUSE_NORM_PROLOGUE and len(self.up[0].attn) == 0
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
+                if fuse_tail and i_level == 0 and i_block == self.num_res_blocks:
+                    break
                 h = self.up[i_level].block[i_block](h)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
-        h = self.norm_out.forward_silu(h)
-        conv = self.conv_out
+        norm, conv = self.norm_out, self.conv_out
+        if fuse_tail:
+            x, r, r_bias = last.forward_parts(h)
+            if r_bias is not None:
+                h = x + (r + r_bias.view(1, -1, 1, 1))
+            else:
+                h = x + r
+            if (
+                can_use_fused_tail(h, norm, conv)
+                and r.dtype == x.dtype
+                and r.shape == x.shape
+                and r.stride() == x.stride()
+                and (r_bias is None or r_bias.dtype == x.dtype)
+            ):
+                # conv_out(swish(norm_out(x + r + r_bias))): per-channel GroupNorm affine
+                # (scale, shift) from norm_out's channel statistics; the kernel forms the
+                # sum, the affine and swish in fp32 as it loads the conv input, so the
+                # sum and the normalized activation are never stored.
+                scale, shift = group_norm_channel_affine(
+                    h, norm.num_groups, norm.weight, norm.bias, norm.eps
+                )
+                return add_norm_swish_conv_out_3x3(
+                    x, r, r_bias, scale, shift, conv.weight, conv.bias
+                )
+        h = norm.forward_silu(h)
         if can_use_conv_out_kernel(h, conv):
             # Same as conv(h) (whose trunk-dtype pre-hook casts h to the weight dtype),
-            # computed by one fp32-FMA Triton kernel with the bias fused in.
+            # computed by one fp32-accumulating Triton kernel with the bias fused in.
             return conv_out_3x3(h.to(conv.weight.dtype), conv.weight, conv.bias)
         h = conv(h)
         return h
