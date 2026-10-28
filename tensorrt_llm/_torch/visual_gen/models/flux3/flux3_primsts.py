@@ -119,6 +119,11 @@ def sm120_linear_preload(device: torch.device) -> None:
         index = device.index if device.index is not None else torch.cuda.current_device()
         with torch.cuda.stream(_sm120_tail_pair_stream(index)):
             _sm120_fi_workspace(device)
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_swiglu_fp4_cutlass
+
+    if flux3_swiglu_fp4_cutlass.enabled():
+        # Build/load the gate_up SwiGLU->NVFP4 module now, outside any timed request.
+        flux3_swiglu_fp4_cutlass.get_module()
 
 
 def _sm120_cutlass_linear(
@@ -1010,7 +1015,22 @@ def nvfp4_swiglu_packed(
     """SwiGLU with fused NVFP4 output using the next projection's static scale."""
     if is_sm120(activation.device):
         from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120 import flux3_sm120_nvfp4
+        from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_swiglu_fp4_cutlass
 
+        # CUTLASS t2 mainloop + register SwiGLU->NVFP4 epilogue, bitwise to run('packed').
+        if flux3_swiglu_fp4_cutlass.enabled() and flux3_swiglu_fp4_cutlass.supported(
+            activation, weight
+        ):
+            return flux3_swiglu_fp4_cutlass.swiglu_packed(
+                activation,
+                weight,
+                activation_scale,
+                weight_scale,
+                flux3_sm120_nvfp4._scalar(
+                    activation.device, input_global_scale * weight_global_scale
+                ),
+                output_inverse_scale,
+            )
         return flux3_sm120_nvfp4.run(
             "packed",
             activation,
