@@ -143,6 +143,166 @@ def _e2m1x2(lo, hi, out_scale):
 
 
 @triton.jit
+def _modq_chunk(
+    tmp29,  # this chunk of x as f32 (from a bf16 load)
+    r0_offset,
+    r0_1,
+    r0_mask,
+    x0,
+    xindex,
+    xmask,
+    tmp5,  # row mean
+    tmp9,  # row M2
+    tmp11,  # row select (HAS_SELECT; unused otherwise)
+    in_ptr2,
+    in_ptr3,
+    in_ptr4,
+    in_ptr5,
+    out_ptr0,
+    fp4_ptr,
+    sf_ptr,
+    gs,
+    fp4_max_rcp,
+    padded_xnumel,
+    scale_row_stride,
+    shift_row_stride,
+    r0_numel: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_SELECT: tl.constexpr,
+    XBLOCK: tl.constexpr,
+    Q_BLOCK: tl.constexpr,
+    STORE_XMOD: tl.constexpr,
+    SF_COLS: tl.constexpr,
+    GROUPS: tl.constexpr,
+):
+    # Pointwise modulate + NVFP4 quantize of one Q_BLOCK chunk (Inductor's pointwise math).
+    if HAS_SELECT:
+        tmp12 = tl.load(
+            in_ptr2 + (scale_row_stride + r0_1),
+            r0_mask,
+            eviction_policy="evict_last",
+            other=0.0,
+        ).to(tl.float32)
+        tmp15 = tl.load(
+            in_ptr2 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
+        ).to(tl.float32)
+        tmp13 = tmp12.to(tl.bfloat16)
+        tmp14 = tmp13.to(tl.float32)
+        tmp16 = tmp15.to(tl.bfloat16)
+        tmp17 = tmp16.to(tl.float32)
+        tmp18 = tl.where(tmp11, tmp14, tmp17)
+    else:
+        tmp18 = tl.load(
+            in_ptr2 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
+        ).to(tl.float32)
+    tmp19 = tmp18.to(tl.bfloat16)
+    tmp20 = tmp19.to(tl.float32)
+    tmp21 = tmp20.to(tl.bfloat16)
+    tmp22 = tmp21.to(tl.float32)
+    tmp23 = tl.full([1, 1], 1.0, tl.float32)
+    tmp24 = tmp22 + tmp23
+    tmp25 = tmp24.to(tl.bfloat16)
+    tmp26 = tmp25.to(tl.float32)
+    tmp27 = tmp26.to(tl.bfloat16)
+    tmp28 = tmp27.to(tl.float32)
+    tmp30 = tmp29.to(tl.bfloat16)
+    tmp31 = tmp30.to(tl.float32)
+    tmp32 = tmp31.to(tl.float32)
+    tmp33 = tmp32 - tmp5
+    tmp34 = tl.full([1, 1], r0_numel, tl.float32)
+    tmp35 = tmp9 / tmp34
+    tmp36 = tl.full([1, 1], EPS, tl.float32)
+    tmp37 = tmp35 + tmp36
+    tmp38 = libdevice.rsqrt(tmp37)
+    tmp39 = tmp33 * tmp38
+    tmp40 = tl.load(
+        in_ptr3 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
+    ).to(tl.float32)
+    tmp41 = tmp40.to(tl.bfloat16)
+    tmp42 = tmp41.to(tl.float32)
+    tmp43 = tmp42.to(tl.float32)
+    tmp44 = tmp39 * tmp43
+    tmp45 = tl.load(
+        in_ptr4 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
+    ).to(tl.float32)
+    tmp46 = tmp45.to(tl.bfloat16)
+    tmp47 = tmp46.to(tl.float32)
+    tmp48 = tmp47.to(tl.float32)
+    tmp49 = tmp44 + tmp48
+    tmp50 = tmp49.to(tl.bfloat16)
+    tmp51 = tmp50.to(tl.float32)
+    tmp52 = tmp51.to(tl.bfloat16)
+    tmp53 = tmp52.to(tl.float32)
+    tmp54 = tmp53.to(tl.bfloat16)
+    tmp55 = tmp54.to(tl.float32)
+    tmp56 = tmp28 * tmp55
+    tmp57 = tmp56.to(tl.bfloat16)
+    tmp58 = tmp57.to(tl.float32)
+    tmp59 = tmp58.to(tl.bfloat16)
+    tmp60 = tmp59.to(tl.float32)
+    if HAS_SELECT:
+        tmp61 = tl.load(
+            in_ptr5 + (shift_row_stride + r0_1),
+            r0_mask,
+            eviction_policy="evict_last",
+            other=0.0,
+        ).to(tl.float32)
+        tmp64 = tl.load(
+            in_ptr5 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
+        ).to(tl.float32)
+        tmp62 = tmp61.to(tl.bfloat16)
+        tmp63 = tmp62.to(tl.float32)
+        tmp65 = tmp64.to(tl.bfloat16)
+        tmp66 = tmp65.to(tl.float32)
+        tmp67 = tl.where(tmp11, tmp63, tmp66)
+    else:
+        tmp67 = tl.load(
+            in_ptr5 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
+        ).to(tl.float32)
+    tmp68 = tmp67.to(tl.bfloat16)
+    tmp69 = tmp68.to(tl.float32)
+    tmp70 = tmp69.to(tl.bfloat16)
+    tmp71 = tmp70.to(tl.float32)
+    tmp72 = tmp60 + tmp71
+    tmp73 = tmp72.to(tl.bfloat16)
+    tmp74 = tmp73.to(tl.float32)
+    if STORE_XMOD:
+        tl.store(out_ptr0 + (r0_1 + r0_numel * x0), tmp73, r0_mask & xmask)
+
+    # ---- NVFP4 quantize of the bf16-rounded x_mod (FlashInfer fast-math path) ----
+    # Pairs stay in one thread (4 elements/thread): one packed byte per pair, and the
+    # 16-element amax is an in-thread max plus a 4-lane max (exact: bf16 magnitudes).
+    pairs = tl.reshape(tmp74, [XBLOCK, Q_BLOCK // 2, 2])
+    lo, hi = tl.split(pairs)
+    m2 = tl.maximum(tl.abs(lo), tl.abs(hi))
+    amax = tl.max(tl.reshape(m2, [XBLOCK, GROUPS, 8]), axis=2)  # [XBLOCK, GROUPS]
+    scale_float = gs * (amax * fp4_max_rcp)
+    sf_bits = _cvt_e4m3(scale_float)
+    out_scale = _output_scale(sf_bits, gs)
+    os_p = tl.reshape(
+        tl.broadcast_to(out_scale[:, :, None], [XBLOCK, GROUPS, 8]),
+        [XBLOCK, Q_BLOCK // 2],
+    )
+    pbyte = (_e2m1x2(lo, hi, os_p) & 0xFF).to(tl.uint8)
+    byte_idx = (r0_offset // 2) + tl.arange(0, Q_BLOCK // 2)[None, :]
+    tl.store(
+        fp4_ptr + (byte_idx + (r0_numel // 2) * x0),
+        pbyte,
+        (byte_idx < r0_numel // 2) & xmask,
+    )
+    col = (r0_offset // 16) + tl.arange(0, GROUPS)[None, :]
+    sf_off = (
+        (col % 4)
+        + (col // 4) * 512
+        + (x0 % 32) * 16
+        + ((x0 % 128) // 32) * 4
+        + (x0 // 128) * (128 * SF_COLS)
+    )
+    sf_val = tl.where(xmask, sf_bits, 0).to(tl.uint8)
+    tl.store(sf_ptr + sf_off, sf_val, (col < r0_numel // 16) & (xindex < padded_xnumel))
+
+
+@triton.jit
 def _adaln_nvfp4_kernel(
     in_ptr0,  # x [M, D] bf16
     in_ptr1,  # select [M] bool (HAS_SELECT)
@@ -176,7 +336,19 @@ def _adaln_nvfp4_kernel(
     x0 = xindex.to(tl.int64)
     gs = tl.load(gs_ptr)
     fp4_max_rcp = _rcp_approx(tl.full([1, 1], 6.0, tl.float32))
-    if xoffset < xnumel:
+    CACHE_X: tl.constexpr = (r0_numel == 3 * R0_BLOCK) & (Q_BLOCK == R0_BLOCK)
+    if CACHE_X:
+        if xoffset < xnumel:
+            _row_cached(
+                in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5, out_ptr0, fp4_ptr, sf_ptr,
+                x0, xindex, xmask, r0_base, gs, fp4_max_rcp, padded_xnumel, scale_row_stride,
+                shift_row_stride, r0_numel, EPS, HAS_SELECT, XBLOCK, R0_BLOCK, Q_BLOCK,
+                STORE_XMOD, SF_COLS, GROUPS,
+            )
+        else:
+            _pad_rows(sf_ptr, x0, xindex, padded_xnumel, SF_COLS)
+    elif xoffset < xnumel:
+        tmp11 = xmask  # replaced below when HAS_SELECT
         # ---- Inductor's LN reduction (verbatim) ----
         tmp5_mean = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
         tmp5_m2 = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
@@ -217,136 +389,18 @@ def _adaln_nvfp4_kernel(
             r0_index = r0_offset + q_base
             r0_mask = r0_index < r0_numel
             r0_1 = r0_index
-            if HAS_SELECT:
-                tmp12 = tl.load(
-                    in_ptr2 + (scale_row_stride + r0_1),
-                    r0_mask,
-                    eviction_policy="evict_last",
-                    other=0.0,
-                ).to(tl.float32)
-                tmp15 = tl.load(
-                    in_ptr2 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
-                ).to(tl.float32)
-                tmp13 = tmp12.to(tl.bfloat16)
-                tmp14 = tmp13.to(tl.float32)
-                tmp16 = tmp15.to(tl.bfloat16)
-                tmp17 = tmp16.to(tl.float32)
-                tmp18 = tl.where(tmp11, tmp14, tmp17)
-            else:
-                tmp18 = tl.load(
-                    in_ptr2 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
-                ).to(tl.float32)
-            tmp19 = tmp18.to(tl.bfloat16)
-            tmp20 = tmp19.to(tl.float32)
-            tmp21 = tmp20.to(tl.bfloat16)
-            tmp22 = tmp21.to(tl.float32)
-            tmp23 = tl.full([1, 1], 1.0, tl.float32)
-            tmp24 = tmp22 + tmp23
-            tmp25 = tmp24.to(tl.bfloat16)
-            tmp26 = tmp25.to(tl.float32)
-            tmp27 = tmp26.to(tl.bfloat16)
-            tmp28 = tmp27.to(tl.float32)
             tmp29 = tl.load(
                 in_ptr0 + (r0_1 + r0_numel * x0),
                 r0_mask & xmask,
                 eviction_policy="evict_first",
                 other=0.0,
             ).to(tl.float32)
-            tmp30 = tmp29.to(tl.bfloat16)
-            tmp31 = tmp30.to(tl.float32)
-            tmp32 = tmp31.to(tl.float32)
-            tmp33 = tmp32 - tmp5
-            tmp34 = tl.full([1, 1], r0_numel, tl.float32)
-            tmp35 = tmp9 / tmp34
-            tmp36 = tl.full([1, 1], EPS, tl.float32)
-            tmp37 = tmp35 + tmp36
-            tmp38 = libdevice.rsqrt(tmp37)
-            tmp39 = tmp33 * tmp38
-            tmp40 = tl.load(
-                in_ptr3 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
-            ).to(tl.float32)
-            tmp41 = tmp40.to(tl.bfloat16)
-            tmp42 = tmp41.to(tl.float32)
-            tmp43 = tmp42.to(tl.float32)
-            tmp44 = tmp39 * tmp43
-            tmp45 = tl.load(
-                in_ptr4 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
-            ).to(tl.float32)
-            tmp46 = tmp45.to(tl.bfloat16)
-            tmp47 = tmp46.to(tl.float32)
-            tmp48 = tmp47.to(tl.float32)
-            tmp49 = tmp44 + tmp48
-            tmp50 = tmp49.to(tl.bfloat16)
-            tmp51 = tmp50.to(tl.float32)
-            tmp52 = tmp51.to(tl.bfloat16)
-            tmp53 = tmp52.to(tl.float32)
-            tmp54 = tmp53.to(tl.bfloat16)
-            tmp55 = tmp54.to(tl.float32)
-            tmp56 = tmp28 * tmp55
-            tmp57 = tmp56.to(tl.bfloat16)
-            tmp58 = tmp57.to(tl.float32)
-            tmp59 = tmp58.to(tl.bfloat16)
-            tmp60 = tmp59.to(tl.float32)
-            if HAS_SELECT:
-                tmp61 = tl.load(
-                    in_ptr5 + (shift_row_stride + r0_1),
-                    r0_mask,
-                    eviction_policy="evict_last",
-                    other=0.0,
-                ).to(tl.float32)
-                tmp64 = tl.load(
-                    in_ptr5 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
-                ).to(tl.float32)
-                tmp62 = tmp61.to(tl.bfloat16)
-                tmp63 = tmp62.to(tl.float32)
-                tmp65 = tmp64.to(tl.bfloat16)
-                tmp66 = tmp65.to(tl.float32)
-                tmp67 = tl.where(tmp11, tmp63, tmp66)
-            else:
-                tmp67 = tl.load(
-                    in_ptr5 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
-                ).to(tl.float32)
-            tmp68 = tmp67.to(tl.bfloat16)
-            tmp69 = tmp68.to(tl.float32)
-            tmp70 = tmp69.to(tl.bfloat16)
-            tmp71 = tmp70.to(tl.float32)
-            tmp72 = tmp60 + tmp71
-            tmp73 = tmp72.to(tl.bfloat16)
-            tmp74 = tmp73.to(tl.float32)
-            if STORE_XMOD:
-                tl.store(out_ptr0 + (r0_1 + r0_numel * x0), tmp73, r0_mask & xmask)
-
-            # ---- NVFP4 quantize of the bf16-rounded x_mod (FlashInfer fast-math path) ----
-            # Pairs stay in one thread (4 elements/thread): one packed byte per pair, and the
-            # 16-element amax is an in-thread max plus a 4-lane max (exact: bf16 magnitudes).
-            pairs = tl.reshape(tmp74, [XBLOCK, Q_BLOCK // 2, 2])
-            lo, hi = tl.split(pairs)
-            m2 = tl.maximum(tl.abs(lo), tl.abs(hi))
-            amax = tl.max(tl.reshape(m2, [XBLOCK, GROUPS, 8]), axis=2)  # [XBLOCK, GROUPS]
-            scale_float = gs * (amax * fp4_max_rcp)
-            sf_bits = _cvt_e4m3(scale_float)
-            out_scale = _output_scale(sf_bits, gs)
-            os_p = tl.reshape(
-                tl.broadcast_to(out_scale[:, :, None], [XBLOCK, GROUPS, 8]),
-                [XBLOCK, Q_BLOCK // 2],
+            _modq_chunk(
+                tmp29, r0_offset, r0_1, r0_mask, x0, xindex, xmask, tmp5, tmp9, tmp11,
+                in_ptr2, in_ptr3, in_ptr4, in_ptr5, out_ptr0, fp4_ptr, sf_ptr, gs,
+                fp4_max_rcp, padded_xnumel, scale_row_stride, shift_row_stride,
+                r0_numel, EPS, HAS_SELECT, XBLOCK, Q_BLOCK, STORE_XMOD, SF_COLS, GROUPS,
             )
-            pbyte = (_e2m1x2(lo, hi, os_p) & 0xFF).to(tl.uint8)
-            byte_idx = (r0_offset // 2) + tl.arange(0, Q_BLOCK // 2)[None, :]
-            tl.store(
-                fp4_ptr + (byte_idx + (r0_numel // 2) * x0),
-                pbyte,
-                (byte_idx < r0_numel // 2) & xmask,
-            )
-            col = (r0_offset // 16) + tl.arange(0, GROUPS)[None, :]
-            sf_off = (
-                (col % 4)
-                + (col // 4) * 512
-                + (x0 % 32) * 16
-                + ((x0 % 128) // 32) * 4
-                + (x0 // 128) * (128 * SF_COLS)
-            )
-            sf_val = tl.where(xmask, sf_bits, 0).to(tl.uint8)
-            tl.store(sf_ptr + sf_off, sf_val, (col < r0_numel // 16) & (xindex < padded_xnumel))
         # Column padding of the 128x4 layout (none at D=3072, SF_COLS == D/16).
         if SF_COLS != r0_numel // 16:
             pcol = r0_numel // 16 + tl.arange(0, 4)[None, :]
@@ -363,20 +417,123 @@ def _adaln_nvfp4_kernel(
                 (pcol < SF_COLS) & (xindex < padded_xnumel),
             )
     else:
-        # Padding rows of the 128x4 layout: zero scale factors.
-        pcol = tl.arange(0, 256)[None, :]
-        for c0 in tl.range(0, SF_COLS, 256):
-            c = c0 + pcol
-            poff = (
-                (c % 4)
-                + (c // 4) * 512
-                + (x0 % 32) * 16
-                + ((x0 % 128) // 32) * 4
-                + (x0 // 128) * (128 * SF_COLS)
-            )
-            tl.store(
-                sf_ptr + poff, tl.zeros([XBLOCK, 256], tl.uint8), (c < SF_COLS) & (xindex < padded_xnumel)
-            )
+        _pad_rows(sf_ptr, x0, xindex, padded_xnumel, SF_COLS)
+
+
+@triton.jit
+def _row_cached(
+    in_ptr0,
+    in_ptr1,
+    in_ptr2,
+    in_ptr3,
+    in_ptr4,
+    in_ptr5,
+    out_ptr0,
+    fp4_ptr,
+    sf_ptr,
+    x0,
+    xindex,
+    xmask,
+    r0_base,
+    gs,
+    fp4_max_rcp,
+    padded_xnumel,
+    scale_row_stride,
+    shift_row_stride,
+    r0_numel: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_SELECT: tl.constexpr,
+    XBLOCK: tl.constexpr,
+    R0_BLOCK: tl.constexpr,
+    Q_BLOCK: tl.constexpr,
+    STORE_XMOD: tl.constexpr,
+    SF_COLS: tl.constexpr,
+    GROUPS: tl.constexpr,
+):
+    # D = 3 * R0_BLOCK (served D=3072): Inductor's LN reduction unrolled, keeping the row's
+    # three x chunks in registers for the pointwise pass (no second x read). Same per-element
+    # welford_reduce sequence, same R0_BLOCK accumulators and final combine. SF_COLS == D/16
+    # here (R0_BLOCK a multiple of 64), so there is no column padding.
+    r0_mask = r0_base < r0_numel
+    xa = tl.load(
+        in_ptr0 + (r0_base + r0_numel * x0),
+        r0_mask & xmask,
+        eviction_policy="evict_last",
+        other=0.0,
+    ).to(tl.float32)
+    xb = tl.load(
+        in_ptr0 + ((R0_BLOCK + r0_base) + r0_numel * x0),
+        r0_mask & xmask,
+        eviction_policy="evict_last",
+        other=0.0,
+    ).to(tl.float32)
+    xc = tl.load(
+        in_ptr0 + ((2 * R0_BLOCK + r0_base) + r0_numel * x0),
+        r0_mask & xmask,
+        eviction_policy="evict_last",
+        other=0.0,
+    ).to(tl.float32)
+    tmp5_mean = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    tmp5_m2 = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    tmp5_weight = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    tmp4 = tl.broadcast_to(xa.to(tl.bfloat16).to(tl.float32).to(tl.float32), [XBLOCK, R0_BLOCK])
+    mn, m2n, wn = triton_helpers.welford_reduce(tmp4, tmp5_mean, tmp5_m2, tmp5_weight, True)
+    tmp5_mean = tl.where(r0_mask & xmask, mn, tmp5_mean)
+    tmp5_m2 = tl.where(r0_mask & xmask, m2n, tmp5_m2)
+    tmp5_weight = tl.where(r0_mask & xmask, wn, tmp5_weight)
+    tmp4 = tl.broadcast_to(xb.to(tl.bfloat16).to(tl.float32).to(tl.float32), [XBLOCK, R0_BLOCK])
+    mn, m2n, wn = triton_helpers.welford_reduce(tmp4, tmp5_mean, tmp5_m2, tmp5_weight, False)
+    tmp5_mean = tl.where(r0_mask & xmask, mn, tmp5_mean)
+    tmp5_m2 = tl.where(r0_mask & xmask, m2n, tmp5_m2)
+    tmp5_weight = tl.where(r0_mask & xmask, wn, tmp5_weight)
+    tmp4 = tl.broadcast_to(xc.to(tl.bfloat16).to(tl.float32).to(tl.float32), [XBLOCK, R0_BLOCK])
+    mn, m2n, wn = triton_helpers.welford_reduce(tmp4, tmp5_mean, tmp5_m2, tmp5_weight, False)
+    tmp5_mean = tl.where(r0_mask & xmask, mn, tmp5_mean)
+    tmp5_m2 = tl.where(r0_mask & xmask, m2n, tmp5_m2)
+    tmp5_weight = tl.where(r0_mask & xmask, wn, tmp5_weight)
+    tmp6, tmp7, tmp8 = triton_helpers.welford(tmp5_mean, tmp5_m2, tmp5_weight, 1)
+    tmp5 = tl.max(tmp6, axis=0)
+    tmp9 = tl.max(tmp7, axis=0)
+    if HAS_SELECT:
+        tmp11 = tl.load(in_ptr1 + (x0), xmask, eviction_policy="evict_last").to(tl.int1)
+    else:
+        tmp11 = xmask
+    _modq_chunk(
+        xa, 0, r0_base, r0_mask, x0, xindex, xmask, tmp5, tmp9, tmp11,
+        in_ptr2, in_ptr3, in_ptr4, in_ptr5, out_ptr0, fp4_ptr, sf_ptr, gs,
+        fp4_max_rcp, padded_xnumel, scale_row_stride, shift_row_stride,
+        r0_numel, EPS, HAS_SELECT, XBLOCK, Q_BLOCK, STORE_XMOD, SF_COLS, GROUPS,
+    )
+    _modq_chunk(
+        xb, R0_BLOCK, R0_BLOCK + r0_base, r0_mask, x0, xindex, xmask, tmp5, tmp9, tmp11,
+        in_ptr2, in_ptr3, in_ptr4, in_ptr5, out_ptr0, fp4_ptr, sf_ptr, gs,
+        fp4_max_rcp, padded_xnumel, scale_row_stride, shift_row_stride,
+        r0_numel, EPS, HAS_SELECT, XBLOCK, Q_BLOCK, STORE_XMOD, SF_COLS, GROUPS,
+    )
+    _modq_chunk(
+        xc, 2 * R0_BLOCK, 2 * R0_BLOCK + r0_base, r0_mask, x0, xindex, xmask, tmp5, tmp9,
+        tmp11, in_ptr2, in_ptr3, in_ptr4, in_ptr5, out_ptr0, fp4_ptr, sf_ptr, gs,
+        fp4_max_rcp, padded_xnumel, scale_row_stride, shift_row_stride,
+        r0_numel, EPS, HAS_SELECT, XBLOCK, Q_BLOCK, STORE_XMOD, SF_COLS, GROUPS,
+    )
+
+
+@triton.jit
+def _pad_rows(sf_ptr, x0, xindex, padded_xnumel, SF_COLS: tl.constexpr):
+    # Padding rows of the 128x4 layout: zero scale factors.
+    pcol = tl.arange(0, 256)[None, :]
+    for c0 in tl.range(0, SF_COLS, 256):
+        c = c0 + pcol
+        poff = (
+            (c % 4)
+            + (c // 4) * 512
+            + (x0 % 32) * 16
+            + ((x0 % 128) // 32) * 4
+            + (x0 // 128) * (128 * SF_COLS)
+        )
+        tl.store(
+            sf_ptr + poff, tl.zeros([1, 256], tl.uint8), (c < SF_COLS) & (xindex < padded_xnumel)
+        )
 
 
 def _scale_size(rows: int, k: int) -> int:
