@@ -103,10 +103,24 @@ def bench_render(n_iter=40):
         times.append((time.perf_counter() - t0) * 1000)
         del r
     times.sort()
+    # Untimed correctness pass matching the timed loop: same n_iter, fresh render
+    # (fresh splicer) per call; every iteration vs JSONResponse reference and iter 0.
+    untimed_ok, first = 0, None
+    for _ in range(n_iter):
+        b64 = base64.b64encode(png)
+        r = fn(b64)
+        if first is None:
+            first = (r.body, r.raw_headers)
+        if (r.body == ref.body and r.raw_headers == ref.raw_headers
+                and r.body == first[0] and r.raw_headers == first[1]):
+            untimed_ok += 1
+        del r
+    assert untimed_ok == n_iter, f"untimed render mismatch: {untimed_ok}/{n_iter}"
     return {"path": "splice" if splicer_cls is not None else "JSONResponse",
             "median_ms": statistics.median(times), "p10_ms": times[len(times) // 10],
             "p90_ms": times[(9 * len(times)) // 10],
-            "body_identical_to_JSONResponse": identical, "body_bytes": len(out.body)}
+            "body_identical_to_JSONResponse": identical, "body_bytes": len(out.body),
+            "untimed_iters_identical": f"{untimed_ok}/{n_iter}"}
 
 
 def stats(xs):
