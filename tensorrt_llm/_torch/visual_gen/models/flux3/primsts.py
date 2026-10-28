@@ -25,6 +25,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
     fp8_linear_swiglu,
     fp8_qkv_qknorm_rope,
     fp8r_out_pair,
+    fp8r_out_pair_q,
     is_sm120,
     nvfp4_out_pair,
     nvfp4_linear_prepared,
@@ -737,6 +738,18 @@ def sm120_tail_pair_forward(
     down = block.ff.down_proj._flux3_primsts_fp8
     if not (up.can_run(original) and out.can_run(attn)):
         return None
+    if _FP8R_FUSED_SWIGLU_QUANT:
+        # Fused SwiGLU + E4M3 quantize (bitwise equal to silu_and_mul -> quantize_fp8r) before
+        # the fork; down's GEMM then takes the quantized hidden directly.
+        if up.weight.shape[0] != 2 * down.weight.shape[1]:
+            return None
+        data, scales = up.activation(mlp_input)
+        hidden, hidden_scales = swiglu_fp8r_quant(up.gemm(data, scales))
+        if hidden.shape[-1] != down.weight.shape[1]:
+            return None
+        return fp8r_out_pair_q(
+            hidden, hidden_scales, down.weight, down.scale, attn_2d, out.weight, out.scale
+        )
     hidden = up(mlp_input)
     if not down.can_run(hidden):
         return None
