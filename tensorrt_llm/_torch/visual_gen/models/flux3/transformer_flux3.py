@@ -1845,7 +1845,12 @@ class Flux3Model(BaseDiffusionModel):
                         part = self.sharder.gather(part, dim=1)
                     parts.append(part)
                 offset += end - start
-            tokens = torch.cat(parts, dim=1)
+            if len(parts) == 1 and parts[0].shape[0] == 1:
+                # No single-part cat copy. Restride the B=1 view so its batch stride is
+                # n*D, not the joint length's: compiled final-layer guards then ignore T.
+                tokens = parts[0][0].unsqueeze(0)
+            else:
+                tokens = torch.cat(parts, dim=1)
             if "final_mod" in streams[name]:
                 output = self.final_layer[name](tokens, None, mod=streams[name]["final_mod"])[0]
             else:
