@@ -39,6 +39,41 @@ from tensorrt_llm.logger import logger
 I2I_COND_T = 0
 I2I_COND_L = -1
 
+# CUDA-graph replay skips copy_ for these EXACT kwarg names when the source tensor is the
+# same object it copied last time (CUDAGraphRunner.register_reusable_input_fn). Each is
+# produced eagerly once per request in _run_denoise and never written in place:
+#   x_text, x_text_ids, x_image_ids: pack() -> torch.cat (fresh per request; x_text is a
+#     copy of the text encoder output, never a view of a static buffer)
+#   _flux3_{text,image,joint}_{cos,sin}: _packed_positions -> _pe_to_block_freqs
+#     (.contiguous() of fresh pe_embedder output)
+#   _flux3_{text,image,joint}_cos_sin: _packed_positions -> rope_cos_sin_table (torch.cat)
+#     then .float().contiguous()
+#   _flux3_joint_select: _packed_positions -> _joint_select (torch.arange on device)
+# Valid only while prepare runs eagerly (not inside a captured graph).
+_FLUX3_GRAPH_REUSABLE_INPUTS = frozenset(
+    (
+        "x_text",
+        "x_text_ids",
+        "x_image_ids",
+        "_flux3_text_cos",
+        "_flux3_text_sin",
+        "_flux3_image_cos",
+        "_flux3_image_sin",
+        "_flux3_joint_cos",
+        "_flux3_joint_sin",
+        "_flux3_text_cos_sin",
+        "_flux3_image_cos_sin",
+        "_flux3_joint_cos_sin",
+        "_flux3_joint_select",
+    )
+)
+# Read at every replay; TRTLLM_FLUX3_GRAPH_REUSE_INPUTS=0 turns the copy skip off.
+FLUX3_GRAPH_REUSE_INPUTS = os.environ.get("TRTLLM_FLUX3_GRAPH_REUSE_INPUTS", "1") != "0"
+
+
+def _flux3_graph_reuse_inputs_enabled() -> bool:
+    return FLUX3_GRAPH_REUSE_INPUTS
+
 
 def prc_img(
     x: Tensor, t_coord: Optional[Tensor] = None, l_coord: Optional[Tensor] = None
@@ -384,6 +419,15 @@ class Flux3Pipeline(BasePipeline):
 
         runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
         self.transformer.register_cuda_graph_extra_key_fns(runner)
+        # Replay skips copy_ for these step-invariant kwargs when the source is the same
+        # tensor object as last time. Valid only while _run_denoise prepares them EAGERLY
+        # per request: each is a fresh allocation per request (pack()'s torch.cat for
+        # x_text / x_text_ids / x_image_ids; _packed_positions' pe_embedder / contiguous /
+        # cat / arange outputs for the _flux3_* tables) and is never written in place.
+        # Never add per-step tensors (x_image, *_timesteps, timesteps_ref,
+        # _flux3_{text,image}_step_*, ...) or anything a static buffer backs.
+        _reusable = _FLUX3_GRAPH_REUSABLE_INPUTS.__contains__
+        runner.register_reusable_input_fn(_reusable, enabled=_flux3_graph_reuse_inputs_enabled)
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(f"CUDA graph runner: wrapping transformer.forward{compile_note}")
         self.transformer.forward = runner.wrap(self.transformer.forward)
