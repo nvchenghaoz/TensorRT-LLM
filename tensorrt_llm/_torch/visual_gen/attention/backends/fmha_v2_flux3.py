@@ -32,6 +32,9 @@ STOCK_KERNEL = "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_128x128_output_b
 _LEVER_FLAGS = {
     "mask_skip": ("ms", "-DFMHA_FLUX3_MASK_SKIP=1"),
     "resident_q": ("rq", "-DFMHA_FLUX3_RESIDENT_Q=1"),
+    # loop_trim (a) (FMHA_FLUX3_LOOP_TRIM, noloop_tiled.h, carried from branch 78): drops the
+    #   WAR __syncthreads after the BMM1-main QMMA loop (bitwise equal).
+    "loop_trim": ("lt", "-DFMHA_FLUX3_LOOP_TRIM=1"),
     # REORDERED levers (not bitwise vs stock):
     # base2 (FMHA_FLUX3_BASE2, softmax.h / fragment.h): raw QK accumulators, one
     #   exp2(fma(x, s*log2e, log2(256) - max*s*log2e)) per element and
@@ -51,7 +54,7 @@ DEFAULT_LEVERS: tuple[str, ...] = ("mask_skip", "resident_q")
 # Job 727 (interleaved, S=4176/4096): ms_rq 427.7/408.4 us, +base2 415.2/397.0 (-2.9%/pass),
 # base2+kv128 (branch 30's 64x128 rqms_b2) 415.5/397.1 (same speed, rel L2 1.0017x ms_rq's;
 # base2 at 64x64 is 1.0000x), kv128 alone 437.9/415.6 (slower).
-ROUTED_LEVERS: tuple[str, ...] = ("base2", "mask_skip", "resident_q", *(("unit_alpha",) if os.environ.get("TRTLLM_FMHA_V2_FLUX3_UA", "1") != "0" else ()))  # noqa: E501
+ROUTED_LEVERS: tuple[str, ...] = ("base2", "mask_skip", "resident_q", *(("unit_alpha",) if os.environ.get("TRTLLM_FMHA_V2_FLUX3_UA", "1") != "0" else ()), *(("loop_trim",) if os.environ.get("TRTLLM_FMHA_V2_FLUX3_LT", "1") != "0" else ()))  # noqa: E501
 DEFAULT_MIN_BLOCKS = 0
 
 

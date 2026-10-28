@@ -383,7 +383,7 @@ def mode_ab(args):
     if UA not in lev_b:
         failures.append(f"ROUTED_LEVERS has no {UA}: {lev_b}")
         lev_b = lev_b + (UA,)
-    lev_a = tuple(x for x in lev_b if x != UA)
+    lev_a = tuple(x for x in lev_b if x not in (UA, "loop_trim"))  # main's routed b2
     tag_a = "fmha_v2_flux3_" + lib._tag(lev_a, 0) + "_"
     tag_b = "fmha_v2_flux3_" + lib._tag(lev_b, 0) + "_"
     log(f"[levers] A {lev_a} ({tag_a}) B {lev_b} ({tag_b})")
@@ -491,7 +491,13 @@ def main():
     p.add_argument("--soak-s", type=float, default=12.0)
     p.add_argument("--blocks", type=int, default=20)
     p.add_argument("--block", type=int, default=25)
+    p.add_argument("--seq", default=None, help="comma list of S replacing the 33-call set")
     args = p.parse_args()
+    if args.seq:
+        global SEQ, K
+        SEQ = [int(x) for x in args.seq.split(",")]
+        K = len(SEQ)
+        args.no_real = True
     log(f"device {torch.cuda.get_device_name()} K={K} calls/graph pid {os.getpid()}")
     {"pair": mode_pair, "ab": mode_ab}[args.mode](args)
 
