@@ -5,5 +5,8 @@
       "qk_dtype": "fp8",
       "v_dtype": "fp8"
     }
+  },
+  "pipeline_config": {
+    "vae_decode_dtype": "bfloat16"
   }
 }

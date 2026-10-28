@@ -43,6 +43,8 @@ p.add_argument("--warmup", type=int, default=5)
 p.add_argument("--iters", type=int, default=60)
 p.add_argument("--save", default=None)
 p.add_argument("--ref", default=None)
+# BF16/FP16 decoder trunk (pipeline_config.vae_decode_dtype); applied before compile.
+p.add_argument("--decode-dtype", default=None)
 args = p.parse_args()
 WARMUP, ITERS = args.warmup, args.iters
 TOL_ABS, TOL_U8 = 1e-2, 2
@@ -52,8 +54,17 @@ def log(*a):
     print(*a, flush=True)
 
 
-def build(compiled=True, **kw):
+def build(compiled=True, decode_dtype="arg", **kw):
     vae, dt = gn_check.build_vae(args.root)
+    decode_dtype = args.decode_dtype if decode_dtype == "arg" else decode_dtype
+    if decode_dtype is not None:
+        from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import (
+            set_vae_decoder_trunk_dtype,
+        )
+
+        set_vae_decoder_trunk_dtype(vae.decoder, getattr(torch, decode_dtype))
+        log("decoder trunk dtype:", decode_dtype, "post_quant_conv", vae.decoder.post_quant_conv.weight.dtype,
+            "conv_out", vae.decoder.conv_out.weight.dtype)
     is_compiled = False
     if compiled and hasattr(vae, "compile_decoder") and os.environ.get("VAE_COMPILE", "1") != "0":
         vae.compile_decoder(**kw)
@@ -135,7 +146,12 @@ def diff(a, b):
 def frames():
     import torch._dynamo.utils as du
 
-    return {k: dict(v) for k, v in du.counters.items() if k in ("frames", "recompiles")}
+    return {k: dict(v) for k, v in du.counters.items() if k in ("frames", "recompiles", "graph_break")}
+
+
+def psnr(a, b):
+    mse = ((a.float().clamp(-1, 1) - b.float().clamp(-1, 1)) ** 2).mean().item()
+    return float("inf") if mse == 0 else 10 * torch.log10(torch.tensor(4.0 / mse)).item()
 
 
 if args.mode == "time":
@@ -151,12 +167,35 @@ if args.mode == "time":
     f0 = frames()
     first, rep, inp = repeat_seq(vae)
     no_recompile = frames() == f0
-    res = {"batch": {"1": {"kernel_ms": st["median_ms"], "noise_floor": st["noise_floor"]}},
+    res = {"batch": {"1": {"kernel_ms": st["median_ms"], "step_ms": st["median_ms"],
+                           "noise_floor": st["noise_floor"]}},
            "output": {"class": "reordered" if comp else "exact"},
            "compiled": comp, "warmup_s": warm_s, **st, "repeat_bitwise": rep,
            "inputs_unchanged": inp, "no_recompile_after_warmup": no_recompile,
+           "frames_after_timing": f0, "out_dtype": str(first.dtype),
            "bench": "experiments/ascent/vae_decode_bench.py time (real weights, 1x128x64x64)"}
     passed = rep and inp and no_recompile
+    if args.decode_dtype is not None:
+        # Mode switch: error vs this tree's served-dtype (fp32) decoder, compiled the
+        # same way (main's code path; unchanged by this branch), seeds 0-2.
+        res["decode_dtype"] = args.decode_dtype
+        res["output"]["class"] = "mode_switch"
+        ref_vae, _ = build(decode_dtype=None)
+        acc = []
+        with torch.inference_mode():
+            for s in range(3):
+                g = torch.Generator(device="cuda").manual_seed(s)
+                z = torch.randn(1, 128, 64, 64, device="cuda", generator=g).to(DTYPE)
+                r = ref_vae.decode(z)
+                o = vae.decode(z)
+                acc.append({"seed": s, "psnr_db": psnr(o, r), **diff(o, r)})
+                log(json.dumps(acc[-1]))
+        res["output"]["error_vs_fp32_compiled"] = {
+            "psnr_min_db": min(a["psnr_db"] for a in acc),
+            "max_abs": max(a["max_abs"] for a in acc),
+            "u8_max_diff": max(a["u8_max_diff"] for a in acc),
+            "u8_frac_diff_max": max(a["u8_frac_diff"] for a in acc)}
+        res["accuracy_per_seed"] = acc
     if args.save:
         torch.save(first.cpu(), args.save)
         res["saved"] = args.save
@@ -234,11 +273,29 @@ elif args.mode == "kernels":
 
     from torch.profiler import ProfilerActivity, profile
 
+    gn_calls = Counter()
+    orig_can = gn_check.iv.can_use_fused_gn
+
+    def counting_can(x, gn):
+        ok = orig_can(x, gn)
+        if not torch.compiler.is_compiling():
+            gn_calls["fused" if ok else "aten"] += 1
+            gn_calls[f"dtype_{str(x.dtype).split('.')[-1]}"] += 1
+        return ok
+
+    gn_check.iv.can_use_fused_gn = counting_can
     vae, comp = build()
     warm(vae, "K")
+    f_warm = frames()
+    gn_calls.clear()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         decode(vae)
         torch.cuda.synchronize()
+    gn_one = dict(gn_calls)
+    for _ in range(3):
+        decode(vae)
+    torch.cuda.synchronize()
+    f_after3 = frames()
     cnt, dur = Counter(), Counter()
     for ev in prof.events():
         if ev.device_type == torch.autograd.DeviceType.CUDA:
@@ -249,10 +306,33 @@ elif args.mode == "kernels":
         ks = [k for k in cnt if s in k]
         return {"launches": sum(cnt[k] for k in ks), "total_ms": sum(dur[k] for k in ks) / 1e3}
 
-    log(json.dumps({"compiled": comp, "total_launches": sum(cnt.values()),
+    conv_like = {k: (cnt[k], round(dur[k] / 1e3, 3)) for k in cnt
+                 if any(s in k.lower() for s in ("conv", "xmma", "cudnn", "implicit", "gemm", "cutlass", "sm80", "sm90", "sm100", "sm120"))}
+    tf32 = {k: v for k, v in conv_like.items() if "tf32" in k.lower() or "f32f32_f32f32" in k.lower()}
+    aten_gn = {k: cnt[k] for k in cnt if ("group_norm" in k or "RowwiseMoments" in k) and "triton_" not in k}
+    fr = f_after3.get("frames", {})
+    verdict = {"counters_unchanged": f_warm == f_after3}
+    if args.decode_dtype is not None:
+        # Only conv_out (3 output channels) stays fp32 -> at most one TF32 conv launch.
+        verdict["only_conv_out_tf32"] = sum(v[0] for v in tf32.values()) <= 1
+    if comp:
+        verdict["one_frame"] = fr.get("total", 0) == 1 and fr.get("ok", 0) == 1
+        verdict["no_graph_break"] = not f_after3.get("graph_break")
+    else:
+        verdict["gn_30_fused"] = gn_one.get("fused", 0) == 30 and gn_one.get("aten", 0) == 0
+        verdict["no_aten_gn_kernels"] = not aten_gn
+    log(json.dumps({"compiled": comp, "decode_dtype": args.decode_dtype, "total_launches": sum(cnt.values()),
+                    "verdict": verdict, "aten_gn_kernels": aten_gn, "passed": all(verdict.values()),
                     "gpu_total_ms": sum(dur.values()) / 1e3,
-                    "RowwiseMoments": match("RowwiseMoments"), "nchwToNhwc": match("nchwToNhwc"),
+                    "RowwiseMoments": match("RowwiseMoments"), "native_group_norm": match("group_norm"),
+                    "nchwToNhwc": match("nchwToNhwc"),
                     "triton_gn_stats_apply": match("_gn_"), "inductor_triton": match("triton_"),
-                    "top": [(k[:110], cnt[k], round(dur[k] / 1e3, 3)) for k, _ in dur.most_common(15)]}))
+                    "sgemm_simt": match("sgemm"), "softmax": match("softmax"),
+                    "gn_python_calls_one_decode": gn_one,
+                    "frames_after_warmup": f_warm, "frames_after_3_more_decodes": f_after3,
+                    "counters_unchanged_3_decodes": f_warm == f_after3,
+                    "tf32_kernels": tf32,
+                    "conv_gemm_kernels": sorted(((k[:140], *v) for k, v in conv_like.items()), key=lambda t: -t[2]),
+                    "top": [(k[:140], cnt[k], round(dur[k] / 1e3, 3)) for k, _ in dur.most_common(25)]}))
 else:
     raise SystemExit(f"unknown mode {args.mode}")

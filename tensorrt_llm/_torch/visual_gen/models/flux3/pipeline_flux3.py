@@ -202,6 +202,42 @@ def _load_image_pixels(source: str | bytes, *, device: torch.device) -> Tensor:
     )
 
 
+_VAE_DECODE_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
+
+
+def set_vae_decoder_trunk_dtype(decoder: torch.nn.Module, dtype: torch.dtype) -> None:
+    """Cast every decoder layer except conv_out to ``dtype``.
+
+    conv_out (and so the output pixels) keeps the package dtype. Forward pre-hooks
+    cast the inputs of post_quant_conv and conv_out to their weight dtypes. Call
+    before Flux3ImageVAE.compile_decoder() and before the first decode.
+    """
+    from torch._dynamo.eval_frame import OptimizedModule
+
+    if isinstance(decoder, OptimizedModule):
+        raise TypeError("set_vae_decoder_trunk_dtype needs the uncompiled decoder module")
+    if getattr(decoder, "_flux3_trunk_dtype_hooks", None):
+        raise RuntimeError("VAE decoder trunk dtype is already set")
+    for name, child in decoder.named_children():
+        if name != "conv_out":
+            child.to(dtype)
+
+    def _cast_in(mod, args):
+        x = args[0]
+        if x.dtype == mod.weight.dtype:
+            return None
+        return (x.to(mod.weight.dtype),) + tuple(args[1:])
+
+    decoder._flux3_trunk_dtype_hooks = [
+        decoder.post_quant_conv.register_forward_pre_hook(_cast_in),
+        decoder.conv_out.register_forward_pre_hook(_cast_in),
+    ]
+
+
 def _as_image_grid(tokens: Tensor, orig_ids: Tensor) -> Tensor:
     return scatter_ids(tokens.float(), orig_ids[:1])[0].squeeze(2)
 
@@ -212,7 +248,7 @@ def _as_image_grid(tokens: Tensor, orig_ids: Tensor) -> Tensor:
         "black-forest-labs/flux-3-image-klein-base",
         "black-forest-labs/flux-3-image-klein",
     ],
-    defaults={"variant": None},
+    defaults={"variant": None, "vae_decode_dtype": None},
     doc="FLUX.3 image generation and editing.",
 )
 class Flux3Pipeline(BasePipeline):
@@ -350,6 +386,17 @@ class Flux3Pipeline(BasePipeline):
             self.vae = Flux3ImageVAE(Flux3ImageVAEConfig())
             self.vae.load_state_dict(load_file(str(package.asset(config["path"]))))
             self.vae = self.vae.to(device=device, dtype=getattr(torch, config["dtype"])).eval()
+            decode_dtype = self.pipeline_config.extra_attrs.get("vae_decode_dtype")
+            if decode_dtype is not None:
+                if decode_dtype not in _VAE_DECODE_DTYPES:
+                    raise ValueError(
+                        f"vae_decode_dtype must be one of {sorted(_VAE_DECODE_DTYPES)}, "
+                        f"got {decode_dtype!r}"
+                    )
+                # Before compile_decoder: it reads the decoder dtype to enable
+                # emulate_precision_casts for low-precision decoders.
+                logger.info(f"FLUX.3 VAE decoder trunk dtype: {decode_dtype} (conv_out fp32)")
+                set_vae_decoder_trunk_dtype(self.vae.decoder, _VAE_DECODE_DTYPES[decode_dtype])
             # Independent of the transformer compile flag; compiled lazily at warmup decode.
             if os.environ.get("TLLM_FLUX3_VAE_COMPILE", "1") != "0":
                 logger.info("torch.compile: vae.decoder (whole module, dynamic=False)")
