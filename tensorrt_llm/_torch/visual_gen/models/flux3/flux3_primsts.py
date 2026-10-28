@@ -98,6 +98,35 @@ def _sm120_qkv_backend() -> str:
     return backend
 
 
+# The SM120 CUTLASS QKV path writes Q, K and V as three contiguous [M, N/3] planes (one
+# [M, N] buffer, plane p at element p*M*N/3), so attention's q/k/v .contiguous() are no-ops.
+# False restores the packed q|k|v rows (module switch for A/B checks; set it before preparing
+# the model and tracing, since qkv_forward reads the layout decision at prepare time).
+SM120_QKV_PLANAR = True
+
+
+def _sm120_qkv_covers(columns: int, q_dim: int, k_dim: int) -> bool:
+    """Shapes the SM120 CUTLASS QKV path (GEMMs + qknorm_rope pass) handles."""
+    return columns % 3 == 0 and (columns // 3) % 512 == 0 and q_dim == 128 and k_dim == 128
+
+
+def sm120_qkv_planar(
+    device: torch.device, columns: int, q_dim: int, k_dim: int | None = None
+) -> bool:
+    """True when nvfp4_qkv_qknorm_rope on ``device`` returns three contiguous Q/K/V planes.
+
+    The one layout decision shared by the op (nvfp4_qkv_qknorm_rope) and its reader
+    (qkv_planes): SM120, CUTLASS QKV backend, covered shape and the planar switch. The CuTe
+    fallback and every other device keep the packed / config-decided layouts.
+    """
+    return (
+        SM120_QKV_PLANAR
+        and is_sm120(device)
+        and _sm120_qkv_backend() == "cutlass"
+        and _sm120_qkv_covers(columns, q_dim, q_dim if k_dim is None else k_dim)
+    )
+
+
 @lru_cache(maxsize=8)
 def _sm120_qkv_side_streams(device_index: int) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
     return torch.cuda.Stream(device_index), torch.cuda.Stream(device_index)
@@ -115,14 +144,18 @@ def _sm120_cutlass_qkv(
     cos_sin: torch.Tensor,
     positions: torch.Tensor,
     qkv_scale: torch.Tensor | None,
+    planar: bool = False,
 ) -> torch.Tensor | None:
     """CUTLASS NVFP4 GEMM(s) + per-head QK-RMSNorm/RoPE pass, bitwise equal to the fused CuTe op.
 
     The CUTLASS epilogue is BF16(acc * alpha) like the CuTe one, and the pass repeats the CuTe QKV
-    epilogue's norm/RoPE arithmetic on those BF16 values. Output: packed BF16 [M, 3*H*128] q|k|v,
-    row stride 3*H*128, v straight from the GEMM. One alpha (qkv_scale None): one GEMM over all
-    columns, pass in place. Per-plane alphas: q on the current stream, k and v on two side
-    streams forked from and joined to it (fills the GEMMs' wave tails), then the pass writes q|k|v.
+    epilogue's norm/RoPE arithmetic on those BF16 values. Output: BF16 [M, 3*H*128]; planar=True
+    lays it out as three contiguous [M, H*128] planes q, k, v (``output.view(3, M, H*128)``),
+    planar=False as packed q|k|v rows (row stride 3*H*128). Same values either way.
+    One alpha (qkv_scale None): one GEMM over all columns; packed runs the pass in place, planar
+    writes a new buffer (v copied by the pass). Per-plane alphas: q on the current stream, k and
+    v on two side streams forked from and joined to it (fills the GEMMs' wave tails), then the
+    pass writes q, k and v into the output.
     Returns None for shapes it does not cover (the caller falls back to the CuTe kernel).
     """
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_nvfp4 import _scalar
@@ -132,7 +165,7 @@ def _sm120_cutlass_qkv(
 
     columns = weight.shape[0]
     width = columns // 3
-    if columns % 3 or width % 512 or q_norm.numel() != 128 or k_norm.numel() != 128:
+    if not _sm120_qkv_covers(columns, q_norm.numel(), k_norm.numel()):
         return None
     runner = _sm120_fp4_gemm_runner()
     activation = activation.detach()
@@ -147,6 +180,12 @@ def _sm120_cutlass_qkv(
             activation, weight, activation_scale, weight_scale, alpha, 0,
             _SM120_LINEAR_CUTLASS_TACTIC, None, None,
         )
+        if planar:
+            dst = torch.empty_like(out)
+            return qknorm_rope(
+                out[:, :width], out[:, width:2 * width], out[:, 2 * width:], dst,
+                q_norm, k_norm, cos_sin, positions, planar=True,
+            )
         return qknorm_rope(
             out[:, :width], out[:, width:2 * width], out[:, 2 * width:], out,
             q_norm, k_norm, cos_sin, positions,
@@ -182,7 +221,7 @@ def _sm120_cutlass_qkv(
         plane.record_stream(current)
     k, v = planes
     out = torch.empty((activation.shape[0], columns), device=activation.device, dtype=torch.bfloat16)
-    return qknorm_rope(q, k, v, out, q_norm, k_norm, cos_sin, positions)
+    return qknorm_rope(q, k, v, out, q_norm, k_norm, cos_sin, positions, planar=planar)
 
 
 # Block tail pair (single blocks and image mode blocks on SM120): ff.down_proj and attn_out are
@@ -497,17 +536,27 @@ def qkv_planes(
     head_dim: int,
     *,
     qkv_scale: bool = False,
+    planar: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Q, K and V of a fused QKV GEMM ``output``, each [M, N/3], as the GEMM laid them out.
 
     The QKV ops return the GEMM buffer itself because a custom op may not return views of
     its own output, so this is the one place that reads the layout: under
-    separate_qkv_output the buffer holds three contiguous [M, N/3] planes, otherwise it is
-    the packed [M, N] tensor and is split along the last dimension. The config lookup is
-    memoized, so it costs a dictionary hit.
+    separate_qkv_output, or from the SM120 CUTLASS NVFP4 path (``sm120_qkv_planar``), the
+    buffer holds three contiguous [M, N/3] planes, otherwise it is the packed [M, N] tensor
+    and is split along the last dimension. ``planar`` is the SM120 decision precomputed at
+    prepare time (primsts.qkv_forward passes it); None derives it from the NVFP4 (uint8)
+    weight. The config lookup is memoized, so it costs a dictionary hit.
     """
-    config = qkv_gemm_config(activation, weight, head_dim, qkv_scale=qkv_scale)
     width = output.shape[-1] // 3
+    if planar is None:
+        planar = weight.dtype == torch.uint8 and sm120_qkv_planar(
+            weight.device, weight.shape[0], head_dim
+        )
+    if planar:
+        q, k, v = output.view(3, -1, width)
+        return q, k, v
+    config = qkv_gemm_config(activation, weight, head_dim, qkv_scale=qkv_scale)
     if config is not None and config.separate_qkv_output:
         q, k, v = output.view(3, -1, width)
     else:
@@ -876,6 +925,9 @@ def nvfp4_qkv_qknorm_rope(
                 cos_sin,
                 positions,
                 qkv_scale,
+                planar=sm120_qkv_planar(
+                    activation.device, weight.shape[0], q_norm.numel(), k_norm.numel()
+                ),
             )
             if output is not None:
                 return output

@@ -14,6 +14,16 @@ shuffle (pairs are independent, so this changes no result). One CTA per row: war
 q heads, 4-7 the k heads (heads/4 each), 8-11 copy v when the source is not the output itself.
 All of a warp's loads are issued before its stores, so the pass can run in place. The row
 count is a runtime value: one compile per layout serves every text length.
+
+Output layouts (``planar`` is part of the compile key):
+- packed (planar=False): out [M, 3*W], row r = q_r | k_r | v_r (row stride 3*W).
+- planar (planar=True): out holds three contiguous [M, W] planes back to back, plane p at
+  element offset p*M*W (q, k, v), i.e. out.view(3, M, W) gives contiguous q, k and v.
+In-place use: every (row, head) a warp stores is exactly a (row, head) that the same warp loaded
+before any of its stores, and rows are owned by one CTA each (row-disjoint ownership), so src
+may equal dst for q and k (packed: q/k/v are the column planes of out; planar: q/k are planes 0
+and 1 of out) and no CTA overwrites data another CTA still has to read. When v already is the
+output's v plane (same address) the v copy is skipped (copy_v False).
 """
 
 import cutlass
@@ -36,9 +46,11 @@ def _qknorm_rope_kernel(
     k_norm: cute.Pointer,
     cos_sin: cute.Pointer,
     positions: cute.Pointer,
+    rows: cutlass.Int32,
     heads: cutlass.Constexpr,
     src_ld: cutlass.Constexpr,
     copy_v: cutlass.Constexpr,
+    planar: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     row, _, _ = cute.arch.block_idx()
@@ -48,6 +60,13 @@ def _qknorm_rope_kernel(
     width = heads * 128
     per_warp = heads // 4
     span = per_warp * 128
+    # Element offset of this row inside each output plane, and the distance between planes.
+    if cutlass.const_expr(planar):
+        dst_row = row64 * width
+        plane_stride = cutlass.Int64(rows) * width
+    else:
+        dst_row = row64 * (3 * width)
+        plane_stride = cutlass.Int64(width)
     if warp < 8:
         plane = warp // 4
         head0 = (warp % 4) * per_warp
@@ -57,7 +76,8 @@ def _qknorm_rope_kernel(
             src + offset + row64 * src_ld + head0 * 128, cute.make_layout(span)
         )
         output = cute.make_tensor(
-            dst + row64 * (3 * width) + plane * width + head0 * 128, cute.make_layout(span)
+            dst + cutlass.Int64(plane) * plane_stride + dst_row + head0 * 128,
+            cute.make_layout(span),
         )
         position = (positions + row).load()
         # Load everything first (in-place safe): the sum-of-squares columns l + 32g and the
@@ -105,7 +125,7 @@ def _qknorm_rope_kernel(
                 src + v_off + row64 * src_ld + head0 * 128, cute.make_layout(span)
             )
             output = cute.make_tensor(
-                dst + row64 * (3 * width) + 2 * width + head0 * 128, cute.make_layout(span)
+                dst + 2 * plane_stride + dst_row + head0 * 128, cute.make_layout(span)
             )
             copied = []
             for i in cutlass.range_constexpr(per_warp * 4):
@@ -128,11 +148,13 @@ def _launch(
     heads: cutlass.Constexpr,
     src_ld: cutlass.Constexpr,
     copy_v: cutlass.Constexpr,
+    planar: cutlass.Constexpr,
     stream,
 ):
     warps = 12 if copy_v else 8
     _qknorm_rope_kernel(
-        src, k_off, v_off, dst, q_norm, k_norm, cos_sin, positions, heads, src_ld, copy_v
+        src, k_off, v_off, dst, q_norm, k_norm, cos_sin, positions, rows, heads, src_ld, copy_v,
+        planar,
     ).launch(grid=[rows, 1, 1], block=[warps * 32, 1, 1], stream=stream)
 
 
@@ -145,21 +167,38 @@ def qknorm_rope(
     k_norm: torch.Tensor,
     cos_sin: torch.Tensor,
     positions: torch.Tensor,
+    planar: bool = False,
 ) -> torch.Tensor:
-    """Write norm+RoPE(q), norm+RoPE(k) and v into ``out`` [M, 3*H*128] (q|k|v packed).
+    """Write norm+RoPE(q), norm+RoPE(k) and v into ``out`` and return ``out``.
 
-    q, k, v are BF16 [M, H*128] row-major tensors sharing one row stride. When q is the first
-    column plane of ``out`` (q, k, v its three planes) the pass runs in place and v is not
-    touched. Heads must be a multiple of 4; cos_sin is FP32 [*, 128] indexed by positions.
+    q, k, v are BF16 [M, W] row-major tensors (W = H*128) sharing one row stride.
+    - planar=False: ``out`` is [M, 3*W], q|k|v packed per row (row stride 3*W).
+    - planar=True: ``out`` is any contiguous BF16 tensor of 3*M*W elements (e.g. [M, 3*W] or
+      [3, M, W]) holding three contiguous [M, W] planes q, k, v back to back;
+      ``out.view(3, M, W)`` reads them.
+    In place: q and k may be the output's own q/k planes (packed: its column planes; planar:
+    planes 0 and 1); each CTA stores only the row it loaded itself, so this is safe. When v is
+    already the output's v plane (same address) v is not touched; otherwise it is copied.
+    Heads must be a multiple of 4; cos_sin is FP32 [*, 128] indexed by positions.
     """
-    rows, width = out.shape[0], out.shape[1] // 3
+    rows, width = q.shape[0], q.shape[1]
+    if planar:
+        if not out.is_contiguous() or out.numel() != 3 * rows * width:
+            raise ValueError(f"planar output must be contiguous with 3*{rows}*{width} elements")
+        v_plane = out.data_ptr() + 2 * rows * width * out.element_size()
+    else:
+        if tuple(out.shape) != (rows, 3 * width) or out.stride() != (3 * width, 1):
+            raise ValueError(f"packed output must be a contiguous [{rows}, {3 * width}] tensor")
+        v_plane = out.data_ptr() + 2 * width * out.element_size()
     heads = width // 128
     if heads % 4 or width % 128:
-        raise ValueError(f"unsupported QKV width {out.shape[1]}")
+        raise ValueError(f"unsupported QKV width {width}")
+    if tuple(k.shape) != (rows, width) or tuple(v.shape) != (rows, width):
+        raise ValueError("q, k and v must have the same [M, W] shape")
     src_ld = q.stride(0)
-    if k.stride(0) != src_ld or v.stride(0) != src_ld:
+    if k.stride(0) != src_ld or v.stride(0) != src_ld or q.stride(1) != 1:
         raise ValueError("q, k and v must share a row stride")
-    copy_v = v.data_ptr() != out.data_ptr() + 2 * width * out.element_size()
+    copy_v = v.data_ptr() != v_plane
     k_off = (k.data_ptr() - q.data_ptr()) // q.element_size()
     v_off = (v.data_ptr() - q.data_ptr()) // q.element_size()
     pointers = [
@@ -174,7 +213,8 @@ def qknorm_rope(
         )
     ]
     src, dst, qn, kn, cs, pos = pointers
-    key = (out.device.index, heads, src_ld, copy_v)
+    planar = bool(planar)
+    key = (out.device.index, heads, src_ld, copy_v, planar)
     stream = cutlass_torch.current_stream()
     compiled = _COMPILED.get(key)
     if compiled is None:
@@ -192,6 +232,7 @@ def qknorm_rope(
             heads,
             src_ld,
             copy_v,
+            planar,
             stream,
         )
         _COMPILED[key] = compiled
