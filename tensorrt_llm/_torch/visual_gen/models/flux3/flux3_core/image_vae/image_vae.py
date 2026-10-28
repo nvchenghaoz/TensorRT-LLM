@@ -29,6 +29,39 @@ def swish(x: Tensor) -> Tensor:
     return x * torch.sigmoid(x)
 
 
+def group_norm_channel_stats(
+    x: Tensor, num_groups: int, weight: Tensor, bias: Tensor, eps: float
+) -> Tensor:
+    """GroupNorm from per-channel statistics (same math as F.group_norm, reordered).
+
+    Each channel's population mean/variance over (H, W) is reduced first; a group's
+    statistics are then combined exactly from its C/G equal-count channels:
+    mean_g = mean_c(mean_c), var_g = mean_c(var_c) + mean_c((mean_c - mean_g)^2).
+    On channels_last activations the per-channel reduction is coalesced (C is the
+    contiguous dim), unlike the (N, G, C/G*H*W) group view. Statistics and the
+    normalization are computed in fp32; the output has x's dtype.
+    """
+    n, c = x.shape[:2]
+    g = num_groups
+    xf = x.float()
+    red = tuple(range(2, x.dim()))
+    var_c, mean_c = torch.var_mean(xf, dim=red, correction=0)
+    mean_c = mean_c.view(n, g, c // g)
+    var_c = var_c.view(n, g, c // g)
+    mean_g = mean_c.mean(-1, keepdim=True)
+    var_g = var_c.mean(-1, keepdim=True) + (mean_c - mean_g).square().mean(-1, keepdim=True)
+    rstd_g = torch.rsqrt(var_g + eps)
+    bshape = (n, c) + (1,) * (x.dim() - 2)
+    mean = mean_g.expand(n, g, c // g).reshape(bshape)
+    rstd = rstd_g.expand(n, g, c // g).reshape(bshape)
+    y = (xf - mean) * rstd
+    if weight is not None:
+        y = y * weight.float().view((1, c) + (1,) * (x.dim() - 2))
+    if bias is not None:
+        y = y + bias.float().view((1, c) + (1,) * (x.dim() - 2))
+    return y.to(x.dtype)
+
+
 class Flux3GroupNorm(nn.GroupNorm):
     """nn.GroupNorm with a split-group fused Triton path (same parameter names).
 
@@ -36,26 +69,36 @@ class Flux3GroupNorm(nn.GroupNorm):
 
     Under torch.compile the Triton kernels are opaque to Inductor, so by default the
     traced graph uses aten GroupNorm, which Inductor lowers into split reductions fused
-    with the neighbouring residual adds, upsampling and swish.
+    with the neighbouring residual adds, upsampling and swish. With
+    ``channel_stats_under_compile`` the traced graph instead uses
+    group_norm_channel_stats (per-channel var_mean + exact group combine), which
+    Inductor reduces efficiently on channels_last activations.
     """
 
     # Per instance: True keeps the Triton kernels inside a compiled graph (as extern calls).
     triton_under_compile = False
+    # Per instance: True traces group_norm_channel_stats instead of aten GroupNorm.
+    channel_stats_under_compile = False
 
     def _fused(self, x: Tensor) -> bool:
         if torch.compiler.is_compiling() and not self.triton_under_compile:
             return False
         return can_use_fused_gn(x, self)
 
+    def _unfused(self, x: Tensor) -> Tensor:
+        if self.channel_stats_under_compile and torch.compiler.is_compiling():
+            return group_norm_channel_stats(x, self.num_groups, self.weight, self.bias, self.eps)
+        return super().forward(x)
+
     def forward(self, x: Tensor) -> Tensor:
         if self._fused(x):
             return fused_group_norm(x, self.num_groups, self.weight, self.bias, self.eps, False)
-        return super().forward(x)
+        return self._unfused(x)
 
     def forward_silu(self, x: Tensor) -> Tensor:
         if self._fused(x):
             return fused_group_norm(x, self.num_groups, self.weight, self.bias, self.eps, True)
-        return swish(super().forward(x))
+        return swish(self._unfused(x))
 
 
 class Flux3ImageAttnBlock(nn.Module):
