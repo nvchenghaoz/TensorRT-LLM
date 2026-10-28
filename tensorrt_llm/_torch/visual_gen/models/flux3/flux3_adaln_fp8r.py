@@ -32,6 +32,8 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
 
 # Module-level so an in-process ON/OFF A/B can flip it (Dynamo guards on it).
 FP8R_ADALN_QUANT = os.environ.get("TRTLLM_FLUX3_FP8R_ADALN_QUANT", "1") != "0"
+# Force the bf16 x_mod store even where no consumer reads it (diagnostics / A/B).
+FP8R_ADALN_STORE_X_MOD = os.environ.get("TRTLLM_FLUX3_FP8R_ADALN_STORE_X_MOD", "0") == "1"
 
 # Inductor's reduction config for main's LN+modulate kernels at these shapes
 # (ReductionHint.INNER -> one config: XBLOCK 1, R0_BLOCK, num_warps), keyed by select/rows.
@@ -98,10 +100,12 @@ def _adaln_fp8r(
     r0_numel: tl.constexpr,
     EPS: tl.constexpr,
     HAS_SELECT: tl.constexpr,
+    STORE_XMOD: tl.constexpr,
     XBLOCK: tl.constexpr,
     R0_BLOCK: tl.constexpr,
 ):
-    """One row per program: x_mod (bf16), its per-row E4M3 data and fp32 scale."""
+    """One row per program: x_mod (bf16, stored when STORE_XMOD), its per-row E4M3 data and
+    fp32 scale."""
     xoffset = tl.program_id(0) * XBLOCK
     x0 = xoffset + tl.arange(0, XBLOCK)[:, None]
     r0_base = tl.arange(0, R0_BLOCK)[None, :]
@@ -140,7 +144,8 @@ def _adaln_fp8r(
             x_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, sel, x0, r0_index, r0_mask, mean, m2,
             mod_row_stride, r0_numel, EPS, HAS_SELECT,
         )
-        tl.store(xmod_ptr + (r0_index + r0_numel * x0), h, r0_mask)
+        if STORE_XMOD:
+            tl.store(xmod_ptr + (r0_index + r0_numel * x0), h, r0_mask)
         amax = tl.maximum(amax, tl.where(r0_mask, tl.abs(h.to(tl.float32)), 0.0))
     row_amax = tl.max(amax, 1)[:, None]
     scale = tl.maximum(tl.div_rn(row_amax, 448.0), 1.0e-12)
@@ -166,12 +171,15 @@ def fp8r_adaln_quant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     eps: float,
+    store_x_mod: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(1 + scale) * LayerNorm(x) + shift (bf16) and its fp8r per-token E4M3 data + fp32 scales.
 
     x [1, S, D] contiguous bf16. Without select, shift/scale are [1, 1, D] rows (any storage
     offset, unit last stride). With select ([1, S, 1] bool, True picks row 1), shift/scale are
     [1, 2, D] tables with unit last stride and a shared row stride.
+    With store_x_mod=False the returned x_mod is allocated but NOT written (uninitialized): only
+    for callers whose consumers read the quantized data alone (x_mod as shape metadata).
     """
     width = x.shape[-1]
     rows = x.numel() // width
@@ -195,6 +203,7 @@ def fp8r_adaln_quant(
             width,
             eps,
             has_select,
+            store_x_mod,
             1,
             _R0_BLOCK[has_select],
             num_warps=_NUM_WARPS[has_select],
@@ -204,7 +213,7 @@ def fp8r_adaln_quant(
 
 
 @fp8r_adaln_quant.register_fake
-def _fp8r_adaln_quant_fake(x, shift, scale, select, weight, bias, eps):
+def _fp8r_adaln_quant_fake(x, shift, scale, select, weight, bias, eps, store_x_mod=True):
     width = x.shape[-1]
     rows = x.numel() // width
     return (
@@ -224,12 +233,27 @@ def _row_ok(value: torch.Tensor, x: torch.Tensor, rows: int) -> bool:
     )
 
 
-def fp8r_adaln_quant_head(block, x: torch.Tensor, mod: tuple):
+def _x_mod_unread(block, x: torch.Tensor, freqs) -> bool:
+    """True when the block's FP8R paths read only the quantized x_mod (bf16 x_mod = metadata):
+    QKV through the fused qknorm_rope op (flux3_fp8r_qkv._sm120_fp8r_qkv_forward, which takes
+    the shared data/scales and reads only the original's shape when its cos/sin checks pass),
+    and the MLP through the two-stream tail pair (sm120_tail_pair_forward: up(mlp_input) reads
+    .quantized/.scales; its fallbacks sm120_fp8_mlp_forward / PreparedFP8 do too)."""
+    if not (getattr(block.attn, "_flux3_sm120_fp8r_qknorm_rope", False) and block._sm120_tail_pair):
+        return False
+    if len(freqs) < 2:
+        return False
+    cos, sin = freqs[0], freqs[1]
+    return cos.numel() == x.numel() // x.shape[-1] * 128 and sin.shape == cos.shape
+
+
+def fp8r_adaln_quant_head(block, x: torch.Tensor, mod: tuple, freqs=()):
     """(x_mod, Fp8RowwiseQuantizedTensor) for an FP8R block's head, or None (use the base path).
 
     Eligible only where main's head would run sm120_fp8_shared_input on the Inductor
     LN+modulate output: SM120 FP8R QKV + MLP-up prepared, broadcast [1, 1, D] rows (mode
     block) or [1, 2, D] tables + [1, S, 1] select (single block), contiguous [1, S, D] x.
+    The bf16 x_mod is written only when some consumer may read its values (_x_mod_unread).
     """
     if not FP8R_ADALN_QUANT or block._fuse_proj_out:
         return None
@@ -264,7 +288,14 @@ def fp8r_adaln_quant_head(block, x: torch.Tensor, mod: tuple):
     else:
         return None
     x_mod, data, scales = torch.ops.trtllm.flux3_fp8r_adaln_quant(
-        x, shift, scale, select, pre_norm.weight, pre_norm.bias, pre_norm.variance_epsilon
+        x,
+        shift,
+        scale,
+        select,
+        pre_norm.weight,
+        pre_norm.bias,
+        pre_norm.variance_epsilon,
+        FP8R_ADALN_STORE_X_MOD or not _x_mod_unread(block, x, freqs),
     )
     return x_mod, Fp8RowwiseQuantizedTensor(x_mod, data, scales)
 

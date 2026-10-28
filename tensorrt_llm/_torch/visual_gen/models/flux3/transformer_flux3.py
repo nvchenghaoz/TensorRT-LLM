@@ -1013,7 +1013,7 @@ class _Flux3FP8RModeBlock(Flux3ModeBlock):
         timestep: Tensor | None = None,
     ) -> Tensor:
         head = self._flux3_fp8r_adaln_head
-        fused = None if head is None else head(self, x, mod)
+        fused = None if head is None else head(self, x, mod, freqs)
         if fused is None:
             return super().forward(x, freqs, mod, sample_bounds=sample_bounds, timestep=timestep)
         # Flux3ModeBlock.forward after its head (FP8R blocks never fuse proj_out).
@@ -1053,7 +1053,7 @@ class _Flux3FP8RSingleStreamBlock(Flux3SingleStreamBlock):
         timestep: Tensor | None = None,
     ) -> Tensor:
         head = self._flux3_fp8r_adaln_head
-        fused = None if head is None else head(self, combined, mod)
+        fused = None if head is None else head(self, combined, mod, freqs)
         if fused is None:
             return super().forward(
                 combined,

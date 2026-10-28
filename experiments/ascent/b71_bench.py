@@ -5,12 +5,14 @@ quantize_fp8r (warpPerTokenFp8QuantKernel). Shapes of one denoise step's FP8R he
   4 x single (M=4176, [1,2,D] shift/scale tables + [1,S,1] select)
   1 x mode   (M=4096, [1,1,D] rows that are views of a [16,1,1,3D] step table)
 Modes:
-  bench   : CUDA graph of 20 step-sequences, median of 60 replays (L2-hot inputs); prints the
-            evidence JSON (kernel_ms per step-sequence of 5 heads). Uses the fused op when the
-            tree has it (candidate), main's path otherwise (baseline).
-  check   : untimed correctness. Fused vs main's compiled head (static and dynamic-shape Inductor
-            kernels) at M=4176/4256 single and M=4096 mode (several step rows, offset 0 included),
-            bitwise x_mod / data / scales; repeat sequence (same warmup/iters as bench) bitwise vs
+  bench   : CUDA graph of 20 step-sequences, median of 60 replays; prints the evidence JSON
+            (kernel_ms per step-sequence of 5 heads). Candidate (tree has the op): the served
+            config, store_x_mod=False (the FP8R consumers read only the quantized data).
+            Baseline (main): Inductor LN+modulate + quantize_fp8r.
+  check   : untimed correctness, for store_x_mod True and False. Fused vs main's compiled head
+            (static and dynamic-shape Inductor kernels) at M=4176/4256 single and M=4096 mode
+            (several step rows, offset 0 included): bitwise E4M3 data + fp32 scales, plus x_mod
+            when stored; repeat sequence (same warmup/iters as bench) bitwise vs main and vs
             iteration 0; inputs unchanged.
 """
 
@@ -30,6 +32,7 @@ except ImportError:
 MODE = sys.argv[1] if len(sys.argv) > 1 else "bench"
 D = 3072
 dev = "cuda"
+WARMUP, ITERS = 3, 20
 torch.manual_seed(1234)
 pre_norm = LayerNorm(
     hidden_size=D, eps=1e-6, has_weights=False, has_bias=False, dtype=torch.bfloat16
@@ -62,15 +65,13 @@ def compiled(module):
 single_c, mode_c = compiled(Single()), compiled(Mode())
 
 
-def make_single(M, scale_x=2.0):
-    T = M - 4096
-    x = torch.randn(1, M, D, device=dev, dtype=torch.bfloat16) * scale_x
+def make_single(M):
+    x = torch.randn(1, M, D, device=dev, dtype=torch.bfloat16) * 2.0
     x[..., 7] *= 40  # an outlier channel like the residual stream
     shift_t = torch.randn(1, 2, D, device=dev, dtype=torch.bfloat16) * 0.3
     scale_t = torch.randn(1, 2, D, device=dev, dtype=torch.bfloat16) * 0.3
     select = torch.zeros(1, M, 1, device=dev, dtype=torch.bool)
     select[:, 4096:] = True  # text rows pick row 1
-    del T
     return x, shift_t, scale_t, select
 
 
@@ -96,14 +97,17 @@ def main_mode(x, shift, scale):
     return x_mod, data, scales
 
 
+STORE = [False]  # served config; check runs both
+
+
 def fused_single(x, shift_t, scale_t, select):
-    return torch.ops.trtllm.flux3_fp8r_adaln_quant(x, shift_t, scale_t, select, pre_norm.weight,
-                                                    pre_norm.bias, 1e-6)
+    return torch.ops.trtllm.flux3_fp8r_adaln_quant(
+        x, shift_t, scale_t, select, pre_norm.weight, pre_norm.bias, 1e-6, STORE[0])
 
 
 def fused_mode(x, shift, scale):
-    return torch.ops.trtllm.flux3_fp8r_adaln_quant(x, shift, scale, None, pre_norm.weight,
-                                                    pre_norm.bias, 1e-6)
+    return torch.ops.trtllm.flux3_fp8r_adaln_quant(
+        x, shift, scale, None, pre_norm.weight, pre_norm.bias, 1e-6, STORE[0])
 
 
 def inductor_configs():
@@ -120,125 +124,133 @@ def inductor_configs():
     return out
 
 
+def u8(t):
+    return t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t
+
+
 def bitwise(a, b):
-    return all(
-        torch.equal(p.view(torch.uint8) if p.dtype == torch.float8_e4m3fn else p,
-                    q.view(torch.uint8) if q.dtype == torch.float8_e4m3fn else q)
-        for p, q in zip(a, b)
-    )
+    if not STORE[0]:  # x_mod not written: compare E4M3 data + fp32 scales only
+        a, b = a[1:], b[1:]
+    return all(torch.equal(u8(p), u8(q)) for p, q in zip(a, b))
 
 
 def mismatch(a, b):
-    xm = (a[0].float() - b[0].float()).abs()
     return {
-        "x_mod_bitwise": torch.equal(a[0], b[0]),
-        "x_mod_diff_elems": int((a[0] != b[0]).sum()),
-        "x_mod_max_abs": xm.max().item(),
-        "data_diff_elems": int((a[1].view(torch.uint8) != b[1].view(torch.uint8)).sum()),
+        "x_mod_bitwise": torch.equal(a[0], b[0]) if STORE[0] else "not stored",
+        "data_diff_elems": int((u8(a[1]) != u8(b[1])).sum()),
         "scales_bitwise": torch.equal(a[2], b[2]),
     }
 
 
-WARMUP, ITERS = 3, 20
+def step_seq(singles, mode_in, use_fused):
+    outs = []
+    for s in singles:
+        outs.append(fused_single(*s) if use_fused else main_single(*s))
+    outs.append(fused_mode(*mode_in) if use_fused else main_mode(*mode_in))
+    return outs
 
-with torch.inference_mode():
-    singles = [make_single(4176) for _ in range(4)]
-    mode_in = make_mode(3)
-    use_fused = fused_mod is not None and MODE == "bench"
 
-    def step_seq():
-        outs = []
-        for s in singles:
-            outs.append(fused_single(*s) if use_fused else main_single(*s))
-        outs.append(fused_mode(*mode_in) if use_fused else main_mode(*mode_in))
-        return outs
+def bench(singles, mode_in):
+    use_fused = fused_mod is not None
+    for _ in range(WARMUP):
+        step_seq(singles, mode_in, use_fused)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(ITERS):
+            step_seq(singles, mode_in, use_fused)
+    for _ in range(5):
+        g.replay()
+    torch.cuda.synchronize()
+    times = []
+    for i in range(60):
+        st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        st.record()
+        g.replay()
+        en.record()
+        en.synchronize()
+        times.append(st.elapsed_time(en) / ITERS)
+        if i % 20 == 0:
+            print("replay", i, times[-1], flush=True)
+    times.sort()
+    med = times[len(times) // 2]
+    p10, p90 = times[len(times) // 10], times[(len(times) * 9) // 10]
+    arm = "fused(store_x_mod=False)" if use_fused else "main"
+    print("arm", arm, "configs", inductor_configs(), flush=True)
+    print(json.dumps({
+        "batch": {"1": {"kernel_ms": med, "noise_floor": (p90 - p10) / med}},
+        "output": {"class": "exact"},
+        "arm": arm,
+        "unit": "ms per denoise step of FP8R heads (4 single M=4176 + 1 mode M=4096)",
+        "per_head_us": med * 1000 / 5,
+    }))
 
-    if MODE == "bench":
-        for _ in range(WARMUP):
-            step_seq()
-        torch.cuda.synchronize()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for _ in range(ITERS):
-                step_seq()
-        for _ in range(5):
-            g.replay()
-        torch.cuda.synchronize()
-        times = []
-        for i in range(60):
-            st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            st.record()
-            g.replay()
-            en.record()
-            en.synchronize()
-            times.append(st.elapsed_time(en) / ITERS)
-            if i % 20 == 0:
-                print("replay", i, times[-1], flush=True)
-        times.sort()
-        med = times[len(times) // 2]
-        p10, p90 = times[len(times) // 10], times[(len(times) * 9) // 10]
-        print("arm", "fused" if use_fused else "main", "configs", inductor_configs(), flush=True)
-        print(json.dumps({
-            "batch": {"1": {"kernel_ms": med, "noise_floor": (p90 - p10) / med}},
-            "output": {"class": "exact"},
-            "arm": "fused" if use_fused else "main",
-            "unit": "ms per denoise step of FP8R heads (4 single M=4176 + 1 mode M=4096)",
-            "per_head_us": med * 1000 / 5,
-        }))
-        sys.exit(0)
 
-    # ---------------- check ----------------
-    assert fused_mod is not None, "check needs the fused op"
-    fails, report = [], {}
-    # Static Inductor kernels (first shapes seen).
+def run_checks(tag, singles, mode_in, fails, report):
     cases = {"single4176": make_single(4176), "single4256": make_single(4256)}
+    # Static Inductor kernels (first shapes seen by single_c).
     for name, inp in cases.items():
-        ref = main_single(*inp)
-        got = fused_single(*inp)
-        report[name + "_static"] = mismatch(got, ref) if not bitwise(got, ref) else "bitwise"
-        if not bitwise(got, ref):
-            fails.append(name + "_static")
+        ref, got = main_single(*inp), fused_single(*inp)
+        ok = bitwise(got, ref)
+        report[tag + name + "_static"] = "bitwise" if ok else mismatch(got, ref)
+        if not ok:
+            fails.append(tag + name + "_static")
     # Dynamic-shape Inductor kernel: a fresh compile that has seen 4176 then 4256.
     single_dyn = compiled(Single())
     single_dyn(*cases["single4176"])
     single_dyn(*cases["single4256"])  # automatic dynamic recompile
     for name, inp in cases.items():
-        ref = main_single(*inp, fn=single_dyn)
-        got = fused_single(*inp)
-        report[name + "_dynamic"] = mismatch(got, ref) if not bitwise(got, ref) else "bitwise"
-        if not bitwise(got, ref):
-            fails.append(name + "_dynamic")
+        ref, got = main_single(*inp, fn=single_dyn), fused_single(*inp)
+        ok = bitwise(got, ref)
+        report[tag + name + "_dynamic"] = "bitwise" if ok else mismatch(got, ref)
+        if not ok:
+            fails.append(tag + name + "_dynamic")
     for step in (0, 3, 15):
         inp = make_mode(step)
-        ref = main_mode(*inp)
-        got = fused_mode(*inp)
-        key = f"mode4096_step{step}_off{inp[1].storage_offset()}"
-        report[key] = mismatch(got, ref) if not bitwise(got, ref) else "bitwise"
-        if not bitwise(got, ref):
+        ref, got = main_mode(*inp), fused_mode(*inp)
+        key = f"{tag}mode4096_step{step}_off{inp[1].storage_offset()}"
+        ok = bitwise(got, ref)
+        report[key] = "bitwise" if ok else mismatch(got, ref)
+        if not ok:
             fails.append(key)
-    # Repeat sequence matching the bench (same warmup/iters), vs main's reference, vs iter 0.
-    pristine = [tuple(t.clone() for t in s) for s in singles] + [tuple(t.clone() for t in mode_in)]
-    refs = [main_single(*s) for s in singles] + [main_mode(*mode_in)]
-    use_fused = True
+    # Repeat sequence matching the bench (same warmup/iters), vs main's reference and iter 0.
+    pristine = [tuple(t.clone() for t in s) for s in singles + [mode_in]]
+    refs = step_seq(singles, mode_in, False)
     first = None
     for it in range(WARMUP + ITERS):
-        outs = step_seq()
+        outs = step_seq(singles, mode_in, True)
         if first is None:
             first = [tuple(t.clone() for t in o) for o in outs]
         for k, (o, r, f) in enumerate(zip(outs, refs, first)):
             if not bitwise(o, r):
-                fails.append(f"repeat it{it} head{k} vs main")
+                fails.append(f"{tag}repeat it{it} head{k} vs main")
             if not bitwise(o, f):
-                fails.append(f"repeat it{it} head{k} vs iter0")
+                fails.append(f"{tag}repeat it{it} head{k} vs iter0")
     for k, (cur, orig) in enumerate(zip(singles + [mode_in], pristine)):
         if not all(torch.equal(a, b) for a, b in zip(cur, orig)):
-            fails.append(f"input {k} mutated")
+            fails.append(f"{tag}input {k} mutated")
+    report[tag + "repeat_sequence"] = f"{WARMUP + ITERS} iterations x 5 heads compared"
+
+
+with torch.inference_mode():
+    singles = [make_single(4176) for _ in range(4)]
+    mode_in = make_mode(3)
+    if MODE == "bench":
+        bench(singles, mode_in)
+        sys.exit(0)
+    assert fused_mod is not None, "check needs the fused op"
+    fails, report = [], {}
+    for store in (True, False):
+        STORE[0] = store
+        run_checks("store_" if store else "nostore_", singles, mode_in, fails, report)
     report["inductor_configs"] = inductor_configs()
     print(json.dumps(report, default=str), flush=True)
     print(json.dumps({
         "passed": not fails,
         "failures": fails[:20],
         "compared_against": "main's per-block-compiled LN+adaLN-modulate (static and dynamic "
-        "Inductor kernels, emulate_precision_casts) + quantize_fp8r; x_mod, E4M3 data, fp32 "
-        "scales bitwise; repeat sequence (3 warmup + 20 iters) vs main and vs iteration 0",
-    }))
+        "Inductor kernels, emulate_precision_casts) + quantize_fp8r. store_x_mod=True: x_mod, "
+        "E4M3 data, fp32 scales bitwise; store_x_mod=False (served): data + scales bitwise. "
+        "Repeat sequence (3 warmup + 20 iters) vs main and vs iteration 0; inputs unchanged",
+        "report": report,
+    }, default=str))

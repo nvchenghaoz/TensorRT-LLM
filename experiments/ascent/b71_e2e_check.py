@@ -74,6 +74,13 @@ heads = [
     if getattr(m, "_flux3_fp8r_adaln_head", None) is not None
 ]
 print("fused heads on", heads, flush=True)
+skip_store = {
+    name: bool(getattr(m.attn, "_flux3_sm120_fp8r_qknorm_rope", False) and m._sm120_tail_pair)
+    for name, m in tr.named_modules()
+    if getattr(m, "_flux3_fp8r_adaln_head", None) is not None
+}
+print("x_mod store skipped (qknorm_rope + tail pair)", skip_store, flush=True)
+results_skip_store = skip_store
 note(len(heads) == 5, f"5 FP8R blocks carry the fused head (got {len(heads)})")
 warm_graphs = unique_graphs()
 
@@ -100,7 +107,11 @@ PROMPTS = {
     "A": ("A red fox standing in fresh snow at sunrise", 11),
     "B": (prompt_for_bucket(te, 2), 22),
 }
-results = {"warmup_unique_graphs": warm_graphs, "fused_heads": heads}
+results = {
+    "warmup_unique_graphs": warm_graphs,
+    "fused_heads": heads,
+    "x_mod_store_skipped": results_skip_store,
+}
 
 
 def run(label, name, on, graphs):
