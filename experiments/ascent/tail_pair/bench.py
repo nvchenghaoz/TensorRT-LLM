@@ -31,6 +31,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import PreparedFP8Sm120
 WARMUP = 3
 ITERS = 60
 STEP_ITERS = 100
+STEP_WARMUP = 100
 SPIN_CYCLES = 6_000_000  # ~2.5 ms at 2.4 GHz
 H, FF = 3072, 9216
 
@@ -147,10 +148,15 @@ def bench(arm):
     cases, plan = step_cases()
     pristine = {k: [t.clone() for t in inputs(c)] for k, c in cases.items()}
     log(f"bench arm={arm} linear_backend={fp._sm120_linear_backend()}")
-    for _ in range(WARMUP):
+    # Warm the full step sequence ~1 s: the first ~10-20 sequences run slower (clock/power ramp),
+    # which otherwise lands in the p90 of the spread.
+    for i in range(STEP_WARMUP):
         for k, n in plan:
             for _ in range(n):
                 fn(cases[k])
+        if i % 25 == 0:
+            torch.cuda.synchronize()
+            log(f"  warmup step {i}")
     torch.cuda.synchronize()
     for k, c in cases.items():
         assert all(torch.equal(p, t) for p, t in zip(pristine[k], inputs(c))), k
