@@ -150,11 +150,14 @@ def _sm120_fp8r_qkv_forward(
     return tuple(t.reshape(*original.shape[:-1], width) for t in (q, k, v))
 
 
-# Hand attention contiguous q/k/v. With landing 29 (fp8_sm12x attention, accepts_strided_qkv) the
-# packed row-stride-3W views made served T=80 images differ after a T=160 request (job 829: A/B/A
-# not bitwise; job 837: same tree with this op off is bitwise). Module-level for A/B.
-_FP8R_QKV_CONTIGUOUS = True
+# Strided (both False): attention gets q/k/v as row-stride-3W column views of the packed GEMM
+# output; fp8_sm12x (accepts_strided_qkv) reads them in place, so neither the planar v copy nor
+# .contiguous() copies run. Bitwise equal to planar/contiguous, ~33 us/call faster than planar
+# (branch 62). The served A(T=80)/B(T=160)/A history effect once blamed on this route (job 829)
+# is intermittent on every layout, contiguous included (knowledge 847), not a strided-route bug.
+# Module-level for A/B in one process.
+_FP8R_QKV_CONTIGUOUS = False
 # Planar: the qknorm_rope pass writes q, k, v as three contiguous [M, W] planes of a fresh buffer
 # (v copied inside the pass), so the three .contiguous() copies above go. Same values (bitwise).
 # Takes precedence over _FP8R_QKV_CONTIGUOUS; module-level for A/B in one process.
-_FP8R_QKV_PLANAR = True
+_FP8R_QKV_PLANAR = False
