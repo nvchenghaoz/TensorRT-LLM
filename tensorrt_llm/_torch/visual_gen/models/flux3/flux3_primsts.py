@@ -1321,3 +1321,158 @@ def _nvfp4_qkv_prepared_fake(
     source_weight=None,
 ):
     return activation.new_empty((activation.shape[0], weight.shape[0]), dtype=torch.bfloat16)
+
+
+def sm120_qkv_fp8_covers(device: torch.device, columns: int, q_dim: int, k_dim: int) -> bool:
+    """Shapes/routes nvfp4_qkv_rope_fp8 handles: main's per-plane in-place planar QKV route."""
+    from . import flux3_sm120_strided_gemm as strided
+
+    return sm120_qkv_planar(device, columns, q_dim, k_dim) and strided.inplace_enabled()
+
+
+def _sm120_qkv_planar_gemms(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    qkv_scale: torch.Tensor,
+) -> torch.Tensor:
+    """The GEMM half of _sm120_cutlass_qkv's in-place planar route, unchanged: plane i's GEMM
+    writes plane i (element offset i*M*W) of one fresh [M, 3W] BF16 buffer, q on the current
+    stream, k and v on the two QKV side streams forked from and joined to it."""
+    from . import flux3_sm120_strided_gemm as strided
+
+    columns = weight.shape[0]
+    width = columns // 3
+    rows = activation.shape[0]
+    segment_scale = weight_scale.numel() // 3
+    out = torch.empty((rows, columns), device=activation.device, dtype=torch.bfloat16)
+
+    def gemm_plane(i: int) -> None:
+        strided.gemm_into(
+            activation,
+            weight[i * width:(i + 1) * width],
+            activation_scale,
+            weight_scale[i * segment_scale:(i + 1) * segment_scale],
+            qkv_scale[i:i + 1],
+            out,
+            i * rows * width,
+            width,
+            i,
+        )
+
+    current = torch.cuda.current_stream(activation.device)
+    side = _sm120_qkv_side_streams(activation.device.index)
+    for stream in side:
+        stream.wait_stream(current)
+    gemm_plane(0)
+    for i, stream in enumerate(side):
+        with torch.cuda.stream(stream):
+            gemm_plane(i + 1)
+    for stream in side:
+        current.wait_stream(stream)
+    return out
+
+
+def nvfp4_qkv_rope_fp8_impl(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    qkv_scale: torch.Tensor,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(qkv8 [3, M, W] E4M3, scales [8] FP32, gemm [M, 3W] BF16 planar GEMM output).
+
+    Same GEMMs as main's route; then flux3_sm120_qknorm_rope_fp8 instead of the in-place BF16
+    norm/RoPE pass + fp8_sm12x K1/K2. gemm.view(3, M, W)[2] is v, the plane main hands PAG."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_qknorm_rope_fp8 import (
+        qknorm_rope_fp8,
+    )
+
+    rows = activation.shape[0]
+    width = weight.shape[0] // 3
+    out = _sm120_qkv_planar_gemms(
+        activation.detach(),
+        weight.detach(),
+        activation_scale.detach(),
+        weight_scale.detach(),
+        qkv_scale.detach(),
+    )
+    planes = out.view(3, rows, width)
+    qkv8, scales = qknorm_rope_fp8(
+        planes[0],
+        planes[1],
+        planes[2],
+        q_norm.detach(),
+        k_norm.detach(),
+        cos_sin.detach(),
+        positions.detach(),
+        sm_scale,
+    )
+    return qkv8, scales, out
+
+
+@torch.library.custom_op(
+    "trtllm::flux3_primsts_nvfp4_qkv_rope_fp8", mutates_args=(), device_types="cuda"
+)
+def nvfp4_qkv_rope_fp8_prepared(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    cos_sin: torch.Tensor,
+    qkv_scale: torch.Tensor,
+    original: torch.Tensor,
+    source_weight: torch.Tensor | None,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """nvfp4_qkv_prepared + fp8_sm12x's quantize, straight from the NVFP4 QKV GEMM to E4M3.
+
+    Same activation handling as nvfp4_qkv_prepared (_prepared_activation; `original` is read only
+    when the source weight's input scale differs). All three outputs are fresh buffers (no view
+    of an input or of another output)."""
+    # Per-plane alphas come from qkv_scale (the global scales only matter for one-alpha QKV).
+    activation, activation_scale = _prepared_activation(
+        activation, activation_scale, original, source_weight, weight
+    )
+    return nvfp4_qkv_rope_fp8_impl(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        q_norm,
+        k_norm,
+        cos_sin,
+        _token_positions(activation.shape[0], activation.device),
+        qkv_scale,
+        sm_scale,
+    )
+
+
+@nvfp4_qkv_rope_fp8_prepared.register_fake
+def _nvfp4_qkv_rope_fp8_prepared_fake(
+    activation,
+    weight,
+    activation_scale,
+    weight_scale,
+    q_norm,
+    k_norm,
+    cos_sin,
+    qkv_scale,
+    original,
+    source_weight,
+    sm_scale,
+):
+    rows, columns = activation.shape[0], weight.shape[0]
+    return (
+        activation.new_empty((3, rows, columns // 3), dtype=torch.float8_e4m3fn),
+        activation.new_empty((8,), dtype=torch.float32),
+        activation.new_empty((rows, columns), dtype=torch.bfloat16),
+    )

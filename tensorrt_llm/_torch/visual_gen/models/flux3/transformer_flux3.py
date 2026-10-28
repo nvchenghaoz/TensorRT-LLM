@@ -70,6 +70,9 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     linear_forward as _primsts_linear_forward,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import qkv_forward as _primsts_qkv_forward
+from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
+    qkv_fp8_attention_forward as _primsts_qkv_fp8_attention,
+)
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_adaln_quant import (
     adaln_nvfp4_input,
     prepare_adaln_nvfp4,
@@ -531,6 +534,28 @@ class Flux3Attention(Attention):
         b, s = hidden_states.shape[:2]
         cos, sin = freqs[0], freqs[1]
         projection_input = hidden_states if quantized is None else quantized
+
+        direct = _primsts_qkv_fp8_attention(
+            self,
+            projection_input,
+            freqs,
+            sample_bounds is None
+            or (
+                _ATTEND_SINGLE_SEGMENT_FAST_PATH
+                and b == 1
+                and len(sample_bounds) == 1
+                and sample_bounds[0][0] == 0
+                and sample_bounds[0][1] == s
+            ),
+        )
+        if direct is not None:
+            # NVFP4 QKV straight to E4M3 + the same fmha_v2 call (bitwise to the path below).
+            attn, gemm = direct
+            if need_v:
+                v = gemm.view(3, b * s, -1)[2]
+                v = v.view(b, s, self.local_num_key_value_heads, self.head_dim).transpose(1, 2)
+                return attn, v  # [B, H, S, D] for apply_flux3_pag
+            return attn
 
         qkv = _primsts_qkv_forward(self, projection_input, freqs)
         if self.fuse_qk_norm_rope or qkv is not None:
