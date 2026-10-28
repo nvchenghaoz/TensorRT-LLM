@@ -779,18 +779,18 @@ def _qknorm_rope_fp8_vec_kernel(
     s_lane = cutlass.Int32(ring.iterator.toint()) + ring_base * 2 + lane * 16
     if warp < 8:
         # Row cta's head pairs go in flight before the partial re-reduce below.
-        for j in cutlass.range_constexpr(stages):
-            _cp_async16(s_lane + j * 512, g_lane + cutlass.Int64(cta) * (src_ld * 2) + j * 512)
+        for s0 in cutlass.range_constexpr(stages):
+            _cp_async16(s_lane + s0 * 512, g_lane + cutlass.Int64(cta) * (src_ld * 2) + s0 * 512)
             _cp_async_commit()
     factor = cutlass.Float32(0.0)
     if cutlass.const_expr(mode == 2):
         loaded = []
         for p in cutlass.range_constexpr(3):
             for i in cutlass.range_constexpr(3):
-                j = tidx + i * 384
+                pidx = tidx + i * 384
                 x = cutlass.Float32(_AMAX_INIT)
-                if j < n_part:
-                    x = (parts + p * n_part + j).load()
+                if pidx < n_part:
+                    x = (parts + p * n_part + pidx).load()
                 loaded.append(x)
         for p in cutlass.range_constexpr(3):
             part_amax = cutlass.Float32(_AMAX_INIT)
@@ -843,11 +843,11 @@ def _qknorm_rope_fp8_vec_kernel(
             sines = [(cs_row + 64 + lane).load(), (cs_row + 96 + lane).load()]
             next_row = row + grid
             d_row = d_warp + cutlass.Int64(row) * width
-            for j in cutlass.range_constexpr(stages):
+            for sj in cutlass.range_constexpr(stages):
                 _cp_async_wait(stages - 1)
                 _syncwarp()
                 for hh in cutlass.range_constexpr(2):
-                    base = ring_base + j * 256 + hh * 128
+                    base = ring_base + sj * 256 + hh * 128
                     sum_squares = cutlass.Float32(0.0)
                     for group in cutlass.range_constexpr(4):
                         value = ring[base + group * 32 + lane].to(cutlass.Float32)
@@ -877,12 +877,12 @@ def _qknorm_rope_fp8_vec_kernel(
                 _syncwarp()
                 if next_row < rows:
                     _cp_async16(
-                        s_lane + j * 512,
-                        g_lane + cutlass.Int64(next_row) * (src_ld * 2) + j * 512,
+                        s_lane + sj * 512,
+                        g_lane + cutlass.Int64(next_row) * (src_ld * 2) + sj * 512,
                     )
                 _cp_async_commit()
                 if cutlass.const_expr(mode == 2):
-                    _st_global_b64(d_row + j * 256 + lane * 8, stage64[warp * 32 + lane])
+                    _st_global_b64(d_row + sj * 256 + lane * 8, stage64[warp * 32 + lane])
     else:
         for row in cutlass.range(cta, rows, grid):
             g_row = g_lane + cutlass.Int64(row) * (src_ld * 2)
