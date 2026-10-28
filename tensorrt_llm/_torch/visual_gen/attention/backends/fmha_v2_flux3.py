@@ -36,6 +36,9 @@ _LEVER_FLAGS = {
     #   exp2(fma(x, s*log2e, log2(256) - max*s*log2e)) per element and
     #   alpha = exp2((prev - cur)*s*log2e). No LSE / attention-sink support.
     "base2": ("b2", "-DFMHA_FLUX3_BASE2=1"),
+    # v_ldsm_x4 (FMHA_FLUX3_V_LDSM_X4, smem_tile_v.h): one LDSM.MT88.4 per V fragment
+    #   instead of two LDSM.MT88.2 (bitwise equal).
+    "v_ldsm_x4": ("vx4", "-DFMHA_FLUX3_V_LDSM_X4=1"),
     # kv128: 64 q rows x 128-key step (the stock d128 E4M3 tile steps 64 keys). Padding mask
     #   only: the causal / sliding / custom-mask kernels are not compiled in.
     "kv128": ("k128", None),
@@ -57,6 +60,16 @@ def _tag(levers: Sequence[str], min_blocks: int) -> str:
     if min_blocks:
         tag += f"_mb{min_blocks}"
     return tag
+
+
+# v_ldsm_x4 (exact vs b2) joins the routed set; TRTLLM_FMHA_V2_FLUX3_VX4=0 drops it.
+def _routed_vx4() -> tuple[str, ...]:
+    import os
+
+    return ("v_ldsm_x4",) if os.environ.get("TRTLLM_FMHA_V2_FLUX3_VX4", "1") != "0" else ()
+
+
+ROUTED_LEVERS = ROUTED_LEVERS + _routed_vx4()
 
 
 def gen_flux3_d128_spec(levers: Sequence[str] = DEFAULT_LEVERS, min_blocks: int = 0):
