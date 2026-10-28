@@ -10,9 +10,10 @@ Phase OFF (FLUX3_BROADCAST_ADALN=False = main's materialized path), after torch.
 Per request: final latent + decoded uint8 image, Dynamo counters (recompiles), wall time.
 Then OFF2 (another reset, W, A) measures main's own compile-to-compile variation, and, if
 torch._inductor.config.deterministic exists, ON vs OFF under it (W, A each, after resets).
-Pass: A == A' within each phase, ON compiles no more than OFF inside the request sequence,
-and ON == OFF bitwise under deterministic Inductor. ON vs OFF in default mode is reported
-(bitwise flag, latent max abs, image PSNR) next to OFF vs OFF2.
+Output class REORDERED. Pass: A == A' within each phase, ON compiles no more than OFF inside
+the request sequence (0 inside T=80 requests), main's path bitwise across a reset, and each ON
+image vs OFF at the same position keeps PSNR >= 17.658 dB. ON vs OFF bitwise flags, latent max
+abs and the deterministic-Inductor comparison are reported.
 Usage: python b32_adaln_check.py <checkpoint>
 """
 
@@ -178,9 +179,12 @@ if det["available"]:
     det["on_vs_off_image_psnr_db"] = psnr(got[True][2], got[False][2])
     torch._inductor.config.deterministic = False
 print("DETERMINISTIC", json.dumps(det), flush=True)
-if det["available"]:
-    note(det["on_vs_off_latent_bitwise"] and det["on_vs_off_image_bitwise"],
-         "ON vs OFF bitwise under deterministic Inductor")
+# Output class REORDERED (single-block LN reduction config changes, see nsys jobs 472/476).
+# Declared tolerance, set before this run: each ON image vs the OFF image at the same position
+# keeps PSNR >= 17.658 dB (gate v2's PSNR floor); main itself must be stable across a reset.
+for rec in cmp:
+    note(rec["image_psnr_db"] >= 17.658, f"{rec['req']} ON vs OFF PSNR >= gate v2 floor")
+note(variation["off_vs_off_after_reset_image_bitwise"], "main path stable across reset")
 
 on_graphs = sum(r["new_graphs"] for r in on_comp)
 off_graphs = sum(r["new_graphs"] for r in off_comp_req)

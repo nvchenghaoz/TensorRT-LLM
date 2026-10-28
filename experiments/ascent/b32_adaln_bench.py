@@ -133,6 +133,7 @@ if MODE == "check":
     ref = None
     cand0 = None
     maxabs = 0.0
+    n_diff = [0]
     for arm in (False, True):
         reset()
         for _ in range(WARM):
@@ -149,8 +150,13 @@ if MODE == "check":
                 cand0 = [o.clone() for o in outs]
             for j, o in enumerate(outs):
                 if not torch.equal(o, ref[j]):
-                    maxabs = max(maxabs, (o.float() - ref[j].float()).abs().max().item())
-                    fails.append(f"arm={arm} iter {i} out {j} != base iter0 reference")
+                    d = (o.float() - ref[j].float()).abs()
+                    maxabs = max(maxabs, d.max().item())
+                    # Declared tolerance (reordered LN reduction): 1 bf16 ulp of the reference.
+                    ulp = torch.exp2(torch.floor(torch.log2(ref[j].float().abs().clamp_min(2**-60))) - 7)
+                    n_diff[0] += int((d > 0).sum())
+                    if not arm or bool((d > ulp).any()):
+                        fails.append(f"arm={arm} iter {i} out {j} beyond 1 ulp of base iter0")
                 if arm and not torch.equal(o, cand0[j]):
                     fails.append(f"cand iter {i} out {j} != cand iter0")
             del outs
@@ -158,6 +164,10 @@ if MODE == "check":
         if not inputs_ok():
             fails.append(f"inputs changed arm={arm}")
     print(json.dumps({"passed": not fails, "failures": fails[:20], "n_failures": len(fails),
+                      "output": {"class": "reordered",
+                                 "tolerance": "<= 1 bf16 ulp of base per element; base and "
+                                 "candidate each bitwise with their own iteration 0"},
+                      "elements_differing_total": n_diff[0],
                       "max_abs": maxabs, "iters": ITERS, "outputs_per_iter": len(ref),
                       "compared_against": "main's materialized per-token modulation path "
                       "(base arm, same compiled ops) iteration 0 and every iteration"}))
@@ -198,6 +208,6 @@ times.sort()
 med = times[len(times) // 2]
 p10, p90 = times[len(times) // 10], times[(9 * len(times)) // 10]
 print(json.dumps({"batch": {"1": {"kernel_ms": med, "noise_floor": (p90 - p10) / med}},
-                  "output": {"class": "exact"},
+                  "output": {"class": "reordered", "max_abs_vs_base": "<= 1 bf16 ulp (check mode)"},
                   "detail": {"arm": "cand" if broadcast else "base", "p10": p10, "p90": p90,
                              "unit": "ms per denoise step of adaLN modulation work"}}))
