@@ -190,7 +190,17 @@ ye = run("SEQ_A2_EAGER", "A2", True, False)
 cmp(x, y, "A vs A2 differ (no stale input replayed)", expect_equal=False)
 cmp(x, xe, "SEQ A flag ON == A graph-off")
 cmp(y, ye, "SEQ A2 flag ON (right after A) == A2 graph-off")
-cmp(x, a1[2], "SEQ A == first A graph-off (repeat)")
+# Cross-history-position diagnostics (NOT gating: ruling 500 / fact 847 -- the pipeline's own
+# graph-off eager output can move with Dynamo history, e.g. after the T=160 compile; job 1164
+# saw SEQ_A_EAGER != A_T80_EAGER while every same-position flag on/off/graph-off triple was
+# bitwise). Graph-off runs never enter CUDAGraphRunner, so this is not the copy skip.
+for what, p, q in (("diag: SEQ A eager vs first A eager (positions 12 vs 3)", xe, a1[2]),
+                   ("diag: A-after-T160 eager vs first A eager (positions 9 vs 3)", a3[2], a1[2])):
+    d = {"what": what, "latent_bitwise": torch.equal(p[1], q[1]),
+         "image_bitwise": torch.equal(p[2], q[2]),
+         "latent_max_abs": (p[1].float() - q[1].float()).abs().max().item()}
+    print("DIAG", json.dumps(d), flush=True)
+    results.setdefault("cross_position_diagnostics", []).append(d)
 steady = [r for r in results["requests"] if r["graphs"] and r["label"] != "B_T160_ON"]
 note(all(r["new_captures"] == 0 for r in steady), "0 captures in steady graph-on requests")
 # The first T=160 request (B_T160_ON) is a new shape bucket: it compiles and captures once.
