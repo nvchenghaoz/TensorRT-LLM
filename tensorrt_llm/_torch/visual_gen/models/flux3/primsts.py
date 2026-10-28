@@ -570,7 +570,9 @@ def _excluded_bf16(layer: nn.Module) -> bool:
 
 
 _EXCLUDED_NVFP4_ENV = "TRTLLM_FLUX3_EXCLUDED_NVFP4"
-_EXCLUDED_NVFP4_DEFAULT = "all"
+# single_blocks.24-27: the largest subset whose Qwen3-VL judge count matched main's (43/43) in
+# branch 105's STEP 1 (job 1270); "all" (adds content_mode_blocks.image.0) lost one answer.
+_EXCLUDED_NVFP4_DEFAULT = "single"
 
 
 def _excluded_bf16_block(block: nn.Module) -> bool:

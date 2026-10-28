@@ -179,7 +179,9 @@ def child(mode_dir, ckpt, reps):
     sys.stderr.flush()
 
     reqs = []
-    seq = [(k, s, p) for k, s, p in CHECK] + [(k, s, p) for k, s, p, _ in ACC]
+    seq = [(k, s, p) for k, s, p in CHECK]
+    if os.environ.get("B105_CHECK_ONLY") != "1":
+        seq += [(k, s, p) for k, s, p, _ in ACC]
     for rep in range(1, reps):
         seq += [(f"{k}#r{rep}", s, p) for k, s, p in CHECK]
     for key, seed, prompt in seq:
@@ -199,7 +201,7 @@ def child(mode_dir, ckpt, reps):
         Image.fromarray(arr).save(path)
         m = out.metrics
         rec = {"key": key, "wall_s": round(wall, 4), "denoise": getattr(m, "denoise", None),
-               "sha256": sha256(path)}
+               "sha256": hashlib.sha256(arr.tobytes()).hexdigest(), "png_sha256": sha256(path)}
         reqs.append(rec)
         print("REQ", json.dumps(rec, default=str), flush=True)
     print("=== TIMED-END ===", flush=True)
@@ -350,8 +352,9 @@ def parent(ckpt, modes, do_judge, reps):
         env["TORCH_LOGS"] = "recompiles"
         env["TLLM_LOG_LEVEL"] = "INFO"
         env.pop("TRTLLM_FLUX3_EXCLUDED_NVFP4", None)
-        if mode != "main":
-            env["TRTLLM_FLUX3_EXCLUDED_NVFP4"] = mode.replace("+", ",")
+        knob = mode.split("@", 1)[0]  # "<value>@<tag>" repeats a value in another fresh process
+        if knob not in ("main", "default"):
+            env["TRTLLM_FLUX3_EXCLUDED_NVFP4"] = knob.replace("+", ",")
         log(f"=== mode {mode} env={env.get('TRTLLM_FLUX3_EXCLUDED_NVFP4')}")
         log_path = os.path.join(d, "log.txt")
         t0 = time.time()
@@ -419,6 +422,8 @@ def parent(ckpt, modes, do_judge, reps):
                                         os.path.join(d, f"{key}.png"))
         if mode != first:
             for key, _, _, _ in ACC:
+                if not os.path.exists(os.path.join(d, f"{key}.png")):
+                    continue
                 vs_first[key] = compare(os.path.join(OUT, first, f"{key}.png"),
                                         os.path.join(d, f"{key}.png"))
         s = summary["modes"][mode]
