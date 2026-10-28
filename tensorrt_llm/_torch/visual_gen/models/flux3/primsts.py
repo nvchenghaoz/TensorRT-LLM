@@ -40,6 +40,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
 from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
     Flux3FP8RowwiseLinearMethod,
     quantize_fp8r,
+    swiglu_fp8r_quant,
 )
 from tensorrt_llm.logger import logger
 
@@ -487,19 +488,51 @@ class PreparedFP8Sm120(PreparedFP8):
         super().__init__(data, scale, swiglu=False, fp32_scales=True)
         self.swiglu = swiglu
 
-    def forward(self, x: torch.Tensor | Fp8RowwiseQuantizedTensor) -> torch.Tensor:
-        original = x.original if isinstance(x, Fp8RowwiseQuantizedTensor) else x
-        data, scales = self.activation(x)
-        output = torch._scaled_mm(
+    def gemm(self, data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """The rowwise-scaled FP8 GEMM alone (no SwiGLU), BF16 [M, N]."""
+        return torch._scaled_mm(
             data,
             self.weight.t(),
             scale_a=scales.reshape(-1, 1),
             scale_b=self.scale.reshape(1, -1),
             out_dtype=torch.bfloat16,
         )
+
+    def forward(self, x: torch.Tensor | Fp8RowwiseQuantizedTensor) -> torch.Tensor:
+        original = x.original if isinstance(x, Fp8RowwiseQuantizedTensor) else x
+        data, scales = self.activation(x)
+        output = self.gemm(data, scales)
         if self.swiglu:
             output = swiglu(output)
         return output.reshape(*original.shape[:-1], output.shape[-1])
+
+
+# Fuse the FP8R MLP's SwiGLU with down_proj's per-token E4M3 quantization (bitwise equal to
+# silu_and_mul -> quantize_fp8r). Module-level so an in-process A/B can flip it.
+_FP8R_FUSED_SWIGLU_QUANT = os.environ.get("TRTLLM_FLUX3_FP8R_FUSED_SWIGLU_QUANT", "1") != "0"
+
+
+def sm120_fp8_mlp_forward(ff: nn.Module, x: PrimsTSInput) -> torch.Tensor | None:
+    """gate_up GEMM -> fused SwiGLU + E4M3 quantize -> down GEMM for FP8R (SM120) blocks."""
+    if not _FP8R_FUSED_SWIGLU_QUANT:
+        return None
+    up = getattr(ff.gate_up_proj, "_flux3_primsts_fp8", None)
+    down = getattr(ff.down_proj, "_flux3_primsts_fp8", None)
+    if not (
+        isinstance(up, PreparedFP8Sm120)
+        and isinstance(down, PreparedFP8Sm120)
+        and up.swiglu
+        and not down.swiglu
+        and up.weight.shape[0] == 2 * down.weight.shape[1]
+    ):
+        return None
+    original = original_input(x)
+    if isinstance(x, NVFP4Activation) or not up.can_run(original):
+        return None
+    data, scales = up.activation(x)
+    hidden, hidden_scales = swiglu_fp8r_quant(up.gemm(data, scales))
+    output = down.gemm(hidden, hidden_scales)
+    return output.reshape(*original.shape[:-1], output.shape[-1])
 
 
 def _excluded_bf16(layer: nn.Module) -> bool:

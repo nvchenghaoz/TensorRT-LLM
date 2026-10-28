@@ -60,6 +60,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     prepare_sm120_tail_pair,
     separate_qkv_forward,
     shared_nvfp4_input,
+    sm120_fp8_mlp_forward,
     sm120_fp8_shared_input,
     sm120_tail_pair_forward,
     verify_nvfp4_coverage,
@@ -636,6 +637,9 @@ def _flux3_gated_mlp_forward(
     nvfp4_output = nvfp4_mlp_forward(ff, x)
     if nvfp4_output is not None:
         return nvfp4_output
+    fp8r_output = sm120_fp8_mlp_forward(ff, x)
+    if fp8r_output is not None:
+        return fp8r_output
     prepared = getattr(ff.gate_up_proj, "_flux3_primsts_fp8", None)
     if prepared is None:
         prepared = getattr(ff.gate_up_proj, "_flux3_primsts_nvfp4", None)
