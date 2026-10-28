@@ -230,6 +230,37 @@ def check():
     }))
 
 
+def profile():
+    """One launch each, inside cudaProfilerStart/Stop: main's PACKED, the tree's PACKED (M=4176),
+    and the CUTLASS t0 yardstick at N=9216 and N=18432."""
+    M = 4176
+    args, kw, _ = make_case(M)
+    a, w, sfa, sfw, s_in, s_w = args
+    alpha = m._scalar(a.device, s_in * s_w)
+    runner = fp._sm120_fp4_gemm_runner()
+    w9 = w[:9216].contiguous()
+    sfw9 = fp.nvfp4_quantize(torch.randn(9216, H, device="cuda", dtype=torch.bfloat16) * 0.02,
+                             torch.tensor([100.0], device="cuda"))[1]
+    calls = [
+        ("packed_main_ref", lambda: run_ref("packed", *args, **kw)),
+        ("packed", lambda: packed(args, kw)),
+        ("cutlass_t0_n9216", lambda: runner.run_gemm(a, w9, sfa, sfw9, alpha, 0, 0, None, None)),
+        ("cutlass_t0_n18432", lambda: runner.run_gemm(a, w, sfa, sfw, alpha, 0, 0, None, None)),
+    ]
+    for _, fn in calls:
+        for _ in range(3):
+            fn()
+    torch.cuda.synchronize()
+    torch.cuda.profiler.start()
+    for name, fn in calls:
+        log("profiling", name)
+        fn()
+    torch.cuda.synchronize()
+    torch.cuda.profiler.stop()
+    print(json.dumps({"order": [c[0] for c in calls]}))
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
-    (bench if sys.argv[1:] == ["bench"] else check)()
+    mode = sys.argv[1] if len(sys.argv) > 1 else "check"
+    {"bench": bench, "check": check, "profile": profile}[mode]()
