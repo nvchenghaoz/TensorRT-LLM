@@ -77,10 +77,12 @@ class Flux3LptGroupScheduler
 
   struct Arguments : BaseArguments {
     uint32_t* tile_counter = nullptr;  // nullptr: static round-robin (stock order)
+    int on_demand = 0;  // 1: claim a tile only once the mainloop DMA warp asks for it
   };
 
   struct Params : BaseParams {
     uint32_t* tile_counter = nullptr;
+    int on_demand = 0;
   };
 
   template <class TileShape, class ClusterShape>
@@ -96,6 +98,7 @@ class Flux3LptGroupScheduler
         static_cast<BaseArguments const&>(arguments), workspace, epilogue_subtile,
         ktile_start_alignment_count);
     params.tile_counter = arguments.tile_counter;
+    params.on_demand = arguments.on_demand;
     return params;
   }
 
@@ -104,8 +107,15 @@ class Flux3LptGroupScheduler
   CUTLASS_DEVICE explicit Flux3LptGroupScheduler(Params const& params,
                                                  SchedulerResponse* response_ptr)
       : Base(static_cast<BaseParams const&>(params), response_ptr),
-        tile_counter_(params.tile_counter) {
+        tile_counter_(params.tile_counter),
+        on_demand_(params.tile_counter != nullptr && params.on_demand != 0) {
 #if defined(__CUDA_ARCH__)
+    // Thread 0 (lane 0 of the mainloop DMA warp, the only writer of the request count) zeroes it
+    // before its own first request (program order). The count only paces the claims; a stale
+    // read can make one claim early but never changes which tiles are computed.
+    if (on_demand_ && threadIdx.x == 0) {
+      *request_count() = 0u;
+    }
     if (params.raster_order_ == RasterOrder::AlongN) {
       lpt_linear_idx_ = uint64_t(blockIdx.x) + uint64_t(blockIdx.y) * uint64_t(gridDim.x);
     } else {
@@ -127,7 +137,16 @@ class Flux3LptGroupScheduler
       lpt_linear_idx_ += lpt_grid_size_ * uint64_t(advance_count);
     } else {
       uint32_t claimed = 0;
+      ++claims_;
       if ((threadIdx.x % 32) == 0) {
+        if (on_demand_) {
+          // Wait until the DMA warp has asked for this tile (it asks right after issuing the
+          // last loads of its current tile, a few k-stages before the MMA warps need it).
+          volatile uint32_t* req = request_count();
+          while (*req < claims_) {
+            __nanosleep(32);
+          }
+        }
         claimed = atomicAdd(tile_counter_, 1u);
       }
       claimed = __shfl_sync(0xffffffff, claimed, 0);
@@ -148,8 +167,31 @@ class Flux3LptGroupScheduler
     return cute::make_tuple(info, true);
   }
 
+  // Consumers read the scheduler's responses here. In on-demand mode the mainloop DMA warp
+  // (warp 0 of the producer warpgroup) first bumps the request count the scheduler warp waits on.
+  template <typename WorkTileWithCallbackInfo, typename TileSchedulerPipeline,
+            typename TileSchedulerPipelineState>
+  CUTLASS_DEVICE auto fetch_next_work(WorkTileWithCallbackInfo work_tile_with_callback_info,
+                                      TileSchedulerPipeline& scheduler_pipeline,
+                                      TileSchedulerPipelineState scheduler_pipe_consumer_state) {
+    if (on_demand_ && threadIdx.x == 0) {
+      volatile uint32_t* req = request_count();
+      *req = *req + 1u;
+    }
+    return Base::fetch_next_work(work_tile_with_callback_info, scheduler_pipeline,
+                                 scheduler_pipe_consumer_state);
+  }
+
  private:
+  // The kernel reserves 8 response slots in shared memory; this scheduler's pipeline uses only
+  // slot 0, so the last slot holds the request count.
+  CUTLASS_DEVICE uint32_t* request_count() const {
+    return reinterpret_cast<uint32_t*>(reinterpret_cast<WorkTileInfo*>(this->response_ptr_) + 7);
+  }
+
   uint32_t* tile_counter_ = nullptr;
+  bool on_demand_ = false;
+  uint32_t claims_ = 0;
   uint64_t lpt_linear_idx_ = 0;
   uint64_t lpt_grid_size_ = 0;
 };
@@ -356,7 +398,8 @@ void check_operand(TensorView a, TensorView b, TensorView sfa, TensorView sfb, T
 }  // namespace
 
 // Group 0 = (a0, b0, ...) is scheduled first (put the long-K GEMM there), group 1 after it.
-// mode: 0 = static round-robin (stock group order), 1 = dynamic longest-first (atomic counter).
+// mode: 0 = static round-robin (stock group order), 1 = dynamic longest-first (atomic counter,
+// each CTA claims one tile ahead), 2 = dynamic, claimed when the mainloop DMA warp asks for it.
 // grid_ctas: 0 = one persistent CTA per SM; >0 overrides the persistent grid (diagnostics).
 void lpt_pair(TensorView a0, TensorView b0, TensorView sfa0, TensorView sfb0, TensorView alpha0,
               TensorView out0, TensorView a1, TensorView b1, TensorView sfa1, TensorView sfb1,
@@ -367,7 +410,8 @@ void lpt_pair(TensorView a0, TensorView b0, TensorView sfa0, TensorView sfb0, Te
   check_operand(a1, b1, sfa1, sfb1, alpha1, out1);
   CHECK_DEVICE(a0, a1);
   CHECK_DEVICE(a0, workspace);
-  TVM_FFI_ICHECK(mode == 0 || mode == 1) << "mode must be 0 (static) or 1 (dynamic)";
+  TVM_FFI_ICHECK(mode >= 0 && mode <= 2)
+      << "mode must be 0 (static), 1 (dynamic, one tile ahead) or 2 (dynamic, on demand)";
 
   PairInputs in{};
   TensorView const* as[2] = {&a0, &a1};
@@ -424,7 +468,8 @@ void lpt_pair(TensorView a0, TensorView b0, TensorView sfa0, TensorView sfb0, Te
        args_layout.sfa_ptr, args_layout.layout_sfa, args_layout.sfb_ptr, args_layout.layout_sfb},
       {{}, nullptr, nullptr, args_layout.d_ptr, args_layout.stride_d},
       hw_info};
-  arguments.scheduler.tile_counter = mode == 1 ? args_layout.counter : nullptr;
+  arguments.scheduler.tile_counter = mode >= 1 ? args_layout.counter : nullptr;
+  arguments.scheduler.on_demand = mode == 2 ? 1 : 0;
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha = 0.0f;
   fusion_args.beta = 0.0f;

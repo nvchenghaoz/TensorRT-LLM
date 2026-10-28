@@ -246,11 +246,15 @@ def table():
         graphs["lpt_dyn_serial_quant"] = capture(seq(run_op), s)
         set_pair_env("1", "static")
         graphs["lpt_static_serial_quant"] = capture(seq(run_op), s)
+        set_pair_env("1", "ondemand")
+        graphs["lpt_ondemand_serial_quant"] = capture(seq(run_op), s)
         set_pair_env("1", "dynamic")
         graphs["lpt_dyn_hoisted"] = capture(seq(lambda c: run_lpt_hoisted(c, 1)), s)
+        graphs["lpt_ondemand_hoisted"] = capture(seq(lambda c: run_lpt_hoisted(c, 2)), s)
         graphs["lpt_static_hoisted"] = capture(seq(lambda c: run_lpt_hoisted(c, 0)), s)
-        graphs["onetile_per_cta_hoisted"] = capture(
-            seq(lambda c: run_lpt_hoisted(c, 0, grid_ctas=tiles)), s)
+        if os.environ.get("LPT_TABLE_ONETILE", "0") == "1":
+            graphs["onetile_per_cta_hoisted"] = capture(
+                seq(lambda c: run_lpt_hoisted(c, 0, grid_ctas=tiles)), s)
         log(f"M={M}: captured {len(graphs)} graphs, timing")
         res = time_graphs(graphs, samples=150, warm=20, calls_per_replay=calls)
         row = {}
@@ -306,7 +310,7 @@ def check():
         results[f"M{M}_attn_quant_repeat_bitwise"] = bool(quant_ok)
         passed &= quant_ok
         ws = lpt.workspace(c["attn"].device)
-        for mode_name, mode in (("dynamic", 1), ("static", 0)):
+        for mode_name, mode in (("dynamic", 1), ("ondemand", 2), ("static", 0)):
             set_pair_env("1", mode_name)
             for t, p in zip(inputs(c), pristine):
                 t.copy_(p)
@@ -357,7 +361,7 @@ def check():
                 counters.add(int(ws[:4].view(torch.int32).item()))
             del graph
             ok = (n_ref == ITERS and n_first == ITERS and inputs_ok and hoisted_ok and g_ok)
-            if mode == 1:
+            if mode >= 1:
                 ok &= counters == {tiles}
             passed &= ok
             key = f"M{M}_lpt_{mode_name}"

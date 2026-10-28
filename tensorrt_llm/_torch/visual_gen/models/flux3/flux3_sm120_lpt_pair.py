@@ -47,14 +47,19 @@ def enabled() -> bool:
     return os.environ.get("TRTLLM_FLUX3_SM120_PAIR_KERNEL", "1").strip() != "0"
 
 
+_SCHED_MODES = {"static": 0, "dynamic": 1, "ondemand": 2}
+
+
 @lru_cache(maxsize=1)
 def sched_mode() -> int:
+    """Tile order of the one-launch pair: 'dynamic' (default) claims tiles from an atomic counter
+    one tile ahead, 'ondemand' when the DMA warp asks, 'static' is CUTLASS's round-robin."""
     sched = os.environ.get("TRTLLM_FLUX3_SM120_PAIR_SCHED", "dynamic").strip().lower()
-    if sched not in ("dynamic", "static"):
+    if sched not in _SCHED_MODES:
         raise ValueError(
-            f"TRTLLM_FLUX3_SM120_PAIR_SCHED must be 'dynamic' or 'static', got {sched!r}"
+            f"TRTLLM_FLUX3_SM120_PAIR_SCHED must be one of {sorted(_SCHED_MODES)}, got {sched!r}"
         )
-    return 1 if sched == "dynamic" else 0
+    return _SCHED_MODES[sched]
 
 
 @lru_cache(maxsize=1)
