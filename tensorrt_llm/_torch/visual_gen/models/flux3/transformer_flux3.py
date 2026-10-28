@@ -70,6 +70,10 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     linear_forward as _primsts_linear_forward,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import qkv_forward as _primsts_qkv_forward
+from tensorrt_llm._torch.visual_gen.models.flux3.flux3_adaln_quant import (
+    adaln_nvfp4_input,
+    prepare_adaln_nvfp4,
+)
 from tensorrt_llm._torch.visual_gen.models.flux3.utils_flux3 import (
     Flux3PerTokenAdaLN,
     Flux3PerTokenAdaLNRuntime,
@@ -800,12 +804,15 @@ class Flux3ModeBlock(nn.Module):
         timestep: Tensor | None = None,
     ) -> Tensor:
         mod_shift, mod_scale, mod_gate = mod
-        x_mod = self._pertoken_adaln.apply(
-            x, mod_shift, mod_scale, self.pre_norm, self.pre_norm.variance_epsilon
-        )
-
-        mlp_in = self.mlp_in if self._fuse_proj_out else self.ff.gate_up_proj
-        quantized = _flux3_shared_fp8_input(self.attn, mlp_in, x_mod)
+        fused = adaln_nvfp4_input(self, x, mod, self.pre_norm.variance_epsilon)
+        if fused is not None:
+            x_mod, quantized = fused
+        else:
+            x_mod = self._pertoken_adaln.apply(
+                x, mod_shift, mod_scale, self.pre_norm, self.pre_norm.variance_epsilon
+            )
+            mlp_in = self.mlp_in if self._fuse_proj_out else self.ff.gate_up_proj
+            quantized = _flux3_shared_fp8_input(self.attn, mlp_in, x_mod)
         attn = self.attn.attn_pre_out(
             x_mod, freqs, quantized=quantized, sample_bounds=sample_bounds, timestep=timestep
         )
@@ -947,10 +954,13 @@ class Flux3SingleStreamBlock(nn.Module):
         residual = combined
 
         eps = self.pre_norm.variance_epsilon
-        combined = self._pertoken_adaln.apply(combined, mod_shift, mod_scale, self.pre_norm, eps)
-
-        mlp_in = self.mlp_in if self._fuse_proj_out else self.ff.gate_up_proj
-        quantized = _flux3_shared_fp8_input(self.attn, mlp_in, combined)
+        fused = adaln_nvfp4_input(self, combined, mod, eps)
+        if fused is not None:
+            combined, quantized = fused
+        else:
+            combined = self._pertoken_adaln.apply(combined, mod_shift, mod_scale, self.pre_norm, eps)
+            mlp_in = self.mlp_in if self._fuse_proj_out else self.ff.gate_up_proj
+            quantized = _flux3_shared_fp8_input(self.attn, mlp_in, combined)
         attn, v = self.attn.attn_pre_out(
             combined,
             freqs,
@@ -1953,6 +1963,9 @@ class Flux3Model(BaseDiffusionModel):
         )
         blocks.extend((f"single_blocks.{i}", block) for i, block in enumerate(self.single_blocks))
         verify_nvfp4_coverage(blocks)
+        fused_adaln = prepare_adaln_nvfp4(blocks, Flux3SingleStreamBlock, Flux3ModeBlock)
+        if fused_adaln:
+            logger.info(f"FLUX.3 fused LN+adaLN+NVFP4 quantize (exact): {fused_adaln}")
         quant = self.model_config.quant_config
         if quant is not None and quant.quant_algo == QuantAlgo.NVFP4:
             # BF16 checkpoint-excluded image/joint blocks run with the fp8r recipe on SM120.
