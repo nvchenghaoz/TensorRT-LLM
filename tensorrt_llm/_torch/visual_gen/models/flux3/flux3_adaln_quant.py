@@ -460,9 +460,11 @@ def adaln_nvfp4_quant(
     return _dispatch(x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod)
 
 
-# warp (default): SM120 warp-per-row kernel (flux3_sm120_adaln_nvfp4, bitwise to the Triton
-# kernel) where it supports the call; triton: always the Triton kernel above (main's path).
-_IMPL = os.environ.get("TRTLLM_FLUX3_ADALN_NVFP4_IMPL", "warp").strip().lower()
+# triton (default): always the Triton kernel above (main's path, byte for byte).
+# warp: SM120 warp-per-row CuTe kernel (flux3_sm120_adaln_nvfp4) where it supports the call.
+# It is REORDERED vs Triton: fp4/SF bitwise in probes, x_mod off by 1 bf16 ulp on ~1e-6 of
+# elements; in-model 15.3 us/call vs 19.0 at M=4176, missed the 12 us gate (branch 125).
+_IMPL = os.environ.get("TRTLLM_FLUX3_ADALN_NVFP4_IMPL", "triton").strip().lower()
 
 
 def _dispatch(x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod):
