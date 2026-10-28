@@ -260,6 +260,10 @@ def prepare_nvfp4_block(block: nn.Module) -> None:
         if is_sm120(adapter.weight.device):
             if not swiglu:
                 sm120_linear_preload(adapter.weight.device)
+                # QKV in place: build the strided GEMM module and its workspaces at load.
+                from .flux3_sm120_strided_gemm import preload as sm120_strided_preload
+
+                sm120_strided_preload(adapter.weight.device)
             continue
         prepare_nvfp4_gemm(
             adapter.weight,
