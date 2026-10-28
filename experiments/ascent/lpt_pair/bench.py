@@ -194,8 +194,11 @@ def bench():
     cases = {M: [make_case(M, 1000 * M + i) for i in range(CASES_PER_M)] for M in (4176, 4096)}
     pristine = {M: [[t.clone() for t in inputs(c)] for c in cs] for M, cs in cases.items()}
     seq = []
+    # Served mix per step since landing 56 (single_blocks.24-27 on NVFP4): 28 @M4176 + 4 @M4096
+    # = 32 pairs/step, 512/request. LPT_BENCH_SINGLE=24 gives the pre-56 mix of jobs 1297/1298.
+    n_single = int(os.environ.get("LPT_BENCH_SINGLE", "28"))
     for _ in range(2):
-        for i in range(24):
+        for i in range(n_single):
             c = cases[4176][i % CASES_PER_M]
             seq.append(lambda c=c: run_op(c))
         for i in range(4):
@@ -209,11 +212,12 @@ def bench():
             assert all(torch.equal(x, y) for x, y in zip(p, inputs(c))), "inputs changed"
     med, p10, p90 = stat(res["pair"])
     ms = med / 1e3
-    log(f"2-step served pair mix (56 calls): median {ms:.4f} ms p10 {p10/1e3:.4f} p90 {p90/1e3:.4f}")
+    log(f"2-step served pair mix ({len(seq)} calls): median {ms:.4f} ms p10 {p10/1e3:.4f} "
+        f"p90 {p90/1e3:.4f}")
     print(json.dumps({
         "batch": {"1": {"kernel_ms": ms, "noise_floor": (p90 - p10) / med}},
         "unit": "one CUDA graph replay = 2 denoise steps of NVFP4 tail pairs "
-                "(2 x (24 @M4176 + 4 @M4096) calls of trtllm::flux3_sm120_nvfp4_out_pair, "
+                f"(2 x ({n_single} @M4176 + 4 @M4096) calls of trtllm::flux3_sm120_nvfp4_out_pair, "
                 "incl. attn_out's activation quantize); 4 distinct weight sets per M",
         "per_step_ms": ms / 2,
         "samples": len(res["pair"]),
