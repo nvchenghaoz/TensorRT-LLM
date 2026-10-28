@@ -10,9 +10,11 @@ modes:
            module within the same tolerance, per-shape compiled module timing.
   decoder  full decoder, fp32 and bf16: candidate compiled decoder vs the original
            Upsample (same tree, instance-patched forward) compiled decoder, both vs
-           an fp64 eager decode with the original Upsample. Tolerance: u8 max diff
-           <= 2 vs original same dtype; candidate mean_abs vs fp64 <= 1.25x the
-           original's (+1e-6). One Dynamo frame, no graph breaks, no recompiles across
+           an fp64 eager decode with the original Upsample. bf16 = served trunk
+           (set_vae_decoder_trunk_dtype). Tolerance (rulings #461/#468): fp32 new vs
+           orig u8 max <= 2 and max_abs <= 1e-2; bf16 vs R = orig fp32 compiled:
+           mean_abs <= 1.05x orig-bf16's, PSNR >= orig-bf16's - 0.3 dB, u8 max <=
+           orig-bf16's + 2. One Dynamo frame, no graph breaks, no recompiles across
            warmup + repeated decodes + 2 consecutive "requests" (seed 1 then seed 0
            again, bitwise == first seed-0 output); state_dict keys unchanged.
   census   torch.profiler kernel census of one warm compiled decode, original vs
@@ -59,9 +61,14 @@ def make_orig(vae):
     return vae
 
 
-def build(dtype=None, original=False):
+def build(dtype=None, original=False, trunk=False):
     vae, _ = gn_check.build_vae(ROOT)
-    if dtype is not None:
+    if dtype is not None and trunk:
+        # served path (main b7acb690+): bf16 trunk, conv_out and pixels stay fp32
+        from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import set_vae_decoder_trunk_dtype
+
+        set_vae_decoder_trunk_dtype(vae.decoder, dtype)
+    elif dtype is not None:
         vae = vae.to(dtype)
     if original:
         make_orig(vae)
@@ -167,6 +174,11 @@ def ref64(seed):
     return out
 
 
+def psnr(a, b):
+    mse = ((a.double().clamp(-1, 1) - b.double().clamp(-1, 1)) ** 2).mean().item()
+    return float("inf") if mse == 0 else 10 * torch.log10(torch.tensor(4.0 / mse)).item()
+
+
 def stat(a, b):
     d = (a.double() - b.double()).abs()
     du = (gn_check.to_u8(a.float()).int() - gn_check.to_u8(b.float()).int()).abs()
@@ -182,14 +194,15 @@ def decoder():
     r64 = ref64(0)
     log("fp64 reference done")
     res, ok_all = {}, True
+    R = None  # original-Upsample compiled fp32 decode (= main's fp32), gate #461 reference
     for dtype in (torch.float32, torch.bfloat16):
         outs = {}
         for arm in ("orig", "new"):
             torch._dynamo.reset()
-            vae = build(dtype, original=(arm == "orig"))
+            vae = build(dtype, original=(arm == "orig"), trunk=(dtype != torch.float32))
             keys_ok = sorted(vae.state_dict()) == keys_ref
             vae.compile_decoder()
-            z0, z1 = latent(0, dtype), latent(1, dtype)
+            z0, z1 = latent(0, torch.float32), latent(1, torch.float32)
             zc = z0.clone()
             c0 = counters()
             first = vae.decode(z0).clone()
@@ -220,8 +233,16 @@ def decoder():
         n, o = res[f"new_{tag}"], res[f"orig_{tag}"]
         gb = sum(n["counters_after_warmup"].get("graph_break", {}).values()) - \
             sum(n["counters_before"].get("graph_break", {}).values())
-        ok = (d["u8_max_diff"] <= 2 and n["vs_fp64"]["mean_abs"] <= 1.25 * o["vs_fp64"]["mean_abs"] + 1e-6
-              and n["repeat_bitwise"] and n["second_request_bitwise"] and n["inputs_unchanged"]
+        if dtype == torch.float32:
+            R = outs["orig"]
+            num_ok = d["u8_max_diff"] <= 2 and d["max_abs"] <= 1e-2  # gate (A)
+        else:  # gate #461 (B) vs R = original fp32 compiled decode
+            cR, mR = stat(outs["new"], R), stat(outs["orig"], R)
+            cR["psnr_db"], mR["psnr_db"] = psnr(outs["new"], R), psnr(outs["orig"], R)
+            res["B_cand_bf16_vs_R"], res["B_main_bf16_vs_R"] = cR, mR
+            num_ok = (cR["mean_abs"] <= 1.05 * mR["mean_abs"] and cR["psnr_db"] >= mR["psnr_db"] - 0.3
+                      and cR["u8_max_diff"] <= mR["u8_max_diff"] + 2)
+        ok = (num_ok and n["repeat_bitwise"] and n["second_request_bitwise"] and n["inputs_unchanged"]
               and n["no_new_frames_after_warmup"] and n["state_dict_keys_unchanged"] and gb == 0)
         res[f"ok_{tag}"] = bool(ok)
         res[f"graph_breaks_new_{tag}"] = gb

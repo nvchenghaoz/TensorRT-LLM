@@ -45,6 +45,10 @@ p.add_argument("--save", default=None)
 p.add_argument("--ref", default=None)
 # BF16/FP16 decoder trunk (pipeline_config.vae_decode_dtype); applied before compile.
 p.add_argument("--decode-dtype", default=None)
+# Default off. With --decode-dtype in time mode: save this arm's per-seed (0-2) outputs,
+# fp32_s{seed}.pt (this tree's compiled fp32 decoder) and dec_s{seed}.pt (the
+# --decode-dtype decoder), for a cross-arm comparison step (gate #461/#468).
+p.add_argument("--save-seeds", default=None)
 args = p.parse_args()
 WARMUP, ITERS = args.warmup, args.iters
 TOL_ABS, TOL_U8 = 1e-2, 2
@@ -188,6 +192,10 @@ if args.mode == "time":
                 z = torch.randn(1, 128, 64, 64, device="cuda", generator=g).to(DTYPE)
                 r = ref_vae.decode(z)
                 o = vae.decode(z)
+                if args.save_seeds:
+                    os.makedirs(args.save_seeds, exist_ok=True)
+                    torch.save(r.float().cpu(), os.path.join(args.save_seeds, f"fp32_s{s}.pt"))
+                    torch.save(o.float().cpu(), os.path.join(args.save_seeds, f"dec_s{s}.pt"))
                 acc.append({"seed": s, "psnr_db": psnr(o, r), **diff(o, r)})
                 log(json.dumps(acc[-1]))
         res["output"]["error_vs_fp32_compiled"] = {
