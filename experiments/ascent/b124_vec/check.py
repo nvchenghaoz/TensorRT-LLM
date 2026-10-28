@@ -198,18 +198,32 @@ def tune():
         cs = torch.cat([th.cos(), th.sin()], -1).float().contiguous()
         pos = torch.arange(M, device="cuda", dtype=torch.int64)
         sets[M] = (planes[0], planes[1], planes[2], qn, kn, cs, pos)
-    configs = [("l58", False, 0, 0), ("vec", True, 0, 0)]
+    parts = {M: torch.rand(3, 564, device="cuda") * 4 for M in sets}
+    configs = [("l58", False, 0, 0, "full"), ("vec", True, 0, 0, "full"),
+               ("l58_m2", False, 0, 0, "m2"), ("vec_m2", True, 0, 0, "m2"),
+               ("cast_floor_m2", None, 0, 0, "cast"), ("amax_floor_m1", None, 0, 0, "amax")]
     for spec in (sys.argv[2:] if len(sys.argv) > 2 else []):
         g1, g2 = (int(x) for x in spec.split(","))
-        configs.append((f"vec_{g1}_{g2}", True, g1, g2))
-    configs.append(("l58b", False, 0, 0))
+        configs.append((f"vec_{g1}_{g2}", True, g1, g2, "full"))
+        configs.append((f"vec_m2_{g2}", True, g1, g2, "m2"))
+    configs.append(("l58b", False, 0, 0, "full"))
     graphs = {}
-    for name, vec, g1, g2 in configs:
-        qr8.VEC, qr8.FOLD, qr8._FOLD_GRID1, qr8._FOLD_GRID2 = vec, True, g1, g2
+    for name, vec, g1, g2, kind in configs:
+        qr8.VEC, qr8.FOLD, qr8._FOLD_GRID1, qr8._FOLD_GRID2 = bool(vec), True, g1, g2
 
-        def body():
+        def body(kind=kind):
             for M in [4176] * 28 + [4096] * 4:
-                qr8.qknorm_rope_fp8(*sets[M], SM_SCALE)
+                q, k, v = sets[M][:3]
+                if kind == "full":
+                    qr8.qknorm_rope_fp8(*sets[M], SM_SCALE)
+                elif kind == "m2":
+                    qr8.qknorm_rope_fp8(*sets[M], SM_SCALE, external_partials=parts[M])
+                elif kind == "cast":  # same bytes as mode 2: read 3 BF16 planes, write E4M3
+                    for t in (q, k, v):
+                        t.to(torch.float8_e4m3fn)
+                else:  # same bytes as mode 1: read 3 BF16 planes
+                    for t in (q, k, v):
+                        torch.amax(t)
 
         body()
         torch.cuda.synchronize()
