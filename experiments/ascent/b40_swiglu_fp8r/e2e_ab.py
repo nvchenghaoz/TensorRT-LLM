@@ -131,6 +131,49 @@ def chains(ks):
     return out
 
 
+def windows(ks, before=2, after=4):
+    """Kernel windows around the FP8R MLP middle (image tokens: grid M >= 4096)."""
+    out = []
+    for i, (name, _, grid) in enumerate(ks):
+        big = "silu_and_mul_kernel" in name and grid.startswith("[") and int(grid[1:].split(",")[0]) >= 4096
+        if big or "_swiglu_fp8r" in name:
+            m = int(grid[1:].split(",")[0])
+            out.append({"M": m, "rows": [{"rel": j - i, "name": ks[j][0][:110], "us": round(ks[j][1], 1),
+                                          "grid": ks[j][2]}
+                                         for j in range(max(0, i - before), min(len(ks), i + after + 1))]})
+    return out
+
+
+def run_profile(ckpt, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    r = Runner(ckpt)
+    res = {}
+    for flag in (False, True):
+        tag = "on" if flag else "off"
+        set_flag(flag)
+        log(PHASE + f"warm_{tag}")
+        r.gen(PROMPT_A)
+        r.gen(PROMPT_A)
+        log(PHASE + f"profile_{tag}")
+        ks = kernel_trace(r, os.path.join(outdir, f"trace_{tag}.json"), PROMPT_A)
+        with open(os.path.join(outdir, f"kernels_{tag}.tsv"), "w") as f:
+            for k in ks:
+                f.write(f"{k[1]:.2f}\t{k[2]}\t{k[0]}\n")
+        w = windows(ks)
+        first = {}
+        for c in w:
+            first.setdefault(c["M"], c)
+        res[tag] = {"fp8r_mlp_calls_per_request": len(w),
+                    "by_M": {str(m): sum(1 for c in w if c["M"] == m) for m in sorted({c["M"] for c in w})},
+                    "first_image0_M4096": first.get(4096), "first_single24_M4176": first.get(4176)}
+        for key in ("first_image0_M4096", "first_single24_M4176"):
+            c = res[tag][key]
+            if c:
+                for row in c["rows"]:
+                    log(f"[step0_{tag}] {key} {row['rel']:+d} {row['us']:8.1f} us {row['grid']:>14s} {row['name']}")
+    log("RESULT " + json.dumps(res))
+
+
 def run_ab(ckpt, outdir):
     import torch
 
@@ -274,6 +317,8 @@ def wrapper(argv):
         result["compared_against"] = ("switch-off path (main's silu_and_mul -> warp_fp8_per_token_quant) "
                                       "in the same process, requests A(T=80), B(T=160), A; images + final latent")
         result["output"] = {"class": "exact"}
+    elif argv[0] == "profile":
+        result["passed"] = True
     else:
         timed = [p for p in counts if p.startswith("timed")]
         result["recompiles_in_timed"] = sum(counts[p] for p in timed)
@@ -288,6 +333,8 @@ def main():
         argv = sys.argv[2:]
         if argv[0] == "ab":
             run_ab(argv[1], argv[2])
+        elif argv[0] == "profile":
+            run_profile(argv[1], argv[2])
         else:
             run_fixed(argv[1], argv[2], argv[3])
         return
