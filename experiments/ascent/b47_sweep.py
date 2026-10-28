@@ -80,11 +80,11 @@ def load_images(dump):
 
 
 def layouts(g):
-    return {
-        "real": g,
-        "chfirst": g.permute(0, 3, 1, 2).contiguous().permute(0, 2, 3, 1),
-        "nhwc": g.contiguous(),
-    }
+    if g.dim() == 3:  # (H, W, C)
+        chfirst = g.permute(2, 0, 1).contiguous().permute(1, 2, 0)
+    else:  # (B, H, W, C)
+        chfirst = g.permute(0, 3, 1, 2).contiguous().permute(0, 2, 3, 1)
+    return {"real": g, "chfirst": chfirst, "nhwc": g.contiguous()}
 
 
 def decode(png):
