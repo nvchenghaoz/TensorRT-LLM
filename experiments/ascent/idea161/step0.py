@@ -161,14 +161,21 @@ def block_front_bf16(c, arm):
     return c["residual"] + (attn_y + mlp_y), attn, packed, sf
 
 
+_CAPTURE_STREAM = []
+
+
 def capture(fn):
     for _ in range(2):
         fn()
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    # thread_local: a CUDA call from another thread (JIT/compile helpers) must not invalidate the
-    # capture (job 1318: global mode failed inside qknorm_rope_fp8 on the 10-block graph).
-    with torch.cuda.graph(g, capture_error_mode="thread_local"):
+    # One capture stream for every graph: torch.cuda.graph() otherwise takes a fresh stream from
+    # PyTorch's 32-per-priority pool per capture, and after enough captures it aliases a side
+    # stream already in use (pitfall 726); jobs 1318/1330 failed with capture invalidated on the
+    # direct path's many-graph table while every single capture passed (job 1341).
+    if not _CAPTURE_STREAM:
+        _CAPTURE_STREAM.append(torch.cuda.Stream())
+    with torch.cuda.graph(g, stream=_CAPTURE_STREAM[0], capture_error_mode="thread_local"):
         out = fn()
     torch.cuda.synchronize()
     return g, out
@@ -339,10 +346,49 @@ def check(arms):
     }))
 
 
+def capone(arm, k, warm):
+    """Capture probe: one graph of k block fronts of `arm` at S=4176 after `warm` eager calls."""
+    c = make_case(4176, 1)
+    for _ in range(warm):
+        block_front(c, arm)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(g, capture_error_mode="thread_local"):
+            [block_front(c, arm)[0] for _ in range(k)]
+        torch.cuda.synchronize()
+        g.replay()
+        torch.cuda.synchronize()
+        print(json.dumps({"arm": arm, "k": k, "warm": warm, "ok": True}), flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(json.dumps({"arm": arm, "k": k, "warm": warm, "ok": False,
+                          "err": f"{type(e).__name__}: {str(e)[:200]}"}), flush=True)
+
+
+def capdbg():
+    import subprocess
+
+    res = []
+    for arm, k, warm in (("off", 1, 2), ("off", 2, 2), ("off", 10, 2), ("m3", 1, 2),
+                         ("m3", 10, 2), ("off", 2, 0), ("off", 1, 0)):
+        p = subprocess.run([sys.executable, __file__, "capone", arm, str(k), str(warm)],
+                           capture_output=True, text=True)
+        line = [x for x in p.stdout.splitlines() if x.startswith("{")]
+        res.append(json.loads(line[-1]) if line else {"arm": arm, "k": k, "warm": warm,
+                                                      "ok": None, "rc": p.returncode,
+                                                      "tail": p.stderr[-600:]})
+        log(json.dumps(res[-1]))
+    print(json.dumps({"capdbg": res}))
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     cmd = sys.argv[1]
-    if cmd == "table":
+    if cmd == "capone":
+        capone(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+    elif cmd == "capdbg":
+        capdbg()
+    elif cmd == "table":
         table(sys.argv[2].split(",") if len(sys.argv) > 2 else ["off", "m1", "m2", "m3"])
     elif cmd == "pair":
         pair(sys.argv[2])
