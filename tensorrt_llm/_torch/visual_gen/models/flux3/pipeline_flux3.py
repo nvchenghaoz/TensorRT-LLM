@@ -249,6 +249,11 @@ class Flux3Pipeline(BasePipeline):
                 self._run_flux3_warmup(height, width, num_frames, steps)
 
     def _run_flux3_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        # Compile (and graph-capture) every text bucket k * pad_multiple up front, so
+        # no request compiles or captures the text encoder; idempotent across passes.
+        if self.text_encoder is not None and hasattr(self.text_encoder, "warmup_buckets"):
+            with self.offloader.context_if_requested("text_encoder"):
+                self.text_encoder.warmup_buckets()
         ctx = self._encode_prompt("warmup", "")
         for mode in self.pipeline_config.compilation.modes or ["t2i", "i2i"]:
             kwargs = dict(ctx=ctx, height=height, width=width, num_inference_steps=steps)
@@ -321,11 +326,8 @@ class Flux3Pipeline(BasePipeline):
         skip_components = skip_components or []
         if "text_encoder" not in skip_components:
             config = package.config["text_encoder"]
-            encoder_device = (
-                torch.device("cpu")
-                if "text_encoder" in self.offloader.requested_components()
-                else device
-            )
+            offloaded = "text_encoder" in self.offloader.requested_components()
+            encoder_device = torch.device("cpu") if offloaded else device
             self.text_encoder = (
                 Qwen3VLEmbedder(
                     str(package.asset(config["path"])),
@@ -335,6 +337,8 @@ class Flux3Pipeline(BasePipeline):
                         pad_multiple=config["pad_multiple"],
                         torch_dtype=config["dtype"],
                         use_compile=self.pipeline_config.torch_compile.enable,
+                        # Graphs bake in device weight pointers; offload moves them.
+                        use_cuda_graph=not offloaded,
                     ),
                     tokenizer_spec=str(package.asset(config["tokenizer"])),
                 )
