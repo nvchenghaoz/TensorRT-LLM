@@ -222,8 +222,12 @@ def mode_check(args):
     import flashinfer.prefill as fp
     stock = build("stock", fp.get_trtllm_fmha_v2_sm120_module)
     msrq = build("ms_rq", lambda: lib.get_flux3_d128_module(lib.DEFAULT_LEVERS))
-    routed_name = lib.flux3_d128_kernel_name(lib.ROUTED_LEVERS)
-    msrq_name = lib.flux3_d128_kernel_name(lib.DEFAULT_LEVERS)
+    # Match by the module's symbol prefix: profiler names are "<prefix>..._kernel_nl_tiled",
+    # the launcher names "<prefix>..._nl_tiled". Main's ms_rq module renames only the padding
+    # kernel; its causal kernel keeps the stock symbol, so causal is judged by "not routed"
+    # plus bitwise equality with the direct ms_rq module.
+    routed_name = "fmha_v2_flux3_" + lib._tag(lib.ROUTED_LEVERS, 0) + "_"
+    msrq_name = "fmha_v2_flux3_" + lib._tag(lib.DEFAULT_LEVERS, 0) + "_"
     failures, report = [], {}
     # 1) Route check through the helper.
     inp = make_inputs(4176, "randn", 5)
@@ -236,8 +240,8 @@ def mode_check(args):
     log("route:", json.dumps(report["route"]))
     if not any(routed_name in n for n in names_nc):
         failures.append("non-causal no-LSE did not launch rqms_b2")
-    if not any(msrq_name in n for n in names_c) or any(routed_name in n for n in names_c):
-        failures.append("causal not on ms_rq")
+    if not names_c or any(routed_name in n for n in names_c):
+        failures.append("causal routed to rqms_b2")
     if not any(msrq_name in n for n in names_l) or any(routed_name in n for n in names_l):
         failures.append("LSE not on ms_rq")
     # causal / LSE outputs bitwise vs direct ms_rq; ms_rq bitwise vs stock (non-causal).
