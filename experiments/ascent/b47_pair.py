@@ -33,25 +33,37 @@ def step(g):
 
 for _, _, _, g, _ in timed:
     step(g)
-ts, sizes = [], []
+per = [[] for _ in timed]  # per image: repeated timings of ONE configuration
+sizes = []
 for it in range(60):
-    for _, _, _, g, _ in timed:
+    for i, (_, _, _, g, _) in enumerate(timed):
         torch.cuda.synchronize()
         t = time.perf_counter()
         b = step(g)
-        ts.append((time.perf_counter() - t) * 1e3)
+        per[i].append((time.perf_counter() - t) * 1e3)
         if it == 0:
             sizes.append(len(b))
     if it % 10 == 0:
-        log(f"round {it}: last {ts[-1]:.2f} ms")
+        log(f"round {it}: last {per[-1][-1]:.2f} ms")
+
+
+def q(v, f):
+    s = sorted(v)
+    return s[min(len(s) - 1, int(f * len(s)))]
+
+
 ok = all(np.array_equal(np.asarray(Image.open(io.BytesIO(base64.b64decode(step(g))))),
-                        src[0].numpy()) for _, _, src, g, _ in timed)
-s = sorted(ts)
-n = len(s)
-med, p10, p90 = s[n // 2], s[n // 10], s[(9 * n) // 10]
-print(json.dumps({"median": round(med, 3), "p10": round(p10, 3), "p90": round(p90, 3),
-                  "mean": round(float(np.mean(ts)), 3), "b64_mb_mean": round(float(np.mean(sizes)) / 1e6, 4),
+                        (src[0] if src.dim() == 4 else src).numpy()) for _, _, src, g, _ in timed)
+img_med = [q(v, 0.5) for v in per]
+img_noise = [(q(v, 0.9) - q(v, 0.1)) / q(v, 0.5) for v in per]
+# step = mean over the 12 workload images of each image's median encode+b64 time
+step_ms = float(np.mean(img_med))
+noise = float(np.median(img_noise))
+allts = [x for v in per for x in v]
+print(json.dumps({"per_image_median_ms": [round(x, 3) for x in img_med],
+                  "per_image_noise": [round(x, 4) for x in img_noise],
+                  "pooled_median": round(q(allts, 0.5), 3), "pooled_p90": round(q(allts, 0.9), 3),
                   "png_mb_mean": round(float(np.mean(sizes)) * 0.75 / 1e6, 4),
                   "decoded_equal_source": ok}), flush=True)
-print(json.dumps({"batch": {"1": {"step_ms": round(med, 3), "noise_floor": round((p90 - p10) / med, 4)}},
-                  "output": {"class": "exact"}}))
+print(json.dumps({"batch": {"1": {"step_ms": round(step_ms, 3), "noise_floor": round(noise, 4)}},
+                  "output": {"class": "exact"}, "decoded_equal_source": ok}))
