@@ -77,12 +77,36 @@ class Flux3ImageAttnBlock(nn.Module):
         v = self.v(h_)
 
         b, c, h, w = q.shape
+        if q.is_cuda:
+            return self._attention_tc(q, k, v)
         q = rearrange(q, "b c h w -> b 1 (h w) c")
         k = rearrange(k, "b c h w -> b 1 (h w) c")
         v = rearrange(v, "b c h w -> b 1 (h w) c")
         h_ = nn.functional.scaled_dot_product_attention(q, k, v)
 
         return rearrange(h_, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
+
+    @staticmethod
+    def _attention_tc(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Single-head attention over h*w tokens on bf16 tensor cores.
+
+        SDPA on the rearranged (non-contiguous, d=512) q/k/v takes the MATH path,
+        an fp32 SIMT sgemm plus a 16384^2 fp32 softmax (8.6 ms at 1024^2). Here:
+        S = q^T k as a bf16 GEMM with fp32 output (scores are never rounded to bf16),
+        fp32 softmax with the d^-0.5 scale, P rounded to bf16, O = v P^T as a bf16
+        GEMM with fp32 accumulation, written directly in the b c (h w) layout.
+        q/k/v are rounded to bf16 (a no-op on the bf16 trunk); the output keeps the
+        input dtype.
+        """
+        b, c, h, w = q.shape
+        dt = q.dtype
+        q = q.reshape(b, c, h * w).to(torch.bfloat16)
+        k = k.reshape(b, c, h * w).to(torch.bfloat16)
+        v = v.reshape(b, c, h * w).to(torch.bfloat16)
+        s = torch.bmm(q.transpose(1, 2), k, out_dtype=torch.float32)
+        p = torch.softmax(s * (c**-0.5), dim=-1).to(torch.bfloat16)
+        o = torch.bmm(v, p.transpose(1, 2))
+        return o.reshape(b, c, h, w).to(dt)
 
     def forward(self, x: Tensor) -> Tensor:
         return x + self.proj_out(self.attention(x))
