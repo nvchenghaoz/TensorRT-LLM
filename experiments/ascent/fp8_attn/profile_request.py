@@ -26,8 +26,11 @@ def inner(ckpt):
 
     r = Runner(ckpt)
     log(PHASE + "warm")
-    for _ in range(2):
-        log(f"[warm] denoise {r.gen(PROMPT_A)[2]:.1f} ms")
+    # The served benchmark's untimed test request + server warmup see more than one text
+    # length before timing; warm both prompt lengths so the dynamic-shape recompile any
+    # tree does on its 2nd distinct text length lands here, not in the timed phase.
+    for p in (PROMPT_A, PROMPT_B, PROMPT_A, PROMPT_B):
+        log(f"[warm] denoise {r.gen(p)[2]:.1f} ms")
     log(PHASE + "timed")
     a1, b, a2 = r.gen(PROMPT_A), r.gen(PROMPT_B), r.gen(PROMPT_A)
     rep_ok = bool(torch.equal(a1[0], a2[0]) and torch.equal(a1[1], a2[1]))
