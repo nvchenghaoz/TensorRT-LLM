@@ -201,7 +201,13 @@ def table(arms):
         f"{fp._sm120_tail_pair_stream(torch.cuda.current_device()).priority}; "
         f"priority range {torch.cuda.Stream.priority_range() if hasattr(torch.cuda.Stream, 'priority_range') else 'n/a'}")
     res = {}
+    # IDEA161_S=4176 or 4096 runs one shape per process (job 1373: capturing the S4096 graphs
+    # after eight S4176 graphs in one process hit cudaErrorStreamCaptureInvalidated inside
+    # qknorm_rope_fp8, while every capture sequence of one shape passed).
+    only = os.environ.get("IDEA161_S")
     for S, seed in ((4176, 1), (4096, 2)):
+        if only and int(only) != S:
+            continue
         c = make_case(S, seed)
         graphs = {}
         for arm in arms:
@@ -242,10 +248,17 @@ def table(arms):
         del graphs
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-    weighted = {
-        arm: round((24 * res[4176][arm]["delta_vs_off"] + 4 * res[4096][arm]["delta_vs_off"]) / 28, 2)
-        for arm in arms
-    }
+    # Per-step NVFP4 mix after landing 56: 28 x S4176 (single) + 4 x S4096 (image.1-4).
+    weighted = (
+        {
+            arm: round(
+                (28 * res[4176][arm]["delta_vs_off"] + 4 * res[4096][arm]["delta_vs_off"]) / 32, 2
+            )
+            for arm in arms
+        }
+        if 4176 in res and 4096 in res
+        else None
+    )
     print(json.dumps({"table": {str(k): v for k, v in res.items()}, "weighted_delta_us_per_block":
                       weighted, "rounds": ROUNDS, "blocks_per_graph": K_BLOCKS,
                       "counters": fp.SIDE_GATE_UP_COUNTERS if hasattr(fp, "SIDE_GATE_UP_COUNTERS")
@@ -253,7 +266,7 @@ def table(arms):
 
 
 def pair(arm):
-    cases = [(make_case(4176, 1), 24), (make_case(4096, 2), 4)]
+    cases = [(make_case(4176, 1), 28), (make_case(4096, 2), 4)]
     pristine = [[t.clone() for t in inputs(c)] for c, _ in cases]
 
     def step():
@@ -288,7 +301,7 @@ def pair(arm):
     log(f"step block fronts: {med:.4f} ms noise {noise:.4f}")
     print(json.dumps({
         "batch": {"1": {"kernel_ms": med, "noise_floor": noise}},
-        "unit": "one graph replay = 24 x S4176 + 4 x S4096 NVFP4 block fronts (QKV op, "
+        "unit": "one graph replay = 28 x S4176 + 4 x S4096 NVFP4 block fronts (QKV op, "
                 "attention, gate_up, down||attn_out pair, residual add)",
         "arm": arm, "samples": PAIR_SAMPLES, "replays_per_sample": PAIR_REPLAYS,
         "soak_s": PAIR_SOAK_S, "output": {"class": "exact"},
