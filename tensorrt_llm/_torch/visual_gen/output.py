@@ -20,12 +20,123 @@ without adding host syncs in the hot path; the implicit sync from
 occurs when the response is consumed.
 """
 
+import hashlib
+import json
+import os
+import time
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+
+# Diagnostic only (off by default): per-request perf_counter stamps of the CUDA IPC
+# media handoff, appended as JSON lines to TRTLLM_VISUALGEN_IPC_STAMPS_FILE.
+_IPC_STAMPS = os.environ.get("TRTLLM_VISUALGEN_IPC_STAMPS") == "1"
+
+
+def _ipc_stamp_write(rec: Dict[str, Any]) -> None:
+    path = os.environ.get(
+        "TRTLLM_VISUALGEN_IPC_STAMPS_FILE", "/tmp/trtllm_visualgen_ipc_stamps.jsonl"
+    )
+    rec["pid"] = os.getpid()
+    rec["t"] = time.time()
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def _ipc_handle_hash(v: Dict[str, Any]) -> Optional[str]:
+    h = v.get("storage_handle")
+    return hashlib.sha1(h.encode()).hexdigest()[:12] if isinstance(h, str) else None
+
+
+def _to_tensor_stamped(name: str, v: Dict[str, Any]) -> torch.Tensor:
+    """Same result as ``from_dict(v).get_local_view().clone()``, split into stamped stages.
+
+    Mirrors torch.multiprocessing.reductions.rebuild_cuda_tensor: open the IPC memory
+    handle (+ ref counter), wait on the producer's IPC event on the current stream,
+    build the view, clone, then drop the view (deleter: close mapping, stream sync,
+    producer ref-counter decrement).
+    """
+    from torch.multiprocessing.reductions import storage_from_cache
+
+    from tensorrt_llm._torch.shared_tensor.shared_tensor import (
+        _SharedTensorRebuildMethodRegistry,
+    )
+
+    t0 = time.perf_counter()
+    c = SharedTensorContainer.from_dict(v)
+    t1 = time.perf_counter()
+    rec: Dict[str, Any] = {"side": "consumer", "field": name, "method_key": c.method_key}
+    if c.method_key != _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
+        out = c.get_local_view().clone()
+        rec.update(from_dict_ms=(t1 - t0) * 1e3, total_ms=(time.perf_counter() - t0) * 1e3)
+        _ipc_stamp_write(rec)
+        return out
+    (
+        _tcls,
+        size,
+        stride,
+        toff,
+        storage_cls,
+        dtype,
+        dev,
+        s_handle,
+        s_size,
+        s_off,
+        _rg,
+        rc_handle,
+        rc_off,
+        ev_handle,
+        ev_sync,
+    ) = c.tensor_handle
+    cache_hit = storage_from_cache(storage_cls, (s_handle, s_off)) is not None
+    torch.cuda._lazy_init()
+    t2 = time.perf_counter()
+    storage = torch.UntypedStorage._new_shared_cuda(
+        dev, s_handle, s_size, s_off, rc_handle, rc_off, ev_handle, False
+    )
+    t3 = time.perf_counter()
+    if ev_sync:
+        ev = torch.cuda.Event.from_ipc_handle(dev, ev_handle)
+        torch.cuda.current_stream(dev).wait_event(ev)
+        del ev
+    t4 = time.perf_counter()
+    view = torch._utils._rebuild_tensor(
+        torch.storage.TypedStorage(wrap_storage=storage, dtype=dtype, _internal=True),
+        toff,
+        size,
+        stride,
+    )
+    t5 = time.perf_counter()
+    out = view.clone()
+    t6 = time.perf_counter()
+    del view, storage
+    t7 = time.perf_counter()
+    rec.update(
+        handle=_ipc_handle_hash(v),
+        seg_bytes=s_size,
+        seg_off=s_off,
+        shape=list(size),
+        stride=list(stride),
+        event_sync=bool(ev_sync),
+        torch_cache_hit=cache_hit,
+        from_dict_ms=(t1 - t0) * 1e3,
+        lookup_ms=(t2 - t1) * 1e3,
+        ipc_open_ms=(t3 - t2) * 1e3,
+        event_ms=(t4 - t3) * 1e3,
+        view_ms=(t5 - t4) * 1e3,
+        clone_ms=(t6 - t5) * 1e3,
+        release_ms=(t7 - t6) * 1e3,
+        total_ms=(t7 - t0) * 1e3,
+    )
+    _ipc_stamp_write(rec)
+    return out
+
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.executor import DiffusionResponse
@@ -93,9 +204,19 @@ class PipelineOutput:
         for f in fields(self):
             t = getattr(self, f.name)
             if isinstance(t, torch.Tensor):
-                setattr(
-                    self, f.name, SharedTensorContainer.from_tensor(t, local=local).dump_to_dict()
-                )
+                t0 = time.perf_counter() if _IPC_STAMPS else 0.0
+                d = SharedTensorContainer.from_tensor(t, local=local).dump_to_dict()
+                setattr(self, f.name, d)
+                if _IPC_STAMPS:
+                    rec = {"side": "producer", "field": f.name, "local": local,
+                           "to_handle_ms": (time.perf_counter() - t0) * 1e3,
+                           "handle": _ipc_handle_hash(d), "seg_bytes": d.get("storage_size_bytes"),
+                           "seg_off": d.get("storage_offset_bytes"), "shape": list(t.shape),
+                           "stride": list(t.stride())}
+                    if t.is_cuda:
+                        rec["mem_alloc"] = torch.cuda.memory_allocated(t.device)
+                        rec["mem_reserved"] = torch.cuda.memory_reserved(t.device)
+                    _ipc_stamp_write(rec)
 
     def to_tensor(self) -> None:
         """Rebuild media tensors from handle dicts, in place. ``clone()`` so the client
@@ -104,6 +225,9 @@ class PipelineOutput:
         for f in fields(self):
             v = getattr(self, f.name)
             if isinstance(v, dict) and "method_key" in v:
+                if _IPC_STAMPS:
+                    setattr(self, f.name, _to_tensor_stamped(f.name, v))
+                    continue
                 setattr(self, f.name, SharedTensorContainer.from_dict(v).get_local_view().clone())
 
 
