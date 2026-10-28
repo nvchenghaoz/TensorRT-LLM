@@ -82,6 +82,9 @@ def prequant(c):
         c["a_x"], c["qkv"].weight, c["sf_x"], c["qkv"].scale, c["q_norm"], c["k_norm"],
         c["cos_sin"], c["qkv"].qkv_scale, c["x"], c["qkv"].weight, 1.0 / math.sqrt(D),
     )
+    up = c["up"]
+    c["alpha"] = torch.tensor([up.input_global_scale * up.weight_global_scale], device="cuda",
+                              dtype=torch.float32)
     torch.cuda.synchronize()
     c["qkv8"], c["scales"] = qkv8, scales
     return c
@@ -106,9 +109,8 @@ def sequential(c):
 
 def gate_up_only(c):
     up, down = c["up"], c["down"]
-    alpha = c.setdefault("alpha", torch.tensor([up.input_global_scale * up.weight_global_scale],
-                                               device="cuda", dtype=torch.float32))
-    return swc.swiglu_packed(c["a_x"], up.weight, c["sf_x"], up.scale, alpha, down.inverse_scale)
+    return swc.swiglu_packed(c["a_x"], up.weight, c["sf_x"], up.scale, c["alpha"],
+                             down.inverse_scale)
 
 
 def table():
