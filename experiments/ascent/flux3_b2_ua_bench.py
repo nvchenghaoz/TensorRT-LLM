@@ -150,7 +150,12 @@ def capture_real(ckpt, step):
     torch.cuda.empty_cache()
     calls = st["keep"]
     for c in calls:  # scales layout used by call(): [.., .., b2, b1]
-        c["scales"] = torch.cat([c["b1"], c["b1"], c["b2"], c["b1"]]).contiguous()
+        # the request ran under inference_mode: clone into normal tensors (restorable in place)
+        with torch.inference_mode(False):
+            for n in ("q", "k", "v", "b1", "b2"):
+                c[n] = c[n].clone()
+            c["scales"] = torch.cat([c["b1"], c["b1"], c["b2"], c["b1"]]).contiguous()
+        assert not c["q"].is_inference()
     info = {"calls_per_request": st["n"], "other_calls": st["other"],
             "seq": [c["S"] for c in calls]}
     return calls, info
