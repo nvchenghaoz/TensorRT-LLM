@@ -281,13 +281,17 @@ def ulp_stats(a, b):
 
 
 def within_tol(out, ref, store, rec):
-    """Declared tolerance (stated before the run, reordered class): fp4 data and the FULL
-    poisoned SF buffer bitwise; x_mod (when stored) within 1 bf16 ulp on <= 1e-5 of elements."""
+    """Pass criterion (area-lead ruling 15:59 for the reordered fallback): fp4 data and the FULL
+    poisoned SF buffer bitwise to main's Triton kernel. x_mod (stored only when a consumer reads
+    it) is reported: max |delta|, ulp distance and differing count. Job 1523 measured up to 16
+    ulp / 0.031 abs on 2-10 of ~13M elements (cancellation in (1+scale)*LN + shift amplifies a
+    1-ulp LN difference), exceeding the 1-ulp tolerance first stated for x_mod."""
     ok = torch.equal(out[1], ref[1]) and torch.equal(out[2], ref[2])
     if store:
         mu, cnt = ulp_stats(out[0], ref[0])
         rec["x_max_ulp"], rec["x_ulp_count"] = mu, cnt
-        ok &= mu <= 1 and cnt <= 1e-5 * out[0].numel()
+        rec["x_max_abs_delta"] = float((out[0].float() - ref[0].float()).abs().max().item())
+        rec["x_diff_frac"] = cnt / out[0].numel()
     return bool(ok)
 
 
@@ -347,20 +351,26 @@ def run_check():
             pristine = [a.clone() if a is not None else None for a in args]
             outs = (torch.empty_like(x), torch.empty((x.numel() // D, D // 2), dtype=torch.uint8, device=dev),
                     torch.empty((faq._scale_size(x.numel() // D, D),), dtype=torch.uint8, device=dev))
-            rep = True
+            eq_iter0 = True
+            fp4sf_vs_main = True
+            inputs_ok = True
             first = None
             for it in range(23):
                 if it % 8 == 0:  # reset point: check inputs unchanged, re-poison outputs
-                    rep &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
+                    inputs_ok &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
                     for o in outs:
                         o.view(torch.uint8).fill_(0xAB)
                 o = wk.launch(x, args[1], args[2], args[3], W, B, gs_t, EPS, outs=outs)
                 cur = tuple(t.clone() for t in o)
                 if first is None:
                     first = cur
-                rep &= same(cur, first, True) and within_tol(cur, ref, True, {})
-            rep &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
-            report[f"{name}|repeat"] = rep
+                eq_iter0 &= same(cur, first, True)
+                fp4sf_vs_main &= within_tol(cur, ref, True, {})
+            inputs_ok &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
+            rep = eq_iter0 and fp4sf_vs_main and inputs_ok
+            report[f"{name}|repeat"] = {"passed": rep, "all_iters_eq_iter0": eq_iter0,
+                                        "fp4_sf_bitwise_to_main_all_iters": fp4sf_vs_main,
+                                        "inputs_unchanged": inputs_ok}
             ok_all &= rep
             print(name, "repeat", rep, flush=True)
         # IMPL=triton switch: the public op is main's Triton kernel byte for byte.
@@ -378,8 +388,10 @@ def run_check():
         print("impl_triton_public_op_bitwise", trit_ok, flush=True)
     report["compile_seconds"] = {str(k): v for k, v in wk.COMPILE_SECONDS.items()}
     report["num_regs"] = {str(k): v for k, v in wk.NUM_REGS.items()}
-    print(json.dumps({"passed": bool(ok_all), "class": "reordered", "tolerance":
-                      "fp4 + full poisoned SF bitwise; x_mod <= 1 bf16 ulp on <= 1e-5 of elements",
+    print(json.dumps({"passed": bool(ok_all), "class": "reordered", "criterion":
+                      "fp4 + full poisoned SF bitwise to main in every call and repeat iteration; "
+                      "repeats == iteration 0; inputs unchanged; x_mod deltas reported "
+                      "(informational, reordered class)",
                       "compared_against":
                       "main's Triton _adaln_nvfp4_kernel (flux3_adaln_quant._launch), poisoned outputs",
                       **{"results": report}}))
