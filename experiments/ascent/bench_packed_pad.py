@@ -222,7 +222,11 @@ def main():
         and torch.equal(out_inv, w_pristine[2])
     )
     ok = ok and w_ok
-    compiles_ok = compiles_by_m[4176] + compiles_by_m[4200] == 1 and _compiles[0] == warm_compiles
+    # One cute.compile per key may count >1 nested compile calls; what matters is
+    # that M=4200 (same padded_rows as 4176) triggers none and timed calls none.
+    compiles_ok = (
+        compiles_by_m[4176] > 0 and compiles_by_m[4200] == 0 and _compiles[0] == warm_compiles
+    )
     result = {
         "passed": bool(ok and compiles_ok),
         "compared": "run('packed') fp4[:M] + full output_scale vs zero-padded-activation reference and vs iteration 0, 200 iters x M=4096/4176/4200/4256; activation tail past [M,K/2] is 0xFF; digests compare across trees",
