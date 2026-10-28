@@ -8,7 +8,13 @@ from collections import Counter
 
 CKPT = sys.argv[1]
 root = "experiments/ascent-benchmark"
-print("files:", flush=True)
+# The protected benchmark dir may live outside the job's source snapshot:
+# argv[2:] are candidate roots (e.g. from `find`); the first with files wins.
+for c in [root] + sys.argv[2:]:
+    if os.path.isdir(c) and any(fs for _, _, fs in os.walk(c)):
+        root = c
+        break
+print("files under", root, ":", flush=True)
 for dp, _, fs in os.walk(root):
     for f in fs:
         p = os.path.join(dp, f)
