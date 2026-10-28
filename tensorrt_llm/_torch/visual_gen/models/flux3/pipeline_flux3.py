@@ -102,20 +102,40 @@ def _compress_time(t_ids: Tensor) -> Tensor:
     return remap[t_ids]
 
 
+def _grid_index(pos: Tensor) -> tuple[int, int, int, Tensor, bool]:
+    """Grid extents and flat scatter index of one sample's [N, 4] position ids.
+
+    Runs on the host: ``pos`` is moved to the CPU first (a no-op for the CPU ids
+    that sample_image_latents returns), so no step reads GPU memory. Returns
+    (t, h, w, flat_ids, identity); identity means flat_ids == arange(t*h*w),
+    i.e. the tokens are already in raster order.
+    """
+    pos = pos.cpu()
+    t_ids = pos[:, 0].to(torch.int64)
+    h_ids = pos[:, 1].to(torch.int64)
+    w_ids = pos[:, 2].to(torch.int64)
+
+    t_ids_c = _compress_time(t_ids)
+    t = int(torch.max(t_ids_c)) + 1
+    h = int(torch.max(h_ids)) + 1
+    w = int(torch.max(w_ids)) + 1
+
+    flat_ids = t_ids_c * w * h + h_ids * w + w_ids
+    n = t * h * w
+    identity = flat_ids.numel() == n and torch.equal(flat_ids, torch.arange(n))
+    return t, h, w, flat_ids, identity
+
+
 def scatter_ids(x: Tensor, x_ids: Tensor):
     out_list = []
     for data, pos in zip(x, x_ids):
         _, ch = data.shape
-        t_ids = pos[:, 0].to(torch.int64)
-        h_ids = pos[:, 1].to(torch.int64)
-        w_ids = pos[:, 2].to(torch.int64)
-
-        t_ids_c = _compress_time(t_ids)
-        t = int(torch.max(t_ids_c)) + 1
-        h = int(torch.max(h_ids)) + 1
-        w = int(torch.max(w_ids)) + 1
-
-        flat_ids = t_ids_c * w * h + h_ids * w + w_ids
+        t, h, w, flat_ids, _ = _grid_index(pos)
+        if data.is_cuda:
+            # Pinned staging: the H2D copy does not wait behind queued GPU work.
+            flat_ids = flat_ids.pin_memory().to(data.device, non_blocking=True)
+        else:
+            flat_ids = flat_ids.to(data.device)
         out = torch.zeros((t * h * w, ch), device=data.device, dtype=data.dtype)
         out.scatter_(0, flat_ids.unsqueeze(1).expand(-1, ch), data)
         out_list.append(out.reshape(1, t, h, w, ch).permute(0, 4, 1, 2, 3))
@@ -135,16 +155,34 @@ def sample_image_latents(
     if min(height, width) < 16 or height % 16 or width % 16:
         raise ValueError("FLUX.3 image dimensions must be positive multiples of 16")
     h, w = height // 16, width // 16
+    device = torch.device(device)
+    # Noise stays the CPU Philox stream of a seeded CPU generator (bitwise contract).
     rng = torch.Generator().manual_seed(seed)
-    x = torch.randn((h * w, 128), generator=rng).unsqueeze(0)
-    x_ids = torch.cartesian_prod(
+    x = torch.randn((h * w, 128), generator=rng)
+    # orig_ids stays on the host: _as_image_grid only needs it there, and keeping
+    # it off the device avoids reading it back after the denoise loop.
+    orig_ids = torch.cartesian_prod(
         torch.arange(1), torch.arange(h), torch.arange(w), torch.arange(1)
     ).unsqueeze(0)
-    orig_ids = x_ids.to(device)
+    if device.type == "cuda":
+        # No pageable H2D copies here: those block the host behind the queued
+        # text-encoder work and leave the GPU idle through the host prep after them.
+        # The noise goes through pinned memory (the caching host allocator keeps the
+        # block alive until the copy completes); the ids are built on the device.
+        x = x.pin_memory().to(device, non_blocking=True)
+        x_ids = torch.cartesian_prod(
+            torch.arange(1, device=device),
+            torch.arange(h, device=device),
+            torch.arange(w, device=device),
+            torch.arange(1, device=device),
+        ).unsqueeze(0)
+    else:
+        x = x.to(device)
+        x_ids = orig_ids.to(device)
     x_ids = x_ids.to(dtype=torch.float32)
     x_ids[..., 1:3] = x_ids[..., 1:3] * image_rope_scale
-    x = x.repeat(copies, 1, 1).to(device=device, dtype=dtype)
-    x_ids = x_ids.repeat(copies, 1, 1).to(device=device)
+    x = x.unsqueeze(0).repeat(copies, 1, 1).to(dtype=dtype)
+    x_ids = x_ids.repeat(copies, 1, 1)
     return x, x_ids, orig_ids
 
 
@@ -239,6 +277,18 @@ def set_vae_decoder_trunk_dtype(decoder: torch.nn.Module, dtype: torch.dtype) ->
 
 
 def _as_image_grid(tokens: Tensor, orig_ids: Tensor) -> Tensor:
+    t, h, w, _, identity = _grid_index(orig_ids[0])
+    if identity:
+        # Raster-ordered ids (every t2i/i2i latent): the scatter is the identity,
+        # so the grid is a view of a fresh contiguous fp32 copy of the tokens, with
+        # the same values and strides as the scattered buffer.
+        data = tokens[0]
+        if data.dtype == torch.float32:
+            data = data.clone(memory_format=torch.contiguous_format)
+        else:
+            data = data.to(torch.float32, memory_format=torch.contiguous_format)
+        ch = data.shape[1]
+        return data.reshape(1, t, h, w, ch).permute(0, 4, 1, 2, 3).squeeze(2)
     return scatter_ids(tokens.float(), orig_ids[:1])[0].squeeze(2)
 
 
