@@ -69,13 +69,31 @@ def qkv_schedule() -> str:
     mainloop. Each output element sees the same MMA sequence and epilogue, so it is bitwise
     equal to the Cooperative entry (and to TRT-LLM t0).
     TRTLLM_FLUX3_SM120_QKV_SCHED=cooperative restores the stock Cooperative strided entry.
+
+    'batched' (default, idea 82): the three planes as ONE launch of the same Pingpong kernel
+    with L=3 (export ``gemm_qkv3_pingpong``): weight plane p is batch p (no copy), A and its
+    scales are shared (batch stride 0), alpha[p] per batch, D planar. Each output element sees
+    the same MMA sequence and BF16(acc * alpha_p) epilogue, so it is bitwise equal to the
+    per-plane launches. 'pingpong' restores the three per-plane launches on three streams.
     """
-    sched = os.environ.get("TRTLLM_FLUX3_SM120_QKV_SCHED", "pingpong").strip().lower()
-    if sched not in ("pingpong", "cooperative"):
+    sched = os.environ.get("TRTLLM_FLUX3_SM120_QKV_SCHED", "batched").strip().lower()
+    if sched not in ("batched", "pingpong", "cooperative"):
         raise ValueError(
-            f"TRTLLM_FLUX3_SM120_QKV_SCHED must be 'pingpong' or 'cooperative', got {sched!r}"
+            "TRTLLM_FLUX3_SM120_QKV_SCHED must be 'batched', 'pingpong' or 'cooperative', "
+            f"got {sched!r}"
         )
     return sched
+
+
+def batched() -> bool:
+    """True when the per-plane-alpha QKV GEMMs run as one batched L=3 launch."""
+    return qkv_schedule() == "batched"
+
+
+# Tile scheduler of the batched launch: raster 0 = heuristic (stock), 1 = along M, 2 = along N;
+# swizzle = max_swizzle_size (stock 1). Module-level so a microbenchmark can sweep them.
+QKV3_RASTER = 0
+QKV3_SWIZZLE = 1
 
 
 @lru_cache(maxsize=1)
@@ -124,8 +142,14 @@ def preload(device: torch.device) -> None:
     """Build the module and allocate every slot's workspace at model load."""
     if not inplace_enabled():
         return
-    if qkv_schedule() == "pingpong":
-        pingpong_module()
+    if qkv_schedule() in ("pingpong", "batched"):
+        mod = pingpong_module()
+        if qkv_schedule() == "batched":
+            # DP StaticPersistent: the batched launch's workspace is tiny and M-independent in
+            # practice; check the largest M once here so a call never needs more.
+            need = int(mod.qkv3_workspace_size(1 << 16, 3072, 3072))
+            if need > _WORKSPACE_BYTES:
+                raise RuntimeError(f"batched QKV workspace {need} B exceeds {_WORKSPACE_BYTES} B")
     else:
         module()
     for slot in range(_SLOTS):
@@ -144,7 +168,7 @@ def gemm_into(
     slot: int,
 ) -> None:
     """out.flat[offset + r*ldd + c] = BF16(alpha * (A @ W^T))[r, c], on the current stream."""
-    if qkv_schedule() == "pingpong":
+    if qkv_schedule() in ("pingpong", "batched"):
         fn = pingpong_module().gemm_into_pingpong
     else:
         fn = module().fp4_gemm_strided
@@ -158,4 +182,31 @@ def gemm_into(
         int(offset),
         int(ldd),
         workspace(activation.device, slot),
+    )
+
+
+def gemm_qkv3(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Planar QKV in one launch: out.view(3, M, N)[p] = BF16(alpha[p] * (A @ W_p^T)).
+
+    weight is the [3N, K/2] NVFP4 weight (plane p = rows [pN, (p+1)N)), weight_scale its
+    swizzled scales (plane p at flat p*numel/3), alpha 3 fp32 plane scales. Current stream,
+    slot-0 workspace (the slot the per-plane path's q GEMM uses), no allocation.
+    """
+    pingpong_module().gemm_qkv3_pingpong(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        alpha,
+        out,
+        workspace(activation.device, 0),
+        int(QKV3_RASTER),
+        int(QKV3_SWIZZLE),
     )
