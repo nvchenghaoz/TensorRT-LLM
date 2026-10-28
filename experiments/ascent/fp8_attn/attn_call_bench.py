@@ -53,6 +53,11 @@ qc = torch.randn(1, 4176, N, device=dev, dtype=torch.bfloat16)
 kc = torch.randn(1, 4176, N, device=dev, dtype=torch.bfloat16)
 vbuf = torch.randn(1, 4176, 3 * N, device=dev, dtype=torch.bfloat16)
 cases["mixed_4176"] = (vbuf, (qc, kc, vbuf[..., 2 * N :]))
+# Landing 18 (planar Q/K/V): q, k, v are contiguous [M, 3072] planes of a [3, M, 3072] buffer.
+# This is the production layout of the NVFP4 blocks on main 0220e28c; it is the headline case.
+for S in (4176, 4096):
+    pbuf = torch.randn(3, 1, S, N, device=dev, dtype=torch.bfloat16) * 2
+    cases[f"planar_{S}"] = (pbuf, (pbuf[0], pbuf[1], pbuf[2]))
 pristine = {name: (c[0].clone(), [t.clone() for t in c[1]]) for name, c in cases.items()}
 
 WARMUP, REPS = 30, 200
@@ -91,7 +96,7 @@ unchanged = all(
     and all(torch.equal(a, b) for a, b in zip(cases[n][1], pristine[n][1]))
     for n in cases
 )
-main = stats["packed_4176"]
+main = stats["planar_4176"]
 print(json.dumps({
     "batch": {"1": {"kernel_ms": main["median_ms"], "noise_floor": main["noise"]}},
     "output": {"class": "reordered"},
