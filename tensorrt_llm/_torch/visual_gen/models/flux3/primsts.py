@@ -46,6 +46,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
 )
 from tensorrt_llm.logger import logger
 
+from .flux3_fp8r_qkv import _sm120_fp8r_qknorm_rope_eligible, _sm120_fp8r_qkv_forward
 from .nvfp4_metadata import register_nvfp4_owner
 
 
@@ -570,6 +571,7 @@ def prepare_sm120_fp8_excluded_block(block: nn.Module) -> bool:
     """
     attn = block.attn
     attn._flux3_sm120_fp8_qkv = None
+    attn._flux3_sm120_fp8r_qknorm_rope = False
     if block._fuse_proj_out or not _sm120_fp8_excluded_enabled():
         return False
     projections = [getattr(attn, name, None) for name in ("to_q", "to_k", "to_v")]
@@ -597,6 +599,7 @@ def prepare_sm120_fp8_excluded_block(block: nn.Module) -> bool:
             block.ff.gate_up_proj.weight, swiglu=True
         )
         block.ff.down_proj._flux3_primsts_fp8 = PreparedFP8Sm120(block.ff.down_proj.weight)
+    attn._flux3_sm120_fp8r_qknorm_rope = _sm120_fp8r_qknorm_rope_eligible(attn)
     return True
 
 
@@ -775,6 +778,8 @@ def qkv_forward(
     then is not rebuilt here."""
     adapter = getattr(attn, "_flux3_primsts_nvfp4_qkv", None)
     if adapter is None:
+        if getattr(attn, "_flux3_sm120_fp8r_qknorm_rope", False):
+            return _sm120_fp8r_qkv_forward(attn, x, original_input(x), freqs)
         if not getattr(attn, "_primsts_fp8_qkv_rope", False):
             return None
         adapter = attn.qkv_proj._flux3_primsts_fp8
