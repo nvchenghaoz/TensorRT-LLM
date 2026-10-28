@@ -44,7 +44,8 @@ def load_pipe(ckpt):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-    engine_path = os.path.join(WT, "experiments", "ascent-config", "engine.json")
+    engine_path = WT_ENGINE_OVERRIDE or os.path.join(WT, "experiments", "ascent-config",
+                                                     "engine.json")
     engine = json.load(open(engine_path)) if os.path.exists(engine_path) else {}
     pipeline_config = dict(engine.pop("pipeline_config", {}))
     pipeline_config["variant"] = "nvfp4"
@@ -96,7 +97,11 @@ class Nvml:
 
             pynvml.nvmlInit()
             self.nv = pynvml
-            self.h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            vis = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip()
+            if vis.startswith("GPU-"):
+                self.h = pynvml.nvmlDeviceGetHandleByUUID(vis)
+            else:
+                self.h = pynvml.nvmlDeviceGetHandleByIndex(int(vis or 0))
         except Exception as exc:  # noqa: BLE001
             log(f"[nvml] unavailable: {exc}")
             self.nv = None
@@ -210,6 +215,69 @@ def aba(order, warm, timed, ckpt, outdir):
     summary["passed"] = bool(summary["outputs_bitwise_across_arms"]
                              and all(summary["repeat_bitwise_each_arm"]))
     print(json.dumps(summary))
+
+
+def diag(ckpt, outdir):
+    """In-model per-call check, CUDA graphs off: every LPT pair call's outputs vs FlashInfer stock
+    tactic 18 (main) and 17 (DP) on the SAME real inputs, plus input facts (shapes, strides)."""
+    import torch
+
+    os.environ["TRTLLM_FLUX3_SM120_PAIR_KERNEL"] = "1"
+    os.makedirs(outdir, exist_ok=True)
+    engine_path = os.path.join(WT, "experiments", "ascent-config", "engine.json")
+    engine = json.load(open(engine_path))
+    engine["cuda_graph_config"] = {"enable": False}
+    tmp = os.path.join(outdir, "engine_nograph.json")
+    json.dump(engine, open(tmp, "w"))
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_primsts as fp
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_sm120_lpt_pair as lpt
+
+    stats = []
+    orig_run = lpt.run
+
+    def stock(a, w, sfa, sfw, alpha, tactic):
+        out = torch.empty((a.shape[0], w.shape[0]), device=a.device, dtype=torch.bfloat16)
+        fp._sm120_fi_fp4_module().fp4_gemm(a, w, sfa, sfw, alpha, out,
+                                           fp._sm120_fi_workspace(a.device), tactic)
+        return out
+
+    def run(da, dw, dsa, dsw, dal, dout, aa, aw, asa, asw, aal, aout, mode=None, grid_ctas=0):
+        orig_run(da, dw, dsa, dsw, dal, dout, aa, aw, asa, asw, aal, aout, mode, grid_ctas)
+        if len(stats) >= 400:
+            return
+        rec = {"M": [da.shape[0], aa.shape[0]], "K2": [da.shape[1], aa.shape[1]],
+               "act_contig": [da.is_contiguous(), aa.is_contiguous()],
+               "act_strides": [list(da.stride()), list(aa.stride())],
+               "sf_numel": [dsa.numel(), asa.numel()], "alpha": [float(dal), float(aal)]}
+        for name, (a, w, sa, sw, al, out) in {"down": (da, dw, dsa, dsw, dal, dout),
+                                              "attn": (aa, aw, asa, asw, aal, aout)}.items():
+            for t in (18, 17):
+                ref = stock(a.contiguous(), w, sa, sw, al, t)
+                rec[f"{name}_eq_t{t}"] = bool(torch.equal(ref, out))
+                if not rec[f"{name}_eq_t{t}"]:
+                    rec[f"{name}_maxabs_t{t}"] = float((ref.float() - out.float()).abs().max())
+        stats.append(rec)
+
+    lpt.run = run
+    # reuse load_pipe with the no-graph overlay
+    global WT_ENGINE_OVERRIDE
+    WT_ENGINE_OVERRIDE = tmp
+    pipe = load_pipe(ckpt)
+    gen = Gen(pipe)
+    stats.clear()
+    d, si, sl = gen()
+    bad = [s for s in stats if not all(s[k] for k in s if k.endswith(("_eq_t18", "_eq_t17")))]
+    summ = {"calls": len(stats), "mismatching_calls": len(bad),
+            "examples_bad": bad[:4], "example_ok": stats[0] if stats else None,
+            "all_down_eq_t18": all(s["down_eq_t18"] for s in stats),
+            "all_attn_eq_t18": all(s["attn_eq_t18"] for s in stats),
+            "all_down_eq_t17": all(s["down_eq_t17"] for s in stats),
+            "all_attn_eq_t17": all(s["attn_eq_t17"] for s in stats)}
+    log("[diag] " + json.dumps(summ))
+    print(json.dumps({"passed": len(bad) == 0, **summ}))
+
+
+WT_ENGINE_OVERRIDE = None
 
 
 def nsys_child(arm, ckpt):
@@ -389,6 +457,8 @@ if __name__ == "__main__":
         nsys_child(sys.argv[2], sys.argv[3])
     elif mode == "analyze":
         analyze(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif mode == "diag":
+        diag(sys.argv[2], sys.argv[3])
     elif mode == "dump":
         # dump <sqlite> <substring> <k>: rows around the k-th kernel whose name has substring
         con = sqlite3.connect(sys.argv[2])
