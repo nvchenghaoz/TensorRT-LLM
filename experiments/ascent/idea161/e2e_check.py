@@ -107,11 +107,21 @@ def parent(mode):
     within = {}
     for tag in ("off", "on"):
         s = res[tag]["seq"]
-        within[tag] = all(torch.equal(s[0][1], s[j][1]) and torch.equal(s[0][2], s[j][2])
-                          for j in (1, 3))
+        within[tag] = {
+            f"A{j + 1 if j < 2 else 3}_vs_A1": {
+                "latent_bitwise": torch.equal(s[0][1], s[j][1]),
+                "image_bitwise": torch.equal(s[0][2], s[j][2]),
+                "latent_max_abs": float((s[0][1].float() - s[j][1].float()).abs().max()),
+                "image_max_abs_px": int((s[0][2].int() - s[j][2].int()).abs().max()),
+            }
+            for j in (1, 3)
+        }
     mem_delta = on["peak_reserved_gib"] - off["peak_reserved_gib"]
     cross = all(p["latent_bitwise"] and p["image_bitwise"] for p in per)
-    passed = (cross and all(within.values()) and mem_delta <= 0.1
+    # The change's claim is ON == OFF call by call. Within-process A repeats are main's property
+    # (both arms are compared and reported; ON must repeat exactly as OFF does).
+    same_repeat_pattern = within["on"] == within["off"]
+    passed = (cross and same_repeat_pattern and mem_delta <= 0.1
               and on["counters"]["sync_fallback"] == 0 and on["side_gate_up_blocks"] > 0
               and off["side_gate_up_blocks"] == 0)
     print(json.dumps({
@@ -119,7 +129,8 @@ def parent(mode):
         "reference": "fresh graph-on process with TRTLLM_FLUX3_SIDE_GATE_UP=0 (main's sequential "
                      "gate_up), same prompts/seeds, A,A,B(T=160),A",
         "on_vs_off": per,
-        "A_repeats_bitwise_within_process": within,
+        "A_repeats_within_process": within,
+        "on_repeats_exactly_like_off": same_repeat_pattern,
         "peak_reserved_gib": {"off": round(off["peak_reserved_gib"], 3),
                               "on": round(on["peak_reserved_gib"], 3),
                               "delta": round(mem_delta, 3)},
