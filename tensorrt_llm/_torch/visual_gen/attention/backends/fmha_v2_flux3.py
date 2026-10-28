@@ -31,10 +31,23 @@ STOCK_KERNEL = "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_128x128_output_b
 _LEVER_FLAGS = {
     "mask_skip": ("ms", "-DFMHA_FLUX3_MASK_SKIP=1"),
     "resident_q": ("rq", "-DFMHA_FLUX3_RESIDENT_Q=1"),
+    # REORDERED levers (not bitwise vs stock):
+    # base2 (FMHA_FLUX3_BASE2, softmax.h / fragment.h): raw QK accumulators, one
+    #   exp2(fma(x, s*log2e, log2(256) - max*s*log2e)) per element and
+    #   alpha = exp2((prev - cur)*s*log2e). No LSE / attention-sink support.
+    "base2": ("b2", "-DFMHA_FLUX3_BASE2=1"),
+    # kv128: 64 q rows x 128-key step (the stock d128 E4M3 tile steps 64 keys). Padding mask
+    #   only: the causal / sliding / custom-mask kernels are not compiled in.
+    "kv128": ("k128", None),
 }
 
 # The lever set main runs.
 DEFAULT_LEVERS: tuple[str, ...] = ("mask_skip", "resident_q")
+# The lever set for non-causal, no-LSE calls: base-2 softmax on main's ms_rq 64x64 tile.
+# Job 727 (interleaved, S=4176/4096): ms_rq 427.7/408.4 us, +base2 415.2/397.0 (-2.9%/pass),
+# base2+kv128 (branch 30's 64x128 rqms_b2) 415.5/397.1 (same speed, rel L2 1.0017x ms_rq's;
+# base2 at 64x64 is 1.0000x), kv128 alone 437.9/415.6 (slower).
+ROUTED_LEVERS: tuple[str, ...] = ("base2", "mask_skip", "resident_q")
 DEFAULT_MIN_BLOCKS = 0
 
 
@@ -72,6 +85,17 @@ def gen_flux3_d128_spec(levers: Sequence[str] = DEFAULT_LEVERS, min_blocks: int 
         )
         if count == 0:
             raise RuntimeError("could not place __launch_bounds__ in the generated kernel")
+    if "kv128" in levers:
+        # Kernel_traits<instruction_traits, kv_loop_step, head_size, head_size_v, noloop_step, ...>
+        text, count = re.subn(
+            r"(fmha::\w+_traits,\s*\n\s*)64(,\s*\n\s*128,\s*\n\s*128,\s*\n\s*64,)",
+            r"\g<1>128\g<2>",
+            text,
+        )
+        if count == 0:
+            raise RuntimeError("could not set kv_loop_step=128 in the generated kernel")
+        for mask in ("causal_mask", "sliding_or_chunked_causal_mask", "custom_mask"):
+            text = text.replace(f"#if 1 // {mask}\n", f"#if 0 // {mask}\n")
     kernel_path = gen_dir / "generated" / f"{kernel}.cu"
     write_if_different(kernel_path, text)
 
@@ -80,7 +104,8 @@ def gen_flux3_d128_spec(levers: Sequence[str] = DEFAULT_LEVERS, min_blocks: int 
     nvcc_flags.append("-Wno-deprecated-gpu-targets")
     nvcc_flags.append(f"-DFMHA_FLUX3_D128_LAUNCHER=run_{kernel}_nl_tiled")
     for name in sorted(set(levers)):
-        nvcc_flags.append(_LEVER_FLAGS[name][1])
+        if _LEVER_FLAGS[name][1]:
+            nvcc_flags.append(_LEVER_FLAGS[name][1])
     binding = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_v2_binding.cu"
     return gen_jit_spec(uri, [kernel_path, binding], extra_cuda_cflags=nvcc_flags)
 
