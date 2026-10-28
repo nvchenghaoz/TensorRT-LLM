@@ -156,6 +156,13 @@ def run_check():
             "fp4_mismatch": int((cand[1] != ref[1]).sum().item()),
             "sf_full_bitwise": cand[2].numel() == sf_ref.numel() and torch.equal(cand[2], sf_ref),
             "sf_mismatch": int((cand[2] != sf_ref).sum().item()) if cand[2].numel() == sf_ref.numel() else -1,
+            "x_diff_elems": int((cand[0] != ref[0]).sum().item()),
+            "x_diff_rows": int((cand[0] != ref[0]).reshape(-1, D).any(dim=1).sum().item()),
+            "x_diff_cols_first_row": (
+                torch.nonzero((cand[0] != ref[0]).reshape(-1, D).any(dim=0)).flatten()[:16].tolist()
+            ),
+            "x_diff_ref_vals": ref[0][cand[0] != ref[0]][:8].float().tolist(),
+            "x_diff_cand_vals": cand[0][cand[0] != ref[0]][:8].float().tolist(),
             "fp4_rows": cand[1].shape[0],
             "sf_bytes": cand[2].numel(),
         }
@@ -190,6 +197,11 @@ def run_check():
         ok &= case_ok
         res["cases"][name] = rec
         print(name, json.dumps(rec), flush=True)
+        print("SUMMARY", name, "pass", case_ok, "x_ulp", rec["x_mod_max_ulp"], "fp4_mm",
+              rec["fp4_mismatch"], "sf_mm", rec["sf_mismatch"], "rep", rep_ok,
+              "xdiff", rec["x_diff_elems"], rec["x_diff_rows"], rec["x_diff_cols_first_row"],
+              rec["x_diff_ref_vals"], rec["x_diff_cand_vals"],
+              "match", [k for k, v in match.items() if v], flush=True)
     print(json.dumps({"passed": bool(ok), "compared_against":
                       "Inductor LN+modulate (emulate_precision_casts) + FlashInfer nvfp4_quantize "
                       "cute-dsl 128x4 host-float gs (main's flux3_nvfp4_quantize_prepared)",
@@ -197,35 +209,51 @@ def run_check():
 
 
 def run_bench():
-    flush = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=dev)
     results = {}
     arm = "candidate" if faq is not None else "baseline"
+    nsets = 8  # 8 x 25.7 MB activations > 128 MB L2: each call reads its x cold
     for name, kind, args in make_cases():
         if name not in ("single_T80", "mode_step5"):
             continue
         xm0, _, _ = reference(kind, args, 1.0)
         gs_float = float(torch.tensor(2688.0 / xm0.float().abs().max().item(), dtype=torch.float32))
         gs_t = torch.tensor([gs_float], dtype=torch.float32, device=dev)
+        sets = [(args[0].roll(i * 7, dims=1).contiguous(),) + tuple(args[1:]) for i in range(nsets)]
         if faq is None:
-            def fn():
-                return reference(kind, args, gs_float)
+            def fn(a):
+                return reference(kind, a, gs_float)
         else:
-            def fn():
-                return candidate(kind, args, gs_t, poison=False)
-        for _ in range(10):
-            fn()
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(3):
-            for _ in range(100):
-                flush.add_(1)  # evict L2 (cold-L2 like the served chain)
+            def fn(a):
+                return candidate(kind, a, gs_t, poison=False)
+        with torch.inference_mode():
+            for a in sets:
+                fn(a)
+            torch.cuda.synchronize()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for a in sets:
+                    fn(a)
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for _ in range(4):
+                    for a in sets:
+                        fn(a)
+            calls = 4 * nsets
+            for _ in range(5):
+                graph.replay()
+            torch.cuda.synchronize()
+            times = []
+            for _ in range(60):
                 s = torch.cuda.Event(enable_timing=True)
                 e = torch.cuda.Event(enable_timing=True)
                 s.record()
-                fn()
+                graph.replay()
                 e.record()
                 e.synchronize()
-                times.append(s.elapsed_time(e))
+                times.append(s.elapsed_time(e) / calls)
         times.sort()
         med = statistics.median(times)
         p10, p90 = times[len(times) // 10], times[(9 * len(times)) // 10]
@@ -237,8 +265,9 @@ def run_bench():
         "output": {"class": "exact"},
         "arm": arm,
         "detail": results,
-        "note": "single_T80 = one single-block LN+mod+quantize call at M=4176, cold L2, "
-                "includes launch overhead of each arm (main: 2 launches, fused: 1)",
+        "note": "single_T80 = one single-block LN+mod+quantize call at M=4176 inside a CUDA graph "
+                "(32 calls over 8 rotating 25.7 MB inputs, cold L2), median of 60 replays; "
+                "main = Inductor LN+mod + FlashInfer quantize (2 kernels), fused = 1 kernel",
     }))
 
 

@@ -39,7 +39,11 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from torch._inductor.runtime.triton_helpers import libdevice
 
+from .primsts import NVFP4Activation, PreparedNVFP4
+
 _ENV = "TRTLLM_FLUX3_ADALN_QUANT"
+# Runtime switch read in the block forwards (tests flip it to compare with main's path).
+FLUX3_ADALN_NVFP4 = True
 
 # Inductor's reduction config for these LN+modulate kernels at D=3072 (dumped from output_code:
 # per-block compile, emulate_precision_casts=True, torch 2.14.0a0 nv26.09, triton 3.8).
@@ -48,6 +52,10 @@ _INDUCTOR_LN_CONFIG = {
     True: (1024, 8),
     False: (1024, 8),
 }
+# Width of the pointwise modulate+quantize pass. 1024 (= Inductor's) is bitwise to main; 2048/4096
+# were ~1 us/call faster but left ~1 bf16 ulp on ~1e-6 of x_mod elements (a different Welford
+# combine layout; fp4/SF stayed bitwise), so they are not used.
+_Q_BLOCK = 1024
 
 
 @triton.jit
@@ -108,31 +116,21 @@ def _output_scale(sf_bits, gs):
 
 
 @triton.jit
-def _e2m1x8(v0, v1, v2, v3, v4, v5, v6, v7, out_scale):
-    # FlashInfer bfloat2_to_float2_scaled (mul.f32) + cvt_e2m1x8_f32: element 2j in the low nibble
-    # of byte j, bytes little-endian in the u32.
+def _e2m1x2(lo, hi, out_scale):
+    # One packed byte (lo nibble = lo) replicated in all four bytes of the u32; caller masks 0xFF.
     return tl.inline_asm_elementwise(
         """
         {
-            .reg .f32 s0, s1, s2, s3, s4, s5, s6, s7;
-            .reg .b8 byte0, byte1, byte2, byte3;
-            mul.f32 s0, $1, $9;
-            mul.f32 s1, $2, $9;
-            mul.f32 s2, $3, $9;
-            mul.f32 s3, $4, $9;
-            mul.f32 s4, $5, $9;
-            mul.f32 s5, $6, $9;
-            mul.f32 s6, $7, $9;
-            mul.f32 s7, $8, $9;
-            cvt.rn.satfinite.e2m1x2.f32 byte0, s1, s0;
-            cvt.rn.satfinite.e2m1x2.f32 byte1, s3, s2;
-            cvt.rn.satfinite.e2m1x2.f32 byte2, s5, s4;
-            cvt.rn.satfinite.e2m1x2.f32 byte3, s7, s6;
-            mov.b32 $0, {byte0, byte1, byte2, byte3};
+            .reg .f32 a, b;
+            .reg .b8 byte0;
+            mul.f32 a, $1, $3;
+            mul.f32 b, $2, $3;
+            cvt.rn.satfinite.e2m1x2.f32 byte0, b, a;
+            mov.b32 $0, {byte0, byte0, byte0, byte0};
         }
         """,
-        "=r,f,f,f,f,f,f,f,f,f",
-        [v0, v1, v2, v3, v4, v5, v6, v7, out_scale],
+        "=r,f,f,f",
+        [lo, hi, out_scale],
         dtype=tl.int32,
         is_pure=True,
         pack=1,
@@ -160,9 +158,11 @@ def _adaln_nvfp4_kernel(
     HAS_SELECT: tl.constexpr,
     XBLOCK: tl.constexpr,
     R0_BLOCK: tl.constexpr,
+    Q_BLOCK: tl.constexpr,
 ):
+    tl.static_assert(XBLOCK == 1)
     SF_COLS: tl.constexpr = ((r0_numel // 16 + 3) // 4) * 4
-    GROUPS: tl.constexpr = R0_BLOCK // 16
+    GROUPS: tl.constexpr = Q_BLOCK // 16
     xoffset = tl.program_id(0) * XBLOCK
     xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
     xmask = xindex < xnumel
@@ -197,12 +197,18 @@ def _adaln_nvfp4_kernel(
             tmp5_m2 = tl.where(r0_mask & xmask, tmp5_m2_next, tmp5_m2)
             tmp5_weight = tl.where(r0_mask & xmask, tmp5_weight_next, tmp5_weight)
         tmp6, tmp7, tmp8 = triton_helpers.welford(tmp5_mean, tmp5_m2, tmp5_weight, 1)
-        tmp5 = tmp6[:, None]
-        tmp9 = tmp7[:, None]
+        # XBLOCK == 1: take the row's mean/M2 as scalars (a max over one element is an exact
+        # copy). This decouples the reduction's register layout (and so its combine tree) from
+        # the wider pointwise pass below, keeping Inductor's 1024-wide Welford order.
+        tmp5 = tl.max(tmp6, axis=0)
+        tmp9 = tl.max(tmp7, axis=0)
         if HAS_SELECT:
             tmp11 = tl.load(in_ptr1 + (x0), xmask, eviction_policy="evict_last").to(tl.int1)
-        for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
-            r0_index = r0_offset + r0_base
+        # Pointwise pass (no reduction order): Q_BLOCK-wide chunks so each thread owns 8
+        # contiguous elements and the NVFP4 lane splits stay in registers.
+        q_base = tl.arange(0, Q_BLOCK)[None, :]
+        for r0_offset in tl.range(0, r0_numel, Q_BLOCK):
+            r0_index = r0_offset + q_base
             r0_mask = r0_index < r0_numel
             r0_1 = r0_index
             if HAS_SELECT:
@@ -304,30 +310,25 @@ def _adaln_nvfp4_kernel(
             tl.store(out_ptr0 + (r0_1 + r0_numel * x0), tmp73, r0_mask & xmask)
 
             # ---- NVFP4 quantize of the bf16-rounded x_mod (FlashInfer fast-math path) ----
-            v = tl.reshape(tmp74, [XBLOCK, GROUPS, 16])
-            amax = tl.max(tl.abs(v), axis=2)  # [XBLOCK, GROUPS]
+            # Pairs stay in one thread (4 elements/thread): one packed byte per pair, and the
+            # 16-element amax is an in-thread max plus a 4-lane max (exact: bf16 magnitudes).
+            pairs = tl.reshape(tmp74, [XBLOCK, Q_BLOCK // 2, 2])
+            lo, hi = tl.split(pairs)
+            m2 = tl.maximum(tl.abs(lo), tl.abs(hi))
+            amax = tl.max(tl.reshape(m2, [XBLOCK, GROUPS, 8]), axis=2)  # [XBLOCK, GROUPS]
             scale_float = gs * (amax * fp4_max_rcp)
             sf_bits = _cvt_e4m3(scale_float)
             out_scale = _output_scale(sf_bits, gs)
-            # Split each 8-element chunk into its 8 lanes (bit0, bit1, bit2 of the lane index).
-            oct8 = tl.reshape(tmp74, [XBLOCK, R0_BLOCK // 8, 2, 2, 2])
-            e_, o_ = tl.split(oct8)  # lane bit0 = 0 / 1 -> [X, N8, 2, 2] (bit2, bit1)
-            e0_, e1_ = tl.split(e_)  # bit1
-            o0_, o1_ = tl.split(o_)
-            v0, v4 = tl.split(e0_)  # bit2
-            v2, v6 = tl.split(e1_)
-            v1, v5 = tl.split(o0_)
-            v3, v7 = tl.split(o1_)
-            os_b = tl.reshape(
-                tl.broadcast_to(out_scale[:, :, None], [XBLOCK, GROUPS, 2]),
-                [XBLOCK, R0_BLOCK // 8],
+            os_p = tl.reshape(
+                tl.broadcast_to(out_scale[:, :, None], [XBLOCK, GROUPS, 8]),
+                [XBLOCK, Q_BLOCK // 2],
             )
-            packed = _e2m1x8(v0, v1, v2, v3, v4, v5, v6, v7, os_b)
-            word_idx = (r0_offset // 8) + tl.arange(0, R0_BLOCK // 8)[None, :]
+            pbyte = (_e2m1x2(lo, hi, os_p) & 0xFF).to(tl.uint8)
+            byte_idx = (r0_offset // 2) + tl.arange(0, Q_BLOCK // 2)[None, :]
             tl.store(
-                fp4_ptr + (word_idx + (r0_numel // 8) * x0),
-                packed,
-                (word_idx < r0_numel // 8) & xmask,
+                fp4_ptr + (byte_idx + (r0_numel // 2) * x0),
+                pbyte,
+                (byte_idx < r0_numel // 2) & xmask,
             )
             col = (r0_offset // 16) + tl.arange(0, GROUPS)[None, :]
             sf_off = (
@@ -375,7 +376,9 @@ def _scale_size(rows: int, k: int) -> int:
     return ((rows + 127) // 128) * 128 * ((k // 16 + 3) // 4) * 4
 
 
-def _launch(x, select, scale, shift, weight, bias, global_scale, eps, config=None, outs=None):
+def _launch(
+    x, select, scale, shift, weight, bias, global_scale, eps, config=None, outs=None, q_block=None
+):
     d = x.shape[-1]
     m = x.numel() // d
     has_select = select is not None
@@ -396,7 +399,7 @@ def _launch(x, select, scale, shift, weight, bias, global_scale, eps, config=Non
         shift,
         global_scale,
         out,
-        fp4.view(torch.int32),
+        fp4,
         sf,
         m,
         padded,
@@ -407,6 +410,7 @@ def _launch(x, select, scale, shift, weight, bias, global_scale, eps, config=Non
         HAS_SELECT=has_select,
         XBLOCK=1,
         R0_BLOCK=r0_block,
+        Q_BLOCK=_Q_BLOCK if q_block is None else q_block,
         num_warps=num_warps,
         num_stages=1,
         enable_fp_fusion=False,
@@ -456,8 +460,6 @@ def enabled_forms() -> tuple[bool, bool]:
 
 
 def _block_ok(block) -> bool:
-    from .primsts import PreparedNVFP4
-
     if getattr(block, "_fuse_proj_out", True):
         return False
     adapter = getattr(block.ff.gate_up_proj, "_flux3_primsts_nvfp4", None)
@@ -467,6 +469,9 @@ def _block_ok(block) -> bool:
         isinstance(adapter, PreparedNVFP4)
         and qkv is not None
         and adapter.weight.is_cuda
+        # Inline PTX (e2m1x2 cvt) and the bitwise contract are validated on SM120 only; SM100
+        # runs the CuTe per-token adaLN instead.
+        and torch.cuda.get_device_capability(adapter.weight.device) == (12, 0)
         and block.hidden_size == 3072
         and adapter.weight.shape[1] * 2 == block.hidden_size
         and norm.weight.dtype == torch.bfloat16
@@ -503,9 +508,13 @@ def _row_ok(t: torch.Tensor, rows: int, d: int) -> bool:
 
 
 def adaln_nvfp4_input(block, x: torch.Tensor, mod: tuple, eps: float):
-    """Fused path for a prepared block: returns (x_mod, NVFP4Activation) or None to fall back."""
-    from .primsts import NVFP4Activation
+    """Fused path for a prepared block: returns (x_mod, NVFP4Activation) or None to fall back.
 
+    block._flux3_adaln_nvfp4 is a static bool (set by prepare_adaln_nvfp4); FLUX3_ADALN_NVFP4 is a
+    module-level switch (Dynamo guards on both), so one process can compare ON and OFF.
+    """
+    if not (FLUX3_ADALN_NVFP4 and getattr(block, "_flux3_adaln_nvfp4", False)):
+        return None
     d = x.shape[-1]
     if not (
         x.dim() == 3
