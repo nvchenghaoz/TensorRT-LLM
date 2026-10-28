@@ -301,7 +301,7 @@ def analyze(sqlite_path, outdir, arm):
     return summ, pairs
 
 
-def analyze_fork(sqlite_path, arm, succ_prefix="triton_poi_fused_add_mul_view"):
+def analyze_fork(sqlite_path, arm, succ_prefix="triton_poi_fused_add_mul"):
     """Per tail pair: wall from the image/single FMHA kernel's end (the fork's only predecessor,
     fact 1205) to the start of the residual add after the join, and every kernel/memset in
     between (start offset and duration). Only windows that end in that residual add and contain a
