@@ -1039,8 +1039,13 @@ def qkv_fp8_attention_forward(
     x: PrimsTSInput,
     freqs: tuple[torch.Tensor, ...],
     full_sequence: bool,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+    side_gate_up: tuple | None = None,
+) -> tuple | None:
     """(attention output [B, S, H*D] BF16, planar BF16 QKV GEMM output [M, 3W]) or None.
+
+    With side_gate_up (sm120_side_gate_up_args) the result gets a third item, the block's packed
+    gate_up (packed, scales), forked onto a side stream right before FMHA
+    (flux3_primsts.fp8_prequant_attention_side_gate_up).
 
     Covers exactly the calls where main runs: qkv_forward's PreparedNVFP4 per-plane in-place planar
     route, then one FlashInferAttention FP8 (non-causal, no LSE) call on the whole [B, S] q/k/v
@@ -1101,5 +1106,18 @@ def qkv_fp8_attention_forward(
         x.quantized_by if isinstance(x, NVFP4Activation) else None,
         backend.scale,
     )
+    if side_gate_up is not None:
+        from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
+            fp8_prequant_attention_side_gate_up,
+        )
+
+        up_data, up_weight, up_scales, up_weight_scale, inverse_scale, up_original, source, mode = (
+            side_gate_up
+        )
+        output, packed, packed_scales = fp8_prequant_attention_side_gate_up(
+            qkv8, fp8_scales, batch, heads, up_data, up_weight, up_scales, up_weight_scale,
+            inverse_scale, up_original, source, mode,
+        )
+        return output.flatten(2), gemm, (packed, packed_scales)
     output = visual_gen_fp8_attention_sm120_prequant(qkv8, fp8_scales, batch, heads)
     return output.flatten(2), gemm

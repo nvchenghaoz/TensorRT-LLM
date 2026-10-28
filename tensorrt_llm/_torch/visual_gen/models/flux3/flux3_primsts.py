@@ -1278,6 +1278,9 @@ def _nvfp4_swiglu_prepared_fake(
 # Side-stream gate_up beside attention (idea 161). The block's packed-SwiGLU gate_up has no data
 # path to or from attention, so this op issues it on a side stream inside the attention op and
 # joins it before returning (attention's consumer, the down || attn_out tail pair, needs both).
+# On the default direct NVFP4-QKV -> E4M3 path (FLUX3_QKV_FP8_DIRECT) there is no K1/K2, so the
+# fork (fp8_prequant_attention_side_gate_up) sits right before FMHA in every mode. On the
+# BF16-QKV path (fp8_attention_side_gate_up):
 # Mode 1: gate_up becomes ready right after QKV (before the attention K1/K2 quantize and FMHA).
 # Mode 2: gate_up becomes ready after K2, just before the FMHA launch (beside FMHA).
 # Mode 3 (default): mode 2 on a dedicated gate_up stream with the current stream's priority (mode
@@ -1321,8 +1324,6 @@ def fp8_attention_side_gate_up(
     on a side stream (mode 1/2/3 above), joined before return. Bitwise to the two ops in order."""
     from tensorrt_llm._torch.visual_gen.attention.backends import flashinfer as _fi
     from tensorrt_llm._torch.visual_gen.attention.backends.fp8_sm12x import quantize_qkv_e4m3
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_nvfp4 import _scalar
-    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_swiglu_fp4_cutlass as swc
 
     device = q.device
     owner = nvfp4_owner(up_weight)
@@ -1343,12 +1344,7 @@ def fp8_attention_side_gate_up(
         )
         return output
 
-    if not (
-        is_sm120(device)
-        and mode in (1, 2, 3)
-        and swc.enabled()
-        and swc.supported(up_activation, up_weight)
-    ):
+    if not _side_gate_up_supported(device, mode, up_activation, up_weight):
         # Sequential fallback: the main path's order (attention, then gate_up).
         SIDE_GATE_UP_COUNTERS["sync_fallback"] += 1
         attn = attention_fmha(*attention_quantize())
@@ -1358,17 +1354,44 @@ def fp8_attention_side_gate_up(
         )
         return attn, packed, packed_scales
 
+    launch_gate_up, join, outputs = _side_gate_up_fork(
+        device, mode, up_activation, up_weight, up_activation_scale, up_weight_scale,
+        output_inverse_scale, owner,
+    )
+    if mode == 1:
+        launch_gate_up()
+        attn = attention_fmha(*attention_quantize())
+    else:
+        quantized = attention_quantize()
+        launch_gate_up()
+        attn = attention_fmha(*quantized)
+    join()
+    return attn, *outputs
+
+
+def _side_gate_up_fork(
+    device, mode, up_activation, up_weight, up_activation_scale, up_weight_scale,
+    output_inverse_scale, owner,
+):
+    """(launch, join, (packed, scales)) for the CUTLASS packed-SwiGLU gate_up on the side stream.
+
+    Outputs are allocated here, on the current stream, before the fork: no side-stream allocation
+    and no record_stream (which defers frees past graph capture). launch() forks the side stream
+    from the current one and enqueues gate_up on it; join() makes the current stream wait for it.
+    The caller keeps the inputs alive until join (they are its op arguments)."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_nvfp4 import _scalar
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_swiglu_fp4_cutlass as swc
+
     up_activation = up_activation.detach().contiguous()
     up_activation_scale = up_activation_scale.detach()
     up_weight, up_weight_scale = up_weight.detach(), up_weight_scale.detach()
     alpha = _scalar(device, owner.input_global_scale * owner.weight_global_scale)
     rows = up_activation.shape[0]
-    # Outputs on the current stream before the fork: no side-stream allocation, no record_stream.
     out_buffer, out_scale = swc.allocate_outputs(rows, up_weight.shape[0], device)
     current = torch.cuda.current_stream(device)
     side = _side_gate_up_stream(device, mode)
 
-    def launch_gate_up():
+    def launch():
         side.wait_stream(current)
         with torch.cuda.stream(side):
             swc.swiglu_packed(
@@ -1377,16 +1400,87 @@ def fp8_attention_side_gate_up(
             )
         SIDE_GATE_UP_COUNTERS["issued"] += 1
 
-    if mode == 1:
-        launch_gate_up()
-        attn = attention_fmha(*attention_quantize())
-    else:
-        quantized = attention_quantize()
-        launch_gate_up()
-        attn = attention_fmha(*quantized)
-    current.wait_stream(side)
-    SIDE_GATE_UP_COUNTERS["joined"] += 1
-    return attn, out_buffer[:rows], out_scale
+    def join():
+        current.wait_stream(side)
+        SIDE_GATE_UP_COUNTERS["joined"] += 1
+
+    return launch, join, (out_buffer[:rows], out_scale)
+
+
+def _side_gate_up_supported(device, mode, up_activation, up_weight) -> bool:
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_swiglu_fp4_cutlass as swc
+
+    return (
+        is_sm120(device)
+        and mode in (1, 2, 3)
+        and swc.enabled()
+        and swc.supported(up_activation, up_weight)
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_fp8_prequant_attention_side_gate_up",
+    mutates_args=(),
+    device_types="cuda",
+)
+def fp8_prequant_attention_side_gate_up(
+    qkv8: torch.Tensor,
+    scales: torch.Tensor,
+    batch: int,
+    heads: int,
+    up_activation: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_activation_scale: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    output_inverse_scale: torch.Tensor,
+    original: torch.Tensor,
+    source_weight: torch.Tensor | None,
+    mode: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(visual_gen_fp8_attention_sm120_prequant(qkv8, scales, batch, heads),
+    nvfp4_swiglu_prepared(up...)) with gate_up forked onto the side stream right before the FMHA
+    launch (the direct NVFP4-QKV -> E4M3 path has no K1/K2, so modes 1 and 2 coincide; mode 3
+    uses the dedicated stream), joined before return. Bitwise to the two ops in order."""
+    from tensorrt_llm._torch.visual_gen.attention.backends.fp8_sm12x import (
+        visual_gen_fp8_attention_sm120_prequant as prequant,
+    )
+
+    device = qkv8.device
+    owner = nvfp4_owner(up_weight)
+    up_activation, up_activation_scale = _prepared_activation(
+        up_activation, up_activation_scale, original, source_weight, up_weight
+    )
+    if not _side_gate_up_supported(device, mode, up_activation, up_weight):
+        SIDE_GATE_UP_COUNTERS["sync_fallback"] += 1
+        attn = prequant(qkv8, scales, batch, heads)
+        packed, packed_scales = nvfp4_swiglu_packed(
+            up_activation, up_weight, up_activation_scale, up_weight_scale,
+            owner.input_global_scale, owner.weight_global_scale, output_inverse_scale,
+        )
+        return attn, packed, packed_scales
+    launch_gate_up, join, outputs = _side_gate_up_fork(
+        device, mode, up_activation, up_weight, up_activation_scale, up_weight_scale,
+        output_inverse_scale, owner,
+    )
+    launch_gate_up()
+    attn = prequant(qkv8, scales, batch, heads)
+    join()
+    return attn, *outputs
+
+
+@fp8_prequant_attention_side_gate_up.register_fake
+def _fp8_prequant_attention_side_gate_up_fake(
+    qkv8, scales, batch, heads, up_activation, up_weight, up_activation_scale, up_weight_scale,
+    output_inverse_scale, original, source_weight, mode,
+):
+    _, rows, width = qkv8.shape
+    packed, packed_scales = _nvfp4_swiglu_packed_fake(
+        up_activation, up_weight, up_activation_scale, up_weight_scale, 1.0, 1.0,
+        output_inverse_scale,
+    )
+    attn = torch.empty((batch, rows // batch, heads, width // heads), dtype=torch.bfloat16,
+                       device=qkv8.device)
+    return attn, packed, packed_scales
 
 
 @fp8_attention_side_gate_up.register_fake

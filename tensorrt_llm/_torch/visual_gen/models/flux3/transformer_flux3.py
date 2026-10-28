@@ -556,14 +556,20 @@ class Flux3Attention(Attention):
                 and sample_bounds[0][0] == 0
                 and sample_bounds[0][1] == s
             ),
+            side_gate_up,
         )
         if direct is not None:
             # NVFP4 QKV straight to E4M3 + the same fmha_v2 call (bitwise to the path below).
-            attn, gemm = direct
+            attn, gemm = direct[0], direct[1]
+            gate_up = direct[2] if side_gate_up is not None else None
             if need_v:
                 v = gemm.view(3, b * s, -1)[2]
                 v = v.view(b, s, self.local_num_key_value_heads, self.head_dim).transpose(1, 2)
+                if side_gate_up is not None:
+                    return attn, v, gate_up
                 return attn, v  # [B, H, S, D] for apply_flux3_pag
+            if side_gate_up is not None:
+                return attn, gate_up
             return attn
 
         qkv = _primsts_qkv_forward(self, projection_input, freqs)

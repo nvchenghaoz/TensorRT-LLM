@@ -8,6 +8,10 @@ pair, as the NVFP4 tail-pair block runs them:
   -> gate_up (CUTLASS packed SwiGLU -> NVFP4)  [OFF: sequential after attention]
   -> trtllm::flux3_sm120_nvfp4_out_pair (down || attn_out) -> residual add.
 Arms: off (main's ops), m1/m2/m3 (trtllm::flux3_sm120_fp8_attention_side_gate_up mode 1/2/3).
+IDEA161_PATH=direct (default, main after landing 54): QKV op = trtllm::flux3_primsts_nvfp4_qkv_rope_fp8
+(QKV GEMMs + fused norm/RoPE/E4M3), attention = trtllm::visual_gen_fp8_attention_sm120_prequant;
+the arms use trtllm::flux3_sm120_fp8_prequant_attention_side_gate_up (gate_up forked right before
+FMHA; m1 == m2 there, m3 = dedicated stream).
 
   table : per S, graphs of K block fronts per arm, two graphs per arm (A and A' = its own A/A),
           ROUNDS interleaved rounds behind a spin, us/block median; weighted 24:4.
@@ -20,6 +24,7 @@ Arms: off (main's ops), m1/m2/m3 (trtllm::flux3_sm120_fp8_attention_side_gate_up
 
 import json
 import math
+import os
 import sys
 import time
 
@@ -36,6 +41,9 @@ SPIN = 6_000_000
 PAIR_SAMPLES = 200
 PAIR_SOAK_S = 30.0
 PAIR_REPLAYS = 3  # graph replays per timed sample (sample = per-replay mean)
+# direct: main's default after landing 54 (QKV -> E4M3 op + prequant FMHA); bf16: the BF16 QKV
+# planes + fp8_sm12x K1/K2 + FMHA path (TRTLLM_FLUX3_QKV_FP8_DIRECT=0).
+PATH = os.environ.get("IDEA161_PATH", "direct")
 
 
 def log(*a):
@@ -92,6 +100,40 @@ def inputs(c):
 
 
 def block_front(c, arm):
+    if PATH == "direct":
+        return block_front_direct(c, arm)
+    return block_front_bf16(c, arm)
+
+
+def block_front_direct(c, arm):
+    """Main after landing 54: NVFP4 QKV straight to E4M3 (trtllm::flux3_primsts_nvfp4_qkv_rope_fp8)
+    then the prequant fmha_v2 (trtllm::visual_gen_fp8_attention_sm120_prequant)."""
+    S = c["S"]
+    sm_scale = 1.0 / math.sqrt(D)
+    qkv8, scales, _ = torch.ops.trtllm.flux3_primsts_nvfp4_qkv_rope_fp8(
+        c["a_x"], c["qkv"].weight, c["sf_x"], c["qkv"].scale, c["q_norm"], c["k_norm"],
+        c["cos_sin"], c["qkv"].qkv_scale, c["x"], c["qkv"].weight, sm_scale,
+    )
+    up, down = c["up"], c["down"]
+    if arm == "off":
+        attn = torch.ops.trtllm.visual_gen_fp8_attention_sm120_prequant(qkv8, scales, 1, HEADS)
+        packed, sf = torch.ops.trtllm.flux3_nvfp4_swiglu_prepared(
+            c["a_x"], up.weight, c["sf_x"], up.scale, down.inverse_scale, c["x"],
+            c["qkv"].weight,
+        )
+    else:
+        mode = {"m1": 1, "m2": 2, "m3": 3}[arm]
+        attn, packed, sf = torch.ops.trtllm.flux3_sm120_fp8_prequant_attention_side_gate_up(
+            qkv8, scales, 1, HEADS, c["a_x"], up.weight, c["sf_x"], up.scale, down.inverse_scale,
+            c["x"], c["qkv"].weight, mode,
+        )
+    attn_y, mlp_y = torch.ops.trtllm.flux3_sm120_nvfp4_out_pair(
+        packed, down.weight, sf, down.scale, attn.reshape(S, H), c["out"].weight, c["out"].scale,
+    )
+    return c["residual"] + (attn_y + mlp_y), attn, packed, sf
+
+
+def block_front_bf16(c, arm):
     S = c["S"]
     qkv = torch.ops.trtllm.flux3_primsts_nvfp4_qkv_rope(
         c["a_x"], c["qkv"].weight, c["sf_x"], c["qkv"].scale,
@@ -286,9 +328,11 @@ def check(arms):
             log(f"S={S} {arm}: {json.dumps(results[f'S{S}_{arm}'])}")
     print(json.dumps({
         "passed": bool(passed),
-        "reference": "main's sequential ops (visual_gen_fp8_attention_sm120, then "
+        "reference": "main's sequential ops (attention: visual_gen_fp8_attention_sm120_prequant "
+                     "on the direct path / visual_gen_fp8_attention_sm120 on the bf16 path; then "
                      "flux3_nvfp4_swiglu_prepared) on pristine inputs, bitwise on block output, "
                      "attention output, packed gate_up bytes and scales",
+        "path": PATH,
         "results": results, "counters": fp.SIDE_GATE_UP_COUNTERS,
     }))
 
