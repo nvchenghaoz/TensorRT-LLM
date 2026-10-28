@@ -68,6 +68,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import qkv_forward as _
 from tensorrt_llm._torch.visual_gen.models.flux3.utils_flux3 import (
     Flux3PerTokenAdaLN,
     Flux3PerTokenAdaLNRuntime,
+    _pertoken_adaln_arch_ok,
 )
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -643,6 +644,25 @@ def _flux3_gated_mlp_forward(
     return ff(x)
 
 
+# Broadcast adaLN modulation (compact, single-segment streams): mode blocks take [1, 1, D]
+# shift/scale/gate rows and single blocks take [1, 2, D] tables plus a [1, S, 1] text-row
+# select mask, so no per-token [1, S, D] modulation is materialized. Same values, same ops.
+FLUX3_BROADCAST_ADALN = True
+
+
+def _flux3_select_mod(mod: tuple) -> Tuple[Tensor, Tensor, Tensor]:
+    """Return per-token-broadcastable (shift, scale, gate) from a 3- or 4-tuple.
+
+    A 4-tuple is (shift_table, scale_table, gate_table, select) with [1, 2, D] tables and a
+    bool [1, S, 1] select (True picks row 1). torch.where copies the bf16 values exactly and
+    Inductor fuses it as a pointwise load into the consumer kernels.
+    """
+    if len(mod) == 3:
+        return mod
+    shift, scale, gate, select = mod
+    return tuple(torch.where(select, value[:, 1:2], value[:, 0:1]) for value in (shift, scale, gate))
+
+
 class Flux3ModeBlock(nn.Module):
     """Per-modality siloed self-attention block ("early"/"late" stage)."""
 
@@ -880,7 +900,7 @@ class Flux3SingleStreamBlock(nn.Module):
         pag_samples: tuple[int, ...] = (0,),
         timestep: Tensor | None = None,
     ) -> Tensor:
-        mod_shift, mod_scale, mod_gate = mod
+        mod_shift, mod_scale, mod_gate = _flux3_select_mod(mod)
         residual = combined
 
         eps = self.pre_norm.variance_epsilon
@@ -1229,6 +1249,18 @@ class Flux3Model(BaseDiffusionModel):
             dim=dim,
         )
 
+    def _broadcast_adaln_ok(self, x: Tensor) -> bool:
+        """Broadcast modulation rows instead of per-token views (see FLUX3_BROADCAST_ADALN).
+
+        Off under sequence sharding and where the fused per-token adaLN kernel (SM100) needs
+        materialized [B, S, D] views.
+        """
+        return (
+            FLUX3_BROADCAST_ADALN
+            and not self.sharder.is_active
+            and not _pertoken_adaln_arch_ok(x.device)
+        )
+
     def _packed_stream(
         self, name: str, inputs: dict, lengths: tuple[int, ...], ref: Tensor | None = None
     ) -> dict[str, Tensor]:
@@ -1266,9 +1298,13 @@ class Flux3Model(BaseDiffusionModel):
         ):
             for field, value in zip(("shift", "scale", "gate"), modules[key](vec)):
                 state[stage + "_" + field] = value
+        broadcast = compact and len(segments) == 1 and self._broadcast_adaln_ok(tokens)
         if compact:
             for field, value in state.items():
-                if field != "tokens":
+                if broadcast and field not in ("tokens", "vec"):
+                    # One segment: keep the [1, 1, D] row; the blocks broadcast it.
+                    state[field] = value[:, 0:1]
+                elif field != "tokens":
                     state[field] = torch.cat(
                         [
                             value[:, row : row + 1].expand(-1, end - start, -1)
@@ -1310,7 +1346,16 @@ class Flux3Model(BaseDiffusionModel):
         chunks, _ = self._joint_chunks(self._local_layout(layout))
         pe = torch.cat([positions[name][:, :, start:end] for name, start, end in chunks], dim=2)
         prepared["_flux3_joint_cos"], prepared["_flux3_joint_sin"] = _pe_to_block_freqs(pe)
+        if len(chunks) == 2:
+            prepared["_flux3_joint_select"] = self._joint_select(chunks, pe.device)
         return prepared
+
+    @staticmethod
+    def _joint_select(chunks: list[tuple[str, int, int]], device: torch.device) -> Tensor:
+        """Bool [1, S, 1]: True on the second chunk's rows (built on device, no H2D copy)."""
+        first = chunks[0][2] - chunks[0][1]
+        total = first + chunks[1][2] - chunks[1][1]
+        return (torch.arange(total, device=device) >= first).view(1, total, 1)
 
     def prepare_static_inputs(self, *, layout: Layout | None = None, **inputs) -> dict[str, Tensor]:
         if torch.is_grad_enabled():
@@ -1397,13 +1442,31 @@ class Flux3Model(BaseDiffusionModel):
 
         chunks, sample_bounds = self._joint_chunks(local_layout)
 
+        def rows(name: str, field: str, start: int, end: int) -> Tensor:
+            value = streams[name][field]
+            # A broadcast [1, 1, D] modulation row stands for every row of its stream.
+            if value.shape[1] == 1:
+                return value.expand(-1, end - start, -1)
+            return value[:, start:end]
+
         def joint(field: str) -> Tensor:
-            return torch.cat(
-                [streams[name][field][:, start:end] for name, start, end in chunks], dim=1
-            )
+            return torch.cat([rows(name, field, start, end) for name, start, end in chunks], dim=1)
 
         combined = joint("tokens")
-        mod = tuple(joint("single_" + field) for field in ("shift", "scale", "gate"))
+        mod_fields = tuple("single_" + field for field in ("shift", "scale", "gate"))
+        if len(chunks) == 2 and all(
+            streams[name][field].shape[1] == 1 for name, _, _ in chunks for field in mod_fields
+        ):
+            # [1, 2, D] tables + a select mask; the compiled blocks pick the row per token.
+            select = prepared.get("_flux3_joint_select")
+            if select is None or select.shape[1] != combined.shape[1]:
+                select = self._joint_select(chunks, combined.device)
+            mod = tuple(
+                torch.cat([streams[name][field] for name, _, _ in chunks], dim=1)
+                for field in mod_fields
+            ) + (select,)
+        else:
+            mod = tuple(joint(field) for field in mod_fields)
         freqs = prepared["_flux3_joint_cos"], prepared["_flux3_joint_sin"]
         combined = self._single_adaln_runtime.prepare(combined, *mod[:2])
         for index, block in enumerate(self.single_blocks):
