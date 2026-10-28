@@ -41,8 +41,29 @@ def gen_spec(suffix: str = "", flags: tuple[str, ...] = ()):
 
 
 @functools.cache
-def get_module():
+def tile_sched() -> str:
+    """TRTLLM_FLUX3_SM120_SWIGLU_SCHED: dynamic (default, CLC work stealing) or static (main's)."""
+    value = os.environ.get("TRTLLM_FLUX3_SM120_SWIGLU_SCHED", "dynamic").strip().lower()
+    if value not in ("dynamic", "static"):
+        raise ValueError(f"TRTLLM_FLUX3_SM120_SWIGLU_SCHED must be dynamic or static, got {value!r}")
+    return value
+
+
+@functools.cache
+def get_module_static():
+    """StaticPersistentScheduler build (main's module, same name)."""
     return gen_spec().build_and_load()
+
+
+@functools.cache
+def get_module_dynamic():
+    """CLC dynamic persistent scheduler build (cutlass::gemm::PersistentScheduler on Sm120)."""
+    return gen_spec("_dyn", ("-DFLUX3_TILESCHED=1",)).build_and_load()
+
+
+def get_module():
+    """The module selected by TRTLLM_FLUX3_SM120_SWIGLU_SCHED; only that one is built."""
+    return get_module_dynamic() if tile_sched() == "dynamic" else get_module_static()
 
 
 def _scale_size(rows: int, columns: int) -> int:

@@ -147,6 +147,12 @@ __device__ __forceinline__ bool div_safe(float a, float b) {
 #ifndef FLUX3_SCHED
 #define FLUX3_SCHED 1
 #endif
+// Tile scheduler. 0 (default): StaticPersistentScheduler (sm_count persistent CTAs, fixed tile
+// stride). 1: cutlass::gemm::PersistentScheduler, which CUTLASS maps on Sm120 to
+// PersistentTileSchedulerSm100 (CLC dynamic work stealing). Same smem, no workspace, bitwise.
+#ifndef FLUX3_TILESCHED
+#define FLUX3_TILESCHED 0
+#endif
 
 struct SwigluParts {
   float prod;
@@ -427,9 +433,15 @@ using StrideCD = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 using CollectiveEpilogue = cutlass::epilogue::collective::detail::Sm90TmaWarpSpecializedAdapter<
     SwigluFp4Epilogue<StrideCD, StrideCD, cutlass::epilogue::NoSmemWarpSpecialized>>;
 
+#if FLUX3_TILESCHED == 1
+using TileSchedulerTag = cutlass::gemm::PersistentScheduler;
+#else
+using TileSchedulerTag = cutlass::gemm::StaticPersistentScheduler;
+#endif
+
 using GemmKernel =
     cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,
-                                         CollectiveEpilogue, cutlass::gemm::StaticPersistentScheduler>;
+                                         CollectiveEpilogue, TileSchedulerTag>;
 
 }  // namespace flux3_swiglu_fp4
 
