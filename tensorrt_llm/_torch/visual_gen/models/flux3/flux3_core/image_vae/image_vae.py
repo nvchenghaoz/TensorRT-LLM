@@ -10,6 +10,7 @@ import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
 
+from .decoder_tail_triton import can_use_conv_out_kernel, conv_out_3x3
 from .group_norm_triton import can_use_fused as can_use_fused_gn
 from .group_norm_triton import fused_group_norm
 
@@ -418,7 +419,12 @@ class Flux3ImageDecoder(nn.Module):
                 h = self.up[i_level].upsample(h)
 
         h = self.norm_out.forward_silu(h)
-        h = self.conv_out(h)
+        conv = self.conv_out
+        if can_use_conv_out_kernel(h, conv):
+            # Same as conv(h) (whose trunk-dtype pre-hook casts h to the weight dtype),
+            # computed by one fp32-FMA Triton kernel with the bias fused in.
+            return conv_out_3x3(h.to(conv.weight.dtype), conv.weight, conv.bias)
+        h = conv(h)
         return h
 
 
