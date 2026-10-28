@@ -257,6 +257,17 @@ class Flux3ImageUpsample(nn.Module):
             w4, b4 = w4.to(x.dtype), b4.to(x.dtype)
         n, c, h, w = x.shape
         o = nn.functional.conv2d(x, w4, b4, padding=1)  # [n, 4C, h+1, w+1]
+        if o.dim() == 4 and o.is_contiguous(memory_format=torch.channels_last):
+            # channels_last (compiled decoder): build the interleaved output in
+            # [n, h, 2, w, 2, c] order so it is realized channel-fastest (NHWC), and
+            # return it as an NCHW-shaped channels_last view. Same values as below.
+            t = o.permute(0, 2, 3, 1).view(n, h + 1, w + 1, 2, 2, c)
+            rows = [
+                torch.stack([t[:, a : a + h, b : b + w, a, b, :] for b in range(2)], dim=3)
+                for a in range(2)
+            ]  # each [n, h, w, 2, c]
+            y = torch.stack(rows, dim=2)  # [n, h, 2, w, 2, c]
+            return y.reshape(n, 2 * h, 2 * w, c).permute(0, 3, 1, 2)
         o = o.view(n, 2, 2, c, h + 1, w + 1)
         rows = [
             torch.stack([o[:, a, b, :, a : a + h, b : b + w] for b in range(2)], dim=-1)
