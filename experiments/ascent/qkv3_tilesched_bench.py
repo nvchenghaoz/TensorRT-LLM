@@ -74,7 +74,9 @@ def bench(strided):
     fns = arms(strided)
     log(f"arms={list(fns)} sched={strided.qkv_schedule()} "
         f"tilesched={getattr(strided, 'qkv_tilesched', lambda: 'n/a')()}")
-    R, WARM, ITERS = 10, 5, 60
+    R = int(os.environ.get("QKV3_BENCH_R", "10"))
+    ITERS = int(os.environ.get("QKV3_BENCH_ITERS", "60"))
+    WARM = 5
     results = {}
     for m in (4176, 4096):
         inp = make_inputs(m, dev)
