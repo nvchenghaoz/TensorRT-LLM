@@ -569,6 +569,127 @@ def _excluded_bf16(layer: nn.Module) -> bool:
     )
 
 
+_EXCLUDED_NVFP4_ENV = "TRTLLM_FLUX3_EXCLUDED_NVFP4"
+# single_blocks.24-27: the largest subset whose Qwen3-VL judge count matched main's (43/43) in
+# branch 105's STEP 1 (job 1270); "all" (adds content_mode_blocks.image.0) lost one answer.
+_EXCLUDED_NVFP4_DEFAULT = "single"
+
+
+def _excluded_bf16_block(block: nn.Module) -> bool:
+    """A BF16 checkpoint-excluded image/joint block whose six projections are plain BF16."""
+    if block._fuse_proj_out or getattr(block, "_allreduce", None) is not None:
+        return False
+    attn = block.attn
+    if getattr(attn, "qkv_proj", None) is not None:
+        return False
+    projections = [getattr(attn, name, None) for name in ("to_q", "to_k", "to_v")]
+    layers = [*projections, block.attn_out, block.ff.gate_up_proj, block.ff.down_proj]
+    return (
+        all(_excluded_bf16(layer) for layer in layers)
+        and all(layer.weight.shape[1] % 128 == 0 for layer in layers)
+        and block.ff.activation is torch.nn.functional.silu
+        and block.ff._is_plain_swiglu()
+        and block.ff.swiglu_limit is None
+    )
+
+
+def _excluded_nvfp4_selection(names: list[str]) -> tuple[str, list[str]]:
+    """(env value, selected names) from TRTLLM_FLUX3_EXCLUDED_NVFP4.
+
+    none / 0 / off: no block (main's FP8R path); all: every excluded block; single: the
+    single_blocks.* ones; otherwise a comma list of block names.
+    """
+    value = os.environ.get(_EXCLUDED_NVFP4_ENV, _EXCLUDED_NVFP4_DEFAULT).strip()
+    key = value.lower()
+    if key in ("", "none", "0", "off", "false"):
+        return value, []
+    if key in ("all", "1"):
+        return value, list(names)
+    if key == "single":
+        return value, [n for n in names if n.startswith("single_blocks.")]
+    wanted = {v.strip() for v in value.split(",") if v.strip()}
+    return value, [n for n in names if n in wanted]
+
+
+def _convert_bf16_linear_to_nvfp4(layer: Linear, quant_config) -> None:
+    """Replace a BF16 Linear's weight with an NVFP4 W4A4 copy in the checkpoint's layout.
+
+    ModelOpt recipe (the checkpoint loader's own quantize_nvfp4): per-tensor weight_scale_2 =
+    amax/(6*448), per-16 E4M3 block scales (128x4 swizzled like checkpoint NVFP4 layers), and
+    a unit activation global scale, as for checkpoint NVFP4 layers without input_scale.
+    """
+    from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_nvfp4
+    from tensorrt_llm.quantization.utils import fp4_utils
+
+    weight = layer.weight.detach()
+    device = weight.device
+    with torch.no_grad():
+        qweight, scale, weight_scale_2 = quantize_nvfp4(weight)
+        scale = torch.ops.trtllm.block_scale_interleave(
+            scale.view(fp4_utils.float4_sf_dtype).contiguous()
+        )
+        weight_scale_2 = weight_scale_2.reshape(1).to(device=device, dtype=torch.float32)
+    del weight
+    layer.quant_config = quant_config
+    layer.quant_method = NVFP4LinearMethod()
+    layer.scaling_vector_size = fp4_utils.NVFP4_SF_VEC_SIZE
+    layer.weight = nn.Parameter(qweight.contiguous(), requires_grad=False)
+    layer.weight_scale = nn.Parameter(
+        scale.reshape(-1).view(fp4_utils.float4_sf_dtype).contiguous(), requires_grad=False
+    )
+    layer.weight_scale_2 = nn.Parameter(weight_scale_2.clone(), requires_grad=False)
+    layer.input_scale = nn.Parameter(
+        torch.ones(1, device=device, dtype=torch.float32), requires_grad=False
+    )
+    layer.inv_input_scale = nn.Parameter(
+        torch.full((1,), 1.0 / 6.0, device=device, dtype=torch.float32), requires_grad=False
+    )
+    layer.alpha = nn.Parameter(weight_scale_2.clone(), requires_grad=False)
+    layer.scalar_alpha = float(weight_scale_2.item())
+    layer.kv_scales = nn.Parameter(
+        torch.ones(3, device=device, dtype=torch.float32), requires_grad=False
+    )
+    layer.inv_kv_scales = nn.Parameter(
+        torch.ones(3, device=device, dtype=torch.float32), requires_grad=False
+    )
+    layer.pre_quant_scale = None
+    layer._flux3_nvfp4_missing_input_scale = True
+
+
+def convert_excluded_blocks_to_nvfp4(
+    blocks: list[tuple[str, nn.Module]], quant_config
+) -> tuple[str, list[str]]:
+    """PRECISION: give the selected BF16 checkpoint-excluded blocks load-time NVFP4 W4A4 weights.
+
+    Runs before prepare_nvfp4_block, so a converted block takes the full NVFP4 block route
+    (PrimsTS adapters, CUTLASS SwiGLU gate_up, NVFP4 tail pair, fused adaLN+NVFP4 quant) and
+    prepare_sm120_fp8_excluded_block leaves it alone. TRTLLM_FLUX3_EXCLUDED_NVFP4=none keeps
+    every excluded block BF16 (main's FP8R route).
+    """
+    if not _enabled():
+        return "", []
+    excluded = [
+        name for name, block in blocks if _excluded_bf16_block(getattr(block, "_orig_mod", block))
+    ]
+    value, selected = _excluded_nvfp4_selection(excluded)
+    by_name = dict(blocks)
+    for name in selected:
+        block = getattr(by_name[name], "_orig_mod", by_name[name])
+        attn = block.attn
+        for layer in (
+            attn.to_q,
+            attn.to_k,
+            attn.to_v,
+            block.attn_out,
+            block.ff.gate_up_proj,
+            block.ff.down_proj,
+        ):
+            _convert_bf16_linear_to_nvfp4(layer, quant_config)
+    if selected:
+        torch.cuda.empty_cache()
+    return value, selected
+
+
 def prepare_sm120_fp8_excluded_block(block: nn.Module) -> bool:
     """Run a BF16 checkpoint-excluded image/joint block of an NVFP4 package as FP8R on SM120.
 

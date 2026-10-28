@@ -52,6 +52,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     NVFP4Activation,
+    convert_excluded_blocks_to_nvfp4,
     nvfp4_mlp_forward,
     original_input,
     prepare_fp8_block,
@@ -1976,6 +1977,25 @@ class Flux3Model(BaseDiffusionModel):
 
     def prepare_primsts_weights(self) -> None:
         """Refresh image/joint PrimsTS layouts after loading or merging LoRA weights."""
+        quant = self.model_config.quant_config
+        if quant is not None and quant.quant_algo == QuantAlgo.NVFP4:
+            # PRECISION: load-time NVFP4 W4A4 for the selected BF16 checkpoint-excluded blocks
+            # (TRTLLM_FLUX3_EXCLUDED_NVFP4), so they take the NVFP4 block route below.
+            named = (
+                [
+                    (f"content_mode_blocks.image.{i}", block)
+                    for i, block in enumerate(self.content_mode_blocks["image"])
+                ]
+                if "image" in self.content_mode_blocks
+                else []
+            )
+            named.extend((f"single_blocks.{i}", block) for i, block in enumerate(self.single_blocks))
+            knob, converted = convert_excluded_blocks_to_nvfp4(named, quant)
+            if converted:
+                logger.info(
+                    "FLUX.3 load-time NVFP4 W4A4 (precision) for BF16 checkpoint-excluded "
+                    f"blocks (TRTLLM_FLUX3_EXCLUDED_NVFP4={knob}): {converted}"
+                )
         if "image" in self.content_mode_blocks:
             for block in self.content_mode_blocks["image"]:
                 prepare_fp8_block(block)
