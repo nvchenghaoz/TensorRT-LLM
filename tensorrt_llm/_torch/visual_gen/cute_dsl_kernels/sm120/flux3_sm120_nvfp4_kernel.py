@@ -283,7 +283,11 @@ class Flux3Sm120Nvfp4Kernel:
 
         # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
-        self.sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec_size)
+        # A may carry its real (dynamic) row count so TMA zero-fills the last
+        # m-tile; the scale layout keeps the static 128-row padded extent of C.
+        self.sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
+            (c.shape[0], a.shape[1], a.shape[2]), self.sf_vec_size
+        )
         sfa_tensor = cute.make_tensor(sfa.iterator, self.sfa_layout)
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
         self.sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)

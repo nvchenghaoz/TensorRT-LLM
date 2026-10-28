@@ -84,6 +84,7 @@ def _launch(
     cos_sin: cute.Pointer,
     positions: cute.Pointer,
     qkv_scale: cute.Pointer,
+    activation_rows: cutlass.Int32,
     rows: cutlass.Constexpr,
     columns: cutlass.Constexpr,
     reduction: cutlass.Constexpr,
@@ -91,9 +92,14 @@ def _launch(
     max_clusters: cutlass.Constexpr,
     stream,
 ):
+    # A keeps its real (runtime) row count: TMA zero-fills rows >= activation_rows
+    # of the last m-tile, so no padded copy of the activation is needed. Everything
+    # else (C, outputs, scales, grid) stays at the static 128-row padded extent.
     activation = cute.make_tensor(
         activation_ptr,
-        cute.make_layout((rows, reduction, 1), stride=(reduction, 1, rows * reduction)),
+        cute.make_layout(
+            (activation_rows, reduction, 1), stride=(reduction, 1, rows * reduction)
+        ),
     )
     weight = cute.make_tensor(
         weight_ptr,
@@ -163,8 +169,8 @@ def run(
     if columns % 128 or reduction % 128:
         raise ValueError(f"unaligned trial shape: {(rows, columns, reduction)}")
     padded_rows = ((rows + 127) // 128) * 128
-    if padded_rows != rows:
-        activation = F.pad(activation, (0, 0, 0, padded_rows - rows))
+    # No F.pad: the kernel's A TMA tensor has the real row count (see _launch).
+    activation = activation.contiguous()
     if activation_scale.numel() != _scale_size(rows, reduction):
         raise ValueError("activation scale layout does not match 128x4")
     if weight_scale.numel() != _scale_size(columns, reduction):
@@ -252,6 +258,7 @@ def run(
             _launch,
             gemm,
             *pointers,
+            cutlass.Int32(rows),
             padded_rows,
             columns,
             reduction,
@@ -260,7 +267,7 @@ def run(
             stream,
         )
         _COMPILED[key] = compiled
-    compiled(*pointers, stream)
+    compiled(*pointers, cutlass.Int32(rows), stream)
     if mode == "packed":
         return output[:rows], output_scale
     return output[:rows]
