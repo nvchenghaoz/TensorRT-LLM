@@ -167,7 +167,8 @@ if args.mode == "time":
     f0 = frames()
     first, rep, inp = repeat_seq(vae)
     no_recompile = frames() == f0
-    res = {"batch": {"1": {"kernel_ms": st["median_ms"], "noise_floor": st["noise_floor"]}},
+    res = {"batch": {"1": {"kernel_ms": st["median_ms"], "step_ms": st["median_ms"],
+                           "noise_floor": st["noise_floor"]}},
            "output": {"class": "reordered" if comp else "exact"},
            "compiled": comp, "warmup_s": warm_s, **st, "repeat_bitwise": rep,
            "inputs_unchanged": inp, "no_recompile_after_warmup": no_recompile,
