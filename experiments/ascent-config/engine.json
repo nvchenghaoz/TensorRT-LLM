@@ -8,5 +8,8 @@
   },
   "pipeline_config": {
     "vae_decode_dtype": "bfloat16"
+  },
+  "cuda_graph_config": {
+    "enable": true
   }
 }
