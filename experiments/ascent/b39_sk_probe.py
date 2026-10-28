@@ -56,7 +56,8 @@ def main():
             a, sfa = fp.nvfp4_quantize(x, torch.tensor([1 / sa], device="cuda"))
             b, sfb = fp.nvfp4_quantize(w, torch.tensor([1 / sw], device="cuda"))
             alpha = _scalar(a.device, sa * sw)
-            ref = fp._sm120_cutlass_linear(a, b, sfa, sfb, sa, sw).clone()
+            # TRT-LLM FP4GemmRunner tactic 0 (main's route), called directly
+            ref = fp._sm120_fp4_gemm_runner().run_gemm(a, b, sfa, sfb, alpha, 0, 0, None, None).clone()
             row = {}
             for idx in ARMS:
                 outs = []

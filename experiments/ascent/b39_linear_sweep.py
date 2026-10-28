@@ -126,8 +126,8 @@ def main():
             tensors = [a, w, sfa, sfw, alpha]
             pristine = [x.clone() for x in tensors]
 
-            def t0():
-                return fp._sm120_cutlass_linear(a, w, sfa, sfw, gsa, gsw)
+            def t0():  # TRT-LLM FP4GemmRunner tactic 0 (main's route), called directly
+                return fp._sm120_fp4_gemm_runner().run_gemm(a, w, sfa, sfw, alpha, 0, 0, None, None)
 
             outs = {idx: torch.empty(M, N, device="cuda", dtype=torch.bfloat16) for idx in ARMS}
 
