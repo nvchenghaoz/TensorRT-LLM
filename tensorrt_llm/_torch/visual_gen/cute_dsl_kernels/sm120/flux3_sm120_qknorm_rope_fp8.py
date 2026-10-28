@@ -22,6 +22,14 @@ per-tensor amax and K2 (_qkv_quantize_kernel) reads them again to write E4M3 q/k
 
 So the E4M3 q/k/v and the four FP32 scalars are bitwise what quantize_qkv_e4m3 gives on main's BF16
 planes. One CTA per row, 12 warps (0-3 q heads, 4-7 k heads, 8-11 v), runtime row count.
+
+Fold (default; TRTLLM_FLUX3_QKV_FP8_FOLD=0 restores the three launches above): two launches.
+_qknorm_rope_fp8_fold_kernel runs the same per-row arithmetic in a grid-stride row loop (grid = 3
+CTAs/SM). Mode 1 writes one partial per (plane, CTA) into FP32 [3, n_part] (n_part = its grid,
+<= 1024; NaN-ignoring max.f32 of |BF16| from init 0.0). Each mode-2 CTA re-reduces the three
+planes' partials (any producer of that contract, runtime n_part <= 1024), computes scale/factor as
+_scale_from_amax, CTA 0 writes scales[0..7], then quantizes its rows. Max is order-free, so the
+amax and everything downstream are bitwise landing 54's.
 """
 
 import os
@@ -53,8 +61,24 @@ _REDUCE_WARPS = 16
 FOLD = os.environ.get("TRTLLM_FLUX3_QKV_FP8_FOLD", "1").strip() != "0"
 _AMAX_INIT = 0.0  # landing 54 mode 1's amax init; every fold starts from it (all-NaN plane -> 0)
 _MAX_PARTIALS = 1024
-_FOLD_GRID1 = int(os.environ.get("TRTLLM_FLUX3_QKV_FP8_FOLD_G1", "752"))
-_FOLD_GRID2 = int(os.environ.get("TRTLLM_FLUX3_QKV_FP8_FOLD_G2", "564"))
+# Grids of the fold passes: one wave of 3 CTAs/SM (564 on 188 SMs; tuned in-graph, job 1391).
+# 0 = derive from the device. Mode 2 re-reads 3 * n_part * 4 B per CTA (564 CTAs x 3 x 564 x 4 B
+# = 3.8 MB/call for mode 1's own partials).
+_FOLD_CTAS_PER_SM = 3
+_FOLD_GRID1 = int(os.environ.get("TRTLLM_FLUX3_QKV_FP8_FOLD_G1", "0"))
+_FOLD_GRID2 = int(os.environ.get("TRTLLM_FLUX3_QKV_FP8_FOLD_G2", "0"))
+_SM_COUNT = {}
+
+
+def _fold_grid(device: torch.device, configured: int) -> int:
+    if configured > 0:
+        return configured
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    count = _SM_COUNT.get(index)
+    if count is None:
+        count = torch.cuda.get_device_properties(index).multi_processor_count
+        _SM_COUNT[index] = count
+    return _FOLD_CTAS_PER_SM * count
 
 
 @dsl_user_op
@@ -369,13 +393,16 @@ def _qknorm_rope_fp8_fold_kernel(
                     x = (parts + p * n_part + j).load()
                 loaded.append(x)
         for p in cutlass.range_constexpr(3):
-            acc = cutlass.Float32(_AMAX_INIT)
+            part_amax = cutlass.Float32(_AMAX_INIT)
             for i in cutlass.range_constexpr(3):
-                acc = _max_f32(acc, loaded[p * 3 + i])
+                part_amax = _max_f32(part_amax, loaded[p * 3 + i])
             for delta in (16, 8, 4, 2, 1):
-                acc = _max_f32(acc, cute.arch.shuffle_sync_op(acc, delta, kind=nvvm.ShflKind.bfly))
+                part_amax = _max_f32(
+                    part_amax,
+                    cute.arch.shuffle_sync_op(part_amax, delta, kind=nvvm.ShflKind.bfly),
+                )
             if lane == 0:
-                red[p * 12 + warp] = acc
+                red[p * 12 + warp] = part_amax
         cute.arch.sync_threads()
         my_plane = warp // 4
         plane_amax = cutlass.Float32(_AMAX_INIT)
@@ -496,12 +523,12 @@ def _qknorm_rope_fp8_fold_kernel(
         if lane == 0:
             red[warp] = amax
         cute.arch.sync_threads()
+        cta_amax = cutlass.Float32(_AMAX_INIT)
         if tidx < 3:
-            acc = cutlass.Float32(_AMAX_INIT)
             for w in cutlass.range_constexpr(4):
-                acc = _max_f32(acc, red[tidx * 4 + w])
+                cta_amax = _max_f32(cta_amax, red[tidx * 4 + w])
             partial = cute.make_tensor(parts + tidx * n_part + cta, cute.make_layout(1))
-            partial[0] = acc
+            partial[0] = cta_amax
 
 
 @cute.jit
@@ -648,7 +675,7 @@ def qknorm_rope_fp8(
     if FOLD or external_partials is not None:
         if external_partials is None:
             # Mode 1 emits the plan-1233 contract: FP32 [3, n_part], n_part = its grid <= 1024.
-            n_part = max(1, min(rows, _FOLD_GRID1, _MAX_PARTIALS))
+            n_part = max(1, min(rows, _fold_grid(device, _FOLD_GRID1), _MAX_PARTIALS))
             fold_parts = torch.empty((3, n_part), dtype=torch.float32, device=device)
         else:
             fold_parts = external_partials
@@ -660,7 +687,8 @@ def qknorm_rope_fp8(
         ptrs = (src, *common, dst, part_ptr, scale_ptr, qn, kn, cs, pos)
         if external_partials is None:
             _fold_pass(1, key_base, ptrs, rows, n_part, n_part, sm_scale)
-        _fold_pass(2, key_base, ptrs, rows, n_part, max(1, min(rows, _FOLD_GRID2)), sm_scale)
+        grid2 = max(1, min(rows, _fold_grid(device, _FOLD_GRID2)))
+        _fold_pass(2, key_base, ptrs, rows, n_part, grid2, sm_scale)
         return qkv8, scales
     partials = torch.empty(3 * rows * _PARTS_PER_ROW, dtype=torch.float32, device=device)
     part_ptr = make_ptr(cutlass.Float32, partials.data_ptr(), assumed_align=16)
