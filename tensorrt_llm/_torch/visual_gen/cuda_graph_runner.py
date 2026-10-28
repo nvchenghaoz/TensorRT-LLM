@@ -120,6 +120,37 @@ class CUDAGraphRunner:
         self._graph_output_refs: Dict[KeyType, Any] = {}
         self.static_inputs: Dict[KeyType, Tuple[List[Any], Dict[str, Any]]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
+        # Opt-in copy skip for step-invariant tensor kwargs (see
+        # register_reusable_input_fn). _last_src holds STRONG references to the
+        # source tensor last copied into each (graph key, kwarg) static buffer, so
+        # a freed object's id can never fake a match.
+        self._reusable_input_fn: Optional[Callable[[str], bool]] = None
+        self._reusable_input_enabled: Optional[Callable[[], bool]] = None
+        self._last_src: Dict[Tuple[KeyType, str], torch.Tensor] = {}
+
+    def register_reusable_input_fn(
+        self,
+        fn: Callable[[str], bool],
+        enabled: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Let replay skip copy_ for kwargs `fn(name)` marks step-invariant.
+
+        For such a kwarg, replay copies only when the source tensor OBJECT differs
+        from the one last copied into that graph's static buffer. The caller must
+        guarantee that every source tensor passed under such a name is never
+        written in place after it is first passed (a fresh allocation per
+        request, or a cache that depends only on shape and is never rewritten),
+        and that the captured graph never writes that static input.
+        `enabled` (optional) is read at every replay; when it returns False every
+        kwarg is copied, exactly as without a registered fn.
+        """
+        if self.graphs:
+            raise RuntimeError(
+                "CUDA graph reusable-input functions must be registered before graph capture."
+            )
+        self._reusable_input_fn = fn
+        self._reusable_input_enabled = enabled
+        self._last_src.clear()
 
     def register_extra_key_fn(self, name: str, fn: ExtraKeyFn) -> None:
         """Register a graph-key extension computed from forward args/kwargs.
@@ -172,6 +203,7 @@ class CUDAGraphRunner:
         self, key: KeyType, fn: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any]
     ) -> None:
         logger.info(f"Capturing graph for key: {key}")
+        self._last_src.clear()
 
         # One time clone of inputs
         static_args = [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
@@ -217,11 +249,32 @@ class CUDAGraphRunner:
             else:
                 static_args[i] = arg
 
-        for k, v in kwargs.items():
-            if isinstance(v, torch.Tensor):
-                static_kwargs[k].copy_(v)
-            else:
-                static_kwargs[k] = v
+        reusable = self._reusable_input_fn
+        if reusable is not None and (
+            self._reusable_input_enabled is None or self._reusable_input_enabled()
+        ):
+            last_src = self._last_src
+            for k, v in kwargs.items():
+                if isinstance(v, torch.Tensor):
+                    if reusable(k):
+                        slot = (key, k)
+                        if last_src.get(slot) is v:
+                            continue
+                        static_kwargs[k].copy_(v)
+                        last_src[slot] = v
+                    else:
+                        static_kwargs[k].copy_(v)
+                else:
+                    static_kwargs[k] = v
+        else:
+            if self._last_src:
+                # Copy-skip disabled: forget sources so re-enabling copies afresh.
+                self._last_src.clear()
+            for k, v in kwargs.items():
+                if isinstance(v, torch.Tensor):
+                    static_kwargs[k].copy_(v)
+                else:
+                    static_kwargs[k] = v
 
         self.graphs[key].replay()
         return self.graph_outputs[key]
@@ -254,6 +307,7 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        self._last_src.clear()
         if not self.graphs:
             return
         for graph in self.graphs.values():
