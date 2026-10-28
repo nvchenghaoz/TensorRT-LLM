@@ -348,6 +348,7 @@ def parent(ckpt, modes, do_judge, reps):
         os.makedirs(d, exist_ok=True)
         env = dict(os.environ)
         env["TORCH_LOGS"] = "recompiles"
+        env["TLLM_LOG_LEVEL"] = "INFO"
         env.pop("TRTLLM_FLUX3_EXCLUDED_NVFP4", None)
         if mode != "main":
             env["TRTLLM_FLUX3_EXCLUDED_NVFP4"] = mode.replace("+", ",")
