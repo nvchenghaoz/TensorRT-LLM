@@ -80,6 +80,10 @@ class Census:
 
     def _show(self, message, category, filename, lineno, file=None, line=None):
         msg = str(message)
+        if "called a synchronizing" not in msg:
+            # e.g. the one-time "Synchronization debug mode is a prototype feature" notice
+            print(f"[sync-notice] window={self.window} {msg[:160]}", flush=True)
+            return
         stack = "".join(traceback.format_stack(limit=14)[:-2])
         self.events.append({"window": self.window, "msg": msg[:200], "stack": stack})
         print(f"[sync] window={self.window} {msg[:160]}\n{stack}", flush=True)
