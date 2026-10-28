@@ -343,7 +343,9 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
       }
 
       // Make sure we are done reading the data (smem).
+#if !(defined(FMHA_FLUX3_LOOP_TRIM) && FMHA_FLUX3_LOOP_TRIM)
       __syncthreads();
+#endif
 
       smem_q.move_to_next_read_buffer();
       smem_k.move_to_next_read_buffer();
