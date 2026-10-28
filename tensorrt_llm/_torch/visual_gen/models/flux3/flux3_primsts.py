@@ -119,6 +119,10 @@ def sm120_linear_preload(device: torch.device) -> None:
         index = device.index if device.index is not None else torch.cuda.current_device()
         with torch.cuda.stream(_sm120_tail_pair_stream(index)):
             _sm120_fi_workspace(device)
+        # The one-launch NVFP4 tail pair: build its module and allocate its workspace now.
+        from . import flux3_sm120_lpt_pair
+
+        flux3_sm120_lpt_pair.preload(device)
     from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_swiglu_fp4_cutlass
 
     if flux3_swiglu_fp4_cutlass.enabled():
@@ -425,6 +429,44 @@ def nvfp4_out_pair(
             attn_owner.input_global_scale,
             attn_owner.weight_global_scale,
         )
+
+    if _sm120_linear_backend() == "cutlass":
+        from . import flux3_sm120_lpt_pair as lpt
+
+        if lpt.enabled():
+            # One persistent launch: down's 128x128 tiles (K=9216) first, then attn_out's
+            # (K=3072) from a dynamic tile counter. Per output tile the MMA sequence is the stock
+            # DP kernel's (bitwise to t0/t17). TRTLLM_FLUX3_SM120_PAIR_KERNEL=0 restores the
+            # two-stream pair below.
+            from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_nvfp4 import (
+                _scalar,
+            )
+
+            device = attn.device
+            data, scales = nvfp4_quantize_prepared(attn.detach(), attn_weight)
+            rows_down = down_activation.shape[0]
+            rows_attn = data.shape[0]
+            down_out = torch.empty(
+                (rows_down, down_weight.shape[0]), device=device, dtype=torch.bfloat16
+            )
+            attn_out = torch.empty(
+                (rows_attn, attn_weight.shape[0]), device=device, dtype=torch.bfloat16
+            )
+            lpt.run(
+                down_activation.detach(),
+                down_weight,
+                down_activation_scale.detach(),
+                down_weight_scale,
+                _scalar(device, down_owner.input_global_scale * down_owner.weight_global_scale),
+                down_out,
+                data,
+                attn_weight,
+                scales,
+                attn_weight_scale,
+                _scalar(device, attn_owner.input_global_scale * attn_owner.weight_global_scale),
+                attn_out,
+            )
+            return attn_out, down_out
 
     return _sm120_tail_pair(attn.device, launch_down, launch_attn)
 
