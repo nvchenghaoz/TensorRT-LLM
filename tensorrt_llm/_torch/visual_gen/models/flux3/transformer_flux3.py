@@ -583,7 +583,9 @@ class Flux3Attention(Attention):
             # One full-range segment: the backend's [B, S, H*D] result is the whole
             # output, so skip the zero-filled buffer and the slice copy into it.
             # Keep the same (contiguous) inputs the general path hands the backend.
-            if not isinstance(self.attn, VanillaAttention):
+            if not isinstance(self.attn, VanillaAttention) and not getattr(
+                self.attn, "accepts_strided_qkv", False
+            ):
                 q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
             return self._attn_impl(q, k, v, timestep=timestep)
         if q.shape[0] == 1 and len(sample_bounds) > 1:
@@ -605,8 +607,10 @@ class Flux3Attention(Attention):
         for start, end in sample_bounds:
             if end > start:
                 q_sample, k_sample, v_sample = q[:, start:end], k[:, start:end], v[:, start:end]
-                # SDPA accepts strided QKV views without copying.
-                if not isinstance(self.attn, VanillaAttention):
+                # SDPA (and backends that read strided views) take QKV without copying.
+                if not isinstance(self.attn, VanillaAttention) and not getattr(
+                    self.attn, "accepts_strided_qkv", False
+                ):
                     q_sample, k_sample, v_sample = (
                         q_sample.contiguous(),
                         k_sample.contiguous(),

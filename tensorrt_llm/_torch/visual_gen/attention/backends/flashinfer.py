@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.interface import PredefinedAttentionMask
+from .fp8_sm12x import visual_gen_fp8_attention_sm120
 from .interface import AttentionBackend, AttentionTensorLayout
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -142,6 +143,9 @@ class FlashInferAttention(AttentionBackend):
                 "FlashInfer quantized attention supports qk_dtype='mxfp8' or 'nvfp4', "
                 f"or 'fp8' with v_dtype='fp8' on SM120/SM121, got {quant_attention_config.qk_dtype!r}."
             )
+        # The SM12x FP8 path reads strided [B, S, H, D] views (packed/planar QKV rows) in its
+        # fused quantize; every other path makes its own contiguous copies.
+        self.accepts_strided_qkv = self._fp8_sm12x
 
     def _validate_inputs(
         self,
@@ -423,7 +427,6 @@ class FlashInferAttention(AttentionBackend):
         x_q, descale = torch.ops.trtllm.quantize_e4m3_per_tensor(x.contiguous())
         return x_q, descale.float().reshape(1)
 
-    @torch.compiler.disable
     def _run_fp8_sm12x(
         self,
         q: torch.Tensor,
@@ -435,9 +438,38 @@ class FlashInferAttention(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Per-tensor FP8 E4M3 Q/K/V attention with BF16 output (fmha_v2 SM120 kernel).
 
-        Short sequences, where the quantize passes cost more than FP8 saves, run
-        unquantized BF16 attention instead.
+        Q/K/V may be strided views. The no-LSE FP8 call is one in-graph custom op (fused
+        strided quantize + fmha_v2); short sequences, where quantizing costs more than FP8
+        saves, run unquantized BF16 attention instead.
         """
+        if return_lse:
+            return self._run_fp8_sm12x_with_lse(q, k, v, is_causal=is_causal)
+        if q.shape != k.shape or q.shape != v.shape:
+            raise ValueError("FlashInfer SM120/SM121 FP8 attention supports self-attention only.")
+        if q.shape[1] < self._fp8_min_seq_len or q.dtype != torch.bfloat16:
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+            output = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                is_causal=is_causal,
+                scale=self.scale,
+            )
+            return output.transpose(1, 2), None
+        return visual_gen_fp8_attention_sm120(q, k, v, self.scale, is_causal), None
+
+    @torch.compiler.disable
+    def _run_fp8_sm12x_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        is_causal: bool,
+        return_lse: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The FP8 path that also returns LSE; runs eagerly on contiguous Q/K/V copies."""
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         if q.shape != k.shape or q.shape != v.shape:
             raise ValueError("FlashInfer SM120/SM121 FP8 attention supports self-attention only.")
         batch_size, sequence_length = q.shape[:2]
