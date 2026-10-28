@@ -711,27 +711,35 @@ def linear_forward(layer: Linear, x: PrimsTSInput) -> torch.Tensor:
     return layer(original if isinstance(x, NVFP4Activation) else x)
 
 
+def rope_cos_sin_table(cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """The fused QK-norm+RoPE ops' table: [rows, 128], the cos half then the sin
+    half (every other column of the repeat-interleaved head_dim cos/sin)."""
+    return torch.cat((cos.reshape(-1, 128)[:, ::2], sin.reshape(-1, 128)[:, ::2]), dim=-1)
+
+
 def qkv_forward(
     attn: nn.Module,
     x: PrimsTSInput,
-    freqs: tuple[torch.Tensor, torch.Tensor],
+    freqs: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Return Q, K and V after the fused projection, or None when the input
     requires native dispatch. Each is ``[..., heads * head_dim]`` and the tuned
-    configs make them contiguous."""
+    configs make them contiguous. ``freqs`` is ``(cos, sin)`` or ``(cos, sin,
+    cos_sin)`` with ``cos_sin`` the per-request FP32 rope_cos_sin_table, which
+    then is not rebuilt here."""
     adapter = getattr(attn, "_flux3_primsts_nvfp4_qkv", None)
     if adapter is None:
         if not getattr(attn, "_primsts_fp8_qkv_rope", False):
             return None
         adapter = attn.qkv_proj._flux3_primsts_fp8
     original = original_input(x)
-    cos, sin = freqs
+    cos, sin = freqs[0], freqs[1]
     if not adapter.can_run(original) or cos.numel() != original.numel() // original.shape[-1] * 128:
         return None
     if sin.shape != cos.shape:
         return None
     data, scales = adapter.activation(x)
-    cos_sin = torch.cat((cos.reshape(-1, 128)[:, ::2], sin.reshape(-1, 128)[:, ::2]), dim=-1)
+    cos_sin = freqs[2] if len(freqs) > 2 else rope_cos_sin_table(cos, sin)
     args = (
         data,
         adapter.weight,
