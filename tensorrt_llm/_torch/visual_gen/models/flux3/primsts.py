@@ -24,7 +24,9 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
     fp8_linear,
     fp8_linear_swiglu,
     fp8_qkv_qknorm_rope,
+    fp8r_out_pair,
     is_sm120,
+    nvfp4_out_pair,
     nvfp4_linear_prepared,
     nvfp4_qkv_prepared,
     nvfp4_quantize_prepared,
@@ -613,6 +615,90 @@ def prepare_fp8_block(block: nn.Module) -> None:
         )
     if qkv is not None and getattr(qkv, "_flux3_primsts_fp8", None) is not None:
         attn._primsts_fp8_qkv_rope = _qkv_epilogue_eligible(attn)
+
+
+def _sm120_tail_pair_enabled() -> bool:
+    return _enabled() and os.environ.get("TRTLLM_FLUX3_SM120_TAIL_PAIR", "1") != "0"
+
+
+def prepare_sm120_tail_pair(block: nn.Module) -> bool:
+    """Set block._sm120_tail_pair, the static switch of sm120_tail_pair_forward.
+
+    True when attn_out and ff.down_proj are both SM120 CUTLASS NVFP4 adapters (with the packed
+    SwiGLU gate_up) or both FP8R adapters, on a local (tp_size 1) block. Call after every
+    adapter preparation and before compiling; forward reads only the flag.
+    """
+    eligible = False
+    if (
+        not block._fuse_proj_out
+        and getattr(block, "_allreduce", None) is None
+        and _sm120_tail_pair_enabled()
+    ):
+        from .flux3_primsts import _sm120_linear_backend
+
+        layers = (block.attn_out, block.ff.gate_up_proj, block.ff.down_proj)
+        out, up, down = (getattr(layer, "_flux3_primsts_nvfp4", None) for layer in layers)
+        fp8 = [getattr(layer, "_flux3_primsts_fp8", None) for layer in layers]
+        if all(a is None for a in fp8) and all(a is not None for a in (out, up, down)):
+            eligible = (
+                up.swiglu
+                and not out.swiglu
+                and not down.swiglu
+                and is_sm120(out.weight.device)
+                and _sm120_linear_backend() == "cutlass"
+                and all(_local_projection(layer) for layer in layers)
+            )
+        elif all(isinstance(a, PreparedFP8Sm120) for a in fp8):
+            out, up, down = fp8
+            eligible = up.swiglu and not out.swiglu and not down.swiglu
+    block._sm120_tail_pair = bool(eligible)
+    return block._sm120_tail_pair
+
+
+def sm120_tail_pair_forward(
+    block: nn.Module, attn: torch.Tensor, mlp_input: PrimsTSInput
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """(attn_out(attn), ff(mlp_input)) as 2D [M, N] tensors, with down and attn_out run as one
+    two-stream op, or None (caller runs the sequential path). Only for blocks whose
+    _sm120_tail_pair flag is set. gate_up runs exactly as in _flux3_gated_mlp_forward.
+    """
+    original = original_input(mlp_input)
+    attn_2d = attn.reshape(-1, attn.shape[-1]).contiguous()
+    out = getattr(block.attn_out, "_flux3_primsts_nvfp4", None)
+    if out is not None:
+        up = block.ff.gate_up_proj._flux3_primsts_nvfp4
+        down = block.ff.down_proj._flux3_primsts_nvfp4
+        if not (up.can_run(original) and out.can_run(attn)):
+            return None
+        data, scales = up.activation(mlp_input)
+        packed, output_scales = nvfp4_swiglu_prepared(
+            data,
+            up.weight,
+            scales,
+            up.scale,
+            down.inverse_scale,
+            original,
+            mlp_input.quantized_by if isinstance(mlp_input, NVFP4Activation) else None,
+        )
+        return nvfp4_out_pair(
+            packed, down.weight, output_scales, down.scale, attn_2d, out.weight, out.scale
+        )
+    out = block.attn_out._flux3_primsts_fp8
+    up = block.ff.gate_up_proj._flux3_primsts_fp8
+    down = block.ff.down_proj._flux3_primsts_fp8
+    if not (up.can_run(original) and out.can_run(attn)):
+        return None
+    hidden = up(mlp_input)
+    if not down.can_run(hidden):
+        return None
+    return fp8r_out_pair(
+        hidden.reshape(-1, hidden.shape[-1]),
+        down.weight,
+        down.scale,
+        attn_2d,
+        out.weight,
+        out.scale,
+    )
 
 
 def linear_forward(layer: Linear, x: PrimsTSInput) -> torch.Tensor:

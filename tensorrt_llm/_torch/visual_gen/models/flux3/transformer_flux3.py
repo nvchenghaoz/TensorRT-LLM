@@ -56,9 +56,11 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     prepare_fp8_block,
     prepare_nvfp4_block,
     prepare_sm120_fp8_excluded_block,
+    prepare_sm120_tail_pair,
     separate_qkv_forward,
     shared_nvfp4_input,
     sm120_fp8_shared_input,
+    sm120_tail_pair_forward,
     verify_nvfp4_coverage,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
@@ -758,6 +760,8 @@ class Flux3ModeBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, has_weights=False, has_bias=False, dtype=dtype
         )
         self._pertoken_adaln = Flux3PerTokenAdaLN(hidden_size, dtype)
+        # Set by prepare_sm120_tail_pair after weight preparation (static, read in forward).
+        self._sm120_tail_pair = False
 
     def forward(
         self,
@@ -792,8 +796,15 @@ class Flux3ModeBlock(nn.Module):
                 mlp_input = Fp8RowwiseQuantizedTensor(
                     mlp_input, quantized.quantized, quantized.scales
                 )
-            mlp_out = _flux3_gated_mlp_forward(self.ff, mlp_input).reshape(*mlp_shape[:-1], -1)
-            output = _primsts_linear_forward(self.attn_out, attn) + mlp_out
+            pair = sm120_tail_pair_forward(self, attn, mlp_input) if self._sm120_tail_pair else None
+            if pair is not None:
+                attn_y, mlp_y = pair
+                output = attn_y.reshape(*attn.shape[:-1], -1) + mlp_y.reshape(
+                    *mlp_shape[:-1], -1
+                )
+            else:
+                mlp_out = _flux3_gated_mlp_forward(self.ff, mlp_input).reshape(*mlp_shape[:-1], -1)
+                output = _primsts_linear_forward(self.attn_out, attn) + mlp_out
             if self._allreduce is not None:
                 output = self._allreduce(output)
         return x + mod_gate * output
@@ -891,6 +902,8 @@ class Flux3SingleStreamBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, has_weights=False, has_bias=False, dtype=dtype
         )
         self._pertoken_adaln = Flux3PerTokenAdaLN(hidden_size, dtype)
+        # Set by prepare_sm120_tail_pair after weight preparation (static, read in forward).
+        self._sm120_tail_pair = False
 
     def forward(
         self,
@@ -934,8 +947,17 @@ class Flux3SingleStreamBlock(nn.Module):
                 mlp_input = Fp8RowwiseQuantizedTensor(
                     mlp_input, quantized.quantized, quantized.scales
                 )
-            mlp_out = _flux3_gated_mlp_forward(self.ff, mlp_input).reshape(*combined_shape[:-1], -1)
-            output = _primsts_linear_forward(self.attn_out, attn) + mlp_out
+            pair = sm120_tail_pair_forward(self, attn, mlp_input) if self._sm120_tail_pair else None
+            if pair is not None:
+                attn_y, mlp_y = pair
+                output = attn_y.reshape(*attn.shape[:-1], -1) + mlp_y.reshape(
+                    *combined_shape[:-1], -1
+                )
+            else:
+                mlp_out = _flux3_gated_mlp_forward(self.ff, mlp_input).reshape(
+                    *combined_shape[:-1], -1
+                )
+                output = _primsts_linear_forward(self.attn_out, attn) + mlp_out
             if self._allreduce is not None:
                 output = self._allreduce(output)
         return residual + mod_gate * output
@@ -1601,3 +1623,10 @@ class Flux3Model(BaseDiffusionModel):
                     "(QKV, attn_out, MLP-up+SwiGLU, MLP-down; per-channel weights "
                     f"bitwise equal to variants/fp8r): {switched}"
                 )
+        paired = [
+            name
+            for name, block in blocks
+            if prepare_sm120_tail_pair(getattr(block, "_orig_mod", block))
+        ]
+        if paired:
+            logger.info(f"FLUX.3 SM120 down || attn_out two-stream tail pair: {paired}")
