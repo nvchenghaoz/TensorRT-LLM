@@ -31,7 +31,8 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import PreparedFP8Sm120
 H, FF = 3072, 9216
 WARMUP = 10
 ITERS = 60
-STEP_ITERS = 60
+STEP_ITERS = 150
+STEP_WARMUP = 200  # ~1.3 s of back-to-back work: clocks settle before timing
 SPIN_CYCLES = 6_000_000
 PLAN = [(4176, 4), (4096, 1)]
 
@@ -92,10 +93,13 @@ def bench():
     log(f"bench flag={primsts._FP8R_FUSED_SWIGLU_QUANT} tree_has_pair_q={has_q}")
     for M, c in cases.items():
         restore(c, pristine[M])
-    for i in range(WARMUP):
+    for i in range(STEP_WARMUP):
         for M, n in PLAN:
             for _ in range(n):
                 assert call(cases[M]) is not None
+        if i % 50 == 0:
+            torch.cuda.synchronize()
+            log(f"  warmup {i}")
     torch.cuda.synchronize()
     for M, c in cases.items():
         assert all(torch.equal(p, t) for p, t in zip(pristine[M], tensors(c))), M
