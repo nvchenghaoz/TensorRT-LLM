@@ -658,7 +658,7 @@ class Flux3Pipeline(BasePipeline):
         pag_samples = (0,) if not flow_map and indices[0] == 0 else ()
         if timer is not None:
             timer.mark_denoise_start()
-        text_steps = None
+        text_steps = image_steps = None
         if flow_map and not (
             self.cache_accelerator is not None and self.cache_accelerator.is_enabled()
         ):
@@ -670,6 +670,17 @@ class Flux3Pipeline(BasePipeline):
                 inputs["x_text_timesteps"].dtype,
             )
             text_steps = self.transformer.prepare_flow_map_text(targets, **inputs, **prepared)
+            # The image stream's vec rows (time_in + ref_time_in, early/single modulations,
+            # final adaLN) depend only on the step's timestep and target: run them once at
+            # M=N. Same bf16 values the per-step fill_ below writes into x_image_timesteps.
+            image_timesteps = _sigmas_to_device(
+                scheduler.timesteps,
+                inputs["x_image_timesteps"].device,
+                inputs["x_image_timesteps"].dtype,
+            )
+            image_steps = self.transformer.prepare_flow_map_image(
+                image_timesteps, targets, **inputs, **prepared
+            )
         for step_index, timestep in self._profile_denoise_steps(scheduler.timesteps):
             inputs["x_image_timesteps"].fill_(timestep.item())
             if flow_map:
@@ -679,10 +690,16 @@ class Flux3Pipeline(BasePipeline):
                 if text_steps is not None
                 else {}
             )
+            step_image = (
+                self.transformer.flow_map_image_step(image_steps, step_index)
+                if image_steps is not None
+                else {}
+            )
             predictions = self.transformer(
                 **inputs,
                 **prepared,
                 **step_text,
+                **step_image,
                 **target_kwargs,
                 timestep=timestep,
                 pag_single_layers=pag_single_layers,

@@ -445,8 +445,10 @@ class Flux3LastLayer(nn.Module):
             ),
         )
 
-    def forward(self, x: Tensor, vec: Tensor) -> Tensor:
-        mod = self.adaLN_modulation(vec)
+    def forward(self, x: Tensor, vec: Tensor | None, mod: Tensor | None = None) -> Tensor:
+        # `mod` is adaLN_modulation(vec) precomputed by the caller (step-batched flow-map rows).
+        if mod is None:
+            mod = self.adaLN_modulation(vec)
         shift, scale = mod.chunk(2, dim=-1)
         if shift.ndim == 2:
             shift = shift[:, None, :]
@@ -1555,6 +1557,85 @@ class Flux3Model(BaseDiffusionModel):
             out["_flux3_text_step_single_" + field] = rows
         return out
 
+    def prepare_flow_map_image(
+        self, image_timesteps: Tensor, targets: Tensor, *, layout: Layout | None = None, **inputs
+    ) -> dict[str, Tensor] | None:
+        """Run a flow-map image stream's per-step M=1 vec GEMVs once for every step.
+
+        The image vec of step i is time_in(emb(image_timesteps[i])) + ref_time_in(emb(
+        targets[i])); its early/single modulations and the final layer's adaLN row depend on
+        nothing else. This runs them at M=N once per request instead of N times at M=1.
+
+        Returns [N, 1, 1, 3D] early/single and [N, 1, 1, 2D] final rows (flow_map_image_step
+        hands forward step i's [1, 1, *] row, laid out like the per-step module outputs), or
+        None when the per-step path must run (non-flow-map, sequence parallel, conditioning
+        image streams, non-uniform timesteps, more than one image segment, no broadcast adaLN
+        rows, or TRTLLM_FLUX3_IMAGE_VEC_STEP_BATCH=0).
+        """
+        if (
+            not self.flow_map
+            or torch.is_grad_enabled()
+            or self.sharder.is_active
+            or set(self.final_layer) != {"image"}
+            or os.environ.get("TRTLLM_FLUX3_IMAGE_VEC_STEP_BATCH", "1") == "0"
+        ):
+            return None
+        inputs, layout, _ = self._packed_inputs(inputs, layout)
+        if not inputs.get("_flux3_uniform_timesteps", False):
+            return None
+        if any(name.endswith("_cond") and any(lengths) for name, lengths in layout):
+            return None
+        image_lengths = dict(layout).get("image", ())
+        if len(image_lengths) != 1 or not image_lengths[0]:
+            return None
+        if (
+            image_timesteps.ndim != 1
+            or not image_timesteps.shape[0]
+            or targets.shape != image_timesteps.shape
+        ):
+            return None
+        tokens = inputs["x_image"]
+        if not self._broadcast_adaln_ok(tokens):
+            return None
+        steps = image_timesteps.shape[0]
+        # Same rows as the per-step compact path (_packed_stream + forward's ref), at M=N.
+        target = targets.to(inputs["x_text_timesteps"])
+        ref = self.ref_time_in(flux3_timestep_embedding(target, 256, out_dtype=target.dtype))
+        ts = image_timesteps.to(inputs["x_image_timesteps"])
+        vec = self.time_in(flux3_timestep_embedding(ts, 256, out_dtype=tokens.dtype))
+        vec = (vec + ref).unsqueeze(0)  # [1, N, D]
+        prepared = {}
+        for stage, modules in (
+            ("early", self.early_stream_modulations),
+            ("single", self.single_stream_modulations),
+        ):
+            module = modules["image"]
+            out = module.lin(module.act(vec))  # [1, N, 3D]
+            prepared["_flux3_image_steps_" + stage] = out.reshape(steps, 1, 1, out.shape[-1])
+        mod = self.final_layer["image"].adaLN_modulation(vec)  # [1, N, 2D]
+        prepared["_flux3_image_steps_final"] = mod.reshape(steps, 1, 1, mod.shape[-1])
+        return prepared
+
+    @staticmethod
+    def flow_map_image_step(prepared: dict[str, Tensor], step: int) -> dict[str, Tensor]:
+        """Step `step`'s [1, 1, *] image rows from prepare_flow_map_image, as forward kwargs."""
+        return {
+            "_flux3_image_step_" + kind: prepared["_flux3_image_steps_" + kind][step]
+            for kind in ("early", "single", "final")
+        }
+
+    def _image_step_stream(self, inputs: dict, lengths: tuple[int, ...]) -> dict[str, Tensor]:
+        """The image stream state from flow_map_image_step's rows: only emb_in runs per step."""
+        embedded = self.emb_in["image"](inputs["x_image"]).unsqueeze(0)
+        state = {"tokens": self._shard_packed(embedded, lengths, 1)}
+        for stage in ("early", "single"):
+            rows = inputs["_flux3_image_step_" + stage].chunk(3, dim=-1)
+            for field, value in zip(("shift", "scale", "gate"), rows):
+                # One segment: the [1, 1, D] row; the blocks broadcast it.
+                state[stage + "_" + field] = value
+        state["final_mod"] = inputs["_flux3_image_step_final"]
+        return state
+
     def forward(
         self,
         *,
@@ -1570,12 +1651,21 @@ class Flux3Model(BaseDiffusionModel):
         if (timesteps_ref is not None) != self.flow_map:
             raise ValueError("timesteps_ref is required by, and only by, a flow-map DiT")
         ref = None
+        image_rows = self.flow_map and "_flux3_image_step_early" in inputs
         if timesteps_ref is not None:
             num_samples = len(layout[0][1])
             if timesteps_ref.shape != (num_samples,):
                 raise ValueError(f"timesteps_ref must have shape ({num_samples},)")
-            target = timesteps_ref.to(inputs["x_text_timesteps"])
-            ref = self.ref_time_in(flux3_timestep_embedding(target, 256, out_dtype=target.dtype))
+            # Only streams built per step need ref; step-batched text/image rows include it.
+            if not (
+                "_flux3_text_step_tokens" in inputs
+                and image_rows
+                and {name for name, lengths in layout if any(lengths)} <= {"text", "image"}
+            ):
+                target = timesteps_ref.to(inputs["x_text_timesteps"])
+                ref = self.ref_time_in(
+                    flux3_timestep_embedding(target, 256, out_dtype=target.dtype)
+                )
         local_layout = self._local_layout(layout)
         local_lengths = dict(local_layout)
         prepared = (
@@ -1600,7 +1690,11 @@ class Flux3Model(BaseDiffusionModel):
                     for field in ("tokens", "single_shift", "single_scale", "single_gate")
                 }
                 continue
-            state = self._packed_stream(name, inputs, lengths, ref)
+            if image_rows and name == "image":
+                # Precomputed for all steps by prepare_flow_map_image.
+                state = self._image_step_stream(inputs, lengths)
+            else:
+                state = self._packed_stream(name, inputs, lengths, ref)
             blocks = self.txt_mode_blocks if name == "text" else self.content_mode_blocks[name]
             freqs = _block_freqs(prepared, prefix)
             mod = tuple(state["early_" + field] for field in ("shift", "scale", "gate"))
@@ -1667,8 +1761,11 @@ class Flux3Model(BaseDiffusionModel):
                     parts.append(part)
                 offset += end - start
             tokens = torch.cat(parts, dim=1)
-            vec = self._final_layer_vec(streams[name]["vec"], inputs, dict(layout)[name])
-            output = self.final_layer[name](tokens, vec)[0]
+            if "final_mod" in streams[name]:
+                output = self.final_layer[name](tokens, None, mod=streams[name]["final_mod"])[0]
+            else:
+                vec = self._final_layer_vec(streams[name]["vec"], inputs, dict(layout)[name])
+                output = self.final_layer[name](tokens, vec)[0]
             outputs["x_" + name] = (
                 output.reshape(batch, -1, output.shape[-1]) if batch is not None else output
             )
