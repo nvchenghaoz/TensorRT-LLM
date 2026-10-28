@@ -117,6 +117,52 @@ def pingpong_module():
     return spec.build_and_load()
 
 
+@lru_cache(maxsize=1)
+def qkv_tilesched() -> str:
+    """Tile scheduler of the Pingpong QKV kernels (idea 200), read once.
+
+    'dynamic' (default): overlay entry ``csrc/flux3_fp4_gemm_sm120_pingpong_dyn.cu`` (module
+    ``flux3_fp4_gemm_sm120_pingpong_dyn``), the same kernel with cutlass::gemm::PersistentScheduler,
+    which on Sm120 is PersistentTileSchedulerSm100 (CLC work stealing): a free CTA takes the next
+    tile instead of a fixed 1/188 share. Same per-tile MMA sequence and epilogue, so bitwise equal.
+    TRTLLM_FLUX3_SM120_QKV_TILESCHED=static restores main's StaticPersistentScheduler module.
+    """
+    sched = os.environ.get("TRTLLM_FLUX3_SM120_QKV_TILESCHED", "dynamic").strip().lower()
+    if sched not in ("dynamic", "static"):
+        raise ValueError(
+            f"TRTLLM_FLUX3_SM120_QKV_TILESCHED must be 'dynamic' or 'static', got {sched!r}"
+        )
+    return sched
+
+
+@lru_cache(maxsize=1)
+def pingpong_dyn_module():
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.core import current_compilation_context, gen_jit_spec
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[12])
+    spec = gen_jit_spec(
+        "flux3_fp4_gemm_sm120_pingpong_dyn",
+        [jit_env.FLASHINFER_CSRC_DIR / "flux3_fp4_gemm_sm120_pingpong_dyn.cu"],
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DFLUX3_PP_ONLY",
+        ],
+        extra_cflags=["-DFAST_BUILD"],
+    )
+    return spec.build_and_load()
+
+
+def qkv_pingpong_module():
+    """The Pingpong QKV module of the selected tile scheduler (built once, at load)."""
+    if qkv_tilesched() == "dynamic":
+        return pingpong_dyn_module()
+    return pingpong_module()
+
+
 def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
@@ -143,10 +189,10 @@ def preload(device: torch.device) -> None:
     if not inplace_enabled():
         return
     if qkv_schedule() in ("pingpong", "batched"):
-        mod = pingpong_module()
+        mod = qkv_pingpong_module()
         if qkv_schedule() == "batched":
-            # DP StaticPersistent: the batched launch's workspace is tiny and M-independent in
-            # practice; check the largest M once here so a call never needs more.
+            # DP StaticPersistent / CLC dynamic: the batched launch's workspace is tiny and
+            # M-independent in practice; check the largest M once here so a call never needs more.
             need = int(mod.qkv3_workspace_size(1 << 16, 3072, 3072))
             if need > _WORKSPACE_BYTES:
                 raise RuntimeError(f"batched QKV workspace {need} B exceeds {_WORKSPACE_BYTES} B")
@@ -169,7 +215,7 @@ def gemm_into(
 ) -> None:
     """out.flat[offset + r*ldd + c] = BF16(alpha * (A @ W^T))[r, c], on the current stream."""
     if qkv_schedule() in ("pingpong", "batched"):
-        fn = pingpong_module().gemm_into_pingpong
+        fn = qkv_pingpong_module().gemm_into_pingpong
     else:
         fn = module().fp4_gemm_strided
     fn(
@@ -199,7 +245,7 @@ def gemm_qkv3(
     swizzled scales (plane p at flat p*numel/3), alpha 3 fp32 plane scales. Current stream,
     slot-0 workspace (the slot the per-plane path's q GEMM uses), no allocation.
     """
-    pingpong_module().gemm_qkv3_pingpong(
+    qkv_pingpong_module().gemm_qkv3_pingpong(
         activation,
         weight,
         activation_scale,
