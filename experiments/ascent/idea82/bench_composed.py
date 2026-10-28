@@ -18,7 +18,8 @@ import statistics
 import torch
 
 REPS = 10
-SAMPLES = int(os.environ.get("IDEA82_SAMPLES", "120"))
+SAMPLES = int(os.environ.get("IDEA82_SAMPLES", "300"))
+BLOCKS = 10
 DEV = torch.device("cuda", 0)
 
 
@@ -83,11 +84,19 @@ def main():
             e1.record()
             e1.synchronize()
             xs.append(e0.elapsed_time(e1) * 1000.0 / REPS)
+        # Noise: spread of the medians of BLOCKS consecutive blocks (repeated timings of this one
+        # configuration), plus the raw per-replay p10-p90 spread for reference.
+        nb = BLOCKS
+        bs = len(xs) // nb
+        block_meds = [statistics.median(xs[i * bs:(i + 1) * bs]) for i in range(nb)]
         xs.sort()
         med = statistics.median(xs)
         p10, p90 = xs[int(0.1 * (len(xs) - 1))], xs[int(0.9 * (len(xs) - 1))]
         res["M"][M] = {"us_med": round(med, 2), "p10": round(p10, 2), "p90": round(p90, 2),
-                       "noise": round((p90 - p10) / med, 4), "repeat_bitwise": bool(rep),
+                       "raw_p10_p90_rel": round((p90 - p10) / med, 4),
+                       "block_medians": [round(b, 2) for b in block_meds],
+                       "noise": round((max(block_meds) - min(block_meds)) / med, 4),
+                       "repeat_bitwise": bool(rep),
                        "inputs_unchanged": bool(inputs_ok), "out_sha": sha[:24]}
         log(json.dumps({M: res["M"][M]}))
         del g
