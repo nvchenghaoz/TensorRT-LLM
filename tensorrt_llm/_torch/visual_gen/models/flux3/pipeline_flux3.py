@@ -581,13 +581,29 @@ class Flux3Pipeline(BasePipeline):
         pag_samples = (0,) if not flow_map and indices[0] == 0 else ()
         if timer is not None:
             timer.mark_denoise_start()
+        text_steps = None
+        if flow_map and not (
+            self.cache_accelerator is not None and self.cache_accelerator.is_enabled()
+        ):
+            # The flow-map text stream depends only on ctx and the step's target time:
+            # run it once for all steps (each step then reads its slice).
+            targets = scheduler.sigmas[1 : len(scheduler.timesteps) + 1].to(
+                device=inputs["x_text_timesteps"].device, dtype=inputs["x_text_timesteps"].dtype
+            )
+            text_steps = self.transformer.prepare_flow_map_text(targets, **inputs, **prepared)
         for step_index, timestep in self._profile_denoise_steps(scheduler.timesteps):
             inputs["x_image_timesteps"].fill_(timestep.item())
             if flow_map:
                 target_kwargs["timesteps_ref"].fill_(scheduler.sigmas[step_index + 1].item())
+            step_text = (
+                self.transformer.flow_map_text_step(text_steps, step_index)
+                if text_steps is not None
+                else {}
+            )
             predictions = self.transformer(
                 **inputs,
                 **prepared,
+                **step_text,
                 **target_kwargs,
                 timestep=timestep,
                 pag_single_layers=pag_single_layers,

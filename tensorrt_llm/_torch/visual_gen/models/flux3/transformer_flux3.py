@@ -21,6 +21,7 @@ FLUX.3 image-small is a joint image/text DiT:
 """
 
 import math
+import os
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -1325,6 +1326,95 @@ class Flux3Model(BaseDiffusionModel):
             )
         return prepared
 
+    # Text attention below this per-sample length runs unquantized BF16 attention in every
+    # backend (FlashInfer's FP8 path starts at 1024), so a batch of N steps keeps each step's
+    # math. At or above it, per-tensor FP8 scales would span all N steps: keep per-step.
+    _TEXT_STEP_BATCH_MAX_LEN = 1024
+
+    def prepare_flow_map_text(
+        self, targets: Tensor, *, layout: Layout | None = None, **inputs
+    ) -> dict[str, Tensor] | None:
+        """Run a flow-map text stream once for every denoising step.
+
+        A flow-map text stream depends only on the context and the step's target time
+        (timesteps_ref), never on the image latents, so step i's text tokens and single_*
+        modulation are f(ctx, targets[i]). This runs the stream over N equal segments, one
+        per target, so txt_mode_blocks run at M=N*T instead of N times at M=T.
+
+        Returns [1, N*T, D] tokens and [1, N, D] single_* rows, or None when the per-step
+        path must run (non-flow-map, sequence parallel, conditioning image streams,
+        non-uniform timesteps, long text, or TRTLLM_FLUX3_TEXT_STEP_BATCH=0).
+        """
+        if (
+            not self.flow_map
+            or torch.is_grad_enabled()
+            or self.sharder.is_active
+            or "text" in self.final_layer
+            or os.environ.get("TRTLLM_FLUX3_TEXT_STEP_BATCH", "1") == "0"
+        ):
+            return None
+        inputs, layout, _ = self._packed_inputs(inputs, layout)
+        if not inputs.get("_flux3_uniform_timesteps", False):
+            return None
+        if any(name.endswith("_cond") and any(lengths) for name, lengths in layout):
+            return None
+        text_lengths = dict(layout).get("text", ())
+        if len(text_lengths) != 1 or targets.ndim != 1 or not targets.shape[0]:
+            return None
+        length, steps = text_lengths[0], targets.shape[0]
+        if not 0 < length < self._TEXT_STEP_BATCH_MAX_LEN:
+            return None
+        if "_flux3_text_cos" not in inputs:
+            inputs = {**inputs, **self._packed_positions(inputs, layout)}
+        tokens, ts = inputs["x_text"], inputs["x_text_timesteps"]
+        # Same rows as the per-step compact path: one time_in row for the text stream plus
+        # one ref_time_in row per step.
+        target = targets.to(ts)
+        ref = self.ref_time_in(flux3_timestep_embedding(target, 256, out_dtype=target.dtype))
+        vec = self.time_in(flux3_timestep_embedding(ts[:1], 256, out_dtype=tokens.dtype))
+        vec = (vec + ref).unsqueeze(0)  # [1, N, D]
+        mods = {}
+        for stage, modules in (
+            ("early", self.early_stream_modulations),
+            ("single", self.single_stream_modulations),
+        ):
+            for field, value in zip(("shift", "scale", "gate"), modules["txt"](vec)):
+                mods[stage + "_" + field] = value
+
+        def per_token(rows: Tensor) -> Tensor:
+            return rows[0].unsqueeze(1).expand(steps, length, rows.shape[-1]).reshape(
+                1, steps * length, rows.shape[-1]
+            )
+
+        # txt_in does not depend on the step: run it once at M=T and repeat.
+        embedded = self.txt_in(tokens).unsqueeze(0).repeat(1, steps, 1)
+        mod = tuple(per_token(mods["early_" + field]) for field in ("shift", "scale", "gate"))
+        freqs = tuple(
+            inputs["_flux3_text_" + kind].repeat(1, steps, 1, 1) for kind in ("cos", "sin")
+        )
+        sample_bounds = bounds((length,) * steps)
+        embedded = self._early_adaln_runtime["text"].prepare(embedded, *mod[:2])
+        for block in self.txt_mode_blocks:
+            embedded = block(embedded, freqs, mod, sample_bounds=sample_bounds)
+        prepared = {"_flux3_text_steps_tokens": embedded}
+        for field in ("shift", "scale", "gate"):
+            prepared["_flux3_text_steps_single_" + field] = mods["single_" + field]
+        return prepared
+
+    @staticmethod
+    def flow_map_text_step(prepared: dict[str, Tensor], step: int) -> dict[str, Tensor]:
+        """Step `step`'s text-stream slice of prepare_flow_map_text's result, as forward kwargs."""
+        tokens = prepared["_flux3_text_steps_tokens"]
+        steps = prepared["_flux3_text_steps_single_shift"].shape[1]
+        length = tokens.shape[1] // steps
+        out = {"_flux3_text_step_tokens": tokens[:, step * length : (step + 1) * length]}
+        for field in ("shift", "scale", "gate"):
+            rows = prepared["_flux3_text_steps_single_" + field]
+            out["_flux3_text_step_single_" + field] = rows[:, step : step + 1].expand(
+                -1, length, -1
+            )
+        return out
+
     def forward(
         self,
         *,
@@ -1360,6 +1450,14 @@ class Flux3Model(BaseDiffusionModel):
                 streams[name] = {
                     field: inputs[prefix + field]
                     for field in ("tokens", "vec", "single_shift", "single_scale", "single_gate")
+                }
+                continue
+            if self.flow_map and name == "text" and "_flux3_text_step_tokens" in inputs:
+                # Precomputed for all steps by prepare_flow_map_text; the text vec only feeds
+                # final layers, which exist for output modalities (image) alone.
+                streams[name] = {
+                    field: inputs["_flux3_text_step_" + field]
+                    for field in ("tokens", "single_shift", "single_scale", "single_gate")
                 }
                 continue
             state = self._packed_stream(name, inputs, lengths, ref)
