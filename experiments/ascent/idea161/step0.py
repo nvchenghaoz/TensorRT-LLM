@@ -35,7 +35,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_primsts as fp
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import PreparedNVFP4
 
 H, HEADS, D, FF = 3072, 24, 128, 9216
-K_BLOCKS = 10
+K_BLOCKS = int(os.environ.get("IDEA161_K", "10"))
 ROUNDS = 48
 SPIN = 6_000_000
 PAIR_SAMPLES = 200
@@ -365,12 +365,37 @@ def capone(arm, k, warm):
                           "err": f"{type(e).__name__}: {str(e)[:200]}"}), flush=True)
 
 
+def capseq(arms, k):
+    """Capture probe: graphs of k block fronts for each arm in `arms`, in order, one process."""
+    c = make_case(4176, 1)
+    graphs = []
+    for i, arm in enumerate(arms):
+        try:
+            g, _ = capture(lambda: [block_front(c, arm)[0] for _ in range(k)])
+            graphs.append(g)
+            g.replay()
+            torch.cuda.synchronize()
+            print(json.dumps({"seq": arms, "i": i, "arm": arm, "ok": True}), flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(json.dumps({"seq": arms, "i": i, "arm": arm, "ok": False,
+                              "err": f"{type(e).__name__}: {str(e)[:160]}"}), flush=True)
+            return
+
+
 def capdbg():
     import subprocess
 
     res = []
-    for arm, k, warm in (("off", 1, 2), ("off", 2, 2), ("off", 10, 2), ("m3", 1, 2),
-                         ("m3", 10, 2), ("off", 2, 0), ("off", 1, 0)):
+    for seq in ("off,off", "off,m3", "m3,off", "m3,m3", "off,off,off,off"):
+        p = subprocess.run([sys.executable, __file__, "capseq", seq, "2"],
+                           capture_output=True, text=True)
+        for x in p.stdout.splitlines():
+            if x.startswith("{"):
+                res.append(json.loads(x))
+                log(x)
+        if p.returncode:
+            res.append({"seq": seq, "rc": p.returncode, "tail": p.stderr[-400:]})
+    for arm, k, warm in (("off", 1, 2),):
         p = subprocess.run([sys.executable, __file__, "capone", arm, str(k), str(warm)],
                            capture_output=True, text=True)
         line = [x for x in p.stdout.splitlines() if x.startswith("{")]
@@ -386,6 +411,8 @@ if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "capone":
         capone(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+    elif cmd == "capseq":
+        capseq(sys.argv[2].split(","), int(sys.argv[3]))
     elif cmd == "capdbg":
         capdbg()
     elif cmd == "table":
