@@ -8,7 +8,8 @@ One process, real checkpoint VAE, latents 1x128x64x64 (1024^2 output), seeds 0..
 Reports max/mean abs, uint8 diff and PSNR (on [-1,1] images) for new and main vs fp64 and
 new vs main; an untimed repeat sequence (warmup + iters decodes, bitwise == iteration 0,
 input latent unchanged); dynamo frame / graph-break / recompile counters before and after.
---dtype bf16 casts the whole decoder to bf16 (stand-in for the bf16 trunk).
+--dtype bf16 applies main's served trunk recipe (set_vae_decoder_trunk_dtype, conv_out fp32)
+to the new and main arms; the fp64 reference stays fully fp64.
 Declared tolerance (precision class): PSNR(new vs fp64) >= 40 dB and within 3 dB of main's.
 """
 
@@ -62,8 +63,11 @@ def frames():
 
 def build(kind):
     vae, dt = gn_check.build_vae(args.root)
-    if args.dtype == "bf16":
-        vae.decoder.to(torch.bfloat16)
+    if args.dtype == "bf16" and kind != "fp64":
+        # main's served recipe (engine.json vae_decode_dtype=bfloat16): trunk bf16, conv_out fp32
+        from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import set_vae_decoder_trunk_dtype
+
+        set_vae_decoder_trunk_dtype(vae.decoder, torch.bfloat16)
     if kind in ("main", "fp64"):
         a = vae.decoder.mid.attn_1
         a.attention = types.MethodType(main_attention, a)
@@ -75,12 +79,13 @@ def build(kind):
 
 
 def dec_dtype(vae):
-    return next(vae.decoder.parameters()).dtype
+    return next(vae.decoder.mid.parameters()).dtype
 
 
 @torch.inference_mode()
 def decode(vae, z):
-    return vae.decode(z.to(dec_dtype(vae))).double()
+    # as the pipeline: latent in the VAE package dtype (trunk casts happen in hooks)
+    return vae.decode(z.to(next(vae.parameters()).dtype)).double()
 
 
 def cmp(a, b):
