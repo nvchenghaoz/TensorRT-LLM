@@ -87,6 +87,11 @@ DEFAULT_SEQUENCE: Dict[str, str] = {
     "x_image_cond": "image_cond",
 }
 
+# Flux3Attention._attend: a single full-range segment calls the backend directly
+# instead of filling a zero buffer and slice-copying the result into it (same
+# backend inputs, same output values). Module-level so an A/B can toggle it.
+_ATTEND_SINGLE_SEGMENT_FAST_PATH = True
+
 
 # =============================================================================
 # RoPE (FLUX.3-local: 2x2 rotation-matrix convention)
@@ -548,6 +553,19 @@ class Flux3Attention(Attention):
         timestep: Tensor | None = None,
     ) -> Tensor:
         if sample_bounds is None:
+            return self._attn_impl(q, k, v, timestep=timestep)
+        if (
+            _ATTEND_SINGLE_SEGMENT_FAST_PATH
+            and len(sample_bounds) == 1
+            and sample_bounds[0][0] == 0
+            and sample_bounds[0][1] == q.shape[1]
+            and q.shape[1] > 0
+        ):
+            # One full-range segment: the backend's [B, S, H*D] result is the whole
+            # output, so skip the zero-filled buffer and the slice copy into it.
+            # Keep the same (contiguous) inputs the general path hands the backend.
+            if not isinstance(self.attn, VanillaAttention):
+                q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
             return self._attn_impl(q, k, v, timestep=timestep)
         if q.shape[0] == 1 and len(sample_bounds) > 1:
             length = sample_bounds[0][1]
