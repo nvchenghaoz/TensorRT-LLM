@@ -111,8 +111,7 @@ def calibrate_sleep(target_ms):
     return int(cyc * target_ms / s.elapsed_time(e))
 
 
-TE_CYC = calibrate_sleep(8.8)
-TAIL_CYC = calibrate_sleep(8.0)
+TE_CYC = TAIL_CYC = None  # calibrated in __main__ (importers only use the ref copies)
 
 
 def run_a(name, seed):
@@ -242,4 +241,7 @@ def check():
     }, default=str))
 
 
-bench() if MODE == "bench" else check()
+if __name__ == "__main__":
+    TE_CYC = calibrate_sleep(8.8)
+    TAIL_CYC = calibrate_sleep(8.0)
+    bench() if MODE == "bench" else check()
