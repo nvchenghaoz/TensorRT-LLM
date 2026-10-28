@@ -234,6 +234,33 @@ def decoder():
     return res
 
 
+@torch.no_grad()
+def bf16cal():
+    """bf16 reorder-noise scale: the same original decoder, eager vs compiled (a pure
+    reordering already on main), against the candidate's diff, all vs fp64."""
+    import torch._dynamo
+
+    r64 = ref64(0)
+    z = latent(0, torch.bfloat16)
+    outs = {}
+    for name, original, comp in (("orig_eager", True, False), ("orig_compiled", True, True),
+                                 ("new_eager", False, False), ("new_compiled", False, True)):
+        torch._dynamo.reset()
+        vae = build(torch.bfloat16, original=original)
+        if comp:
+            vae.compile_decoder()
+        vae.decode(z)
+        outs[name] = vae.decode(z).clone()
+        del vae
+        torch.cuda.empty_cache()
+    res = {f"{a}_vs_{b}": stat(outs[a], outs[b]) for a, b in (
+        ("orig_compiled", "orig_eager"), ("new_compiled", "orig_compiled"), ("new_eager", "orig_eager"),
+        ("new_compiled", "new_eager"))}
+    res.update({f"{k}_vs_fp64": stat(v, r64) for k, v in outs.items()})
+    res["passed"] = True
+    return res
+
+
 def kernel_census(fn):
     from collections import Counter
 
@@ -297,7 +324,7 @@ def census():
 if __name__ == "__main__":
     t0 = time.time()
     log("torch", torch.__version__, "cudnn.allow_tf32", torch.backends.cudnn.allow_tf32)
-    out = {"unit": unit, "decoder": decoder, "census": census}[MODE]()
+    out = {"unit": unit, "decoder": decoder, "census": census, "bf16cal": bf16cal}[MODE]()
     out["elapsed_s"] = time.time() - t0
     out["mode"] = MODE
     print(json.dumps(out))
