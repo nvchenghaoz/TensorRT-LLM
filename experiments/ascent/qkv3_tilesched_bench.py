@@ -17,7 +17,7 @@ import time
 
 import torch
 
-MAIN_AT_START = "cec13c57"
+MAIN_AT_START = "762d1fc684da"
 N = 3072
 K = 3072
 

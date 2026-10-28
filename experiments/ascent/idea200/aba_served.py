@@ -34,7 +34,7 @@ TIMED = int(os.environ.get("ABA_TIMED", "12"))
 PROMPT = "A red fox sitting in a snowy forest at dawn, photorealistic"
 SEED = 100
 ARMS = [("A", "static"), ("B", "dynamic"), ("A2", "static")]
-MAIN_AT_START = "cec13c57"
+MAIN_AT_START = "762d1fc684da"
 
 
 def log(*a):
