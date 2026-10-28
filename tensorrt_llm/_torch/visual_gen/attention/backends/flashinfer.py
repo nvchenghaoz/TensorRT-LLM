@@ -25,9 +25,9 @@ _FP8_MIN_SEQ_LEN = 1024
 # head_dim 128 E4M3 calls run the FLUX.3 fmha_v2 variant (fmha_v2_flux3.py: same math,
 # bitwise equal to the stock kernel); set TRTLLM_FMHA_V2_FLUX3=0 to use the stock kernel.
 _USE_FMHA_V2_FLUX3 = os.environ.get("TRTLLM_FMHA_V2_FLUX3", "1") != "0"
-# Non-causal, no-LSE, contiguous d128 E4M3 calls run the 64x128-tile + base-2 softmax variant
-# (fmha_v2_flux3.ROUTED_LEVERS, reordered vs stock); TRTLLM_FMHA_V2_FLUX3_B2=0 keeps them on
-# the exact ms_rq variant.
+# Non-causal, no-LSE, contiguous d128 E4M3 calls run the base-2 softmax variant of the 64x64
+# ms_rq kernel (fmha_v2_flux3.ROUTED_LEVERS, reordered vs stock); TRTLLM_FMHA_V2_FLUX3_B2=0
+# keeps them on the exact ms_rq variant.
 _USE_FMHA_V2_FLUX3_B2 = os.environ.get("TRTLLM_FMHA_V2_FLUX3_B2", "1") != "0"
 
 
