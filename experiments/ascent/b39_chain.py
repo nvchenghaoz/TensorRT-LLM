@@ -70,6 +70,44 @@ def main():
             x = x + gate * d
         return x
 
+    if len(sys.argv) > 1 and sys.argv[1] == "variants":
+        import os
+
+        def set_route(r):
+            if r == "t0":
+                os.environ["TRTLLM_FLUX3_SM120_LINEAR"] = "trtllm"
+            else:
+                os.environ["TRTLLM_FLUX3_SM120_LINEAR"] = "cutlass"
+                os.environ["TRTLLM_FLUX3_SM120_LINEAR_FI_TACTIC"] = r
+            fp._sm120_linear_backend.cache_clear()
+            fp._sm120_linear_fi_tactic.cache_clear()
+
+        routes = ["t0", "17", "18", "27", "16"]
+        evs = {r: [] for r in routes}
+        refs = {}
+        for r in routes:
+            set_route(r)
+            for _ in range(WARMUP):
+                chain()
+            refs[r] = chain().clone()
+        torch.cuda.synchronize()
+        for i in range(ITERS):
+            for r in routes:
+                set_route(r)
+                a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                a.record()
+                chain()
+                b.record()
+                evs[r].append((a, b))
+            torch.cuda.synchronize()
+        res = {}
+        for r in routes:
+            med, noise = stat([a.elapsed_time(b) for a, b in evs[r]])
+            res[r] = {"per_block_us": round(med / BLOCKS * 1e3, 2), "noise": round(noise, 4),
+                      "bitwise_vs_t0_chain": bool(torch.equal(refs[r], refs["t0"]))}
+            log(f"route {r}: {res[r]}")
+        print(json.dumps({"passed": True, "variants": res}))
+        return
     for _ in range(WARMUP):
         chain()
     torch.cuda.synchronize()
