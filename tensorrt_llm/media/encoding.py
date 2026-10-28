@@ -449,7 +449,13 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_COLOR_TYPES = {1: 0, 3: 2, 4: 6}
 _PNG_STRIP_ROWS = 64
 _PNG_WINDOW = 32768
-_PNG_POOL = None
+# Deflate configuration of each strip (any config decodes to the same pixels).
+_PNG_STRATEGY = zlib.Z_FILTERED
+_PNG_MEM_LEVEL = 9
+# Bytes of the previous strip given as preset dictionary (0: none).
+_PNG_DICT_BYTES = _PNG_WINDOW
+_PNG_MAX_WORKERS = 16
+_PNG_POOLS = {}  # max workers -> ThreadPoolExecutor
 _PNG_POOL_LOCK = threading.Lock()
 
 
@@ -458,17 +464,20 @@ def _fast_png_enabled() -> bool:
 
 
 def _png_pool():
-    global _PNG_POOL
-    if _PNG_POOL is None:
+    key = _PNG_MAX_WORKERS
+    pool = _PNG_POOLS.get(key)
+    if pool is None:
         with _PNG_POOL_LOCK:
-            if _PNG_POOL is None:
+            pool = _PNG_POOLS.get(key)
+            if pool is None:
                 try:
                     ncpu = len(os.sched_getaffinity(0))
                 except (AttributeError, OSError):
                     ncpu = os.cpu_count() or 1
-                workers = max(1, min(16, ncpu))
-                _PNG_POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="png_enc")
-    return _PNG_POOL
+                workers = max(1, min(key, ncpu))
+                pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="png_enc")
+                _PNG_POOLS[key] = pool
+    return pool
 
 
 def _png_filter_scanlines(img: torch.Tensor) -> torch.Tensor:
@@ -546,31 +555,35 @@ def _encode_png_tensor(image: Any, compress_level: int = 1) -> Optional[bytes]:
     data = memoryview(scan.reshape(-1))
     row_bytes = 1 + w * c
 
+    strip_rows = _PNG_STRIP_ROWS
+    strategy = _PNG_STRATEGY
+    mem_level = _PNG_MEM_LEVEL
+    dict_bytes = _PNG_DICT_BYTES
     bounds = []
-    for r0 in range(0, h, _PNG_STRIP_ROWS):
-        r1 = min(h, r0 + _PNG_STRIP_ROWS)
+    for r0 in range(0, h, strip_rows):
+        r1 = min(h, r0 + strip_rows)
         bounds.append((r0 * row_bytes, r1 * row_bytes))
     last = len(bounds) - 1
 
     def _deflate(i: int):
         start, end = bounds[i]
-        if start > 0:
+        if start > 0 and dict_bytes > 0:
             comp = zlib.compressobj(
                 compress_level,
                 zlib.DEFLATED,
                 -15,
-                9,
-                zlib.Z_FILTERED,
-                bytes(data[max(0, start - _PNG_WINDOW) : start]),
+                mem_level,
+                strategy,
+                bytes(data[max(0, start - dict_bytes) : start]),
             )
         else:
-            comp = zlib.compressobj(compress_level, zlib.DEFLATED, -15, 9, zlib.Z_FILTERED)
+            comp = zlib.compressobj(compress_level, zlib.DEFLATED, -15, mem_level, strategy)
         out = comp.compress(data[start:end])
         out += comp.flush(zlib.Z_FINISH if i == last else zlib.Z_SYNC_FLUSH)
         if i == 0:
             # zlib header for a 32 KiB window; FLEVEL as zlib writes it.
-            flevel = 0 if compress_level < 2 else (1 if compress_level < 6 else
-                                                   (2 if compress_level == 6 else 3))
+            flevel = 0 if (compress_level < 2 or strategy >= zlib.Z_HUFFMAN_ONLY) else (
+                1 if compress_level < 6 else (2 if compress_level == 6 else 3))
             cmf = 0x78
             flg = flevel << 6
             flg += 31 - ((cmf * 256 + flg) % 31)
@@ -714,8 +727,47 @@ def save_image(
     return output_path
 
 
+_DUMP_SEQ = [0]
+
+
+def _dump_image_to_bytes(dump_dir: str, image: Any, format: str, quality: int) -> bytes:
+    """Debug only (TRTLLM_VISUALGEN_DUMP_DIR): time the encode, save the tensor."""
+    import base64
+    import json
+    import time
+
+    if isinstance(image, torch.Tensor) and image.is_cuda:
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    data = _image_to_bytes(image, format, quality)
+    t1 = time.perf_counter()
+    b64 = base64.b64encode(data)
+    t2 = time.perf_counter()
+    seq = _DUMP_SEQ[0]
+    _DUMP_SEQ[0] += 1
+    os.makedirs(dump_dir, exist_ok=True)
+    rec = {"seq": seq, "encode_ms": (t1 - t0) * 1e3, "b64_ms": (t2 - t1) * 1e3,
+           "png_bytes": len(data), "format": format}
+    if isinstance(image, torch.Tensor):
+        rec.update(shape=list(image.shape), stride=list(image.stride()),
+                   storage_offset=int(image.storage_offset()), dtype=str(image.dtype),
+                   device=str(image.device))
+        torch.save({"data": image.detach().contiguous().cpu(), **rec},
+                   os.path.join(dump_dir, f"img_{seq:04d}.pt"))
+    with open(os.path.join(dump_dir, "stamps.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    return data
+
+
 def image_to_bytes(image: torch.Tensor, format: str = "PNG", quality: int = 95) -> bytes:
     """Encode an image tensor to in-memory bytes."""
+    dump_dir = os.environ.get("TRTLLM_VISUALGEN_DUMP_DIR")
+    if dump_dir:
+        return _dump_image_to_bytes(dump_dir, image, format, quality)
+    return _image_to_bytes(image, format, quality)
+
+
+def _image_to_bytes(image: torch.Tensor, format: str, quality: int) -> bytes:
     if format.upper() not in ("JPEG", "JPG", "WEBP"):
         # Same branch as _save_pil_image's PNG default.
         data = _encode_png_tensor(image)
