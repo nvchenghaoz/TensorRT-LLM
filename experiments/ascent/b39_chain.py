@@ -54,20 +54,35 @@ def main():
     s_down_in = 0.05
     inv_down = torch.tensor([1 / s_down_in], device=dev)
 
+    import os as _os
+
+    tail_pair = _os.environ.get("B39_CHAIN_TAIL_PAIR", "1") == "1"
+
     def chain():
+        # Single-block shape as on main (landing 20): gate_up from LN(x), then the tail pair runs
+        # down on the current stream || attn_out (+ its quantize) on the tail-pair side stream.
         x = x0.clone()
         for (q, s) in blocks:
             (qo, so), (qu, su), (qd, sd) = q
-            a, sa = fp.nvfp4_quantize(attn, inv_x)
-            o = torch.ops.trtllm.flux3_primsts_nvfp4_linear(a, qo, sa, so, s_x, s[0])
-            x = x + gate * o
             h = torch.nn.functional.layer_norm(x, (H,)) * 1.1 + 0.1
             hq, hs = fp.nvfp4_quantize(h, inv_x)
             packed, psf = flux3_sm120_nvfp4.run(
                 "packed", hq, qu, hs, su, s_x, s[1], output_inverse_scale=inv_down)
-            d = torch.ops.trtllm.flux3_primsts_nvfp4_linear(
-                packed.contiguous(), qd, psf.reshape(-1).contiguous(), sd, s_down_in, s[2])
-            x = x + gate * d
+            pk, pkf = packed.contiguous(), psf.reshape(-1).contiguous()
+
+            def launch_down():
+                return torch.ops.trtllm.flux3_primsts_nvfp4_linear(pk, qd, pkf, sd, s_down_in, s[2])
+
+            def launch_attn():
+                a, sa = fp.nvfp4_quantize(attn, inv_x)
+                return torch.ops.trtllm.flux3_primsts_nvfp4_linear(a, qo, sa, so, s_x, s[0])
+
+            if tail_pair:
+                o, d = fp._sm120_tail_pair(x.device, launch_down, launch_attn)
+            else:
+                d = launch_down()
+                o = launch_attn()
+            x = x + gate * (o + d)
         return x
 
     if len(sys.argv) > 1 and sys.argv[1] == "variants":

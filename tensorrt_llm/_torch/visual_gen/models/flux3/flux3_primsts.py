@@ -115,6 +115,10 @@ def sm120_linear_preload(device: torch.device) -> None:
     if _sm120_linear_backend() == "cutlass":
         _sm120_fi_fp4_module()
         _sm120_fi_workspace(device)
+        # The block tail pair runs attn_out on its own side stream: give it its workspace now too.
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        with torch.cuda.stream(_sm120_tail_pair_stream(index)):
+            _sm120_fi_workspace(device)
 
 
 def _sm120_cutlass_linear(
