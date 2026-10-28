@@ -1266,14 +1266,8 @@ class Flux3Model(BaseDiffusionModel):
         ):
             for field, value in zip(("shift", "scale", "gate"), modules[key](vec)):
                 state[stage + "_" + field] = value
-        # A single-segment compact vec is one row; its only consumer (the final
-        # layer's adaLN) broadcasts it, so skip the per-token expansion and the
-        # M=S modulation GEMM on identical rows.
-        compact_vec = compact and len(segments) == 1 and not self.sharder.is_active
         if compact:
             for field, value in state.items():
-                if field == "vec" and compact_vec:
-                    continue
                 if field != "tokens":
                     state[field] = torch.cat(
                         [
@@ -1435,11 +1429,24 @@ class Flux3Model(BaseDiffusionModel):
                     parts.append(part)
                 offset += end - start
             tokens = torch.cat(parts, dim=1)
-            output = self.final_layer[name](tokens, streams[name]["vec"])[0]
+            vec = self._final_layer_vec(streams[name]["vec"], inputs, dict(layout)[name])
+            output = self.final_layer[name](tokens, vec)[0]
             outputs["x_" + name] = (
                 output.reshape(batch, -1, output.shape[-1]) if batch is not None else output
             )
         return outputs
+
+    def _final_layer_vec(self, vec: Tensor, inputs: dict, lengths: tuple[int, ...]) -> Tensor:
+        """The vec the final layer's adaLN needs: one row when the stream is a single
+        compact segment (every row of the expanded vec is that segment's timestep row,
+        and the final layer broadcasts it), else the per-token vec unchanged."""
+        if (
+            inputs.get("_flux3_uniform_timesteps", False)
+            and not self.sharder.is_active
+            and sum(1 for length in lengths if length) == 1
+        ):
+            return vec[:, :1]
+        return vec
 
     def load_weights(self, weights: dict) -> None:
         fuse_qkv = _use_fused_qkv(self.model_config)

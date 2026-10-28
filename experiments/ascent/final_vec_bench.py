@@ -97,9 +97,13 @@ pristine_ref, pristine_x = ref.clone(), x_final.clone()
 lengths = (S,)
 
 
+_final_vec = getattr(T.Flux3Model, "_final_layer_vec", None)  # absent on the base tree
+
+
 def region():
     st = T.Flux3Model._packed_stream(fake, "image", inputs, lengths, ref)
-    return final(x_final, st["vec"])[0], st
+    vec = st["vec"] if _final_vec is None else _final_vec(fake, st["vec"], inputs, lengths)
+    return final(x_final, vec)[0], vec
 
 
 @torch.no_grad()
@@ -119,8 +123,7 @@ def main():
         f"max_rel={gemm_max_rel:.3e} M4096 rows identical={rows_equal}")
 
     # ---- 2. tree output vs explicit expanded reference (main's math) ----
-    out, st = region()
-    vec = st["vec"]
+    out, vec = region()
     log("tree vec shape", tuple(vec.shape))
     vec_row = vec[:, :1]
     ref_out = final(x_final, torch.cat([vec_row.expand(-1, S, -1)], dim=1))[0]
