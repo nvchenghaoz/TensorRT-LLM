@@ -166,7 +166,9 @@ def capture(fn):
         fn()
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    # thread_local: a CUDA call from another thread (JIT/compile helpers) must not invalidate the
+    # capture (job 1318: global mode failed inside qknorm_rope_fp8 on the 10-block graph).
+    with torch.cuda.graph(g, capture_error_mode="thread_local"):
         out = fn()
     torch.cuda.synchronize()
     return g, out
