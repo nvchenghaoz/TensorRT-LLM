@@ -44,6 +44,11 @@ from .primsts import NVFP4Activation, PreparedNVFP4
 _ENV = "TRTLLM_FLUX3_ADALN_QUANT"
 # Runtime switch read in the block forwards (tests flip it to compare with main's path).
 FLUX3_ADALN_NVFP4 = True
+# Force the bf16 x_mod store even where no consumer reads its values (diagnostics / A/B; module
+# level so one process can flip it, Dynamo guards on it).
+FLUX3_ADALN_NVFP4_STORE_X_MOD = (
+    os.environ.get("TRTLLM_FLUX3_ADALN_NVFP4_STORE_X_MOD", "0") == "1"
+)
 
 # Inductor's reduction config for these LN+modulate kernels at D=3072 (dumped from output_code:
 # per-block compile, emulate_precision_casts=True, torch 2.14.0a0 nv26.09, triton 3.8).
@@ -159,6 +164,7 @@ def _adaln_nvfp4_kernel(
     XBLOCK: tl.constexpr,
     R0_BLOCK: tl.constexpr,
     Q_BLOCK: tl.constexpr,
+    STORE_XMOD: tl.constexpr = True,
 ):
     tl.static_assert(XBLOCK == 1)
     SF_COLS: tl.constexpr = ((r0_numel // 16 + 3) // 4) * 4
@@ -307,7 +313,8 @@ def _adaln_nvfp4_kernel(
             tmp72 = tmp60 + tmp71
             tmp73 = tmp72.to(tl.bfloat16)
             tmp74 = tmp73.to(tl.float32)
-            tl.store(out_ptr0 + (r0_1 + r0_numel * x0), tmp73, r0_mask & xmask)
+            if STORE_XMOD:
+                tl.store(out_ptr0 + (r0_1 + r0_numel * x0), tmp73, r0_mask & xmask)
 
             # ---- NVFP4 quantize of the bf16-rounded x_mod (FlashInfer fast-math path) ----
             # Pairs stay in one thread (4 elements/thread): one packed byte per pair, and the
@@ -377,7 +384,18 @@ def _scale_size(rows: int, k: int) -> int:
 
 
 def _launch(
-    x, select, scale, shift, weight, bias, global_scale, eps, config=None, outs=None, q_block=None
+    x,
+    select,
+    scale,
+    shift,
+    weight,
+    bias,
+    global_scale,
+    eps,
+    config=None,
+    outs=None,
+    q_block=None,
+    store_x_mod=True,
 ):
     d = x.shape[-1]
     m = x.numel() // d
@@ -411,6 +429,7 @@ def _launch(
         XBLOCK=1,
         R0_BLOCK=r0_block,
         Q_BLOCK=_Q_BLOCK if q_block is None else q_block,
+        STORE_XMOD=bool(store_x_mod),
         num_warps=num_warps,
         num_stages=1,
         enable_fp_fusion=False,
@@ -428,18 +447,25 @@ def adaln_nvfp4_quant(
     bias: torch.Tensor,
     global_scale: torch.Tensor,
     eps: float,
+    store_x_mod: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(1 + scale) * LayerNorm(x) + shift in bf16, plus its NVFP4 data and 128x4 scales.
 
     x: contiguous [..., D] bf16. Single-block form: scale/shift are [1, 2, D] tables (last dim
     contiguous, any row stride / storage offset) and select is the [..., 1] bool row picker.
     Row form (select None): scale/shift are [1, 1, D] rows.
+    With store_x_mod=False the returned x_mod is allocated but NOT written (uninitialized): only
+    for callers whose consumers read the NVFP4 data alone (x_mod as shape metadata).
     """
-    return _launch(x, select, scale, shift, weight, bias, global_scale, eps)
+    return _launch(
+        x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod=store_x_mod
+    )
 
 
 @adaln_nvfp4_quant.register_fake
-def _adaln_nvfp4_quant_fake(x, select, scale, shift, weight, bias, global_scale, eps):
+def _adaln_nvfp4_quant_fake(
+    x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod=True
+):
     d = x.shape[-1]
     m = x.numel() // d
     return (
@@ -507,7 +533,38 @@ def _row_ok(t: torch.Tensor, rows: int, d: int) -> bool:
     )
 
 
-def adaln_nvfp4_input(block, x: torch.Tensor, mod: tuple, eps: float):
+def _x_mod_unread(block, x: torch.Tensor, freqs) -> bool:
+    """True when every consumer of the block's x_mod reads only its NVFP4 data (bf16 x_mod is
+    shape metadata), so the kernel may skip the bf16 store.
+
+    Static part: separate attn_out/MLP (no fused proj_out); QKV through the PreparedNVFP4 fused
+    qkv adapter (primsts.qkv_forward -> nvfp4_qkv_prepared); gate_up a PreparedNVFP4 SwiGLU with
+    a PreparedNVFP4 down, so the MLP runs sm120_tail_pair_forward or nvfp4_mlp_forward (both
+    nvfp4_swiglu_prepared); equal qkv/gate_up input_global_scale, so _prepared_activation never
+    re-quantizes from `original` (gate_up's weight is the activation's quantized_by).
+    Dynamic part: qkv_forward's own shape conditions on cos/sin (otherwise attn_pre_out takes a
+    path that may read the bf16 values).
+    """
+    if getattr(block, "_fuse_proj_out", True):
+        return False
+    up = getattr(block.ff.gate_up_proj, "_flux3_primsts_nvfp4", None)
+    down = getattr(block.ff.down_proj, "_flux3_primsts_nvfp4", None)
+    qkv = getattr(block.attn, "_flux3_primsts_nvfp4_qkv", None)
+    if not (
+        isinstance(up, PreparedNVFP4)
+        and isinstance(down, PreparedNVFP4)
+        and isinstance(qkv, PreparedNVFP4)
+        and up.swiglu
+        and qkv.input_global_scale == up.input_global_scale
+    ):
+        return False
+    if len(freqs) < 2:
+        return False
+    cos, sin = freqs[0], freqs[1]
+    return cos.numel() == x.numel() // x.shape[-1] * 128 and sin.shape == cos.shape
+
+
+def adaln_nvfp4_input(block, x: torch.Tensor, mod: tuple, eps: float, freqs=()):
     """Fused path for a prepared block: returns (x_mod, NVFP4Activation) or None to fall back.
 
     block._flux3_adaln_nvfp4 is a static bool (set by prepare_adaln_nvfp4); FLUX3_ADALN_NVFP4 is a
@@ -550,5 +607,6 @@ def adaln_nvfp4_input(block, x: torch.Tensor, mod: tuple, eps: float):
         block.pre_norm.bias,
         adapter.inverse_scale,
         eps,
+        FLUX3_ADALN_NVFP4_STORE_X_MOD or not _x_mod_unread(block, x, freqs),
     )
     return x_mod, NVFP4Activation(x_mod, data, scales, adapter.weight)
