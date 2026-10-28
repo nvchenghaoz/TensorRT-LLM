@@ -31,7 +31,7 @@ import torch
 MODE = sys.argv[1] if len(sys.argv) > 1 else "bench"
 STEPS = 16
 T_A, T_B = 80, 160
-ITERS = int(os.environ.get("B33_ITERS", "40"))
+ITERS = int(os.environ.get("B33_ITERS", "60"))
 WARMUP = 5
 # Declared before running (reordered: other cuBLAS tactics at M=16T vs M=T split-K, M=16 vs
 # M=1 modulation GEMVs): per step, rel-L2 ||batched - per_step|| / ||per_step|| <= 1e-2 and
@@ -274,19 +274,28 @@ def main():
         if MODE == "profile":
             import torch.cuda.nvtx as nvtx
 
+            # B33_PROFILE_PATH=per_step|batched|both selects what the capture region holds.
+            which = os.environ.get("B33_PROFILE_PATH", "both")
+            paths = []
+            if which in ("per_step", "both"):
+                paths.append(("per_step_request", lambda: per_step_request(model, inputs, prepared)))
+            if batched and which in ("batched", "both"):
+                paths.append(("batched_request", lambda: batched_request(model, inputs, prepared)))
+            reps = 3
+            wall = {name: [] for name, _ in paths}
             torch.cuda.cudart().cudaProfilerStart()
-            for i in range(3):
-                nvtx.range_push("per_step_request")
-                per_step_request(model, inputs, prepared)
-                torch.cuda.synchronize()
-                nvtx.range_pop()
-                if batched:
-                    nvtx.range_push("batched_request")
-                    batched_request(model, inputs, prepared)
+            for i in range(reps):
+                for name, fn in paths:
                     torch.cuda.synchronize()
+                    nvtx.range_push(name)
+                    t = time.perf_counter()
+                    fn()
+                    torch.cuda.synchronize()
+                    wall[name].append((time.perf_counter() - t) * 1e3)
                     nvtx.range_pop()
             torch.cuda.cudart().cudaProfilerStop()
-            print(json.dumps({"passed": True, "profiled": True}))
+            log("wall ms per request (under nsys)", json.dumps(wall))
+            print(json.dumps({"passed": True, "profiled": True, "requests_per_path": reps, "wall_ms": wall}))
             return
 
         # check
@@ -349,6 +358,30 @@ def main():
         os.environ["TRTLLM_FLUX3_TEXT_STEP_BATCH"] = "1"
         if off is not None:
             fails.append("env switch did not disable batching")
+        # FP8 switch-over below T (TRTLLM_VISUAL_GEN_FP8_ATTN_MIN_SEQ lowered) must fall back.
+        backend = model.txt_mode_blocks[0].attn.attn
+        old_min = backend.__dict__.get("_fp8_min_seq_len", None)
+        backend._fp8_min_seq_len = T_A
+        fp8_fallback = batched_request(model, inputs, prepared) is None
+        if old_min is None:
+            del backend._fp8_min_seq_len
+        else:
+            backend._fp8_min_seq_len = old_min
+        if not fp8_fallback:
+            fails.append("FP8 min-seq <= T did not fall back to per-step")
+        # A backend that may use `timestep` (anything but VANILLA/FLASHINFER) must fall back.
+
+        class _TimestepBackend:  # backends are plain AttentionBackend objects, not Modules
+            pass
+
+        attn_mod = model.txt_mode_blocks[0].attn
+        attn_mod.attn = _TimestepBackend()
+        backend_fallback = batched_request(model, inputs, prepared) is None
+        attn_mod.attn = backend
+        if not backend_fallback:
+            fails.append("non VANILLA/FLASHINFER backend did not fall back to per-step")
+        if batched_request(model, inputs, prepared) is None:
+            fails.append("batching not restored after fallback checks")
         mem_mb = sum(v.numel() * v.element_size() for v in a1.values()) / 2**20
         print(
             json.dumps(

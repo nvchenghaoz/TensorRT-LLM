@@ -1331,6 +1331,27 @@ class Flux3Model(BaseDiffusionModel):
     # math. At or above it, per-tensor FP8 scales would span all N steps: keep per-step.
     _TEXT_STEP_BATCH_MAX_LEN = 1024
 
+    def _text_step_batch_max_len(self) -> int:
+        """Longest text length (exclusive) the step-batched text stream may run at; 0 disables it.
+
+        Only backends that ignore `timestep` (the batched blocks run without one) and keep
+        per-row math for equal packed segments qualify: VANILLA (SDPA) and FLASHINFER. The
+        bound is the lowest FP8 switch-over length of any text-block backend (env
+        TRTLLM_VISUAL_GEN_FP8_ATTN_MIN_SEQ), so a batch never shares one per-tensor FP8 scale.
+        """
+        limit = self._TEXT_STEP_BATCH_MAX_LEN
+        for block in self.txt_mode_blocks:
+            backend = block.attn.attn
+            if not (
+                isinstance(backend, VanillaAttention)
+                or type(backend).__name__ == "FlashInferAttention"
+            ):
+                return 0
+            fp8_min = getattr(backend, "_fp8_min_seq_len", None)
+            if fp8_min is not None:
+                limit = min(limit, int(fp8_min))
+        return limit
+
     def prepare_flow_map_text(
         self, targets: Tensor, *, layout: Layout | None = None, **inputs
     ) -> dict[str, Tensor] | None:
@@ -1362,7 +1383,7 @@ class Flux3Model(BaseDiffusionModel):
         if len(text_lengths) != 1 or targets.ndim != 1 or not targets.shape[0]:
             return None
         length, steps = text_lengths[0], targets.shape[0]
-        if not 0 < length < self._TEXT_STEP_BATCH_MAX_LEN:
+        if not 0 < length < self._text_step_batch_max_len():
             return None
         if "_flux3_text_cos" not in inputs:
             inputs = {**inputs, **self._packed_positions(inputs, layout)}
