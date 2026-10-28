@@ -25,6 +25,10 @@ _FP8_MIN_SEQ_LEN = 1024
 # head_dim 128 E4M3 calls run the FLUX.3 fmha_v2 variant (fmha_v2_flux3.py: same math,
 # bitwise equal to the stock kernel); set TRTLLM_FMHA_V2_FLUX3=0 to use the stock kernel.
 _USE_FMHA_V2_FLUX3 = os.environ.get("TRTLLM_FMHA_V2_FLUX3", "1") != "0"
+# Non-causal, no-LSE, contiguous d128 E4M3 calls run the base-2 softmax variant of the 64x64
+# ms_rq kernel (fmha_v2_flux3.ROUTED_LEVERS, reordered vs stock); TRTLLM_FMHA_V2_FLUX3_B2=0
+# keeps them on the exact ms_rq variant.
+_USE_FMHA_V2_FLUX3_B2 = os.environ.get("TRTLLM_FMHA_V2_FLUX3_B2", "1") != "0"
 
 
 def run_fmha_v2_fp8_sm12x(
@@ -44,8 +48,30 @@ def run_fmha_v2_fp8_sm12x(
 ) -> torch.Tensor:
     """The one entry to FlashInfer's SM120 FP8 fmha_v2 (contiguous E4M3 BSHD Q/K/V, BF16 out)."""
     if _USE_FMHA_V2_FLUX3 and head_dim == 128:
-        from .fmha_v2_flux3 import fmha_v2_flux3_d128
+        from .fmha_v2_flux3 import ROUTED_LEVERS, fmha_v2_flux3_d128, get_flux3_d128_module
 
+        if (
+            _USE_FMHA_V2_FLUX3_B2
+            and not causal
+            and not return_lse
+            and q_fp8.is_contiguous()
+            and k_fp8.is_contiguous()
+            and v_fp8.is_contiguous()
+        ):
+            return fmha_v2_flux3_d128(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                output,
+                num_heads,
+                head_dim,
+                seq_len,
+                scale_bmm1_d=scale_bmm1_d,
+                scale_bmm2_d=scale_bmm2_d,
+                causal=False,
+                lse=None,
+                module=get_flux3_d128_module(ROUTED_LEVERS),
+            )
         return fmha_v2_flux3_d128(
             q_fp8,
             k_fp8,
