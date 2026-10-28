@@ -193,8 +193,10 @@ cmp(y, ye, "SEQ A2 flag ON (right after A) == A2 graph-off")
 cmp(x, a1[2], "SEQ A == first A graph-off (repeat)")
 steady = [r for r in results["requests"] if r["graphs"] and r["label"] != "B_T160_ON"]
 note(all(r["new_captures"] == 0 for r in steady), "0 captures in steady graph-on requests")
-note(all(r["new_dynamo_graphs"] == 0 for r in results["requests"]),
-     "0 Dynamo recompiles in all requests")
+# The first T=160 request (B_T160_ON) is a new shape bucket: it compiles and captures once.
+note(all(r["new_dynamo_graphs"] == 0 for r in results["requests"] if r["label"] != "B_T160_ON"),
+     "0 Dynamo recompiles in all requests after the first T=160 request")
+results["first_T160_request"] = next(r for r in results["requests"] if r["label"] == "B_T160_ON")
 
 # ---------------- timing: in-process interleaved OFF / ON / OFF2 ----------------
 runner.enabled = True
@@ -205,7 +207,7 @@ for i in range(WARM):
     if i % 20 == 19:
         print("warm", i + 1, flush=True)
 rows = []
-for r in range(ROUNDS):
+for r in range(max(ROUNDS, 1)):
     ms = {}
     for arm, flag in (("OFF", False), ("ON", True), ("OFF2", False)):
         pf.FLUX3_GRAPH_REUSE_INPUTS = flag
