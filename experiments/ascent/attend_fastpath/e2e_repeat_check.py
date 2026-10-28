@@ -137,34 +137,51 @@ def main():
             px = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"))
             return png, px, (time.time() - t) * 1000
 
-        passes = []
-        for p in range(2):
-            out = []
-            for i in range(len(PROMPTS)):
+        short = list(range(len(PROMPTS) - 1))  # T=80 prompts
+        long_i = len(PROMPTS) - 1               # pads to T=160
+
+        def run_pass(tag, idxs):
+            out = {}
+            for i in idxs:
                 png, px, ms = gen(i)
-                out.append((hashlib.sha256(png).hexdigest(), px))
-                log(f"[pass {p}] prompt {i} seed {SEEDS[i]} {ms:.0f} ms png_sha "
-                    f"{out[-1][0][:16]} px_sha {hashlib.sha256(px.tobytes()).hexdigest()[:16]}")
-            passes.append(out)
-        per = []
-        for i in range(len(PROMPTS)):
-            a, b = passes[0][i], passes[1][i]
-            px_eq = a[1].shape == b[1].shape and bool((a[1] == b[1]).all())
-            per.append({"prompt": i, "seed": SEEDS[i], "pixels_bitwise": px_eq,
-                        "png_bytes_equal": a[0] == b[0],
-                        "max_abs_px_diff": int(np.abs(a[1].astype(int) - b[1].astype(int)).max())})
-        rep = all(x["pixels_bitwise"] for x in per)
-        # distinct-image sanity: outputs are not degenerate / identical across prompts
-        distinct = len({passes[0][i][0] for i in range(len(PROMPTS))})
+                out[i] = (hashlib.sha256(png).hexdigest(), px)
+                log(f"[{tag}] prompt {i} seed {SEEDS[i]} {ms:.0f} ms png_sha "
+                    f"{out[i][0][:16]} px_sha {hashlib.sha256(px.tobytes()).hexdigest()[:16]}")
+            return out
+
+        # P1, P2: plain repeats of the T=80 prompts (what check.py does);
+        # then the T=160 prompt twice; then P3 = T=80 prompts after T=160.
+        p1 = run_pass("P1", short)
+        p2 = run_pass("P2", short)
+        l1 = run_pass("L1", [long_i])
+        l2 = run_pass("L2", [long_i])
+        p3 = run_pass("P3", short)
+
+        def cmp(a, b, idxs):
+            per = []
+            for i in idxs:
+                x, y = a[i], b[i]
+                eq = x[1].shape == y[1].shape and bool((x[1] == y[1]).all())
+                per.append({"prompt": i, "pixels_bitwise": eq, "png_bytes_equal": x[0] == y[0],
+                            "max_abs_px_diff": int(np.abs(x[1].astype(int) - y[1].astype(int)).max())})
+            return per
+
+        r12 = cmp(p1, p2, short)
+        rL = cmp(l1, l2, [long_i])
+        r13 = cmp(p1, p3, short)
+        rep = all(x["pixels_bitwise"] for x in r12 + rL)
+        after_long = all(x["pixels_bitwise"] for x in r13)
+        distinct = len({p1[i][0] for i in short} | {l1[long_i][0]})
         result = {
             "passed": rep and distinct == len(PROMPTS),
             "repeated_execution_passed": rep,
+            "T80_repeat_bitwise": sum(x["pixels_bitwise"] for x in r12),
+            "T160_repeat_bitwise": sum(x["pixels_bitwise"] for x in rL),
+            "T80_after_T160_equal_to_first": after_long,
+            "T80_after_T160_bitwise_count": sum(x["pixels_bitwise"] for x in r13),
             "prompts": len(PROMPTS),
-            "passes": 2,
-            "pixels_bitwise_count": sum(x["pixels_bitwise"] for x in per),
-            "png_bytes_equal_count": sum(x["png_bytes_equal"] for x in per),
             "distinct_images": distinct,
-            "per_prompt": per,
+            "P1_vs_P2": r12, "L1_vs_L2": rL, "P1_vs_P3": r13,
             "engine_overlay": overlay,
             "note": "stand-in for check.py repeated-execution; gate v2 vs reference.json "
                     "is not runnable from worker jobs (reference not shipped)",
