@@ -296,6 +296,18 @@ class Flux3Pipeline(BasePipeline):
             if mode == "i2i":
                 kwargs["image_cond"] = torch.zeros(1, 3, height, width, device=self.device)
             self.forward(mode, **kwargs)
+            # A flow-map text stream runs once per request at M = steps * T, so the
+            # sampler's default step count is its own compiled shape: warm it too.
+            default_steps = self.pipeline_config.extra_attrs["flux3_checkpoint"].config[
+                "sampler"
+            ]["steps"]
+            if (
+                mode == "t2i"
+                and self.transformer.flow_map
+                and steps is not None
+                and steps != default_steps
+            ):
+                self.forward(mode, **{**kwargs, "num_inference_steps": default_steps})
 
     def _setup_cuda_graphs(self):
         """
