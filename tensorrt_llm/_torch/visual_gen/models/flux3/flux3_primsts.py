@@ -185,6 +185,145 @@ def _sm120_cutlass_qkv(
     return qknorm_rope(q, k, v, out, q_norm, k_norm, cos_sin, positions)
 
 
+# Block tail pair (single blocks and image mode blocks on SM120): ff.down_proj and attn_out are
+# independent once attention and gate_up have run, so one op launches down on the current stream
+# and attn_out (with its activation quantize) on a side stream forked from and joined to it.
+# Each GEMM is ~4.1-4.2 waves of 128x128 tiles on 188 SMs; launched second, attn_out's CTAs fill
+# down's last partial wave. Same kernels, same inputs, so the outputs are bitwise unchanged.
+# Module-level so a microbenchmark can time attn_out-first.
+_SM120_TAIL_PAIR_DOWN_FIRST = True
+
+
+@lru_cache(maxsize=8)
+def _sm120_tail_pair_stream(device_index: int) -> torch.cuda.Stream:
+    return torch.cuda.Stream(device_index)
+
+
+def _sm120_tail_pair(device: torch.device, launch_down, launch_attn):
+    current = torch.cuda.current_stream(device)
+    side = _sm120_tail_pair_stream(device.index)
+    side.wait_stream(current)
+    if _SM120_TAIL_PAIR_DOWN_FIRST:
+        down = launch_down()
+        with torch.cuda.stream(side):
+            attn = launch_attn()
+    else:
+        with torch.cuda.stream(side):
+            attn = launch_attn()
+        down = launch_down()
+    current.wait_stream(side)
+    # attn was allocated on the side stream; keep its block until the current stream is done.
+    attn.record_stream(current)
+    return attn, down
+
+
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_nvfp4_out_pair", mutates_args=(), device_types="cuda"
+)
+def nvfp4_out_pair(
+    down_activation: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_activation_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    attn: torch.Tensor,
+    attn_weight: torch.Tensor,
+    attn_weight_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(attn_out(attn), down(down_activation)) on the SM120 CUTLASS NVFP4 LINEAR path.
+
+    down takes the packed-SwiGLU FP4 output and its scales; attn is BF16 [M, K] and is quantized
+    with attn_out's static scale, as PreparedNVFP4.forward does.
+    """
+    down_owner = nvfp4_owner(down_weight)
+    attn_owner = nvfp4_owner(attn_weight)
+    down_weight, down_weight_scale = down_weight.detach(), down_weight_scale.detach()
+    attn_weight, attn_weight_scale = attn_weight.detach(), attn_weight_scale.detach()
+
+    def launch_down() -> torch.Tensor:
+        return _sm120_cutlass_linear(
+            down_activation.detach(),
+            down_weight,
+            down_activation_scale.detach(),
+            down_weight_scale,
+            down_owner.input_global_scale,
+            down_owner.weight_global_scale,
+        )
+
+    def launch_attn() -> torch.Tensor:
+        data, scales = nvfp4_quantize_prepared(attn.detach(), attn_weight)
+        return _sm120_cutlass_linear(
+            data,
+            attn_weight,
+            scales,
+            attn_weight_scale,
+            attn_owner.input_global_scale,
+            attn_owner.weight_global_scale,
+        )
+
+    return _sm120_tail_pair(attn.device, launch_down, launch_attn)
+
+
+@nvfp4_out_pair.register_fake
+def _nvfp4_out_pair_fake(
+    down_activation,
+    down_weight,
+    down_activation_scale,
+    down_weight_scale,
+    attn,
+    attn_weight,
+    attn_weight_scale,
+):
+    return (
+        attn.new_empty((attn.shape[0], attn_weight.shape[0]), dtype=torch.bfloat16),
+        attn.new_empty((down_activation.shape[0], down_weight.shape[0]), dtype=torch.bfloat16),
+    )
+
+
+def _fp8r_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """PreparedFP8Sm120.forward for a 2D BF16 input: fp8r quantize + rowwise cuBLASLt GEMM."""
+    from .fp8 import quantize_fp8r
+
+    data, scales = quantize_fp8r(x)
+    scales = scales.float().reshape(-1).contiguous()
+    return torch._scaled_mm(
+        data.contiguous(),
+        weight.t(),
+        scale_a=scales.reshape(-1, 1),
+        scale_b=scale.reshape(1, -1),
+        out_dtype=torch.bfloat16,
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_fp8r_out_pair", mutates_args=(), device_types="cuda"
+)
+def fp8r_out_pair(
+    down_input: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    attn: torch.Tensor,
+    attn_weight: torch.Tensor,
+    attn_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(attn_out(attn), down(down_input)) for FP8R (PreparedFP8Sm120) blocks, BF16 2D inputs."""
+    down_input, attn = down_input.detach(), attn.detach()
+    down_weight, down_scale = down_weight.detach(), down_scale.detach()
+    attn_weight, attn_scale = attn_weight.detach(), attn_scale.detach()
+    return _sm120_tail_pair(
+        attn.device,
+        lambda: _fp8r_linear(down_input, down_weight, down_scale),
+        lambda: _fp8r_linear(attn, attn_weight, attn_scale),
+    )
+
+
+@fp8r_out_pair.register_fake
+def _fp8r_out_pair_fake(down_input, down_weight, down_scale, attn, attn_weight, attn_scale):
+    return (
+        attn.new_empty((attn.shape[0], attn_weight.shape[0]), dtype=torch.bfloat16),
+        attn.new_empty((down_input.shape[0], down_weight.shape[0]), dtype=torch.bfloat16),
+    )
+
+
 @lru_cache(maxsize=32)
 def _token_positions(rows: int, device: torch.device) -> torch.Tensor:
     """Cache identity RoPE indices across blocks and denoising steps."""
