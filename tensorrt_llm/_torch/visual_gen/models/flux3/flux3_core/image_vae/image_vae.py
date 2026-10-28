@@ -38,22 +38,25 @@ def group_norm_channel_stats(
     statistics are then combined exactly from its C/G equal-count channels:
     mean_g = mean_c(mean_c), var_g = mean_c(var_c) + mean_c((mean_c - mean_g)^2).
     On channels_last activations the per-channel reduction is coalesced (C is the
-    contiguous dim), unlike the (N, G, C/G*H*W) group view. Statistics and the
-    normalization are computed in fp32; the output has x's dtype.
+    contiguous dim), unlike the (N, G, C/G*H*W) group view. The normalization is
+    computed in fp32 and the output has x's dtype. Statistics accumulate in fp32 for
+    low-precision inputs (the served bf16 trunk) and in fp64 for fp32 inputs (the fp32
+    reference decoder), so neither is less accurate than aten's fp32 group statistics.
     """
     n, c = x.shape[:2]
     g = num_groups
     xf = x.float()
+    acc = torch.float64 if x.dtype == torch.float32 else torch.float32
     red = tuple(range(2, x.dim()))
-    var_c, mean_c = torch.var_mean(xf, dim=red, correction=0)
+    var_c, mean_c = torch.var_mean(x.to(acc), dim=red, correction=0)
     mean_c = mean_c.view(n, g, c // g)
     var_c = var_c.view(n, g, c // g)
     mean_g = mean_c.mean(-1, keepdim=True)
     var_g = var_c.mean(-1, keepdim=True) + (mean_c - mean_g).square().mean(-1, keepdim=True)
     rstd_g = torch.rsqrt(var_g + eps)
     bshape = (n, c) + (1,) * (x.dim() - 2)
-    mean = mean_g.expand(n, g, c // g).reshape(bshape)
-    rstd = rstd_g.expand(n, g, c // g).reshape(bshape)
+    mean = mean_g.expand(n, g, c // g).reshape(bshape).float()
+    rstd = rstd_g.expand(n, g, c // g).reshape(bshape).float()
     y = (xf - mean) * rstd
     if weight is not None:
         y = y * weight.float().view((1, c) + (1,) * (x.dim() - 2))
