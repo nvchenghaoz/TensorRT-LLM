@@ -804,7 +804,7 @@ class Flux3ModeBlock(nn.Module):
         timestep: Tensor | None = None,
     ) -> Tensor:
         mod_shift, mod_scale, mod_gate = mod
-        fused = adaln_nvfp4_input(self, x, mod, self.pre_norm.variance_epsilon)
+        fused = adaln_nvfp4_input(self, x, mod, self.pre_norm.variance_epsilon, freqs=freqs)
         if fused is not None:
             x_mod, quantized = fused
         else:
@@ -954,7 +954,7 @@ class Flux3SingleStreamBlock(nn.Module):
         residual = combined
 
         eps = self.pre_norm.variance_epsilon
-        fused = adaln_nvfp4_input(self, combined, mod, eps)
+        fused = adaln_nvfp4_input(self, combined, mod, eps, freqs=freqs)
         if fused is not None:
             combined, quantized = fused
         else:
