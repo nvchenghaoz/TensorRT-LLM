@@ -30,6 +30,7 @@ import torch
 STOCK_KERNEL = "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_128x128_output_bf16_sm120"
 
 _LEVER_FLAGS = {
+    "softmax_trim": ("st", "-DFMHA_FLUX3_SOFTMAX_TRIM=1"),
     "mask_skip": ("ms", "-DFMHA_FLUX3_MASK_SKIP=1"),
     "resident_q": ("rq", "-DFMHA_FLUX3_RESIDENT_Q=1"),
     # loop_trim (a) (FMHA_FLUX3_LOOP_TRIM, noloop_tiled.h, carried from branch 78): drops the
@@ -180,3 +181,12 @@ def fmha_v2_flux3_d128(
         True,
     )
     return out
+
+
+# softmax_trim (FMHA_FLUX3_SOFTMAX_TRIM, softmax.h; bitwise vs base2): P packs to FP8 without the
+# multiply by scale_softmax (requires scale_softmax == 1, as fmha_v2_flux3_d128 passes) and the
+# row max reduces as a depth-4 fmaxf tree. TRTLLM_FMHA_V2_FLUX3_ST=0 drops it from the routed set.
+import os as _os_st  # noqa: E402
+
+if _os_st.environ.get("TRTLLM_FMHA_V2_FLUX3_ST", "1") != "0":
+    ROUTED_LEVERS = (*ROUTED_LEVERS, "softmax_trim")
