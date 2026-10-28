@@ -19,6 +19,7 @@ from b39_linear_sweep import make_case  # noqa: E402
 
 WARMUP = 5
 ITERS = 200
+TAIL_PAIR = len(sys.argv) > 1 and sys.argv[1] == "tailpair"
 
 
 def log(*a):
@@ -48,8 +49,40 @@ def main():
     for p, t in zip(pristine, tensors):
         t.copy_(p)
     ev = {(M, s): [] for M in cases for s in ("attn_out", "down")}
+    if TAIL_PAIR:
+        # Main's real schedule (landing 20): down on the current stream || attn_out on the tail-pair
+        # side stream, forked and joined by flux3_primsts._sm120_tail_pair. One event pair spans
+        # the whole fork/join; it is booked under "down" and "attn_out" gets 0.
+        from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_primsts as fp
+
+        def pair(c):
+            return fp._sm120_tail_pair(c["down"][0].device, lambda: op(c["down"]),
+                                       lambda: op(c["attn_out"]))
+
+        for _ in range(WARMUP):
+            for c in cases.values():
+                pair(c)
+        torch.cuda.synchronize()
+        for p, t in zip(pristine, tensors):
+            t.copy_(p)
+        ref = {M: tuple(o.clone() for o in pair(c)) for M, c in cases.items()}
+        torch.cuda.synchronize()
+        for p, t in zip(pristine, tensors):
+            t.copy_(p)
+    zero = None
     for i in range(ITERS):
         for M, c in cases.items():
+            if TAIL_PAIR:
+                a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                a.record()
+                pair(c)
+                b.record()
+                ev[(M, "down")].append((a, b))
+                if zero is None:
+                    zero = torch.cuda.Event(enable_timing=True)
+                    zero.record()
+                ev[(M, "attn_out")].append((zero, zero))
+                continue
             for s in ("attn_out", "down"):
                 a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 a.record()
@@ -59,6 +92,15 @@ def main():
         if i % 50 == 0:
             log(f"iter {i}")
     torch.cuda.synchronize()
+    if TAIL_PAIR:
+        # Untimed correctness pass, same calls as the timed loop: repeat outputs vs the first call.
+        rep_ok = True
+        for _ in range(3):
+            for M, c in cases.items():
+                out = pair(c)
+                rep_ok &= all(torch.equal(x, y) for x, y in zip(out, ref[M]))
+        torch.cuda.synchronize()
+        log(f"tail-pair repeat bitwise vs first call: {rep_ok}")
     for p, t in zip(pristine, tensors):
         assert torch.equal(p, t), "input mutated"
     ms = {k: [a.elapsed_time(b) for a, b in v] for k, v in ev.items()}
@@ -74,6 +116,8 @@ def main():
         "batch": {"1": {"kernel_ms": med, "noise_floor": noise}},
         "per_shape_ms": {k: [m, n] for k, (m, n) in per.items()},
         "per_request_ms": med * 448,
+        "tail_pair": TAIL_PAIR,
+        "repeat_bitwise": bool(rep_ok) if TAIL_PAIR else None,
         "output": {"class": "reordered"},
     }))
 
