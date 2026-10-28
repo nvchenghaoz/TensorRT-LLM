@@ -20,8 +20,8 @@ DEV = torch.device("cuda", 0)
 MS = (4096, 4176, 4256)
 K = 3072
 W = 3072
-REPS = 10
-SAMPLES = int(os.environ.get("IDEA79_SAMPLES", "80"))
+REPS = int(os.environ.get("IDEA79_REPS", "50"))
+SAMPLES = int(os.environ.get("IDEA79_SAMPLES", "150"))
 
 
 def log(*a):
@@ -106,7 +106,7 @@ def run_time():
             e1.record()
             e1.synchronize()
             times[M].append(e0.elapsed_time(e1) * 1000.0 / REPS)
-        if s % 20 == 0:
+        if s % 30 == 0:
             log(f"sample {s}")
     res = {f"M{M}": stats(times[M]) for M in MS}
     log(json.dumps(res))
