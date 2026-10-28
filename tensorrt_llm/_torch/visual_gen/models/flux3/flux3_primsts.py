@@ -436,6 +436,52 @@ def _fp8r_out_pair_fake(down_input, down_weight, down_scale, attn, attn_weight, 
     )
 
 
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_fp8r_out_pair_q", mutates_args=(), device_types="cuda"
+)
+def fp8r_out_pair_q(
+    down_data: torch.Tensor,
+    down_scales: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    attn: torch.Tensor,
+    attn_weight: torch.Tensor,
+    attn_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fp8r_out_pair with down's input already E4M3-quantized (data [M, K], FP32 scales [M]),
+    e.g. by the fused swiglu_fp8r_quant. Same GEMMs as fp8r_out_pair, so bitwise equal."""
+    down_data = down_data.detach().contiguous()
+    down_scales = down_scales.detach().float().reshape(-1).contiguous()
+    attn = attn.detach()
+    down_weight, down_scale = down_weight.detach(), down_scale.detach()
+    attn_weight, attn_scale = attn_weight.detach(), attn_scale.detach()
+
+    def launch_down() -> torch.Tensor:
+        return torch._scaled_mm(
+            down_data,
+            down_weight.t(),
+            scale_a=down_scales.reshape(-1, 1),
+            scale_b=down_scale.reshape(1, -1),
+            out_dtype=torch.bfloat16,
+        )
+
+    return _sm120_tail_pair(
+        attn.device,
+        launch_down,
+        lambda: _fp8r_linear(attn, attn_weight, attn_scale),
+    )
+
+
+@fp8r_out_pair_q.register_fake
+def _fp8r_out_pair_q_fake(
+    down_data, down_scales, down_weight, down_scale, attn, attn_weight, attn_scale
+):
+    return (
+        attn.new_empty((attn.shape[0], attn_weight.shape[0]), dtype=torch.bfloat16),
+        attn.new_empty((down_data.shape[0], down_weight.shape[0]), dtype=torch.bfloat16),
+    )
+
+
 @lru_cache(maxsize=32)
 def _token_positions(rows: int, device: torch.device) -> torch.Tensor:
     """Cache identity RoPE indices across blocks and denoising steps."""
