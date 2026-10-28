@@ -170,6 +170,9 @@ def child(mode_dir, ckpt, reps):
     engine = json.load(open(os.path.join(WORKTREE, "experiments", "ascent-config", "engine.json")))
     vga = deep_merge(BASE_VGA, {k: v for k, v in engine.items() if k not in ("env",)})
     vga["pipeline_config"]["variant"] = "nvfp4"
+    if os.environ.get("B105_NO_AUTOTUNE") == "1":
+        # Deterministic tactics for cross-tree bitwise checks (autotuner choices vary per job).
+        vga["torch_compile_config"]["enable_autotune"] = False
     print("VGA", json.dumps(vga), flush=True)
     t0 = time.time()
     model = VisualGen(model=ckpt, args=VisualGenArgs(**vga))
