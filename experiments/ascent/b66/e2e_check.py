@@ -76,10 +76,13 @@ fused_blocks = []
 if faq is not None:
     tr = pipe.transformer
     for name, mod in tr.named_modules():
-        if getattr(mod, "_flux3_adaln_nvfp4", False):
+        if getattr(mod, "_flux3_adaln_nvfp4", False) and not name.endswith("_orig_mod"):
             fused_blocks.append(name)
 print("fused blocks", len(fused_blocks), fused_blocks[:3], fused_blocks[-3:], flush=True)
 if runner is not None and faq is not None:
+    # Test-only key so ON and OFF get their own graphs. Keys must be registered before capture:
+    # drop the warmup graphs (the first SERVED request recaptures, counted in its new_captures).
+    runner.clear()
     runner.register_extra_key_fn("b66_adaln_nvfp4", lambda *a, **k: bool(faq.FLUX3_ADALN_NVFP4))
 
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_gemm_config import (  # noqa: E402
