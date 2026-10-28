@@ -99,13 +99,31 @@ def base_tail(out, cos, sin, qn, kn):
     return q.flatten(2), k.flatten(2), v.flatten(2)
 
 
+def _strided_attention_on_main():
+    # Landing 29 (fp8_sm12x attention, accepts_strided_qkv on the served fp8/fp8 config):
+    # _attend no longer copies q/k/v to contiguous, so neither arm does here.
+    try:
+        import tensorrt_llm._torch.visual_gen.attention.backends.fp8_sm12x  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+STRIDED = _strided_attention_on_main()
+
+
+def contig(t):
+    # Strided q/k/v are passed to attention as-is; return a non-aliasing view for the graph.
+    return t if STRIDED else t.contiguous()
+
+
 def make_base(inp):
     adapter = inp["adapter"]
 
     def fn(x, data, scales, cos, sin, cos_sin, qn, kn):
         out = adapter.gemm(data, scales)
         q, k, v = base_tail(out, cos, sin, qn, kn)
-        return q.contiguous(), k.contiguous(), v.contiguous()
+        return contig(q), contig(k), contig(v)
 
     return torch.compile(fn, dynamic=False, options={"emulate_precision_casts": True})
 
@@ -116,7 +134,7 @@ def make_cand(inp):
     def fn(x, data, scales, cos, sin, cos_sin, qn, kn):
         xq = Fp8RowwiseQuantizedTensor(x, data, scales)
         q, k, v = qkv_forward(attn, xq, (cos, sin, cos_sin))
-        return q.contiguous(), k.contiguous(), v.contiguous()
+        return contig(q), contig(k), contig(v)
 
     return torch.compile(fn, dynamic=False, options={"emulate_precision_casts": True})
 
