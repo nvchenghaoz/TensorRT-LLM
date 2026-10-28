@@ -1266,8 +1266,14 @@ class Flux3Model(BaseDiffusionModel):
         ):
             for field, value in zip(("shift", "scale", "gate"), modules[key](vec)):
                 state[stage + "_" + field] = value
+        # A single-segment compact vec is one row; its only consumer (the final
+        # layer's adaLN) broadcasts it, so skip the per-token expansion and the
+        # M=S modulation GEMM on identical rows.
+        compact_vec = compact and len(segments) == 1 and not self.sharder.is_active
         if compact:
             for field, value in state.items():
+                if field == "vec" and compact_vec:
+                    continue
                 if field != "tokens":
                     state[field] = torch.cat(
                         [
