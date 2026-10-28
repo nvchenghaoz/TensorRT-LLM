@@ -151,38 +151,59 @@ def step_seq(singles, mode_in, use_fused):
 
 
 def bench(singles, mode_in):
+    """Two input sets, graphs replayed interleaved:
+    cold: 5 distinct x (128 MB working set, x mostly from DRAM);
+    hot : the 5 heads read one x (L2-resident after the first head), like the model, where x
+          was just written by the previous block's tail. kernel_ms reports the hot set."""
     use_fused = fused_mod is not None
-    for _ in range(WARMUP):
-        step_seq(singles, mode_in, use_fused)
+    x_hot = singles[0][0]
+    hot_singles = [(x_hot,) + tuple(s[1:]) for s in singles]
+    hot_mode = (x_hot[:, :4096],) + tuple(mode_in[1:])
+    sets = {"cold": (singles, mode_in), "hot": (hot_singles, hot_mode)}
+    graphs = {}
+    for name, (ss, mm) in sets.items():
+        for _ in range(WARMUP):
+            step_seq(ss, mm, use_fused)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(ITERS):
+                step_seq(ss, mm, use_fused)
+        for _ in range(5):
+            g.replay()
+        graphs[name] = g
     torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        for _ in range(ITERS):
-            step_seq(singles, mode_in, use_fused)
-    for _ in range(5):
-        g.replay()
-    torch.cuda.synchronize()
-    times = []
+    times = {name: [] for name in graphs}
     for i in range(60):
-        st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        st.record()
-        g.replay()
-        en.record()
-        en.synchronize()
-        times.append(st.elapsed_time(en) / ITERS)
+        for name, g in graphs.items():
+            st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            st.record()
+            g.replay()
+            en.record()
+            en.synchronize()
+            times[name].append(st.elapsed_time(en) / ITERS)
         if i % 20 == 0:
-            print("replay", i, times[-1], flush=True)
-    times.sort()
-    med = times[len(times) // 2]
-    p10, p90 = times[len(times) // 10], times[(len(times) * 9) // 10]
+            print("replay", i, {n: t[-1] for n, t in times.items()}, flush=True)
+    stats = {}
+    for name, t in times.items():
+        t.sort()
+        med = t[len(t) // 2]
+        stats[name] = {
+            "kernel_ms": med,
+            "noise_floor": (t[(len(t) * 9) // 10] - t[len(t) // 10]) / med,
+            "per_head_us": med * 1000 / 5,
+        }
     arm = "fused(store_x_mod=False)" if use_fused else "main"
     print("arm", arm, "configs", inductor_configs(), flush=True)
     print(json.dumps({
-        "batch": {"1": {"kernel_ms": med, "noise_floor": (p90 - p10) / med}},
+        "batch": {"1": {"kernel_ms": stats["hot"]["kernel_ms"],
+                        "noise_floor": stats["hot"]["noise_floor"]}},
         "output": {"class": "exact"},
         "arm": arm,
-        "unit": "ms per denoise step of FP8R heads (4 single M=4176 + 1 mode M=4096)",
-        "per_head_us": med * 1000 / 5,
+        "unit": "ms per denoise step of FP8R heads (4 single M=4176 + 1 mode M=4096); "
+        "kernel_ms = L2-hot x (in-model-like); cold = 5 distinct x",
+        "hot": stats["hot"],
+        "cold": stats["cold"],
     }))
 
 

@@ -81,7 +81,11 @@ skip_store = {
 }
 print("x_mod store skipped (qknorm_rope + tail pair)", skip_store, flush=True)
 results_skip_store = skip_store
-note(len(heads) == 5, f"5 FP8R blocks carry the fused head (got {len(heads)})")
+unique_heads = {
+    id(getattr(m, "_orig_mod", m)) for _, m in tr.named_modules()
+    if getattr(m, "_flux3_fp8r_adaln_head", None) is not None
+}
+note(len(unique_heads) == 5, f"5 FP8R blocks carry the fused head (got {len(unique_heads)})")
 warm_graphs = unique_graphs()
 
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_gemm_config import (  # noqa: E402

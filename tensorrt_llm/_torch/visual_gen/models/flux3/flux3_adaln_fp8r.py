@@ -135,31 +135,71 @@ def _adaln_fp8r(
     sel = tl.full([XBLOCK, 1], 0, tl.int1)
     if HAS_SELECT:
         sel = tl.load(sel_ptr + x0).to(tl.int1)
-    # Pass 2: x_mod (bf16) and the row's amax.
-    amax = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
-    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
-        r0_index = r0_offset + r0_base
-        r0_mask = r0_index < r0_numel
-        h = _modulated(
-            x_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, sel, x0, r0_index, r0_mask, mean, m2,
+    if r0_numel == 3 * R0_BLOCK:
+        # The row is three register-resident chunks: modulate, amax, quantize without a
+        # recompute pass. Same per-element math as the generic loop below.
+        c0 = r0_base
+        c1 = R0_BLOCK + r0_base
+        c2 = 2 * R0_BLOCK + r0_base
+        m0 = c0 < r0_numel
+        m1 = c1 < r0_numel
+        m2_ = c2 < r0_numel
+        h0 = _modulated(
+            x_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, sel, x0, c0, m0, mean, m2,
+            mod_row_stride, r0_numel, EPS, HAS_SELECT,
+        )
+        h1 = _modulated(
+            x_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, sel, x0, c1, m1, mean, m2,
+            mod_row_stride, r0_numel, EPS, HAS_SELECT,
+        )
+        h2 = _modulated(
+            x_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, sel, x0, c2, m2_, mean, m2,
             mod_row_stride, r0_numel, EPS, HAS_SELECT,
         )
         if STORE_XMOD:
-            tl.store(xmod_ptr + (r0_index + r0_numel * x0), h, r0_mask)
-        amax = tl.maximum(amax, tl.where(r0_mask, tl.abs(h.to(tl.float32)), 0.0))
-    row_amax = tl.max(amax, 1)[:, None]
-    scale = tl.maximum(tl.div_rn(row_amax, 448.0), 1.0e-12)
-    # Pass 3: recompute the same bf16 x_mod (deterministic) and quantize it.
-    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
-        r0_index = r0_offset + r0_base
-        r0_mask = r0_index < r0_numel
-        h = _modulated(
-            x_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, sel, x0, r0_index, r0_mask, mean, m2,
-            mod_row_stride, r0_numel, EPS, HAS_SELECT,
-        ).to(tl.float32)
-        q = tl.minimum(tl.maximum(tl.div_rn(h, scale), -448.0), 448.0)
-        tl.store(q_ptr + (r0_index + r0_numel * x0), q.to(tl.float8e4nv), r0_mask)
-    tl.store(s_ptr + x0, scale)
+            tl.store(xmod_ptr + (c0 + r0_numel * x0), h0, m0)
+            tl.store(xmod_ptr + (c1 + r0_numel * x0), h1, m1)
+            tl.store(xmod_ptr + (c2 + r0_numel * x0), h2, m2_)
+        f0 = h0.to(tl.float32)
+        f1 = h1.to(tl.float32)
+        f2 = h2.to(tl.float32)
+        row_amax = tl.maximum(
+            tl.maximum(tl.max(tl.abs(f0), 1), tl.max(tl.abs(f1), 1)), tl.max(tl.abs(f2), 1)
+        )[:, None]
+        scale = tl.maximum(tl.div_rn(row_amax, 448.0), 1.0e-12)
+        q0 = tl.minimum(tl.maximum(tl.div_rn(f0, scale), -448.0), 448.0)
+        q1 = tl.minimum(tl.maximum(tl.div_rn(f1, scale), -448.0), 448.0)
+        q2 = tl.minimum(tl.maximum(tl.div_rn(f2, scale), -448.0), 448.0)
+        tl.store(q_ptr + (c0 + r0_numel * x0), q0.to(tl.float8e4nv), m0)
+        tl.store(q_ptr + (c1 + r0_numel * x0), q1.to(tl.float8e4nv), m1)
+        tl.store(q_ptr + (c2 + r0_numel * x0), q2.to(tl.float8e4nv), m2_)
+        tl.store(s_ptr + x0, scale)
+    else:
+        # Generic widths. Pass 2: x_mod (bf16) and the row's amax.
+        amax = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+        for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+            r0_index = r0_offset + r0_base
+            r0_mask = r0_index < r0_numel
+            h = _modulated(
+                x_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, sel, x0, r0_index, r0_mask, mean,
+                m2, mod_row_stride, r0_numel, EPS, HAS_SELECT,
+            )
+            if STORE_XMOD:
+                tl.store(xmod_ptr + (r0_index + r0_numel * x0), h, r0_mask)
+            amax = tl.maximum(amax, tl.where(r0_mask, tl.abs(h.to(tl.float32)), 0.0))
+        row_amax = tl.max(amax, 1)[:, None]
+        scale = tl.maximum(tl.div_rn(row_amax, 448.0), 1.0e-12)
+        # Pass 3: recompute the same bf16 x_mod (deterministic) and quantize it.
+        for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+            r0_index = r0_offset + r0_base
+            r0_mask = r0_index < r0_numel
+            h = _modulated(
+                x_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, sel, x0, r0_index, r0_mask, mean,
+                m2, mod_row_stride, r0_numel, EPS, HAS_SELECT,
+            ).to(tl.float32)
+            q = tl.minimum(tl.maximum(tl.div_rn(h, scale), -448.0), 448.0)
+            tl.store(q_ptr + (r0_index + r0_numel * x0), q.to(tl.float8e4nv), r0_mask)
+        tl.store(s_ptr + x0, scale)
 
 
 @torch.library.custom_op("trtllm::flux3_fp8r_adaln_quant", mutates_args=())
