@@ -8,8 +8,11 @@ Phase ON  (FLUX3_BROADCAST_ADALN=True, as loaded and warmed up):
 Phase OFF (FLUX3_BROADCAST_ADALN=False = main's materialized path), after torch._dynamo.reset():
     W (T=80, stands in for warmup), A, B, C, D, A
 Per request: final latent + decoded uint8 image, Dynamo counters (recompiles), wall time.
-Pass: every ON latent/image == OFF latent/image bitwise, A == A' within each phase, and
-ON compiles no more than OFF inside the request sequence.
+Then OFF2 (another reset, W, A) measures main's own compile-to-compile variation, and, if
+torch._inductor.config.deterministic exists, ON vs OFF under it (W, A each, after resets).
+Pass: A == A' within each phase, ON compiles no more than OFF inside the request sequence,
+and ON == OFF bitwise under deterministic Inductor. ON vs OFF in default mode is reported
+(bitwise flag, latent max abs, image PSNR) next to OFF vs OFF2.
 Usage: python b32_adaln_check.py <checkpoint>
 """
 
@@ -134,9 +137,50 @@ for (n1, l1, i1), (n2, l2, i2) in zip(on, off):
         "latent_max_abs": d.max().item(),
         "image_max_abs": (i1.int() - i2.int()).abs().max().item(),
     }
-    note(rec["latent_bitwise"] and rec["image_bitwise"], f"{n1} ON vs OFF bitwise")
     cmp.append(rec)
     print("CMP", json.dumps(rec), flush=True)
+
+def psnr(a, b):
+    mse = (a.float() - b.float()).pow(2).mean().item()
+    return 99.0 if mse == 0 else round(10 * __import__("math").log10(255.0**2 / mse), 3)
+
+
+for rec, (_, _, i1), (_, _, i2) in zip(cmp, on, off):
+    rec["image_psnr_db"] = psnr(i1, i2)
+
+# Compile-to-compile variation of main's own path: OFF again after another reset.
+torch._dynamo.reset()
+tf.FLUX3_BROADCAST_ADALN = False
+off2, off2_comp = phase("OFF2", ["W", "A"])
+a_off2 = off2[-1]
+a_off = off[0]
+variation = {
+    "off_vs_off_after_reset_latent_bitwise": torch.equal(a_off2[1], a_off[1]),
+    "off_vs_off_after_reset_image_bitwise": torch.equal(a_off2[2], a_off[2]),
+    "off_vs_off_after_reset_latent_max_abs": (a_off2[1].float() - a_off[1].float()).abs().max().item(),
+    "off_vs_off_after_reset_image_psnr_db": psnr(a_off2[2], a_off[2]),
+}
+print("VARIATION", json.dumps(variation), flush=True)
+
+# Deterministic Inductor (no benchmark-picked reduction configs): ON vs OFF must be bitwise.
+det = {"available": hasattr(torch._inductor.config, "deterministic")}
+if det["available"]:
+    torch._inductor.config.deterministic = True
+    got = {}
+    for flag in (False, True):
+        torch._dynamo.reset()
+        tf.FLUX3_BROADCAST_ADALN = flag
+        out_d, _ = phase(f"DET_{'ON' if flag else 'OFF'}", ["W", "A"])
+        got[flag] = out_d[-1]
+    det["on_vs_off_latent_bitwise"] = torch.equal(got[True][1], got[False][1])
+    det["on_vs_off_image_bitwise"] = torch.equal(got[True][2], got[False][2])
+    det["on_vs_off_latent_max_abs"] = (got[True][1].float() - got[False][1].float()).abs().max().item()
+    det["on_vs_off_image_psnr_db"] = psnr(got[True][2], got[False][2])
+    torch._inductor.config.deterministic = False
+print("DETERMINISTIC", json.dumps(det), flush=True)
+if det["available"]:
+    note(det["on_vs_off_latent_bitwise"] and det["on_vs_off_image_bitwise"],
+         "ON vs OFF bitwise under deterministic Inductor")
 
 on_graphs = sum(r["new_graphs"] for r in on_comp)
 off_graphs = sum(r["new_graphs"] for r in off_comp_req)
@@ -154,6 +198,8 @@ print(
             "on_requests": on_comp,
             "off_requests": off_comp,
             "on_vs_off": cmp,
+            "compile_variation_of_main_path": variation,
+            "deterministic_inductor": det,
         },
         default=str,
     )
