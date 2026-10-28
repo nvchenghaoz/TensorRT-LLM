@@ -36,6 +36,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
     pack_swiglu_weight,
     prepare_nvfp4_gemm,
     qkv_planes,
+    sm120_linear_preload,
     sm120_qkv_planar,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
@@ -255,6 +256,8 @@ def prepare_nvfp4_block(block: nn.Module) -> None:
         layer._flux3_primsts_nvfp4 = _prepare_nvfp4(layer, swiglu)
         adapter = layer._flux3_primsts_nvfp4
         if is_sm120(adapter.weight.device):
+            if not swiglu:
+                sm120_linear_preload(adapter.weight.device)
             continue
         prepare_nvfp4_gemm(
             adapter.weight,
