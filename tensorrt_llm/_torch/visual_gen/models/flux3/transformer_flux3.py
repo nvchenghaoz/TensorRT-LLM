@@ -58,6 +58,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     prepare_nvfp4_block,
     prepare_sm120_fp8_excluded_block,
     prepare_sm120_tail_pair,
+    rope_cos_sin_table,
     separate_qkv_forward,
     shared_nvfp4_input,
     sm120_fp8_mlp_forward,
@@ -131,6 +132,19 @@ def _pe_to_block_freqs(pe: Tensor) -> Tuple[Tensor, Tensor]:
     apply_rotary_emb."""
     cos, sin = flux3_pe_to_cos_sin(pe)
     return cos.transpose(1, 2).contiguous(), sin.transpose(1, 2).contiguous()
+
+
+# Build the fused QK-norm+RoPE FP32 [rows, 128] cos/sin table once per request in
+# _packed_positions and hand it to every block as freqs[2], instead of every fused QKV
+# re-concatenating it from cos/sin. Same values (a copy), so outputs are unchanged.
+FLUX3_ROPE_TABLE = True
+
+
+def _block_freqs(prepared: dict, prefix: str) -> Tuple[Tensor, ...]:
+    """(cos, sin), plus the prebuilt cos_sin table when _packed_positions made one."""
+    cos, sin = prepared[prefix + "cos"], prepared[prefix + "sin"]
+    table = prepared.get(prefix + "cos_sin")
+    return (cos, sin) if table is None else (cos, sin, table)
 
 
 def apply_flux3_pag(
@@ -509,7 +523,7 @@ class Flux3Attention(Attention):
         result [B, S, H*D] (and v [B, H, S, D] when need_v, for PAG). Fused path
         does QK-norm+RoPE in one kernel; unfused uses eager rms_norm + rotary."""
         b, s = hidden_states.shape[:2]
-        cos, sin = freqs
+        cos, sin = freqs[0], freqs[1]
         projection_input = hidden_states if quantized is None else quantized
 
         qkv = _primsts_qkv_forward(self, projection_input, freqs)
@@ -1375,6 +1389,10 @@ class Flux3Model(BaseDiffusionModel):
         chunks, _ = self._joint_chunks(self._local_layout(layout))
         pe = torch.cat([positions[name][:, :, start:end] for name, start, end in chunks], dim=2)
         prepared["_flux3_joint_cos"], prepared["_flux3_joint_sin"] = _pe_to_block_freqs(pe)
+        if FLUX3_ROPE_TABLE:
+            for prefix in [f"_flux3_{name}_" for name in positions] + ["_flux3_joint_"]:
+                table = rope_cos_sin_table(prepared[prefix + "cos"], prepared[prefix + "sin"])
+                prepared[prefix + "cos_sin"] = table.float().contiguous()
         if len(chunks) == 2:
             prepared["_flux3_joint_select"] = self._joint_select(chunks, pe.device)
         return prepared
@@ -1401,7 +1419,7 @@ class Flux3Model(BaseDiffusionModel):
                 continue
             state = self._packed_stream(name, inputs, lengths)
             blocks = self.txt_mode_blocks if name == "text" else self.content_mode_blocks[name]
-            freqs = prepared[f"_flux3_{name}_cos"], prepared[f"_flux3_{name}_sin"]
+            freqs = _block_freqs(prepared, f"_flux3_{name}_")
             mod = tuple(state["early_" + field] for field in ("shift", "scale", "gate"))
             state["tokens"] = self._early_adaln_runtime[name].prepare(state["tokens"], *mod[:2])
             for block in blocks:
@@ -1574,7 +1592,7 @@ class Flux3Model(BaseDiffusionModel):
                 continue
             state = self._packed_stream(name, inputs, lengths, ref)
             blocks = self.txt_mode_blocks if name == "text" else self.content_mode_blocks[name]
-            freqs = prepared[prefix + "cos"], prepared[prefix + "sin"]
+            freqs = _block_freqs(prepared, prefix)
             mod = tuple(state["early_" + field] for field in ("shift", "scale", "gate"))
             state["tokens"] = self._early_adaln_runtime[name].prepare(state["tokens"], *mod[:2])
             for block in blocks:
@@ -1614,7 +1632,7 @@ class Flux3Model(BaseDiffusionModel):
             ) + (select,)
         else:
             mod = tuple(joint(field) for field in mod_fields)
-        freqs = prepared["_flux3_joint_cos"], prepared["_flux3_joint_sin"]
+        freqs = _block_freqs(prepared, "_flux3_joint_")
         combined = self._single_adaln_runtime.prepare(combined, *mod[:2])
         for index, block in enumerate(self.single_blocks):
             combined = block(
