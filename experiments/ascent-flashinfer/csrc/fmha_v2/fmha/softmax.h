@@ -390,6 +390,29 @@ struct Softmax_base {
       }
     } else
 #endif  // defined(USE_SAME_SUM_ORDER_IN_SOFTMAX_AS_REF_CODE)
+#if defined(FMHA_FLUX3_SOFTMAX_TRIM) && FMHA_FLUX3_SOFTMAX_TRIM
+    if (!Functor::IS_SUM && (((MMAS_N * 4) & (MMAS_N * 4 - 1)) == 0)) {
+// FLUX.3 softmax trim: the row max as a balanced tree (same FMNMX count, depth log2(N)
+// instead of N-1). fmaxf is exact and order-free, so the result is bitwise the chain's.
+// Sum_ keeps the linear order below (changing it would reorder the FP32 sum).
+#pragma unroll
+      for (int mi = 0; mi < MMAS_M * 2; ++mi) {
+        float t[MMAS_N * 4];
+#pragma unroll
+        for (int ni = 0; ni < MMAS_N * 4; ++ni) {
+          t[ni] = elt_[mi][ni];
+        }
+#pragma unroll
+        for (int stride = MMAS_N * 2; stride >= 1; stride /= 2) {
+#pragma unroll
+          for (int ni = 0; ni < stride; ++ni) {
+            t[ni] = Functor::apply(t[ni], t[ni + stride]);
+          }
+        }
+        dst[mi] = t[0];
+      }
+    } else
+#endif  // FMHA_FLUX3_SOFTMAX_TRIM
     {
 // Apply the functor for each row inside a thread.
 #pragma unroll
@@ -1286,7 +1309,13 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile, Kernel_traits>
   // Pack the data to a fragment for the next GEMM.
   template <typename Fragment_a, int K, int M>
   inline __device__ void pack(Fragment_a (&dst)[K][M]) const {
+#if defined(FMHA_FLUX3_SOFTMAX_TRIM) && FMHA_FLUX3_SOFTMAX_TRIM
+    // FLUX.3 softmax trim: REQUIRES scale_softmax == 1.0f (fmha_v2_flux3_d128 hard-codes it;
+    // the binding stores it as FP32 for E4M3). x * 1.0f == x, so P converts unscaled.
+    float const scale = 1.f;
+#else
     float const scale = reinterpret_cast<float const&>(this->params_scale_softmax_);
+#endif
 
 // The canonical layout in K should be R0: [0,1,2,3] R2: [16,17,18,19]
 // Note below that this is not possible with the register layout of the accumulator.
