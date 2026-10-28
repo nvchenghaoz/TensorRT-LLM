@@ -671,6 +671,9 @@ def _flux3_gated_mlp_forward(
 # Inductor picks another reduction config for the single-block LN+modulate kernel, so the
 # LayerNorm sums are reordered (mode blocks stay bitwise).
 FLUX3_BROADCAST_ADALN = True
+# The step-batched flow-map text stream (flow_map_text_step) hands forward its single_* rows
+# as broadcast [1, 1, D] rows too, so the single blocks keep the table + select path.
+FLUX3_TEXT_STEP_BROADCAST = True
 
 
 def _flux3_select_mod(mod: tuple) -> Tuple[Tensor, Tensor, Tensor]:
@@ -1538,11 +1541,14 @@ class Flux3Model(BaseDiffusionModel):
         steps = prepared["_flux3_text_steps_single_shift"].shape[1]
         length = tokens.shape[1] // steps
         out = {"_flux3_text_step_tokens": tokens[:, step * length : (step + 1) * length]}
+        # Keep each single_* row as a broadcast [1, 1, D] row (like _packed_stream's compact
+        # single-segment stream), so forward takes the [1, 2, D] table + select path for the
+        # single blocks; where it cannot, forward's rows() expands it to the text length.
         for field in ("shift", "scale", "gate"):
-            rows = prepared["_flux3_text_steps_single_" + field]
-            out["_flux3_text_step_single_" + field] = rows[:, step : step + 1].expand(
-                -1, length, -1
-            )
+            rows = prepared["_flux3_text_steps_single_" + field][:, step : step + 1]
+            if not FLUX3_TEXT_STEP_BROADCAST:
+                rows = rows.expand(-1, length, -1)
+            out["_flux3_text_step_single_" + field] = rows
         return out
 
     def forward(
