@@ -198,13 +198,25 @@ def mode_pair(args):
     assert all(same_inputs(i, s) for i, s in zip(inputs, snaps)), "inputs mutated"
     per = {S: stats(xs) for S, xs in t.items()}
     series = [sum(CALLS[S] * t[S][r] for S in CALLS) / 1e3 for r in range(args.reps)]
-    med, nf = stats(series)
+    med, nf_sample = stats(series)
+    # Noise floor = spread of REPEATED TIMINGS of this configuration: the per-pass median of
+    # each block of args.block consecutive reps ((p90 - p10) / median over blocks). The
+    # per-sample spread of single CUDA-event timings is reported alongside.
+    nb = max(1, args.reps // args.block)
+    blocks = [torch.tensor(series[b * args.block:(b + 1) * args.block]).median().item()
+              for b in range(nb)]
+    _, nf_block = stats(blocks)
     for S, (m_, n_) in per.items():
-        log(f"S={S}: {m_:.1f} us (noise {n_:.3f})")
-    log(f"per-pass (28x4176 + 5x4096): {med:.4f} ms noise {nf:.4f}")
-    print(json.dumps({"batch": {"1": {"kernel_ms": med,
-                                      "noise_floor": max(nf, *[n for _, n in per.values()])}},
+        log(f"S={S}: {m_:.1f} us (per-sample noise {n_:.3f})")
+    log(f"per-pass (28x4176 + 5x4096): {med:.4f} ms  block-median noise {nf_block:.4f} "
+        f"({nb} blocks x {args.block})  per-sample noise {nf_sample:.4f}")
+    print(json.dumps({"batch": {"1": {"kernel_ms": med, "noise_floor": nf_block}},
                       "output": {"class": "reordered"},
+                      "noise_detail": {"block_median": nf_block, "blocks": nb,
+                                       "block_size": args.block,
+                                       "per_sample_pass": nf_sample,
+                                       "per_sample_call": {str(S): v[1] for S, v in per.items()},
+                                       "block_medians_ms": blocks},
                       "per_call_us": {str(S): v[0] for S, v in per.items()}}))
 
 
@@ -326,6 +338,7 @@ def main():
                                          "base2+mask_skip+resident_q")
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--reps", type=int, default=200)
+    p.add_argument("--block", type=int, default=20)
     args = p.parse_args()
     log(f"device {torch.cuda.get_device_name()}")
     {"ab": mode_ab, "pair": mode_pair, "check": mode_check}[args.mode](args)
