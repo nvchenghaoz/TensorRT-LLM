@@ -154,7 +154,8 @@ void gemm_qkv3_pingpong(TensorView a, TensorView b, TensorView sfa, TensorView s
       static_cast<float const*>(alpha.data_ptr()), m, n, k, 3);
   // A and its scales are shared by the 3 planes: batch stride 0.
   cute::get<2>(args.mainloop.dA) = 0;
-  cute::get<2>(args.mainloop.layout_SFA.stride()) = 0;
+  // layout_SFA's L mode is (_1, L) with stride (_0, int): zero the dynamic batch stride.
+  cute::get<1>(cute::get<2>(args.mainloop.layout_SFA.stride())) = 0;
   // Per-plane alpha.
   args.epilogue.thread.dAlpha = {cute::_0{}, cute::_0{}, 1};
   if constexpr (!std::is_const_v<decltype(args.scheduler.max_swizzle_size)>) {
@@ -189,7 +190,7 @@ int64_t qkv3_workspace_size(int64_t m, int64_t n, int64_t k) {
                                                           static_cast<int>(n),
                                                           static_cast<int>(k), 3);
   cute::get<2>(args.mainloop.dA) = 0;
-  cute::get<2>(args.mainloop.layout_SFA.stride()) = 0;
+  cute::get<1>(cute::get<2>(args.mainloop.layout_SFA.stride())) = 0;
   return static_cast<int64_t>(Gemm::get_workspace_size(args));
 }
 
