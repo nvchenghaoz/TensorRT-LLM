@@ -144,12 +144,31 @@ pipe._encode_prompt = encode
 pipe._profile_denoise_steps = steps
 pipe.vae.decode = vae_decode
 
-TREE = (pf.sample_image_latents, pf._as_image_grid)
-MAIN = (ref.ref_sample_image_latents, ref.ref_as_image_grid)
+TREE = (pf.sample_image_latents, pf._as_image_grid, pf._sigmas_to_device)
+MAIN = (ref.ref_sample_image_latents, ref.ref_as_image_grid, ref.ref_sigmas_to_device)
 
 
 def use(arm):
-    pf.sample_image_latents, pf._as_image_grid = TREE if arm == "tree" else MAIN
+    impl = TREE if arm == "tree" else MAIN
+    pf.sample_image_latents, pf._as_image_grid = impl[0], impl[1]
+
+    def sigmas_to_device(sigmas, device, dtype, _f=impl[2]):
+        captured["text_ts_dtype"] = dtype
+        captured["targets_calls"] = captured.get("targets_calls", 0) + 1
+        return _f(sigmas, device, dtype)
+
+    pf._sigmas_to_device = sigmas_to_device
+
+
+# Prime sync-debug mode once outside any window: job 638's first tree request logged
+# one event raised from inside torch.cuda.set_sync_debug_mode itself (first-call
+# artifact, not pipeline code).
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("warn")
+    torch.cuda.set_sync_debug_mode(0)
+    torch.cuda.synchronize()
 
 
 width, height = pipe.pipeline_config.extra_attrs["flux3_checkpoint"].config["sampler"]["size"]
@@ -216,6 +235,18 @@ for seed in (100, 101):
         "x_ids": a[1].stride() == b[1].stride() and torch.equal(a[1], b[1]),
         "orig_ids": torch.equal(a[2].cpu(), b[2].cpu()) and a[2].dtype == b[2].dtype,
     }
+# flow-map targets as _run_denoise builds them (real scheduler, real text-timestep dtype)
+from tensorrt_llm._torch.visual_gen.models.flux3.flux3_core.scheduler import (  # noqa: E402
+    Flux3FlowMatchScheduler)
+_sch = Flux3FlowMatchScheduler(
+    pipe.pipeline_config.extra_attrs["flux3_checkpoint"].config["sampler"]["alpha"])
+_sch.set_timesteps(16)
+_tdt = captured.get("text_ts_dtype", torch.float32)
+_ta = TREE[2](_sch.sigmas[1:17], dev, _tdt)
+_tb = MAIN[2](_sch.sigmas[1:17], dev, _tdt)
+torch.cuda.synchronize()
+inp_eq["targets"] = {"targets": bool(_ta.dtype == _tb.dtype and _ta.device == _tb.device
+                                     and torch.equal(_ta, _tb)), "dtype": str(_tdt)}
 
 
 def summ(arm, key):
@@ -236,6 +267,7 @@ res = {
     "z_strides_tree": zs_t0, "z_strides_main": zs_m0,
     "z_strides_equal": zs_t0 == zs_m0 and zs_t2 == zs_m2,
     "inputs_eq": inp_eq,
+    "targets_calls": captured.get("targets_calls", 0),
     "no_recompile_after_warmup": after == before,
     "counters_before": before, "counters_after": after,
 }

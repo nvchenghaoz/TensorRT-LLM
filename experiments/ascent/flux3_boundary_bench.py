@@ -78,12 +78,24 @@ def ref_as_image_grid(tokens, orig_ids):
     return ref_scatter_ids(tokens.float(), orig_ids[:1])[0].squeeze(2)
 
 
+def ref_sigmas_to_device(sigmas, device, dtype):
+    # main 49e7d5e5 _run_denoise (landing 21): targets = sigmas[...].to(device=, dtype=)
+    return sigmas.to(device=device, dtype=dtype)
+
+
 # ---- harness -------------------------------------------------------------------------
+# The base tree inlines the targets copy in _run_denoise; its "module" arm uses main's.
+_mod_sigmas = getattr(pf, "_sigmas_to_device", ref_sigmas_to_device)
 IMPL = {
-    "module": (pf.sample_image_latents, pf._as_image_grid),
-    "ref": (ref_sample_image_latents, ref_as_image_grid),
-    "ref2": (ref_sample_image_latents, ref_as_image_grid),
+    "module": (pf.sample_image_latents, pf._as_image_grid, _mod_sigmas),
+    "ref": (ref_sample_image_latents, ref_as_image_grid, ref_sigmas_to_device),
+    "ref2": (ref_sample_image_latents, ref_as_image_grid, ref_sigmas_to_device),
 }
+# Scheduler sigmas as Flux3FlowMatchScheduler builds them (CPU float32, 16 steps).
+_ALPHA = 3.0
+_T = torch.linspace(1.0, 0.0, 17)
+SIGMAS = _ALPHA * _T / (1.0 + (_ALPHA - 1.0) * _T)
+TARGET_DTYPE = torch.float32
 # VAE entry stand-in (Flux3ImageVAE.inv_normalize + rearrange) with fixed bn stats.
 g = torch.Generator(device="cpu").manual_seed(1234)
 BN_VAR = (torch.rand(128, generator=g) + 0.5).to(dev)
@@ -115,21 +127,22 @@ TE_CYC = TAIL_CYC = None  # calibrated in __main__ (importers only use the ref c
 
 
 def run_a(name, seed):
-    sample, _ = IMPL[name]
+    sample, _, to_dev = IMPL[name]
     e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
     torch.cuda._sleep(TE_CYC)
     e0.record()
     x, x_ids, oid = sample(height=1024, width=1024, seed=seed, device=dev,
                            image_rope_scale=0.5, copies=2)
-    marker = x.float().sum() + x_ids.sum()  # first consumer of the prepared inputs
+    targets = to_dev(SIGMAS[1:17], dev, TARGET_DTYPE)  # _run_denoise flow-map targets
+    marker = x.float().sum() + x_ids.sum() + targets.sum()  # first consumer
     e1.record()
     e1.synchronize()
-    return e0.elapsed_time(e1), (x, x_ids, oid, marker)
+    return e0.elapsed_time(e1), (x, x_ids, oid, marker, targets)
 
 
 def run_b(name, oid):
-    _, grid_fn = IMPL[name]
+    _, grid_fn, _ = IMPL[name]
     e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
     torch.cuda._sleep(TAIL_CYC)
@@ -199,15 +212,15 @@ def check():
     for it in range(WARMUP + ITERS):
         assert torch.equal(LATENT, LATENT_PRISTINE), "input latent mutated"
         seed = it % 4
-        _, (x, x_ids, oid, _) = run_a("module", seed)
-        _, (rx, rx_ids, roid, _) = run_a("ref", seed)
+        _, (x, x_ids, oid, _, tg) = run_a("module", seed)
+        _, (rx, rx_ids, roid, _, rtg) = run_a("ref", seed)
         _, (grid, z) = run_b("module", oid)
         _, (rgrid, rz) = run_b("ref", roid)
         r = {
             "x": same(x, rx), "x_ids": same(x_ids, rx_ids),
             "orig_ids_values": torch.equal(oid.cpu(), roid.cpu()) and oid.shape == roid.shape
             and oid.dtype == roid.dtype,
-            "grid": same(grid, rgrid), "z": same(z, rz),
+            "grid": same(grid, rgrid), "z": same(z, rz), "targets": same(tg, rtg),
             "z_strides": list(z.stride()), "ref_z_strides": list(rz.stride()),
             "orig_ids_device": str(oid.device),
         }
@@ -232,12 +245,24 @@ def check():
     nr_ref = ref_as_image_grid(toks, ids.to(dev))
     nonraster = same(nr_mod, nr_ref) and same(nr_mod_cpu, nr_ref)
     ok &= nonraster
+    # targets: every dtype the text timesteps may take, and a few step counts.
+    targets_eq = {}
+    for steps in (4, 16, 50):
+        t = torch.linspace(1.0, 0.0, steps + 1)
+        sig = _ALPHA * t / (1.0 + (_ALPHA - 1.0) * t)
+        for dt in (torch.float32, torch.bfloat16, torch.float16):
+            a = IMPL["module"][2](sig[1:steps + 1], dev, dt)
+            b = ref_sigmas_to_device(sig[1:steps + 1], dev, dt)
+            torch.cuda.synchronize()
+            targets_eq[f"{steps}:{dt}"] = same(a, b) and a.device == b.device
+    ok &= all(targets_eq.values())
     print(json.dumps({
         "passed": bool(ok),
         "compared": "tree pipeline_flux3 sample_image_latents/_as_image_grid (+VAE entry) vs "
                     "verbatim main copies: x, x_ids, orig_ids, grid and z bitwise with equal "
                     "strides, every iteration and vs iteration 0 per seed; non-raster scatter path",
-        "iters": WARMUP + ITERS, "nonraster_scatter_equal": nonraster, "details": details,
+        "iters": WARMUP + ITERS, "nonraster_scatter_equal": nonraster,
+        "targets_equal": targets_eq, "details": details,
     }, default=str))
 
 

@@ -126,6 +126,21 @@ def _grid_index(pos: Tensor) -> tuple[int, int, int, Tensor, bool]:
     return t, h, w, flat_ids, identity
 
 
+def _sigmas_to_device(sigmas: Tensor, device, dtype: torch.dtype) -> Tensor:
+    """``sigmas.to(device=device, dtype=dtype)`` without a host sync for CPU sigmas.
+
+    A pageable CPU->GPU copy blocks the host behind all queued GPU work (the graphed
+    text encoder at the TE->denoise boundary). Stage through pinned memory and copy
+    with non_blocking instead; the caching host allocator keeps the pinned block alive
+    until the copy completes. The single dtype cast runs on the CPU, where the combined
+    CPU->GPU ``.to()`` also converts, so the values are identical.
+    """
+    device = torch.device(device)
+    if sigmas.device.type == "cpu" and device.type == "cuda":
+        return sigmas.to(dtype=dtype).pin_memory().to(device, non_blocking=True)
+    return sigmas.to(device=device, dtype=dtype)
+
+
 def scatter_ids(x: Tensor, x_ids: Tensor):
     out_list = []
     for data, pos in zip(x, x_ids):
@@ -649,8 +664,10 @@ class Flux3Pipeline(BasePipeline):
         ):
             # The flow-map text stream depends only on ctx and the step's target time:
             # run it once for all steps (each step then reads its slice).
-            targets = scheduler.sigmas[1 : len(scheduler.timesteps) + 1].to(
-                device=inputs["x_text_timesteps"].device, dtype=inputs["x_text_timesteps"].dtype
+            targets = _sigmas_to_device(
+                scheduler.sigmas[1 : len(scheduler.timesteps) + 1],
+                inputs["x_text_timesteps"].device,
+                inputs["x_text_timesteps"].dtype,
             )
             text_steps = self.transformer.prepare_flow_map_text(targets, **inputs, **prepared)
         for step_index, timestep in self._profile_denoise_steps(scheduler.timesteps):
