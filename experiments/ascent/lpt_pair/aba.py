@@ -412,9 +412,15 @@ def analyze_fork(sqlite_path, arm, succ_prefix="triton_poi_fused_add_mul"):
             "parts": [(r[2][:48], round((r[0] - f_end) / 1e3, 1), round((r[1] - r[0]) / 1e3, 1))
                       for r in inside],
         })
+    fp8r = [p for p in out if any("at::cuda" in q[0] for q in p["parts"])]
+    out = [p for p in out if p not in fp8r]  # keep the NVFP4 tail pairs only
+    span = (rows[-1][1] - rows[0][0]) / 1e3 if rows else None
+    busy = sum(r[1] - r[0] for r in rows) / 1e3
     walls = sorted(p["wall_us"] for p in out)
     n = len(walls)
-    summ = {"arm": arm, "pairs": n}
+    summ = {"arm": arm, "pairs": n, "fp8r_windows_dropped": len(fp8r),
+            "request_span_us": span, "kernel_time_sum_us": busy,
+            "nvfp4_wall_sum_us": sum(walls)}
     if n:
         fg = sorted(p["first_gemm_start_us"] for p in out)
         lg = sorted(p["last_gemm_end_us"] for p in out)
