@@ -1000,15 +1000,100 @@ class _Flux3FP8RModeBlock(Flux3ModeBlock):
     (bits changed after a request with another text length).
     """
 
-    def forward(self, *args, **kwargs):
-        return super().forward(*args, **kwargs)
+    # Set by prepare_fp8r_adaln_quant (flux3_adaln_fp8r.py): the fused LN + adaLN-modulate +
+    # per-token E4M3 head. Returns (x_mod, quantized) or None for the base forward.
+    _flux3_fp8r_adaln_head = None
+
+    def forward(
+        self,
+        x: Tensor,
+        freqs: Tuple[Tensor, Tensor],
+        mod: Tuple[Tensor, Tensor, Tensor],
+        sample_bounds: Bounds | None = None,
+        timestep: Tensor | None = None,
+    ) -> Tensor:
+        head = self._flux3_fp8r_adaln_head
+        fused = None if head is None else head(self, x, mod, freqs)
+        if fused is None:
+            return super().forward(x, freqs, mod, sample_bounds=sample_bounds, timestep=timestep)
+        # Flux3ModeBlock.forward after its head (FP8R blocks never fuse proj_out).
+        mod_gate = mod[2]
+        x_mod, quantized = fused
+        attn = self.attn.attn_pre_out(
+            x_mod, freqs, quantized=quantized, sample_bounds=sample_bounds, timestep=timestep
+        )
+        mlp_shape = x_mod.shape
+        mlp_input = x_mod.reshape(-1, mlp_shape[-1])
+        mlp_input = Fp8RowwiseQuantizedTensor(mlp_input, quantized.quantized, quantized.scales)
+        pair = sm120_tail_pair_forward(self, attn, mlp_input) if self._sm120_tail_pair else None
+        if pair is not None:
+            attn_y, mlp_y = pair
+            output = attn_y.reshape(*attn.shape[:-1], -1) + mlp_y.reshape(*mlp_shape[:-1], -1)
+        else:
+            mlp_out = _flux3_gated_mlp_forward(self.ff, mlp_input).reshape(*mlp_shape[:-1], -1)
+            output = _primsts_linear_forward(self.attn_out, attn) + mlp_out
+        if self._allreduce is not None:
+            output = self._allreduce(output)
+        return x + mod_gate * output
 
 
 class _Flux3FP8RSingleStreamBlock(Flux3SingleStreamBlock):
     """Single-stream counterpart of _Flux3FP8RModeBlock."""
 
-    def forward(self, *args, **kwargs):
-        return super().forward(*args, **kwargs)
+    _flux3_fp8r_adaln_head = None
+
+    def forward(
+        self,
+        combined: Tensor,
+        freqs: Tuple[Tensor, Tensor],
+        mod: Tuple[Tensor, Tensor, Tensor],
+        pag_strength: float = 0.0,
+        sample_bounds: Bounds | None = None,
+        pag_samples: tuple[int, ...] = (0,),
+        timestep: Tensor | None = None,
+    ) -> Tensor:
+        head = self._flux3_fp8r_adaln_head
+        fused = None if head is None else head(self, combined, mod, freqs)
+        if fused is None:
+            return super().forward(
+                combined,
+                freqs,
+                mod,
+                pag_strength=pag_strength,
+                sample_bounds=sample_bounds,
+                pag_samples=pag_samples,
+                timestep=timestep,
+            )
+        # Flux3SingleStreamBlock.forward after its head (FP8R blocks never fuse proj_out).
+        mod_gate = _flux3_select_mod(mod)[2]
+        residual = combined
+        combined, quantized = fused
+        attn, v = self.attn.attn_pre_out(
+            combined,
+            freqs,
+            need_v=True,
+            quantized=quantized,
+            sample_bounds=sample_bounds,
+            timestep=timestep,
+        )
+        attn = apply_flux3_pag(attn, v, pag_strength, sample_bounds, pag_samples)
+        combined_shape = combined.shape
+        mlp_input = combined.reshape(-1, combined_shape[-1])
+        mlp_input = Fp8RowwiseQuantizedTensor(mlp_input, quantized.quantized, quantized.scales)
+        pair = sm120_tail_pair_forward(self, attn, mlp_input) if self._sm120_tail_pair else None
+        if pair is not None:
+            attn_y, mlp_y = pair
+            output = attn_y.reshape(*attn.shape[:-1], -1) + mlp_y.reshape(
+                *combined_shape[:-1], -1
+            )
+        else:
+            mlp_out = _flux3_gated_mlp_forward(self.ff, mlp_input).reshape(
+                *combined_shape[:-1], -1
+            )
+            output = _primsts_linear_forward(self.attn_out, attn) + mlp_out
+        if self._allreduce is not None:
+            output = self._allreduce(output)
+        return residual + mod_gate * output
 
 
 _FP8R_BLOCK_CLASSES = {
@@ -1891,3 +1976,10 @@ class Flux3Model(BaseDiffusionModel):
         ]
         if paired:
             logger.info(f"FLUX.3 SM120 down || attn_out two-stream tail pair: {paired}")
+        from tensorrt_llm._torch.visual_gen.models.flux3.flux3_adaln_fp8r import (
+            prepare_fp8r_adaln_quant,
+        )
+
+        fused_heads = prepare_fp8r_adaln_quant(blocks)
+        if fused_heads:
+            logger.info(f"FLUX.3 FP8R fused LN+adaLN+E4M3 quantize head: {fused_heads}")
