@@ -20,6 +20,7 @@ import torch
 REPS = 10
 SAMPLES = int(os.environ.get("IDEA82_SAMPLES", "300"))
 BLOCKS = 10
+WARM_S = float(os.environ.get("IDEA82_WARM_S", "4"))
 DEV = torch.device("cuda", 0)
 
 
@@ -72,9 +73,15 @@ def main():
             for _ in range(REPS):
                 op()
         torch.cuda.synchronize()
-        for _ in range(10):
-            g.replay()
-        torch.cuda.synchronize()
+        # Sustained warm-up (~WARM_S s of back-to-back replays) so the SM clock / power state
+        # settles before timing (without it the block medians drift up ~4% within a run).
+        import time as _time
+
+        t_end = _time.time() + WARM_S
+        while _time.time() < t_end:
+            for _ in range(20):
+                g.replay()
+            torch.cuda.synchronize()
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         xs = []
