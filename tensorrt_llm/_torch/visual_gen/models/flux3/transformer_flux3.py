@@ -42,6 +42,8 @@ from tensorrt_llm._torch.modules.linear import (
     WeightsLoadingConfig,
 )
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
+from tensorrt_llm._torch.visual_gen.attention.backends.flashinfer import FlashInferAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnMLPProj
@@ -64,9 +66,11 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     shared_nvfp4_input,
     sm120_fp8_mlp_forward,
     sm120_fp8_shared_input,
+    sm120_side_gate_up_args,
     sm120_tail_pair_forward,
     verify_nvfp4_coverage,
 )
+from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import fp8_attention_side_gate_up
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     linear_forward as _primsts_linear_forward,
 )
@@ -528,10 +532,14 @@ class Flux3Attention(Attention):
         quantized: Fp8RowwiseQuantizedTensor | NVFP4Activation | None = None,
         sample_bounds: Bounds | None = None,
         timestep: Tensor | None = None,
+        side_gate_up: tuple | None = None,
     ):
         """QKV -> QK-norm -> RoPE -> attention, returning the pre-out-projection
         result [B, S, H*D] (and v [B, H, S, D] when need_v, for PAG). Fused path
-        does QK-norm+RoPE in one kernel; unfused uses eager rms_norm + rotary."""
+        does QK-norm+RoPE in one kernel; unfused uses eager rms_norm + rotary.
+        side_gate_up (primsts.sm120_side_gate_up_args): also return the block's packed
+        gate_up (packed, scales), run on a side stream beside attention, or None when the
+        attention call is not the covered FP8 SM12x one (the caller then runs gate_up)."""
         b, s = hidden_states.shape[:2]
         cos, sin = freqs[0], freqs[1]
         projection_input = hidden_states if quantized is None else quantized
@@ -548,14 +556,20 @@ class Flux3Attention(Attention):
                 and sample_bounds[0][0] == 0
                 and sample_bounds[0][1] == s
             ),
+            side_gate_up,
         )
         if direct is not None:
             # NVFP4 QKV straight to E4M3 + the same fmha_v2 call (bitwise to the path below).
-            attn, gemm = direct
+            attn, gemm = direct[0], direct[1]
+            gate_up = direct[2] if side_gate_up is not None else None
             if need_v:
                 v = gemm.view(3, b * s, -1)[2]
                 v = v.view(b, s, self.local_num_key_value_heads, self.head_dim).transpose(1, 2)
+                if side_gate_up is not None:
+                    return attn, v, gate_up
                 return attn, v  # [B, H, S, D] for apply_flux3_pag
+            if side_gate_up is not None:
+                return attn, gate_up
             return attn
 
         qkv = _primsts_qkv_forward(self, projection_input, freqs)
@@ -567,10 +581,20 @@ class Flux3Attention(Attention):
                 self.apply_packed_qk_norm_rope(qkv, fc, fs)
                 qkv = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
             q, k, v = qkv
-            attn = self._attend(q, k, v, sample_bounds, timestep)
+            side = None
+            if side_gate_up is not None:
+                side = self._attend_side_gate_up(q, k, v, sample_bounds, side_gate_up)
+            if side is not None:
+                attn, gate_up = side
+            else:
+                attn, gate_up = self._attend(q, k, v, sample_bounds, timestep), None
             if need_v:
                 v = v.view(b, s, self.local_num_key_value_heads, self.head_dim).transpose(1, 2)
+                if side_gate_up is not None:
+                    return attn, v, gate_up
                 return attn, v  # [B, H, S, D] for apply_flux3_pag
+            if side_gate_up is not None:
+                return attn, gate_up
             return attn
 
         separate = (
@@ -592,8 +616,51 @@ class Flux3Attention(Attention):
         k = apply_rotary_emb(k, cos, sin).to(v.dtype)
         attn = self._attend(q.flatten(2), k.flatten(2), v.flatten(2), sample_bounds, timestep)
         if need_v:
+            if side_gate_up is not None:
+                return attn, v.transpose(1, 2), None
             return attn, v.transpose(1, 2)  # v as [B, H, S, D] for apply_flux3_pag
+        if side_gate_up is not None:
+            return attn, None
         return attn
+
+    def _attend_side_gate_up(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        sample_bounds: Bounds | None,
+        side_gate_up: tuple,
+    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]] | None:
+        """_attend's FP8 SM12x call (no-LSE, non-causal, one full segment) fused with the
+        block's side-stream gate_up into one op; None when _attend would take another path."""
+        backend = self.attn
+        if not (isinstance(backend, FlashInferAttention) and backend._fp8_sm12x):
+            return None
+        if backend.preferred_layout != AttentionTensorLayout.NHD:
+            return None
+        if sample_bounds is not None and not (
+            _ATTEND_SINGLE_SEGMENT_FAST_PATH
+            and len(sample_bounds) == 1
+            and sample_bounds[0][0] == 0
+            and sample_bounds[0][1] == q.shape[1]
+            and q.shape[1] > 0
+        ):
+            return None
+        if q.dtype != torch.bfloat16 or q.shape[1] < backend._fp8_min_seq_len:
+            return None
+        batch_size = q.shape[0]
+        q = q.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
+        k = k.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
+        if q.shape != k.shape or q.shape != v.shape:
+            return None
+        backend._validate_inputs(q, k, v, None)
+        data, weight, scales, weight_scale, inverse_scale, original, source, mode = side_gate_up
+        out, packed, packed_scales = fp8_attention_side_gate_up(
+            q, k, v, backend.scale, False, data, weight, scales, weight_scale, inverse_scale,
+            original, source, mode,
+        )
+        return out.flatten(2), (packed, packed_scales)
 
     def _attend(
         self,
@@ -820,6 +887,7 @@ class Flux3ModeBlock(nn.Module):
         self._pertoken_adaln = Flux3PerTokenAdaLN(hidden_size, dtype)
         # Set by prepare_sm120_tail_pair after weight preparation (static, read in forward).
         self._sm120_tail_pair = False
+        self._sm120_side_gate_up = 0
 
     def forward(
         self,
@@ -839,9 +907,25 @@ class Flux3ModeBlock(nn.Module):
             )
             mlp_in = self.mlp_in if self._fuse_proj_out else self.ff.gate_up_proj
             quantized = _flux3_shared_fp8_input(self.attn, mlp_in, x_mod)
-        attn = self.attn.attn_pre_out(
-            x_mod, freqs, quantized=quantized, sample_bounds=sample_bounds, timestep=timestep
-        )
+        side_args = None
+        if self._sm120_side_gate_up and isinstance(quantized, NVFP4Activation):
+            side_args = sm120_side_gate_up_args(
+                self, quantized._replace(original=x_mod.reshape(-1, x_mod.shape[-1]))
+            )
+        gate_up = None
+        if side_args is not None:
+            attn, gate_up = self.attn.attn_pre_out(
+                x_mod,
+                freqs,
+                quantized=quantized,
+                sample_bounds=sample_bounds,
+                timestep=timestep,
+                side_gate_up=side_args,
+            )
+        else:
+            attn = self.attn.attn_pre_out(
+                x_mod, freqs, quantized=quantized, sample_bounds=sample_bounds, timestep=timestep
+            )
 
         if self._fuse_proj_out:
             mlp = self.mlp_in(x_mod if quantized is None else quantized)
@@ -857,7 +941,11 @@ class Flux3ModeBlock(nn.Module):
                 mlp_input = Fp8RowwiseQuantizedTensor(
                     mlp_input, quantized.quantized, quantized.scales
                 )
-            pair = sm120_tail_pair_forward(self, attn, mlp_input) if self._sm120_tail_pair else None
+            pair = (
+                sm120_tail_pair_forward(self, attn, mlp_input, gate_up)
+                if self._sm120_tail_pair
+                else None
+            )
             if pair is not None:
                 attn_y, mlp_y = pair
                 output = attn_y.reshape(*attn.shape[:-1], -1) + mlp_y.reshape(
@@ -965,6 +1053,7 @@ class Flux3SingleStreamBlock(nn.Module):
         self._pertoken_adaln = Flux3PerTokenAdaLN(hidden_size, dtype)
         # Set by prepare_sm120_tail_pair after weight preparation (static, read in forward).
         self._sm120_tail_pair = False
+        self._sm120_side_gate_up = 0
 
     def forward(
         self,
@@ -987,14 +1076,31 @@ class Flux3SingleStreamBlock(nn.Module):
             combined = self._pertoken_adaln.apply(combined, mod_shift, mod_scale, self.pre_norm, eps)
             mlp_in = self.mlp_in if self._fuse_proj_out else self.ff.gate_up_proj
             quantized = _flux3_shared_fp8_input(self.attn, mlp_in, combined)
-        attn, v = self.attn.attn_pre_out(
-            combined,
-            freqs,
-            need_v=True,
-            quantized=quantized,
-            sample_bounds=sample_bounds,
-            timestep=timestep,
-        )
+        side_args = None
+        if self._sm120_side_gate_up and isinstance(quantized, NVFP4Activation):
+            side_args = sm120_side_gate_up_args(
+                self, quantized._replace(original=combined.reshape(-1, combined.shape[-1]))
+            )
+        gate_up = None
+        if side_args is not None:
+            attn, v, gate_up = self.attn.attn_pre_out(
+                combined,
+                freqs,
+                need_v=True,
+                quantized=quantized,
+                sample_bounds=sample_bounds,
+                timestep=timestep,
+                side_gate_up=side_args,
+            )
+        else:
+            attn, v = self.attn.attn_pre_out(
+                combined,
+                freqs,
+                need_v=True,
+                quantized=quantized,
+                sample_bounds=sample_bounds,
+                timestep=timestep,
+            )
         attn = apply_flux3_pag(attn, v, pag_strength, sample_bounds, pag_samples)
 
         if self._fuse_proj_out:
@@ -1011,7 +1117,11 @@ class Flux3SingleStreamBlock(nn.Module):
                 mlp_input = Fp8RowwiseQuantizedTensor(
                     mlp_input, quantized.quantized, quantized.scales
                 )
-            pair = sm120_tail_pair_forward(self, attn, mlp_input) if self._sm120_tail_pair else None
+            pair = (
+                sm120_tail_pair_forward(self, attn, mlp_input, gate_up)
+                if self._sm120_tail_pair
+                else None
+            )
             if pair is not None:
                 attn_y, mlp_y = pair
                 output = attn_y.reshape(*attn.shape[:-1], -1) + mlp_y.reshape(

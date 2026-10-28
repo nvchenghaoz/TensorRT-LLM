@@ -827,15 +827,61 @@ def prepare_sm120_tail_pair(block: nn.Module) -> bool:
             out, up, down = fp8
             eligible = up.swiglu and not out.swiglu and not down.swiglu
     block._sm120_tail_pair = bool(eligible)
+    # Side-stream gate_up beside attention (flux3_primsts.fp8_attention_side_gate_up): NVFP4
+    # tail-pair blocks only. TRTLLM_FLUX3_SIDE_GATE_UP=0 keeps the sequential gate_up (main's graph).
+    block._sm120_side_gate_up = (
+        _side_gate_up_mode()
+        if block._sm120_tail_pair
+        and getattr(block.attn_out, "_flux3_primsts_nvfp4", None) is not None
+        else 0
+    )
     return block._sm120_tail_pair
 
 
+def _side_gate_up_mode() -> int:
+    # Default 3: issued after the attention quantize (K2), right before FMHA, on a dedicated stream
+    # (idea 161 STEP 0, job 1232: -22.4 us/block weighted vs 0; mode 2 -15.0, mode 1 -5.3).
+    mode = int(os.environ.get("TRTLLM_FLUX3_SIDE_GATE_UP", "3"))
+    if mode not in (0, 1, 2, 3):
+        raise ValueError(f"TRTLLM_FLUX3_SIDE_GATE_UP must be 0-3, got {mode}")
+    return mode
+
+
+def sm120_side_gate_up_args(block: nn.Module, mlp_input: PrimsTSInput) -> tuple | None:
+    """The gate_up operands of fp8_attention_side_gate_up for an NVFP4 tail-pair block (the same
+    operands sm120_tail_pair_forward passes nvfp4_swiglu_prepared), or None."""
+    if not getattr(block, "_sm120_side_gate_up", 0):
+        return None
+    up = getattr(block.ff.gate_up_proj, "_flux3_primsts_nvfp4", None)
+    down = getattr(block.ff.down_proj, "_flux3_primsts_nvfp4", None)
+    if up is None or down is None or not isinstance(mlp_input, NVFP4Activation):
+        return None
+    original = original_input(mlp_input)
+    if not up.can_run(original):
+        return None
+    data, scales = up.activation(mlp_input)
+    return (
+        data,
+        up.weight,
+        scales,
+        up.scale,
+        down.inverse_scale,
+        original,
+        mlp_input.quantized_by,
+        block._sm120_side_gate_up,
+    )
+
+
 def sm120_tail_pair_forward(
-    block: nn.Module, attn: torch.Tensor, mlp_input: PrimsTSInput
+    block: nn.Module,
+    attn: torch.Tensor,
+    mlp_input: PrimsTSInput,
+    gate_up: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """(attn_out(attn), ff(mlp_input)) as 2D [M, N] tensors, with down and attn_out run as one
     two-stream op, or None (caller runs the sequential path). Only for blocks whose
-    _sm120_tail_pair flag is set. gate_up runs exactly as in _flux3_gated_mlp_forward.
+    _sm120_tail_pair flag is set. gate_up runs exactly as in _flux3_gated_mlp_forward, unless
+    ``gate_up`` (packed, scales) was already computed beside attention.
     """
     original = original_input(mlp_input)
     attn_2d = attn.reshape(-1, attn.shape[-1]).contiguous()
@@ -843,6 +889,14 @@ def sm120_tail_pair_forward(
     if out is not None:
         up = block.ff.gate_up_proj._flux3_primsts_nvfp4
         down = block.ff.down_proj._flux3_primsts_nvfp4
+        if gate_up is not None:
+            packed, output_scales = gate_up
+            if not out.can_run(attn):
+                y = nvfp4_linear_prepared(packed, down.weight, output_scales, down.scale)
+                return out(attn).reshape(-1, out.weight.shape[0]), y
+            return nvfp4_out_pair(
+                packed, down.weight, output_scales, down.scale, attn_2d, out.weight, out.scale
+            )
         if not (up.can_run(original) and out.can_run(attn)):
             return None
         data, scales = up.activation(mlp_input)
@@ -985,8 +1039,13 @@ def qkv_fp8_attention_forward(
     x: PrimsTSInput,
     freqs: tuple[torch.Tensor, ...],
     full_sequence: bool,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+    side_gate_up: tuple | None = None,
+) -> tuple | None:
     """(attention output [B, S, H*D] BF16, planar BF16 QKV GEMM output [M, 3W]) or None.
+
+    With side_gate_up (sm120_side_gate_up_args) the result gets a third item, the block's packed
+    gate_up (packed, scales), forked onto a side stream right before FMHA
+    (flux3_primsts.fp8_prequant_attention_side_gate_up).
 
     Covers exactly the calls where main runs: qkv_forward's PreparedNVFP4 per-plane in-place planar
     route, then one FlashInferAttention FP8 (non-causal, no LSE) call on the whole [B, S] q/k/v
@@ -1047,5 +1106,18 @@ def qkv_fp8_attention_forward(
         x.quantized_by if isinstance(x, NVFP4Activation) else None,
         backend.scale,
     )
+    if side_gate_up is not None:
+        from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
+            fp8_prequant_attention_side_gate_up,
+        )
+
+        up_data, up_weight, up_scales, up_weight_scale, inverse_scale, up_original, source, mode = (
+            side_gate_up
+        )
+        output, packed, packed_scales = fp8_prequant_attention_side_gate_up(
+            qkv8, fp8_scales, batch, heads, up_data, up_weight, up_scales, up_weight_scale,
+            inverse_scale, up_original, source, mode,
+        )
+        return output.flatten(2), gemm, (packed, packed_scales)
     output = visual_gen_fp8_attention_sm120_prequant(qkv8, fp8_scales, batch, heads)
     return output.flatten(2), gemm

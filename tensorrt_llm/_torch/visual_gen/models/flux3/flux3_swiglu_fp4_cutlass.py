@@ -64,6 +64,18 @@ def supported(activation: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
+def allocate_outputs(
+    rows: int, columns: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(packed FP4 [rows padded to 128, columns/4] u8, swizzled scales u8) for swiglu_packed."""
+    padded_rows = ((rows + 127) // 128) * 128
+    output = torch.empty((padded_rows, columns // 4), device=device, dtype=torch.uint8)
+    output_scale = torch.empty(
+        (_scale_size(padded_rows, columns // 2),), device=device, dtype=torch.uint8
+    )
+    return output, output_scale
+
+
 def swiglu_packed(
     activation: torch.Tensor,
     weight: torch.Tensor,
@@ -72,16 +84,22 @@ def swiglu_packed(
     alpha: torch.Tensor,
     output_inverse_scale: torch.Tensor,
     module=None,
+    output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns (FP4 bytes [rows, N/4] as a view of a 128-row padded buffer, scales) like run('packed')."""
+    """Returns (FP4 bytes [rows, N/4] as a view of a 128-row padded buffer, scales) like run('packed').
+
+    output/output_scale: optional preallocated buffers (allocate_outputs), e.g. made on the current
+    stream before a side-stream launch so no allocation happens on the side stream.
+    """
     rows = activation.shape[0]
     columns = weight.shape[0]
     padded_rows = ((rows + 127) // 128) * 128
-    device = activation.device
-    output = torch.empty((padded_rows, columns // 4), device=device, dtype=torch.uint8)
-    output_scale = torch.empty(
-        (_scale_size(padded_rows, columns // 2),), device=device, dtype=torch.uint8
-    )
+    if output is None or output_scale is None:
+        output, output_scale = allocate_outputs(rows, columns, activation.device)
+    else:
+        assert output.shape == (padded_rows, columns // 4) and output.dtype == torch.uint8
+        assert output_scale.numel() == _scale_size(padded_rows, columns // 2)
     (module or get_module()).flux3_swiglu_fp4_gemm(
         _u8(activation.contiguous()),
         _u8(weight),
