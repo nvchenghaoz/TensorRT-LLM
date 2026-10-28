@@ -303,6 +303,7 @@ def kernel_census(fn):
 
     return {"total_launches": sum(cnt.values()), "gpu_total_ms": round(sum(dur.values()), 3),
             "nchwToNhwc": match("nchwToNhwc"), "nhwcToNchw": match("nhwcToNchw"),
+            "xmma_fprop": match("fprop"),
             "conv_gemm": match("fprop", "implicit", "conv"), "inductor_triton": match("triton_"),
             "by_kernel": sorted(((k, cnt[k], round(dur[k], 3)) for k in cnt), key=lambda t: -t[2])}, seq
 
@@ -312,9 +313,11 @@ def census():
     import torch._dynamo
 
     res = {}
+    cdt = getattr(torch, sys.argv[3]) if len(sys.argv) > 3 else torch.float32
+    res["dtype"] = str(cdt)
     for arm in ("orig", "new"):
         torch._dynamo.reset()
-        vae = build(original=(arm == "orig"))
+        vae = build(cdt if cdt != torch.float32 else None, original=(arm == "orig"), trunk=True)
         vae.compile_decoder()
         z = latent(0, torch.float32)
         for _ in range(4):
@@ -326,8 +329,8 @@ def census():
         levels = {}
         for lvl, C, H in LEVELS:
             m = vae.decoder.up[lvl].upsample
-            cm = compile_mod(m, torch.float32)
-            x = torch.randn(1, C, H, H, device="cuda")
+            cm = compile_mod(m, cdt)
+            x = torch.randn(1, C, H, H, device="cuda").to(cdt)
             for _ in range(3):
                 cm(x)
             ms = timeit(lambda: cm(x))
