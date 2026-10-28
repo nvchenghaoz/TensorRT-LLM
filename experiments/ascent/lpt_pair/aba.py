@@ -389,6 +389,27 @@ if __name__ == "__main__":
         nsys_child(sys.argv[2], sys.argv[3])
     elif mode == "analyze":
         analyze(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif mode == "dump":
+        # dump <sqlite> <substring> <k>: rows around the k-th kernel whose name has substring
+        con = sqlite3.connect(sys.argv[2])
+        cur = con.cursor()
+        strings = dict(cur.execute("SELECT id, value FROM StringIds"))
+        rows = [(s, e, strings.get(n, "?"), st) for s, e, n, st in cur.execute(
+            "SELECT start, end, demangledName, streamId FROM CUPTI_ACTIVITY_KIND_KERNEL")]
+        try:
+            rows += [(s, e, "memset", st) for s, e, st in cur.execute(
+                "SELECT start, end, streamId FROM CUPTI_ACTIVITY_KIND_MEMSET")]
+        except sqlite3.Error:
+            pass
+        rows.sort()
+        hits = [i for i, r in enumerate(rows) if sys.argv[3] in r[2]]
+        log(f"{len(hits)} hits")
+        for k in (int(sys.argv[4]), int(sys.argv[4]) + 1):
+            i = hits[k]
+            t0 = rows[i][0]
+            for r in rows[max(0, i - 12):i + 8]:
+                log(f"  {(r[0] - t0) / 1e3:9.1f} {(r[1] - r[0]) / 1e3:8.1f} s{r[3]} {r[2][:150]}")
+            log("----")
     elif mode == "fork":
         res = {arm: analyze_fork(path, arm) for arm, path in zip(sys.argv[2::2], sys.argv[3::2])}
         print(json.dumps({"passed": True, "fork": res}))
