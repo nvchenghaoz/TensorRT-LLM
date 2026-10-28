@@ -141,6 +141,27 @@ def smoke():
     print(json.dumps({"passed": bool(passed), "mode": "smoke", "results": results}))
 
 
+def rot():
+    """Which explicit RoPE contraction reproduces main's fold kernel bitwise (diagnostic)."""
+    res = {}
+    for forms in [("E0", "O0"), ("E1", "O1"), ("E1", "O2"), ("E2", "O1"), ("E2", "O2")]:
+        qr8._ROT_FORMS = forms
+        for key in [k for k in qr8._COMPILED if "vec" in k]:
+            del qr8._COMPILED[key]
+        g = torch.Generator(device="cuda").manual_seed(192)
+        tot_even = tot_odd = 0
+        for case in range(6):
+            M, mags, packed, special, src, ins = c115.make_pass_case(case, g)
+            r8, rs = with_vec(False, qr8.qknorm_rope_fp8, *ins, SM_SCALE)
+            v8, vs = with_vec(True, qr8.qknorm_rope_fp8, *ins, SM_SCALE)
+            bad = b100.u8(v8) != b100.u8(r8)
+            tot_even += int(bad[..., 0::2].sum())
+            tot_odd += int(bad[..., 1::2].sum())
+        res["".join(forms)] = {"even_col_mismatch": tot_even, "odd_col_mismatch": tot_odd}
+        log("rot forms", forms, res["".join(forms)])
+    print(json.dumps({"passed": True, "diagnostic": "rot forms", "res": res}))
+
+
 def check():
     results, passed = {}, True
     log("VEC default", qr8.VEC, "FOLD default", qr8.FOLD, "G1", qr8._FOLD_GRID1,
@@ -225,4 +246,4 @@ def tune():
 if __name__ == "__main__":
     torch.manual_seed(0)
     mode = sys.argv[1] if len(sys.argv) > 1 else "check"
-    {"smoke": smoke, "check": check, "tune": tune}[mode]()
+    {"smoke": smoke, "check": check, "tune": tune, "rot": rot}[mode]()

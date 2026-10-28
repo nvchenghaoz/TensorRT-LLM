@@ -652,6 +652,65 @@ def _st_global_b64(gaddr: cutlass.Int64, a: cutlass.Int64, *, loc=None, ip=None)
 
 
 @dsl_user_op
+def _fma_of_mul(
+    a: cutlass.Float32,
+    b: cutlass.Float32,
+    c: cutlass.Float32,
+    d: cutlass.Float32,
+    neg_a: bool,
+    neg_t: bool,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Float32:
+    """fma.rn((+-a), b, (+-t)) with t = mul.rn(c, d): one explicit contraction of a*b +- c*d."""
+    text = "{\n.reg .f32 t, u;\nmul.rn.f32 t, $3, $4;\n"
+    text += "neg.f32 t, t;\n" if neg_t else ""
+    text += "neg.f32 u, $1;\n" if neg_a else "mov.f32 u, $1;\n"
+    text += "fma.rn.f32 $0, u, $2, t;\n}"
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(c).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(d).ir_value(loc=loc, ip=ip),
+            ],
+            text,
+            "=f,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+# The RoPE contraction main's fold kernel compiles to (fsub/fadd of two products; the fadd is
+# commutative, so which product LLVM fuses depends on DAG order): pinned here explicitly.
+# "E1": fma(even, cos, -(odd*sin)); "E2": fma(-odd, sin, even*cos); "E0": DSL expression.
+# "O1": fma(odd, cos, even*sin);    "O2": fma(even, sin, odd*cos);  "O0": DSL expression.
+_ROT_FORMS = ("E1", "O1")
+
+
+def _rope(even, odd, cosine, sine):
+    form_even, form_odd = _ROT_FORMS
+    if form_even == "E1":
+        rot_even = _fma_of_mul(even, cosine, odd, sine, False, True)
+    elif form_even == "E2":
+        rot_even = _fma_of_mul(odd, sine, even, cosine, True, False)
+    else:
+        rot_even = even * cosine - odd * sine
+    if form_odd == "O1":
+        rot_odd = _fma_of_mul(odd, cosine, even, sine, False, False)
+    elif form_odd == "O2":
+        rot_odd = _fma_of_mul(even, sine, odd, cosine, False, False)
+    else:
+        rot_odd = odd * cosine + even * sine
+    return cutlass.BFloat16(rot_even), cutlass.BFloat16(rot_odd)
+
+
+@dsl_user_op
 def _bf16_lo(w: cutlass.Int32, *, loc=None, ip=None) -> cutlass.Float32:
     """FP32 of the BF16 in the low half of w (exact, as BFloat16.to(Float32))."""
     return cutlass.Float32(
@@ -863,10 +922,9 @@ def _qknorm_rope_fp8_vec_kernel(
                         word = ring32[base // 2 + pair_group * 32 + lane]
                         even = _bf16_lo(word) * inv_rms * weights[2 * pair_group]
                         odd = _bf16_hi(word) * inv_rms * weights[2 * pair_group + 1]
-                        cosine = cosines[pair_group]
-                        sine = sines[pair_group]
-                        rot_even = cutlass.BFloat16(even * cosine - odd * sine)
-                        rot_odd = cutlass.BFloat16(odd * cosine + even * sine)
+                        rot_even, rot_odd = _rope(
+                            even, odd, cosines[pair_group], sines[pair_group]
+                        )
                         if cutlass.const_expr(mode == 1):
                             amax = _max_abs(amax, rot_even.to(cutlass.Float32))
                             amax = _max_abs(amax, rot_odd.to(cutlass.Float32))
