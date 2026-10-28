@@ -128,15 +128,72 @@ class Flux3ImageDownsample(nn.Module):
         return x
 
 
+def _subpixel_upsample_weights(weight: Tensor, bias: Tensor) -> tuple[Tensor, Tensor]:
+    """Fold nearest-2x upsampling into a 3x3 conv: four 2x2 phase kernels.
+
+    Output pixel (2i+a, 2j+b) of conv3x3(nearest2x(x)) reads low-res rows {i-1, i}
+    (a=0, taps [w0, w1+w2]) or {i, i+1} (a=1, taps [w0+w1, w2]); columns likewise.
+    Returns W4 [4C_out, C_in, 2, 2] and b4 [4C_out] in phase-major (a, b, c) order.
+    Sums are taken in fp64 and rounded once to the weight's dtype.
+    """
+    w = weight.detach().double()
+    r = torch.tensor(
+        [[[1.0, 0.0, 0.0], [0.0, 1.0, 1.0]], [[1.0, 1.0, 0.0], [0.0, 0.0, 1.0]]],
+        dtype=torch.float64,
+        device=w.device,
+    )  # r[a, p, k]: 2x2 tap p of phase a sums 3x3 taps k
+    w4 = torch.einsum("apk,oikl,bql->aboipq", r, w, r)
+    w4 = w4.reshape(4 * w.shape[0], w.shape[1], 2, 2).to(weight.dtype)
+    b4 = bias.detach().repeat(4).to(bias.dtype)
+    return w4.contiguous(), b4.contiguous()
+
+
 class Flux3ImageUpsample(nn.Module):
+    """nearest-2x upsample + 3x3 conv, computed as one sub-pixel 2x2 conv.
+
+    The 2x2 conv with 4C phase-major outputs runs on the low-res input (4/9 of the
+    FLOPs of the 3x3 conv on the upsampled input); the phases are then interleaved.
+    The combined weights are non-persistent buffers derived from conv.weight/conv.bias
+    at load (state_dict keys are unchanged) and follow .to(dtype/device).
+    """
+
     def __init__(self, in_channels: int):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.register_buffer(
+            "subpixel_weight", torch.zeros(4 * in_channels, in_channels, 2, 2), persistent=False
+        )
+        self.register_buffer("subpixel_bias", torch.zeros(4 * in_channels), persistent=False)
+        self._subpixel_ready = False
+        self.register_load_state_dict_post_hook(Flux3ImageUpsample._after_load)
+
+    @staticmethod
+    def _after_load(module: "Flux3ImageUpsample", incompatible_keys) -> None:
+        module.refresh_subpixel()
+
+    @torch.no_grad()
+    def refresh_subpixel(self) -> None:
+        """Recompute the 2x2 phase weights from conv.weight/conv.bias."""
+        w4, b4 = _subpixel_upsample_weights(self.conv.weight, self.conv.bias)
+        self.subpixel_weight = w4.to(self.subpixel_weight.device)
+        self.subpixel_bias = b4.to(self.subpixel_bias.device)
+        self._subpixel_ready = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
-        x = self.conv(x)
-        return x
+        if not self._subpixel_ready:
+            self.refresh_subpixel()
+        w4, b4 = self.subpixel_weight, self.subpixel_bias
+        if w4.dtype != x.dtype:
+            w4, b4 = w4.to(x.dtype), b4.to(x.dtype)
+        n, c, h, w = x.shape
+        o = nn.functional.conv2d(x, w4, b4, padding=1)  # [n, 4C, h+1, w+1]
+        o = o.view(n, 2, 2, c, h + 1, w + 1)
+        rows = [
+            torch.stack([o[:, a, b, :, a : a + h, b : b + w] for b in range(2)], dim=-1)
+            for a in range(2)
+        ]  # each [n, c, h, w, 2]
+        y = torch.stack(rows, dim=3)  # [n, c, h, 2, w, 2]
+        return y.reshape(n, c, 2 * h, 2 * w)
 
 
 class Flux3ImageEncoder(nn.Module):
@@ -363,6 +420,8 @@ class Flux3ImageVAE(nn.Module):
         for m in self.decoder.modules():
             if isinstance(m, Flux3GroupNorm):
                 m.triton_under_compile = triton_group_norm
+            elif isinstance(m, Flux3ImageUpsample) and not m._subpixel_ready:
+                m.refresh_subpixel()  # weights were not loaded through load_state_dict
         dtype = next(self.decoder.parameters()).dtype
         options = {"layout_optimization": False}
         if dtype != torch.float32:
