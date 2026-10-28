@@ -266,6 +266,44 @@ def _sm120_cutlass_qkv(
     qkv_scale = qkv_scale.detach()
     segment_scale = weight_scale.numel() // 3
 
+    from . import flux3_sm120_strided_gemm as strided
+
+    if planar and strided.inplace_enabled():
+        # QKV in place (case 1): plane i's GEMM writes plane i of the one planar output (FlashInfer
+        # strided SM120 entry, bitwise to t0); then norm+RoPE runs in place on planes 0/1 and v
+        # (already plane 2) is not touched.
+        rows = activation.shape[0]
+        out = torch.empty((rows, columns), device=activation.device, dtype=torch.bfloat16)
+        planes_view = out.view(3, rows, width)
+
+        def gemm_plane(i: int) -> None:
+            strided.gemm_into(
+                activation,
+                weight[i * width:(i + 1) * width],
+                activation_scale,
+                weight_scale[i * segment_scale:(i + 1) * segment_scale],
+                qkv_scale[i:i + 1],
+                out,
+                i * rows * width,
+                width,
+                i,
+            )
+
+        current = torch.cuda.current_stream(activation.device)
+        side = _sm120_qkv_side_streams(activation.device.index)
+        for stream in side:
+            stream.wait_stream(current)
+        gemm_plane(0)
+        for i, stream in enumerate(side):
+            with torch.cuda.stream(stream):
+                gemm_plane(i + 1)
+        for stream in side:
+            current.wait_stream(stream)
+        return qknorm_rope(
+            planes_view[0], planes_view[1], planes_view[2], out,
+            q_norm, k_norm, cos_sin, positions, planar=True,
+        )
+
     def gemm(i: int) -> torch.Tensor:
         return runner.run_gemm(
             activation,
