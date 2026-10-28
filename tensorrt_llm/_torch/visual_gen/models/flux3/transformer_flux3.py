@@ -55,8 +55,10 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     original_input,
     prepare_fp8_block,
     prepare_nvfp4_block,
+    prepare_sm120_fp8_excluded_block,
     separate_qkv_forward,
     shared_nvfp4_input,
+    sm120_fp8_shared_input,
     verify_nvfp4_coverage,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
@@ -71,6 +73,7 @@ from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -585,6 +588,9 @@ def _flux3_shared_fp8_input(
     nvfp4 = shared_nvfp4_input(attn, mlp_in, x)
     if nvfp4 is not None:
         return nvfp4
+    fp8_excluded = sm120_fp8_shared_input(attn, mlp_in, x)
+    if fp8_excluded is not None:
+        return fp8_excluded
     qkv = getattr(attn, "qkv_proj", None)
     if not all(
         isinstance(layer, Linear) and isinstance(layer.quant_method, FP8RowwiseLinearMethod)
@@ -893,6 +899,40 @@ class Flux3SingleStreamBlock(nn.Module):
             if self._allreduce is not None:
                 output = self._allreduce(output)
         return residual + mod_gate * output
+
+
+class _Flux3FP8RModeBlock(Flux3ModeBlock):
+    """A BF16 checkpoint-excluded mode block switched to the SM120 FP8R path.
+
+    The override gives the block its own forward code object, so its Dynamo cache entries,
+    guards and automatic-dynamic state stay separate from the NVFP4 and BF16 blocks of the
+    same class. Sharing them made the NVFP4 blocks' outputs depend on request history
+    (bits changed after a request with another text length).
+    """
+
+    def forward(self, *args, **kwargs):
+        return super().forward(*args, **kwargs)
+
+
+class _Flux3FP8RSingleStreamBlock(Flux3SingleStreamBlock):
+    """Single-stream counterpart of _Flux3FP8RModeBlock."""
+
+    def forward(self, *args, **kwargs):
+        return super().forward(*args, **kwargs)
+
+
+_FP8R_BLOCK_CLASSES = {
+    Flux3ModeBlock: _Flux3FP8RModeBlock,
+    Flux3SingleStreamBlock: _Flux3FP8RSingleStreamBlock,
+}
+
+
+def _set_fp8r_block_class(block: nn.Module, switched: bool) -> None:
+    """Swap an (uncompiled) block between its base class and its FP8R subclass."""
+    for base, fp8r in _FP8R_BLOCK_CLASSES.items():
+        if type(block) in (base, fp8r):
+            block.__class__ = fp8r if switched else base
+            return
 
 
 # =============================================================================
@@ -1462,3 +1502,19 @@ class Flux3Model(BaseDiffusionModel):
         )
         blocks.extend((f"single_blocks.{i}", block) for i, block in enumerate(self.single_blocks))
         verify_nvfp4_coverage(blocks)
+        quant = self.model_config.quant_config
+        if quant is not None and quant.quant_algo == QuantAlgo.NVFP4:
+            # BF16 checkpoint-excluded image/joint blocks run with the fp8r recipe on SM120.
+            switched = []
+            for name, block in blocks:
+                target = getattr(block, "_orig_mod", block)
+                enabled = prepare_sm120_fp8_excluded_block(target)
+                _set_fp8r_block_class(target, enabled)
+                if enabled:
+                    switched.append(name)
+            if switched:
+                logger.info(
+                    "FLUX.3 SM120 FP8R for BF16 checkpoint-excluded blocks "
+                    "(QKV, attn_out, MLP-up+SwiGLU, MLP-down; per-channel weights "
+                    f"bitwise equal to variants/fp8r): {switched}"
+                )
