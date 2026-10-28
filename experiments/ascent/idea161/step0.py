@@ -33,8 +33,9 @@ H, HEADS, D, FF = 3072, 24, 128, 9216
 K_BLOCKS = 10
 ROUNDS = 48
 SPIN = 6_000_000
-PAIR_SAMPLES = 160
-PAIR_SOAK_S = 8.0
+PAIR_SAMPLES = 200
+PAIR_SOAK_S = 30.0
+PAIR_REPLAYS = 3  # graph replays per timed sample (sample = per-replay mean)
 
 
 def log(*a):
@@ -222,9 +223,14 @@ def pair(arm):
     times = []
     for i in range(PAIR_SAMPLES):
         torch.cuda.synchronize()
-        a, b = time_graph(g)
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        torch.cuda._sleep(SPIN)
+        a.record()
+        for _ in range(PAIR_REPLAYS):
+            g.replay()
+        b.record()
         b.synchronize()
-        times.append(a.elapsed_time(b))
+        times.append(a.elapsed_time(b) / PAIR_REPLAYS)
         if i % 40 == 0:
             log(f"  sample {i}: {times[-1]:.3f} ms")
     med, noise = stat(times)
@@ -233,7 +239,8 @@ def pair(arm):
         "batch": {"1": {"kernel_ms": med, "noise_floor": noise}},
         "unit": "one graph replay = 24 x S4176 + 4 x S4096 NVFP4 block fronts (QKV op, "
                 "attention, gate_up, down||attn_out pair, residual add)",
-        "arm": arm, "samples": PAIR_SAMPLES, "output": {"class": "exact"},
+        "arm": arm, "samples": PAIR_SAMPLES, "replays_per_sample": PAIR_REPLAYS,
+        "soak_s": PAIR_SOAK_S, "output": {"class": "exact"},
     }))
 
 
