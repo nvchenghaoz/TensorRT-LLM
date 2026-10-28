@@ -30,6 +30,8 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import PreparedFP8Sm120
 
 WARMUP = 3
 ITERS = 60
+STEP_ITERS = 100
+SPIN_CYCLES = 6_000_000  # ~2.5 ms at 2.4 GHz
 H, FF = 3072, 9216
 
 
@@ -152,18 +154,24 @@ def bench(arm):
     torch.cuda.synchronize()
     for k, c in cases.items():
         assert all(torch.equal(p, t) for p, t in zip(pristine[k], inputs(c))), k
-    ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-          for _ in range(ITERS)]
-    for i in range(ITERS):
-        ev[i][0].record()
+    # Each iteration starts from an idle GPU behind a ~3 ms spin, so the host has enqueued the
+    # step ahead of the GPU (the served denoise is GPU-bound, ~98% busy) and the events measure
+    # GPU time only, not launch gaps or the previous iteration's tail.
+    step_times = []
+    for i in range(STEP_ITERS):
+        torch.cuda.synchronize()
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        torch.cuda._sleep(SPIN_CYCLES)
+        a.record()
         for k, n in plan:
             for _ in range(n):
                 fn(cases[k])
-        ev[i][1].record()
-        if i % 20 == 0:
-            log(f"  step iter {i}")
-    torch.cuda.synchronize()
-    step_med, step_noise = stat([a.elapsed_time(b) for a, b in ev])
+        b.record()
+        b.synchronize()
+        step_times.append(a.elapsed_time(b))
+        if i % 25 == 0:
+            log(f"  step iter {i}: {step_times[-1]:.3f} ms")
+    step_med, step_noise = stat(step_times)
     log(f"step tails: {step_med:.3f} ms (noise {step_noise:.4f})")
     per = {}
     for k, c in cases.items():
