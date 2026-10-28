@@ -21,6 +21,7 @@ This file must not import tensorrt_llm at module level: microbenchmarks load it 
 from __future__ import annotations
 
 import functools
+import os
 import re
 from typing import Optional, Sequence
 
@@ -39,6 +40,9 @@ _LEVER_FLAGS = {
     # kv128: 64 q rows x 128-key step (the stock d128 E4M3 tile steps 64 keys). Padding mask
     #   only: the causal / sliding / custom-mask kernels are not compiled in.
     "kv128": ("k128", None),
+    # unit_alpha (FMHA_FLUX3_SKIP_UNIT_ALPHA, fragment.h, base2 only): a warp whose 2x16 rows
+    #   all keep their running max (alpha == 1.0f) skips the O rescale (bitwise vs base2).
+    "unit_alpha": ("ua", "-DFMHA_FLUX3_SKIP_UNIT_ALPHA=1"),
 }
 
 # The lever set main runs.
@@ -47,7 +51,7 @@ DEFAULT_LEVERS: tuple[str, ...] = ("mask_skip", "resident_q")
 # Job 727 (interleaved, S=4176/4096): ms_rq 427.7/408.4 us, +base2 415.2/397.0 (-2.9%/pass),
 # base2+kv128 (branch 30's 64x128 rqms_b2) 415.5/397.1 (same speed, rel L2 1.0017x ms_rq's;
 # base2 at 64x64 is 1.0000x), kv128 alone 437.9/415.6 (slower).
-ROUTED_LEVERS: tuple[str, ...] = ("base2", "mask_skip", "resident_q")
+ROUTED_LEVERS: tuple[str, ...] = ("base2", "mask_skip", "resident_q", *(("unit_alpha",) if os.environ.get("TRTLLM_FMHA_V2_FLUX3_UA", "1") != "0" else ()))  # noqa: E501
 DEFAULT_MIN_BLOCKS = 0
 
 

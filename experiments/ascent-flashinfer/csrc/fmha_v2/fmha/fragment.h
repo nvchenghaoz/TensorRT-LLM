@@ -1487,11 +1487,18 @@ struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile>
         alpha[ii] = exp2f((prev_max[jj] - curr_max[jj]) * s_log2e_);
         sum[jj] *= alpha[ii];
       }
+#if defined(FMHA_FLUX3_SKIP_UNIT_ALPHA) && FMHA_FLUX3_SKIP_UNIT_ALPHA
+      // Exact: x * 1.0f == x bitwise, so a warp whose rows all keep their max skips the
+      // O rescale. update() runs converged (after the max reduce's shuffles).
+      if (!__all_sync(0xffffffffu, alpha[0] == 1.f && alpha[1] == 1.f))
+#endif
+      {
 #pragma unroll
-      for (int ni = 0; ni < Base::MMAS_N; ++ni) {
+        for (int ni = 0; ni < Base::MMAS_N; ++ni) {
 #pragma unroll
-        for (int ii = 0; ii < Base::REGS_PER_THREAD; ++ii) {
-          acc_o[mi][ni].elt(ii) = alpha[(ii & 2) / 2] * acc_o[mi][ni].elt(ii);
+          for (int ii = 0; ii < Base::REGS_PER_THREAD; ++ii) {
+            acc_o[mi][ni].elt(ii) = alpha[(ii & 2) / 2] * acc_o[mi][ni].elt(ii);
+          }
         }
       }
     }
