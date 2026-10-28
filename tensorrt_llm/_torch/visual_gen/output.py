@@ -20,10 +20,13 @@ without adding host syncs in the hot path; the implicit sync from
 occurs when the response is consumed.
 """
 
+import atexit
 import hashlib
 import json
 import os
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -34,6 +37,97 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 # Diagnostic only (off by default): per-request perf_counter stamps of the CUDA IPC
 # media handoff, appended as JSON lines to TRTLLM_VISUALGEN_IPC_STAMPS_FILE.
 _IPC_STAMPS = os.environ.get("TRTLLM_VISUALGEN_IPC_STAMPS") == "1"
+
+# Consumer-side CUDA IPC mapping cache for the image handoff (kill switch:
+# TRTLLM_VISUALGEN_IPC_FAST=0, read at start-up).
+_IPC_FAST = os.environ.get("TRTLLM_VISUALGEN_IPC_FAST", "1") != "0"
+_IPC_FAST_ACTIVE = _IPC_FAST
+
+
+class _IpcMappingCache:
+    """Keep the consumer's mapping of each producer segment open across requests.
+
+    torch opens a CUDA IPC handle (``cudaIpcOpenMemHandle`` of the producer's whole
+    caching-allocator segment) on every rebuild and closes it when the last storage of
+    that handle dies, i.e. at the end of every ``to_tensor``. The worker's image blocks
+    come from a couple of long-lived segments, so the same handles repeat request after
+    request. This holds one "anchor" storage per segment handle: torch's
+    ``getIpcDevPtr`` cache then returns the open mapping, and the per-request
+    rebuild/clone/release (event wait, stream sync, producer ref-counter decrement) is
+    unchanged. The anchor is built with a ref-counter name that does not exist, so it
+    never holds a producer ref-count (the producer's blocks are released exactly as
+    before; torch's deleter treats the missing counter file as best-effort). At most
+    ``MAX_HANDLES`` segments stay mapped (LRU).
+    """
+
+    MAX_HANDLES = 4
+    _anchors: "OrderedDict[bytes, torch.UntypedStorage]" = OrderedDict()
+    _lock = threading.Lock()
+    _no_counter = f"/trtllm_vg_ipc_anchor_{os.getpid()}_none".encode()
+
+    @classmethod
+    def ensure(cls, dev, s_handle: bytes, s_size: int, s_off: int, ev_handle: bytes) -> bool:
+        """Map ``s_handle`` once; returns True if it was already mapped."""
+        with cls._lock:
+            if s_handle in cls._anchors:
+                cls._anchors.move_to_end(s_handle)
+                return True
+        anchor = torch.UntypedStorage._new_shared_cuda(
+            dev, s_handle, s_size, s_off, cls._no_counter, 0, ev_handle, False
+        )
+        evicted = []
+        with cls._lock:
+            cls._anchors[s_handle] = anchor
+            while len(cls._anchors) > cls.MAX_HANDLES:
+                evicted.append(cls._anchors.popitem(last=False)[1])
+        del evicted
+        return False
+
+    @classmethod
+    def clear(cls) -> None:
+        with cls._lock:
+            anchors = list(cls._anchors.values())
+            cls._anchors.clear()
+        del anchors
+
+
+atexit.register(_IpcMappingCache.clear)
+
+
+def _set_ipc_fast(enabled: bool) -> None:
+    """Test hook: switch the mapping cache at runtime (start-up default: env)."""
+    global _IPC_FAST_ACTIVE
+    _IPC_FAST_ACTIVE = bool(enabled)
+    if not _IPC_FAST_ACTIVE:
+        _IpcMappingCache.clear()
+
+
+def _ipc_fast_eligible(name: str, v: Dict[str, Any]) -> bool:
+    from tensorrt_llm._torch.shared_tensor.shared_tensor import (
+        _SharedTensorRebuildMethodRegistry,
+    )
+
+    return (
+        _IPC_FAST_ACTIVE
+        and name == "image"
+        and v.get("method_key") == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA
+    )
+
+
+def _ipc_ensure_mapped(c: SharedTensorContainer) -> bool:
+    global _IPC_FAST_ACTIVE
+    h = c.tensor_handle
+    try:
+        return _IpcMappingCache.ensure(h[6], h[7], h[8], h[9], h[13])
+    except Exception as e:  # noqa: BLE001 - fall back to torch's per-request open
+        _IPC_FAST_ACTIVE = False
+        _IpcMappingCache.clear()
+        import logging
+
+        logging.getLogger(__name__).warning(
+            f"VisualGen IPC mapping cache disabled, using per-request open: {e!r}"
+        )
+        return False
 
 
 def _ipc_stamp_write(rec: Dict[str, Any]) -> None:
@@ -96,6 +190,11 @@ def _to_tensor_stamped(name: str, v: Dict[str, Any]) -> torch.Tensor:
     ) = c.tensor_handle
     cache_hit = storage_from_cache(storage_cls, (s_handle, s_off)) is not None
     torch.cuda._lazy_init()
+    t_a = time.perf_counter()
+    if _ipc_fast_eligible(name, v):
+        rec["fast"] = True
+        rec["anchor_hit"] = _ipc_ensure_mapped(c)
+    rec["anchor_ms"] = (time.perf_counter() - t_a) * 1e3
     t2 = time.perf_counter()
     storage = torch.UntypedStorage._new_shared_cuda(
         dev, s_handle, s_size, s_off, rc_handle, rc_off, ev_handle, False
@@ -228,7 +327,12 @@ class PipelineOutput:
                 if _IPC_STAMPS:
                     setattr(self, f.name, _to_tensor_stamped(f.name, v))
                     continue
-                setattr(self, f.name, SharedTensorContainer.from_dict(v).get_local_view().clone())
+                c = SharedTensorContainer.from_dict(v)
+                if _ipc_fast_eligible(f.name, v):
+                    # Keep this producer segment mapped across requests; the rebuild
+                    # below then reuses the open mapping (same view, same clone).
+                    _ipc_ensure_mapped(c)
+                setattr(self, f.name, c.get_local_view().clone())
 
 
 class CudaPhaseTimer:

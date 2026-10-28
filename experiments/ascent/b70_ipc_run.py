@@ -129,7 +129,8 @@ def stats(xs):
         return None
     s = sorted(xs)
     return {"n": len(s), "mean": statistics.mean(s), "median": statistics.median(s),
-            "p90": s[min(len(s) - 1, (9 * len(s)) // 10)], "max": s[-1], "min": s[0]}
+            "p10": s[len(s) // 10], "p90": s[min(len(s) - 1, (9 * len(s)) // 10)],
+            "max": s[-1], "min": s[0]}
 
 
 def read_jsonl(path):
@@ -259,7 +260,7 @@ def main():
         o_p1 = [r["to_tensor_ms"] for r in o if 1 <= r["n"] <= 12]
         o_p2 = [r["to_tensor_ms"] for r in o if 13 <= r["n"] <= 24]
         keys = ["from_dict_ms", "lookup_ms", "ipc_open_ms", "event_ms", "view_ms", "clone_ms",
-                "release_ms", "total_ms", "fast_ms", "deferred_release_ms"]
+                "release_ms", "total_ms", "anchor_ms"]
         # first consumer stamp of a real request: skip the READY handshake (no media)
         cons_timed = cons[1:25] if len(cons) >= 25 else cons[1:]
         stamp_stats = {k: stats([r[k] for r in cons_timed if k in r]) for k in keys}
@@ -273,7 +274,13 @@ def main():
         mem_flat = {pid: {"first_after_test": v[1] if len(v) > 1 else v[0], "last": v[-1],
                           "max": max(v), "min": min(v[1:]) if len(v) > 1 else v[0]}
                     for pid, v in mem_per_pid.items() if all(isinstance(x, int) for x in v)}
+        ot = stats(o_timed)
         result = {
+            "batch": {"1": {"step_ms": ot["median"],
+                            "noise_floor": (ot["p90"] - ot["p10"]) / ot["median"]}},
+            "output": {"class": "exact"},
+            "measure_note": "step_ms = median server-side PipelineOutput.to_tensor wall time over "
+                            "24 timed c1 requests (after the untimed client test request)",
             "passed": all(repeat_px) and all(repeat_png) and (c2 is None or c2["passed"]),
             "repeated_execution_passed": all(repeat_px),
             "repeat_pixels_equal": f"{sum(repeat_px)}/12",
@@ -286,6 +293,9 @@ def main():
                                    "n_records": len(o)},
             "stamps": stamp_stats,
             "stamp_rows": len(cons),
+            "anchor_hits": sum(1 for r in cons if r.get("anchor_hit")),
+            "fast_rows": sum(1 for r in cons if r.get("fast")),
+            "outer_fast_flags": [r.get("fast") for r in o],
             "consumer_handles_distinct": len(set(h for h in handles if h)),
             "producer_handles_distinct": len(set(h for h in prod_handles if h)),
             "producer_seg": sorted(set((r.get("seg_bytes"), r.get("seg_off")) for r in prod
