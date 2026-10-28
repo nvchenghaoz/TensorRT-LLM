@@ -16,6 +16,9 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
+import heapq
+
+import numpy as np
 import torch
 from PIL import Image
 
@@ -534,6 +537,318 @@ def _png_chunk(tag: bytes, payload: bytes) -> bytes:
     )
 
 
+# ---------------------------------------------------------------------------
+# GPU Huffman-only deflate of the filtered scanlines
+# ---------------------------------------------------------------------------
+#
+# Exact: any valid deflate stream inflates to the same filtered scanlines, so
+# decoded pixels are unchanged. The filtered scanlines stay on the GPU. Rows
+# are split into fixed blocks (a function of the height only); one bincount
+# gives every block's byte histogram, which (with the Adler-32 partial sums)
+# is all that crosses to the host before the stream itself. The host builds a
+# dynamic Huffman code per block (BTYPE=2, literals + EOB only, like zlib's
+# Z_HUFFMAN_ONLY; two 1-bit distance codes as zlib writes them), and the GPU
+# writes every symbol's bit-reversed code at its exclusive-cumsum bit offset
+# with integer scatter-adds (bits never overlap, so add == OR and the result
+# is deterministic). Two host syncs per image: the histogram and the stream.
+# Set TRTLLM_PNG_GPU_DEFLATE=0 to use the zlib strip writer instead.
+
+# Rows per deflate block. One Huffman table per 1024 rows: each extra block
+# costs ~0.2 ms of host Huffman building, more than its size saving buys
+# (1024^2 FLUX images: 1.772 MB at 1024 rows, 1.732 at 256, 1.715 at 64).
+_PNG_GPU_BLOCK_ROWS = 1024
+_PNG_GPU_MAX_BLOCK_BYTES = 1 << 24  # keeps Huffman weights small
+_PNG_GPU_MAX_BYTES = 1 << 27  # keeps the int64 Adler-32 sums and int bit offsets exact
+_PNG_IDAT_PIECES = 4  # IDAT chunks whose CRCs run in parallel
+_DEFLATE_CL_ORDER = np.array(
+    (16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15), dtype=np.int64
+)
+_DEFLATE_REV16 = None
+
+
+def _gpu_deflate_enabled() -> bool:
+    return os.environ.get("TRTLLM_PNG_GPU_DEFLATE", "1") != "0"
+
+
+def _rev16() -> np.ndarray:
+    global _DEFLATE_REV16
+    if _DEFLATE_REV16 is None:
+        x = np.arange(1 << 16, dtype=np.int64)
+        r = np.zeros_like(x)
+        for i in range(16):
+            r |= ((x >> i) & 1) << (15 - i)
+        _DEFLATE_REV16 = r
+    return _DEFLATE_REV16
+
+
+def _huffman_lengths(counts: List[int], limit: int) -> List[int]:
+    """Code lengths (<= limit) of a complete Huffman code for ``counts``.
+
+    Zero counts get length 0. Fewer than two used symbols are padded with
+    count-1 dummies (as zlib's build_tree does), so the code is complete.
+    Ties break on (weight, node id), so the result is deterministic. A tree
+    deeper than ``limit`` is flattened on its per-length counts (JPEG Annex
+    K.3 adjust_bits, which keeps the code complete) and the lengths are
+    re-dealt shortest-first in (count desc, symbol) order.
+    """
+    n = len(counts)
+    c = list(counts)
+    used = sum(1 for x in c if x)
+    for s in range(n):
+        if used >= 2:
+            break
+        if not c[s]:
+            c[s] = 1
+            used += 1
+    pop, push = heapq.heappop, heapq.heappush
+    heap = [(w, s) for s, w in enumerate(c) if w]
+    heapq.heapify(heap)
+    parent = [0] * (2 * n)
+    nxt = n
+    while len(heap) > 1:
+        w1, a = pop(heap)
+        w2, b = pop(heap)
+        parent[a] = nxt
+        parent[b] = nxt
+        push(heap, (w1 + w2, nxt))
+        nxt += 1
+    depth = [0] * (2 * n)
+    for node in range(nxt - 2, n - 1, -1):
+        depth[node] = depth[parent[node]] + 1
+    lengths = [depth[parent[s]] + 1 if c[s] else 0 for s in range(n)]
+    mx = max(lengths)
+    if mx <= limit:
+        return lengths
+    bl = [0] * (mx + 1)
+    for x in lengths:
+        if x:
+            bl[x] += 1
+    for i in range(mx, limit, -1):
+        while bl[i] > 0:
+            j = i - 2
+            while j > 0 and bl[j] == 0:
+                j -= 1
+            if j <= 0:
+                raise RuntimeError("Huffman length limit failed")
+            bl[i] -= 2
+            bl[i - 1] += 1
+            bl[j + 1] += 2
+            bl[j] -= 1
+    if any(bl[limit + 1 :]) or sum(bl[x] << (limit - x) for x in range(1, limit + 1)) != (
+        1 << limit
+    ):
+        raise RuntimeError("Huffman length limit produced an incomplete code")
+    syms = sorted((s for s in range(n) if c[s]), key=lambda s: (-c[s], s))
+    out = [0] * n
+    k = 0
+    for length in range(1, limit + 1):
+        for _ in range(bl[length]):
+            out[syms[k]] = length
+            k += 1
+    return out
+
+
+def _canonical_rev_codes(lengths: np.ndarray, max_bits: int) -> np.ndarray:
+    """RFC 1951 3.2.2 canonical codes, bit-reversed for LSB-first packing."""
+    full = np.bincount(lengths, minlength=max_bits + 1)
+    fl = full.tolist()
+    next_code = [0] * (max_bits + 1)
+    code = 0
+    for bits in range(1, max_bits + 1):
+        code = (code + (fl[bits - 1] if bits > 1 else 0)) << 1
+        next_code[bits] = code
+    order = np.argsort(lengths, kind="stable")
+    sl = lengths[order]
+    first = np.cumsum(full) - full
+    codes = np.empty(len(lengths), dtype=np.int64)
+    codes[order] = np.asarray(next_code, dtype=np.int64)[sl] + (
+        np.arange(len(lengths), dtype=np.int64) - first[sl]
+    )
+    return _rev16()[codes & 0xFFFF] >> (16 - lengths)
+
+
+class _GpuPngCache(threading.local):
+    def __init__(self):
+        self.shape_key = None
+        self.shape_val = None
+        self.pins = {}
+
+
+_GPU_PNG_CACHE = _GpuPngCache()
+
+
+def _png_pinned(name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
+    """Thread-local pinned staging buffer (grown, never shrunk)."""
+    buf = _GPU_PNG_CACHE.pins.get(name)
+    if buf is None or buf.numel() < numel:
+        buf = torch.empty(max(1, numel + (numel >> 2)), dtype=dtype, pin_memory=True)
+        _GPU_PNG_CACHE.pins[name] = buf
+    return buf[:numel]
+
+
+def _png_gpu_deflate(scan: torch.Tensor):
+    """Huffman-only raw deflate of ``scan`` (H, rowbytes) uint8 CUDA.
+
+    Returns (stream bytes-like, adler32). Every GPU read of ``scan`` is
+    finished when this returns.
+    """
+    h, rb = scan.shape
+    n = h * rb
+    dev = scan.device
+    br = max(1, min(_PNG_GPU_BLOCK_ROWS, _PNG_GPU_MAX_BLOCK_BYTES // rb))
+    nb = (h + br - 1) // br
+    key = (dev, h, rb, br)
+    cache = _GPU_PNG_CACHE
+    if cache.shape_key != key:
+        rowblk = torch.arange(h, device=dev, dtype=torch.int64) // br
+        cache.shape_val = (
+            rowblk,
+            (rowblk * 257).to(torch.int32).view(h, 1),
+            torch.arange(h, device=dev, dtype=torch.int64),
+            torch.arange(rb, device=dev, dtype=torch.int64),
+        )
+        cache.shape_key = key
+    rowblk, rowoff, ar_h, ar_rb = cache.shape_val
+    stream = torch.cuda.current_stream(dev)
+
+    # --- histogram per block + Adler-32 partial sums (sync 1)
+    ids = rowoff + scan  # int32 (h, rb): block * 257 + byte
+    counts = torch.bincount(ids.view(-1), minlength=nb * 257)
+    rs = scan.sum(dim=1, dtype=torch.int64)
+    cs = scan.sum(dim=0, dtype=torch.int64)
+    sums = torch.stack((rs.sum(), (rs * ar_h).sum(), (cs * ar_rb).sum()))
+    pin_c = _png_pinned("counts", nb * 257 + 3, torch.int64)
+    pin_c[: nb * 257].copy_(counts, non_blocking=True)
+    pin_c[nb * 257 :].copy_(sums, non_blocking=True)
+    stream.synchronize()
+    host = pin_c.numpy()
+    s_sum, t_row, t_col = (int(v) for v in host[nb * 257 :])
+    # Adler-32: A = 1 + sum d_i; B = n + sum (n - i) d_i  (mod 65521)
+    a_mod = (1 + s_sum) % 65521
+    b_mod = (n + n * s_sum - (rb * t_row + t_col)) % 65521
+    adler = (b_mod << 16) | a_mod
+    cnt = host[: nb * 257].reshape(nb, 257).copy()
+    cnt[:, 256] = 1  # end-of-block
+
+    # --- per-block dynamic Huffman headers (host)
+    tab = np.empty((nb, 257), dtype=np.int64)
+    vals = np.zeros((nb, 280), dtype=np.int64)
+    wids = np.zeros((nb, 280), dtype=np.int64)
+    body = np.empty(nb, dtype=np.int64)
+    ar19 = np.arange(19)
+    for b in range(nb):
+        row = cnt[b]
+        lit_len = np.asarray(_huffman_lengths(row.tolist(), 15), dtype=np.int64)
+        lit_code = _canonical_rev_codes(lit_len, 15)
+        tab[b] = lit_code | (lit_len << 16)
+        seq = np.concatenate((lit_len, np.ones(2, dtype=np.int64)))
+        cl_len = np.asarray(
+            _huffman_lengths(np.bincount(seq, minlength=19).tolist(), 7), dtype=np.int64
+        )
+        cl_code = _canonical_rev_codes(cl_len, 7)
+        ordered = cl_len[_DEFLATE_CL_ORDER]
+        nz = np.flatnonzero(ordered)
+        hclen = max(4, int(nz[-1]) + 1) - 4
+        bfinal = 1 if b == nb - 1 else 0
+        # BFINAL, BTYPE=2, HLIT=257-257, HDIST=2-1, HCLEN
+        vals[b, 0] = bfinal | (2 << 1) | (0 << 3) | (1 << 8) | (hclen << 13)
+        wids[b, 0] = 17
+        vals[b, 1:20] = ordered
+        wids[b, 1:20] = np.where(ar19 < hclen + 4, 3, 0)
+        vals[b, 20:279] = cl_code[seq]
+        wids[b, 20:279] = cl_len[seq]
+        vals[b, 279] = lit_code[256]
+        wids[b, 279] = lit_len[256]
+        body[b] = int(row[:256] @ lit_len[:256])
+    hw = wids[:, :279]
+    hbits = hw.sum(axis=1)
+    tbits = hbits + body + wids[:, 279]
+    start = np.cumsum(tbits) - tbits
+    offs = np.empty_like(wids)
+    offs[:, :279] = start[:, None] + np.cumsum(hw, axis=1) - hw
+    offs[:, 279] = start + hbits + body
+    extra = start + hbits - (np.cumsum(body) - body)
+    total_bits = int(tbits.sum())
+
+    ne = nb * 280
+    pin_u = _png_pinned("upload", nb * 257 + nb + 2 * ne, torch.int64)
+    u = pin_u.numpy()
+    u[: nb * 257] = tab.reshape(-1)
+    u[nb * 257 : nb * 258] = extra
+    u[nb * 258 : nb * 258 + ne] = offs.reshape(-1)
+    u[nb * 258 + ne :] = vals.reshape(-1)
+    up = pin_u.to(dev, non_blocking=True)
+    tab_g = up[: nb * 257]
+    extra_g = up[nb * 257 : nb * 258]
+    hoff = up[nb * 258 : nb * 258 + ne]
+    hval = up[nb * 258 + ne :]
+
+    # --- GPU bit packing (sync 2)
+    packed = tab_g[ids]  # (h, rb): code | len << 16
+    del ids
+    lens = packed >> 16
+    off = torch.cumsum(lens.view(-1), 0).view(h, rb)
+    off.sub_(lens).add_(extra_g[rowblk].view(h, 1))
+    del lens
+    v = packed.bitwise_and_(0xFFFF).bitwise_left_shift_(off & 31)
+    widx = off.bitwise_right_shift_(5).view(-1)
+    v = v.view(-1)
+    words = torch.zeros((total_bits >> 5) + 2, dtype=torch.int64, device=dev)
+    words.scatter_add_(0, widx, v & 0xFFFFFFFF)
+    words.scatter_add_(0, widx + 1, v >> 32)
+    del v, widx, off, packed
+    hv = hval << (hoff & 31)
+    hwi = hoff >> 5
+    words.scatter_add_(0, hwi, hv & 0xFFFFFFFF)
+    words.scatter_add_(0, hwi + 1, hv >> 32)
+    nbytes = (total_bits + 7) >> 3
+    out = words.view(torch.uint8).view(-1, 8)[:, :4].reshape(-1)[:nbytes]
+    pin_o = _png_pinned("out", nbytes, torch.uint8)
+    pin_o.copy_(out, non_blocking=True)
+    stream.synchronize()
+    return memoryview(pin_o.numpy()), adler
+
+
+def _png_assemble(w: int, h: int, c: int, stream, adler: int) -> bytes:
+    """PNG file around a raw deflate ``stream``: zlib header 78 01 + Adler-32."""
+    nbytes = len(stream)
+    k = max(1, min(_PNG_IDAT_PIECES, nbytes >> 16))
+    cuts = [nbytes * i // k for i in range(k + 1)]
+    zhdr = b"\x78\x01"  # 32 KiB window, FLEVEL 0, FCHECK ok
+    tail = struct.pack(">I", adler)
+    init = zlib.crc32(b"IDAT")
+    pieces = [stream[cuts[i] : cuts[i + 1]] for i in range(k)]
+    if k > 1:
+        pool = _png_pool()
+        futs = [
+            pool.submit(zlib.crc32, p, zlib.crc32(zhdr, init) if i == 0 else init)
+            for i, p in enumerate(pieces)
+        ]
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, _PNG_COLOR_TYPES[c], 0, 0, 0)
+    parts = [_PNG_SIGNATURE, _png_chunk(b"IHDR", ihdr)]
+    for i, p in enumerate(pieces):
+        if k > 1:
+            crc = futs[i].result()
+        else:
+            crc = zlib.crc32(p, zlib.crc32(zhdr, init))
+        plen = len(p)
+        if i == 0:
+            plen += 2
+        if i == k - 1:
+            plen += 4
+            crc = zlib.crc32(tail, crc)
+        parts.append(struct.pack(">I", plen))
+        parts.append(b"IDAT")
+        if i == 0:
+            parts.append(zhdr)
+        parts.append(p)
+        if i == k - 1:
+            parts.append(tail)
+        parts.append(struct.pack(">I", crc))
+    parts.append(_png_chunk(b"IEND", b""))
+    return b"".join(parts)
+
+
 def _encode_png_tensor(image: Any, compress_level: int = 1) -> Optional[bytes]:
     """Encode a uint8 L/RGB/RGBA image tensor as PNG; None when not eligible."""
     if not _fast_png_enabled() or not isinstance(image, torch.Tensor):
@@ -555,7 +870,15 @@ def _encode_png_tensor(image: Any, compress_level: int = 1) -> Optional[bytes]:
     if c not in _PNG_COLOR_TYPES or h == 0 or w == 0:
         return None
 
-    scan = _png_filter_scanlines(image).cpu().numpy()
+    scan_g = _png_filter_scanlines(image)
+    if _gpu_deflate_enabled() and scan_g.numel() <= _PNG_GPU_MAX_BYTES:
+        try:
+            stream, adler = _png_gpu_deflate(scan_g)
+        except RuntimeError as e:  # Huffman limit failure: use the zlib writer
+            logger.warning(f"GPU PNG deflate failed ({e}); using zlib")
+        else:
+            return _png_assemble(w, h, c, stream, adler)
+    scan = scan_g.cpu().numpy()
     data = memoryview(scan.reshape(-1))
     row_bytes = 1 + w * c
 
