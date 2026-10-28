@@ -88,6 +88,103 @@ def _sm120_cutlass_linear(
     )
 
 
+@lru_cache(maxsize=1)
+def _sm120_qkv_backend() -> str:
+    import os
+
+    backend = os.environ.get("TRTLLM_FLUX3_SM120_QKV", "cutlass").strip().lower()
+    if backend not in ("cutlass", "cute"):
+        raise ValueError(f"TRTLLM_FLUX3_SM120_QKV must be 'cutlass' or 'cute', got {backend!r}")
+    return backend
+
+
+@lru_cache(maxsize=8)
+def _sm120_qkv_side_streams(device_index: int) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
+    return torch.cuda.Stream(device_index), torch.cuda.Stream(device_index)
+
+
+def _sm120_cutlass_qkv(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_global_scale: float,
+    weight_global_scale: float,
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    qkv_scale: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """CUTLASS NVFP4 GEMM(s) + per-head QK-RMSNorm/RoPE pass, bitwise equal to the fused CuTe op.
+
+    The CUTLASS epilogue is BF16(acc * alpha) like the CuTe one, and the pass repeats the CuTe QKV
+    epilogue's norm/RoPE arithmetic on those BF16 values. Output: packed BF16 [M, 3*H*128] q|k|v,
+    row stride 3*H*128, v straight from the GEMM. One alpha (qkv_scale None): one GEMM over all
+    columns, pass in place. Per-plane alphas: q on the current stream, k and v on two side
+    streams forked from and joined to it (fills the GEMMs' wave tails), then the pass writes q|k|v.
+    Returns None for shapes it does not cover (the caller falls back to the CuTe kernel).
+    """
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_nvfp4 import _scalar
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_qknorm_rope import (
+        qknorm_rope,
+    )
+
+    columns = weight.shape[0]
+    width = columns // 3
+    if columns % 3 or width % 512 or q_norm.numel() != 128 or k_norm.numel() != 128:
+        return None
+    runner = _sm120_fp4_gemm_runner()
+    activation = activation.detach()
+    activation_scale = activation_scale.detach()
+    weight = weight.detach()
+    weight_scale = weight_scale.detach()
+    cos_sin = cos_sin.detach()
+    positions = positions.detach()
+    if qkv_scale is None:
+        alpha = _scalar(activation.device, input_global_scale * weight_global_scale)
+        out = runner.run_gemm(
+            activation, weight, activation_scale, weight_scale, alpha, 0,
+            _SM120_LINEAR_CUTLASS_TACTIC, None, None,
+        )
+        return qknorm_rope(
+            out[:, :width], out[:, width:2 * width], out[:, 2 * width:], out,
+            q_norm, k_norm, cos_sin, positions,
+        )
+    qkv_scale = qkv_scale.detach()
+    segment_scale = weight_scale.numel() // 3
+
+    def gemm(i: int) -> torch.Tensor:
+        return runner.run_gemm(
+            activation,
+            weight[i * width:(i + 1) * width],
+            activation_scale,
+            weight_scale[i * segment_scale:(i + 1) * segment_scale],
+            qkv_scale[i:i + 1],
+            0,  # BufferKind.DEFAULT
+            _SM120_LINEAR_CUTLASS_TACTIC,
+            None,
+            None,
+        )
+
+    current = torch.cuda.current_stream(activation.device)
+    side = _sm120_qkv_side_streams(activation.device.index)
+    for stream in side:
+        stream.wait_stream(current)
+    q = gemm(0)
+    planes = []
+    for i, stream in enumerate(side):
+        with torch.cuda.stream(stream):
+            planes.append(gemm(i + 1))
+    for stream in side:
+        current.wait_stream(stream)
+    for plane in planes:
+        plane.record_stream(current)
+    k, v = planes
+    out = torch.empty((activation.shape[0], columns), device=activation.device, dtype=torch.bfloat16)
+    return qknorm_rope(q, k, v, out, q_norm, k_norm, cos_sin, positions)
+
+
 @lru_cache(maxsize=32)
 def _token_positions(rows: int, device: torch.device) -> torch.Tensor:
     """Cache identity RoPE indices across blocks and denoising steps."""
@@ -627,6 +724,22 @@ def nvfp4_qkv_qknorm_rope(
         positions = _token_positions(activation.shape[0], activation.device)
 
     if is_sm120(activation.device):
+        if _sm120_qkv_backend() == "cutlass":
+            output = _sm120_cutlass_qkv(
+                activation,
+                weight,
+                activation_scale,
+                weight_scale,
+                input_global_scale,
+                weight_global_scale,
+                q_norm,
+                k_norm,
+                cos_sin,
+                positions,
+                qkv_scale,
+            )
+            if output is not None:
+                return output
         from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120 import flux3_sm120_nvfp4
 
         return flux3_sm120_nvfp4.run(
