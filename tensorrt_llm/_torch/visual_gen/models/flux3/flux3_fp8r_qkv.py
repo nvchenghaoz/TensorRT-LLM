@@ -133,4 +133,12 @@ def _sm120_fp8r_qkv_forward(
     )
     width = output.shape[-1] // 3
     q, k, v = output.split(width, -1)
+    if _FP8R_QKV_CONTIGUOUS:
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     return tuple(t.reshape(*original.shape[:-1], width) for t in (q, k, v))
+
+
+# Hand attention contiguous q/k/v. With landing 29 (fp8_sm12x attention, accepts_strided_qkv) the
+# packed row-stride-3W views made served T=80 images differ after a T=160 request (job 829: A/B/A
+# not bitwise; job 837: same tree with this op off is bitwise). Module-level for A/B.
+_FP8R_QKV_CONTIGUOUS = True
