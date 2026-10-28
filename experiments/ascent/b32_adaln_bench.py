@@ -130,7 +130,9 @@ def inputs_ok():
 if MODE == "check":
     assert HAS_CAND, "check runs in the candidate tree"
     fails = []
-    res = {}
+    ref = None
+    cand0 = None
+    maxabs = 0.0
     for arm in (False, True):
         reset()
         for _ in range(WARM):
@@ -139,23 +141,22 @@ if MODE == "check":
         if not inputs_ok():
             fails.append(f"inputs changed during warmup arm={arm}")
         reset()
-        seq = []
         for i in range(ITERS):
-            outs = [o.clone() for o in step(arm)]
-            seq.append(outs)
+            outs = step(arm)
+            if ref is None:
+                ref = [o.clone() for o in outs]  # base iteration 0 = reference
+            if arm and cand0 is None:
+                cand0 = [o.clone() for o in outs]
+            for j, o in enumerate(outs):
+                if not torch.equal(o, ref[j]):
+                    maxabs = max(maxabs, (o.float() - ref[j].float()).abs().max().item())
+                    fails.append(f"arm={arm} iter {i} out {j} != base iter0 reference")
+                if arm and not torch.equal(o, cand0[j]):
+                    fails.append(f"cand iter {i} out {j} != cand iter0")
+            del outs
         torch.cuda.synchronize()
         if not inputs_ok():
             fails.append(f"inputs changed arm={arm}")
-        res[arm] = seq
-    ref = res[False][0]
-    maxabs = 0.0
-    for i, (b, c) in enumerate(zip(res[False], res[True])):
-        for j, (ob, oc, o0) in enumerate(zip(b, c, ref)):
-            if not torch.equal(ob, oc):
-                maxabs = max(maxabs, (ob.float() - oc.float()).abs().max().item())
-                fails.append(f"iter {i} out {j} cand != base")
-            if not torch.equal(oc, o0):
-                fails.append(f"iter {i} out {j} cand != iter0 ref")
     print(json.dumps({"passed": not fails, "failures": fails[:20], "n_failures": len(fails),
                       "max_abs": maxabs, "iters": ITERS, "outputs_per_iter": len(ref),
                       "compared_against": "main's materialized per-token modulation path "
