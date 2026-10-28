@@ -58,6 +58,47 @@ def module():
     return spec.build_and_load()
 
 
+@lru_cache(maxsize=1)
+def qkv_schedule() -> str:
+    """Mainloop schedule of the QKV plane GEMMs.
+
+    'pingpong' (default): overlay entry ``csrc/flux3_fp4_gemm_sm120_pingpong.cu`` (module
+    ``flux3_fp4_gemm_sm120_pingpong_route``, export ``gemm_into_pingpong``), the same CUTLASS SM120
+    NVFP4 128x128x128 StaticPersistent kernel with KernelTmaWarpSpecializedPingpong: the two
+    consumer warpgroups alternate tiles, so one tile's epilogue overlaps the next tile's
+    mainloop. Each output element sees the same MMA sequence and epilogue, so it is bitwise
+    equal to the Cooperative entry (and to TRT-LLM t0).
+    TRTLLM_FLUX3_SM120_QKV_SCHED=cooperative restores the stock Cooperative strided entry.
+    """
+    sched = os.environ.get("TRTLLM_FLUX3_SM120_QKV_SCHED", "pingpong").strip().lower()
+    if sched not in ("pingpong", "cooperative"):
+        raise ValueError(
+            f"TRTLLM_FLUX3_SM120_QKV_SCHED must be 'pingpong' or 'cooperative', got {sched!r}"
+        )
+    return sched
+
+
+@lru_cache(maxsize=1)
+def pingpong_module():
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.core import current_compilation_context, gen_jit_spec
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[12])
+    spec = gen_jit_spec(
+        "flux3_fp4_gemm_sm120_pingpong_route",
+        [jit_env.FLASHINFER_CSRC_DIR / "flux3_fp4_gemm_sm120_pingpong.cu"],
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DFLUX3_PP_ONLY",
+        ],
+        extra_cflags=["-DFAST_BUILD"],
+    )
+    return spec.build_and_load()
+
+
 def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
@@ -83,7 +124,10 @@ def preload(device: torch.device) -> None:
     """Build the module and allocate every slot's workspace at model load."""
     if not inplace_enabled():
         return
-    module()
+    if qkv_schedule() == "pingpong":
+        pingpong_module()
+    else:
+        module()
     for slot in range(_SLOTS):
         workspace(device, slot)
 
@@ -100,7 +144,11 @@ def gemm_into(
     slot: int,
 ) -> None:
     """out.flat[offset + r*ldd + c] = BF16(alpha * (A @ W^T))[r, c], on the current stream."""
-    module().fp4_gemm_strided(
+    if qkv_schedule() == "pingpong":
+        fn = pingpong_module().gemm_into_pingpong
+    else:
+        fn = module().fp4_gemm_strided
+    fn(
         activation,
         weight,
         activation_scale,

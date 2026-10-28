@@ -14,6 +14,7 @@
 
 #include <cstdint>
 
+#include "flashinfer/gemm/cutlass_gemm_configs.h"
 #include "flashinfer/gemm/fp4_gemm_template_sm120.h"
 #include "tvm_ffi_utils.h"
 
@@ -59,8 +60,10 @@ struct Fp4GemmSm120 {
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
+#ifndef FLUX3_PP_ONLY
 using CoopGemm = Fp4GemmSm120<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
                               cutlass::epilogue::TmaWarpSpecialized, 128, 128, 128>::Gemm;
+#endif
 using PingpongGemm = Fp4GemmSm120<cutlass::gemm::KernelTmaWarpSpecializedPingpong,
                                   cutlass::epilogue::TmaWarpSpecialized, 128, 128, 128>::Gemm;
 
@@ -109,11 +112,13 @@ void run_strided(TensorView a, TensorView b, TensorView sfa, TensorView sfb, Ten
       << "run failed: " << cutlass::cutlassGetStatusString(st);
 }
 
+#ifndef FLUX3_PP_ONLY
 void gemm_into_coop(TensorView a, TensorView b, TensorView sfa, TensorView sfb, TensorView alpha,
                     TensorView out_base, int64_t offset_elems, int64_t ldd,
                     TensorView workspace) {
   run_strided<CoopGemm>(a, b, sfa, sfb, alpha, out_base, offset_elems, ldd, workspace);
 }
+#endif
 
 void gemm_into_pingpong(TensorView a, TensorView b, TensorView sfa, TensorView sfb,
                         TensorView alpha, TensorView out_base, int64_t offset_elems, int64_t ldd,
@@ -122,19 +127,23 @@ void gemm_into_pingpong(TensorView a, TensorView b, TensorView sfa, TensorView s
 }
 
 int64_t smem_pingpong() { return static_cast<int64_t>(PingpongGemm::GemmKernel::SharedStorageSize); }
-int64_t smem_coop() { return static_cast<int64_t>(CoopGemm::GemmKernel::SharedStorageSize); }
 int64_t stages_pingpong() {
   return static_cast<int64_t>(PingpongGemm::GemmKernel::CollectiveMainloop::DispatchPolicy::Stages);
 }
+#ifndef FLUX3_PP_ONLY
+int64_t smem_coop() { return static_cast<int64_t>(CoopGemm::GemmKernel::SharedStorageSize); }
 int64_t stages_coop() {
   return static_cast<int64_t>(CoopGemm::GemmKernel::CollectiveMainloop::DispatchPolicy::Stages);
 }
+#endif
 
 }  // namespace flux3_sm120_pp
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_into_coop, flux3_sm120_pp::gemm_into_coop);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_into_pingpong, flux3_sm120_pp::gemm_into_pingpong);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(smem_pingpong, flux3_sm120_pp::smem_pingpong);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(smem_coop, flux3_sm120_pp::smem_coop);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(stages_pingpong, flux3_sm120_pp::stages_pingpong);
+#ifndef FLUX3_PP_ONLY
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_into_coop, flux3_sm120_pp::gemm_into_coop);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(smem_coop, flux3_sm120_pp::smem_coop);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(stages_coop, flux3_sm120_pp::stages_coop);
+#endif
