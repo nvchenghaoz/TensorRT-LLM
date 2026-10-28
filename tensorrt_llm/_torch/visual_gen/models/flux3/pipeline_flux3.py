@@ -536,6 +536,19 @@ class Flux3Pipeline(BasePipeline):
                     options={"emulate_precision_casts": True},
                 )
 
+        # The final layers (ModuleDict of Flux3LastLayer, not ModuleLists): one fused
+        # LayerNorm+modulate kernel instead of eager fp32 casts/layer_norm/mul/add.
+        final_layer = getattr(transformer, "final_layer", None)
+        if isinstance(final_layer, torch.nn.ModuleDict):
+            for key in list(final_layer.keys()):
+                logger.info(f"torch.compile: transformer.final_layer.{key}")
+                final_layer[key] = torch.compile(
+                    final_layer[key],
+                    dynamic=None,
+                    fullgraph=tc_config.enable_fullgraph,
+                    options={"emulate_precision_casts": True},
+                )
+
     @property
     def default_generation_params(self) -> dict:
         sampler = self.pipeline_config.extra_attrs["flux3_checkpoint"].config["sampler"]
