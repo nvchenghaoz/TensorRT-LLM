@@ -223,3 +223,43 @@ def visual_gen_fp8_attention_sm120(
 @visual_gen_fp8_attention_sm120.register_fake
 def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, is_causal: bool):
     return torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+
+
+@torch.library.custom_op("trtllm::visual_gen_fp8_attention_sm120_prequant", mutates_args=())
+def visual_gen_fp8_attention_sm120_prequant(
+    qkv8: torch.Tensor, scales: torch.Tensor, batch: int, heads: int
+) -> torch.Tensor:
+    """visual_gen_fp8_attention_sm120 (non-causal) on already-quantized Q/K/V.
+
+    qkv8: E4M3 [3, B*S, H*D] (contiguous q, k, v planes); scales: FP32 [>=4] laid out as
+    quantize_qkv_e4m3's ([q, k, v descales, q*k*sm_scale]). Same fmha_v2 call, same arguments.
+    """
+    from . import flashinfer as _fi
+
+    _, rows, width = qkv8.shape
+    seq_len = rows // batch
+    head_dim = width // heads
+    q8, k8, v8 = (plane.view(batch, seq_len, heads, head_dim) for plane in qkv8.unbind(0))
+    output = torch.empty((batch, seq_len, heads, head_dim), dtype=torch.bfloat16,
+                         device=qkv8.device)
+    _fi.run_fmha_v2_fp8_sm12x(
+        q8,
+        k8,
+        v8,
+        output,
+        heads,
+        head_dim,
+        seq_len,
+        scale_bmm1_d=scales[3:4],
+        scale_bmm2_d=scales[2:3],
+        causal=False,
+        return_lse=False,
+    )
+    return output
+
+
+@visual_gen_fp8_attention_sm120_prequant.register_fake
+def _(qkv8: torch.Tensor, scales: torch.Tensor, batch: int, heads: int):
+    _, rows, width = qkv8.shape
+    return torch.empty((batch, rows // batch, heads, width // heads), dtype=torch.bfloat16,
+                       device=qkv8.device)

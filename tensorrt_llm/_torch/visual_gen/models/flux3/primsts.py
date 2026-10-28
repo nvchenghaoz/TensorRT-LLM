@@ -837,3 +837,94 @@ def qkv_forward(
         planar=planar,
     )
     return tuple(t.reshape(*original.shape[:-1], t.shape[-1]) for t in planes)
+
+
+# NVFP4 QKV straight to E4M3 for the SM120 per-tensor FP8 attention backend: one op runs main's
+# planar QKV GEMMs and writes E4M3 q/k/v + scales directly (no BF16 norm+RoPE q/k planes, no
+# fp8_sm12x K1/K2), then the same fmha_v2 call. Bitwise equal to main's path (qkv_forward ->
+# _attend -> FlashInferAttention FP8). Module-level so one process can compare (Dynamo guards on it);
+# TRTLLM_FLUX3_QKV_FP8_DIRECT=0 keeps main's path.
+FLUX3_QKV_FP8_DIRECT = os.environ.get("TRTLLM_FLUX3_QKV_FP8_DIRECT", "1").strip() != "0"
+
+
+def _fp8_direct_backend(attn: nn.Module):
+    """The attention's FlashInfer SM12x per-tensor FP8 backend, or None."""
+    from tensorrt_llm._torch.visual_gen.attention.backends.flashinfer import FlashInferAttention
+
+    backend = getattr(attn, "attn", None)
+    if type(backend) is not FlashInferAttention or not getattr(backend, "_fp8_sm12x", False):
+        return None
+    if backend.head_dim != 128 or backend.num_heads != backend.num_kv_heads:
+        return None
+    return backend
+
+
+def qkv_fp8_attention_forward(
+    attn: nn.Module,
+    x: PrimsTSInput,
+    freqs: tuple[torch.Tensor, ...],
+    full_sequence: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """(attention output [B, S, H*D] BF16, planar BF16 QKV GEMM output [M, 3W]) or None.
+
+    Covers exactly the calls where main runs: qkv_forward's PreparedNVFP4 per-plane in-place planar
+    route, then one FlashInferAttention FP8 (non-causal, no LSE) call on the whole [B, S] q/k/v
+    (``full_sequence``: sample_bounds None, or one full-range segment at B=1 on the _attend fast
+    path) with S >= the backend's FP8 minimum. Anything else returns None (main's path).
+    Like qkv_forward it never reads the BF16 values of ``x`` (the fused adaLN head may not store
+    them); `original` goes to _prepared_activation only, as in nvfp4_qkv_prepared.
+    """
+    if not FLUX3_QKV_FP8_DIRECT or not full_sequence:
+        return None
+    adapter = getattr(attn, "_flux3_primsts_nvfp4_qkv", None)
+    if not isinstance(adapter, PreparedNVFP4) or adapter.qkv_scale is None:
+        return None
+    if not getattr(attn, "_flux3_primsts_nvfp4_qkv_planar", False):
+        return None
+    backend = _fp8_direct_backend(attn)
+    if backend is None:
+        return None
+    original = original_input(x)
+    if original.dim() != 3:
+        return None
+    batch, seq_len = original.shape[0], original.shape[1]
+    cos, sin = freqs[0], freqs[1]
+    if not adapter.can_run(original) or cos.numel() != original.numel() // original.shape[-1] * 128:
+        return None
+    if sin.shape != cos.shape:
+        return None
+    if seq_len < backend._fp8_min_seq_len or seq_len <= 0:
+        return None
+    q_dim, k_dim = attn.norm_q.weight.numel(), attn.norm_k.weight.numel()
+    from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
+        nvfp4_qkv_rope_fp8_prepared,
+        sm120_qkv_fp8_covers,
+    )
+
+    columns = adapter.weight.shape[0]
+    if not sm120_qkv_fp8_covers(original.device, columns, q_dim, k_dim):
+        return None
+    heads = columns // 3 // 128
+    if heads != backend.num_heads:
+        return None
+    from tensorrt_llm._torch.visual_gen.attention.backends.fp8_sm12x import (
+        visual_gen_fp8_attention_sm120_prequant,
+    )
+
+    data, scales = adapter.activation(x)
+    cos_sin = freqs[2] if len(freqs) > 2 else rope_cos_sin_table(cos, sin)
+    qkv8, fp8_scales, gemm = nvfp4_qkv_rope_fp8_prepared(
+        data,
+        adapter.weight,
+        scales,
+        adapter.scale,
+        attn.norm_q.weight.contiguous(),
+        attn.norm_k.weight.contiguous(),
+        cos_sin.float().contiguous(),
+        adapter.qkv_scale,
+        original,
+        x.quantized_by if isinstance(x, NVFP4Activation) else None,
+        backend.scale,
+    )
+    output = visual_gen_fp8_attention_sm120_prequant(qkv8, fp8_scales, batch, heads)
+    return output.flatten(2), gemm
