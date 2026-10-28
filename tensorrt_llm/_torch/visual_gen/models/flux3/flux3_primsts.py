@@ -49,8 +49,10 @@ def _sm120_linear_backend() -> str:
     import os
 
     backend = os.environ.get("TRTLLM_FLUX3_SM120_LINEAR", "cutlass").strip().lower()
-    if backend not in ("cutlass", "cute"):
-        raise ValueError(f"TRTLLM_FLUX3_SM120_LINEAR must be 'cutlass' or 'cute', got {backend!r}")
+    if backend not in ("cutlass", "trtllm", "cute"):
+        raise ValueError(
+            f"TRTLLM_FLUX3_SM120_LINEAR must be 'cutlass', 'trtllm' or 'cute', got {backend!r}"
+        )
     return backend
 
 
@@ -61,6 +63,58 @@ def _sm120_fp4_gemm_runner():
     return torch.classes.trtllm.FP4GemmRunner(
         torch.bfloat16, int(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4)
     )
+
+
+# SM120 plain linears can instead run FlashInfer's stock SM120 CUTLASS NVFP4 GEMM
+# (flashinfer.jit.gemm.gen_gemm_sm120_module_cutlass_fp4, entry fp4_gemm) at a pinned tactic.
+# Stock tactic index = tile_idx * 4 + {0 swap-AB DP, 1 DP, 2 swap-AB StreamK, 3 StreamK}; tile 4 is
+# TileShape 128x128x128 (FP4 elements; FlashInfer's enum name CtaShape128x128x64B counts K in bytes).
+# Index 18 = 128x128x128, swap-AB, CUTLASS StreamKScheduler (default heuristic decomposition,
+# deterministic reduction): it splits the wave tail's K range across CTAs, so its outputs are a
+# REORDERED fp32 accumulation of t0's (run-to-run deterministic). Index 17 is bitwise to t0.
+# TRTLLM_FLUX3_SM120_LINEAR_FI_TACTIC=<idx> picks another stock tactic; TRTLLM_FLUX3_SM120_LINEAR=trtllm
+# restores TRT-LLM FP4GemmRunner tactic 0.
+_SM120_LINEAR_FI_TACTIC = 18
+# Workspace for the stock entry. Its runGemm wants the max over all 32 stock tactics for (m, n, k)
+# and allocates a fresh buffer on EVERY call when the one passed in is smaller, so it is allocated
+# once per (device, stream) at model load, sized well above that max for M up to ~16K rows.
+_SM120_LINEAR_FI_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+@lru_cache(maxsize=1)
+def _sm120_linear_fi_tactic() -> int:
+    import os
+
+    return int(os.environ.get("TRTLLM_FLUX3_SM120_LINEAR_FI_TACTIC", _SM120_LINEAR_FI_TACTIC))
+
+
+@lru_cache(maxsize=1)
+def _sm120_fi_fp4_module():
+    from flashinfer.jit.gemm import gen_gemm_sm120_module_cutlass_fp4
+
+    return gen_gemm_sm120_module_cutlass_fp4().build_and_load()
+
+
+_SM120_FI_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _sm120_fi_workspace(device: torch.device) -> torch.Tensor:
+    # One buffer per stream: StreamK keeps partials and barrier flags in it, so two GEMMs running
+    # concurrently on different streams must not share one.
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, torch.cuda.current_stream(index).cuda_stream)
+    ws = _SM120_FI_WORKSPACES.get(key)
+    if ws is None:
+        ws = torch.empty(_SM120_LINEAR_FI_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        _SM120_FI_WORKSPACES[key] = ws
+    return ws
+
+
+def sm120_linear_preload(device: torch.device) -> None:
+    """Load the FlashInfer SM120 GEMM module and allocate its workspace at model load."""
+    if _sm120_linear_backend() == "cutlass":
+        _sm120_fi_fp4_module()
+        _sm120_fi_workspace(device)
 
 
 def _sm120_cutlass_linear(
@@ -75,6 +129,21 @@ def _sm120_cutlass_linear(
 
     # Cached device scalar (CUDA-graph safe), the same value the CuTe epilogue multiplies by.
     alpha = _scalar(activation.device, input_global_scale * weight_global_scale)
+    if _sm120_linear_backend() == "cutlass":
+        out = torch.empty(
+            (activation.shape[0], weight.shape[0]), device=activation.device, dtype=torch.bfloat16
+        )
+        _sm120_fi_fp4_module().fp4_gemm(
+            activation.detach(),
+            weight.detach(),
+            activation_scale.detach(),
+            weight_scale.detach(),
+            alpha,
+            out,
+            _sm120_fi_workspace(activation.device),
+            _sm120_linear_fi_tactic(),
+        )
+        return out
     return _sm120_fp4_gemm_runner().run_gemm(
         activation.detach(),
         weight.detach(),
@@ -701,7 +770,7 @@ def nvfp4_linear(
     weight_global_scale: float,
 ) -> torch.Tensor:
     if is_sm120(activation.device):
-        if _sm120_linear_backend() == "cutlass":
+        if _sm120_linear_backend() != "cute":
             return _sm120_cutlass_linear(
                 activation,
                 weight,
