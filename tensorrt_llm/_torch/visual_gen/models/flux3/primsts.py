@@ -34,6 +34,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
     pack_swiglu_weight,
     prepare_nvfp4_gemm,
     qkv_planes,
+    sm120_qkv_planar,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
     Flux3FP8RowwiseLinearMethod,
@@ -230,6 +231,7 @@ def prepare_nvfp4_block(block: nn.Module) -> None:
         return
     attn = block.attn
     attn._flux3_primsts_nvfp4_qkv = None
+    attn._flux3_primsts_nvfp4_qkv_planar = False
     qkv = getattr(attn, "qkv_proj", None)
     projections = [qkv] if qkv is not None else [attn.to_q, attn.to_k, attn.to_v]
     layers = [*projections, block.attn_out, block.ff.gate_up_proj, block.ff.down_proj]
@@ -298,6 +300,14 @@ def prepare_nvfp4_block(block: nn.Module) -> None:
             ),
         )
     adapter = attn._flux3_primsts_nvfp4_qkv
+    # Static layout decision of the SM120 CUTLASS QKV op (three contiguous planes), resolved
+    # here so traced code reads a plain bool (no env/lru_cache lookups under Dynamo).
+    attn._flux3_primsts_nvfp4_qkv_planar = sm120_qkv_planar(
+        adapter.weight.device,
+        adapter.weight.shape[0],
+        attn.norm_q.weight.numel(),
+        attn.norm_k.weight.numel(),
+    )
     if is_sm120(adapter.weight.device):
         return
     prepare_nvfp4_gemm(
@@ -662,9 +672,16 @@ def qkv_forward(
             original,
             x.quantized_by if isinstance(x, NVFP4Activation) else None,
         )
+        planar = bool(getattr(attn, "_flux3_primsts_nvfp4_qkv_planar", False))
     else:
         output = fp8_qkv_qknorm_rope(*args, None)
+        planar = False
     planes = qkv_planes(
-        output, data, adapter.weight, 128, qkv_scale=getattr(adapter, "qkv_scale", None) is not None
+        output,
+        data,
+        adapter.weight,
+        128,
+        qkv_scale=getattr(adapter, "qkv_scale", None) is not None,
+        planar=planar,
     )
     return tuple(t.reshape(*original.shape[:-1], t.shape[-1]) for t in planes)
