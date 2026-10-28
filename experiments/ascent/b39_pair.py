@@ -33,6 +33,8 @@ def op(args):
 def stat(v):
     v = sorted(v)
     med = v[len(v) // 2]
+    if med == 0:
+        return 0.0, 0.0
     return med, (v[(len(v) * 9) // 10] - v[len(v) // 10]) / med
 
 
