@@ -21,9 +21,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def gpu_used_mib():
+    """memory.used of this job's GPU (CUDA_VISIBLE_DEVICES is a UUID or index)."""
+    cmd = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    if vis:
+        cmd += ["-i", vis]
     try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
         return int(out.strip().splitlines()[0])
     except Exception:  # noqa: BLE001
         return None

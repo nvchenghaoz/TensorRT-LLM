@@ -61,7 +61,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
-from tensorrt_llm.media.encoding import image_to_bytes
+from tensorrt_llm.media.encoding import image_to_b64, image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
@@ -3799,8 +3799,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     data = [
                         ImageObject(
                             b64_json=b64_splicer.placeholder(
-                                base64.b64encode(
-                                    image_to_bytes(image, format=pil_format))),
+                                image_to_b64(image, format=pil_format)),
                             revised_prompt=request.prompt,
                         ) for image in output_images
                     ]

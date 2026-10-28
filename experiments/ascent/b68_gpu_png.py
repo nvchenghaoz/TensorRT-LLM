@@ -37,12 +37,23 @@ ROWS = [int(x) for x in sys.argv[2:]] or [64, 256, 1024]
 DEFAULT_ROWS = enc._PNG_GPU_BLOCK_ROWS
 
 
+USE_B64 = [False]
+
+
 def set_cfg(cfg):
+    USE_B64[0] = cfg == "b64"
     if cfg in ("main", "main_aa"):
         os.environ["TRTLLM_PNG_GPU_DEFLATE"] = "0"
     else:
         os.environ.pop("TRTLLM_PNG_GPU_DEFLATE", None)
-        enc._PNG_GPU_BLOCK_ROWS = cfg
+        enc._PNG_GPU_BLOCK_ROWS = DEFAULT_ROWS if cfg == "b64" else cfg
+
+
+def served_step(g):
+    """What openai_server's b64_json site runs: b64encode(image_to_bytes) or image_to_b64."""
+    if USE_B64[0]:
+        return enc.image_to_b64(g, format="PNG")
+    return base64.b64encode(encode(g))
 
 
 def encode(g):
@@ -174,6 +185,10 @@ def check():
             b = base64.b64encode(png)
             if base64.b64decode(b) != png:
                 fails.append((name, r, "b64"))
+            if hasattr(enc, "image_to_b64"):
+                gb = [enc.image_to_b64(gg, format="PNG") for _ in range(2)]
+                if gb[0] != b or gb[1] != b:
+                    fails.append((name, r, "image_to_b64!=b64encode(png)"))
             if png == ref:
                 fails.append((name, r, "gpu_path_not_used"))
             if kind != "synthetic":
@@ -185,7 +200,7 @@ def check():
     for name, scan in raw_scan_cases().items():
         for r in ROWS + [1, 3]:
             enc._PNG_GPU_BLOCK_ROWS = r
-            stream, adler = enc._png_gpu_deflate(scan.cuda())
+            stream, adler = enc._png_gpu_deflate(scan.cuda())[:2]
             z = b"\x78\x01" + bytes(stream) + adler.to_bytes(4, "big")
             try:
                 ok = zlib.decompress(z) == scan.numpy().tobytes()
@@ -222,7 +237,7 @@ def timing(cfgs, rounds):
         for c in cfgs:
             set_cfg(c)
             for _ in range(2):
-                base64.b64encode(encode(gg))
+                served_step(gg)
     t = {str(c): [] for c in cfgs}
     mb = {str(c): [] for c in cfgs}
     rng = random.Random(42)
@@ -234,7 +249,7 @@ def timing(cfgs, rounds):
                 set_cfg(c)
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                b = base64.b64encode(encode(gg))
+                b = served_step(gg)
                 t[str(c)].append((time.perf_counter() - t0) * 1e3)
                 if r == 0:
                     mb[str(c)].append(len(b) * 0.75 / 1e6)
@@ -262,7 +277,7 @@ def breakdown(rows):
         scan = enc._png_filter_scanlines(gg)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        st, ad = enc._png_gpu_deflate(scan)
+        st, ad = enc._png_gpu_deflate(scan)[:2]
         t2 = time.perf_counter()
         png = enc._png_assemble(w, h, c, st, ad)
         t3 = time.perf_counter()
@@ -293,7 +308,7 @@ def prof(rows):
     for _ in range(50):
         enc._canonical_rev_codes(ll, 15)
     log(f"canonical(257): {(time.perf_counter() - t0) / 50 * 1e3:.3f} ms")
-    st, ad = enc._png_gpu_deflate(scan)
+    st, ad = enc._png_gpu_deflate(scan)[:2]
     for k in (1, 2, 4, 8, 16):
         enc._PNG_IDAT_PIECES = k
         t0 = time.perf_counter()
@@ -335,11 +350,12 @@ elif MODE == "sweep":
     res, n = timing(["main", "main_aa"] + ROWS, 20)
     print(json.dumps({"passed": True, "n_timed": n, "ab": res}), flush=True)
 else:
-    res, n = timing(["main", "main_aa", DEFAULT_ROWS], 60)
+    cfgs = ["main", "main_aa", DEFAULT_ROWS] + (["b64"] if MODE == "ab_b64" else [])
+    res, n = timing(cfgs, 60)
     aa = abs(res["main_aa"]["median_ms"] - res["main"]["median_ms"])
     aa90 = abs(res["main_aa"]["p90_ms"] - res["main"]["p90_ms"])
-    new = res[str(DEFAULT_ROWS)]
-    print(json.dumps({"passed": True, "n_timed": n, "rounds": 60, "ab": res,
+    new = res[str(cfgs[-1])]
+    print(json.dumps({"passed": True, "n_timed": n, "rounds": 60, "ab": res, "new_cfg": str(cfgs[-1]),
                       "aa_noise_ms": {"median": round(aa, 3), "p90": round(aa90, 3)},
                       "gain_ms": {"median": round(res["main"]["median_ms"] - new["median_ms"], 3),
                                   "p90": round(res["main"]["p90_ms"] - new["p90_ms"], 3)}}), flush=True)

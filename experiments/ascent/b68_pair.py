@@ -21,11 +21,18 @@ from b47_common import find_dump, load_images, log  # noqa: E402
 os.environ.pop("TRTLLM_VISUALGEN_DUMP_DIR", None)
 from tensorrt_llm.media.encoding import image_to_bytes  # noqa: E402
 
+try:  # the tree's b64_json call site: image_to_b64 when the tree has it
+    from tensorrt_llm.media.encoding import image_to_b64  # noqa: E402
+except ImportError:
+    image_to_b64 = None
+
 imgs = [x for x in load_images(find_dump()) if x[1] == "timed"][:12]
-log(f"{len(imgs)} timed served tensors")
+log(f"{len(imgs)} timed served tensors; image_to_b64 {'present' if image_to_b64 else 'absent'}")
 
 
 def step(g):
+    if image_to_b64 is not None and os.environ.get("B68_FORCE_A") != "1":
+        return image_to_b64(g, format="PNG")
     return base64.b64encode(image_to_bytes(g, format="PNG"))
 
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tensor → image/video encoding free functions."""
 
+import base64
 import os
 import shutil
 import struct
@@ -806,11 +807,57 @@ def _png_gpu_deflate(scan: torch.Tensor):
     pin_o = _png_pinned("out", nbytes, torch.uint8)
     pin_o.copy_(out, non_blocking=True)
     stream.synchronize()
-    return memoryview(pin_o.numpy()), adler
+    return memoryview(pin_o.numpy()), adler, out
 
 
-def _png_assemble(w: int, h: int, c: int, stream, adler: int) -> bytes:
-    """PNG file around a raw deflate ``stream``: zlib header 78 01 + Adler-32."""
+_B64_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+
+def _b64_gpu(segs, stream, gpu_stream: torch.Tensor) -> bytes:
+    """base64 (RFC 4648, '=' padded, no newlines) of the concatenated segments.
+
+    ``segs`` items are bytes (copied to the device in one transfer) or
+    (start, end) ranges of the device-resident deflate ``gpu_stream``.
+    """
+    dev = gpu_stream.device
+    small = b"".join(s for s in segs if isinstance(s, bytes))
+    pin_s = _png_pinned("b64_small", len(small) + 64, torch.uint8)
+    pin_s[: len(small)].numpy()[:] = np.frombuffer(small, dtype=np.uint8)
+    pin_s[len(small) : len(small) + 64].numpy()[:] = np.frombuffer(_B64_ALPHABET, dtype=np.uint8)
+    small_g = pin_s.to(dev, non_blocking=True)
+    pieces, pos, n = [], 0, 0
+    for s in segs:
+        if isinstance(s, bytes):
+            pieces.append(small_g[pos : pos + len(s)])
+            pos += len(s)
+            n += len(s)
+        else:
+            pieces.append(gpu_stream[s[0] : s[1]])
+            n += s[1] - s[0]
+    table = small_g[len(small) :]
+    m = (n + 2) // 3
+    pad = 3 * m - n
+    if pad:
+        pieces.append(torch.zeros(pad, dtype=torch.uint8, device=dev))
+    t = torch.cat(pieces).view(m, 3).to(torch.int32)
+    v = (t[:, 0] << 16) | (t[:, 1] << 8) | t[:, 2]
+    idx = torch.stack((v >> 18, (v >> 12) & 63, (v >> 6) & 63, v & 63), dim=1)
+    enc = table[idx]  # (m, 4) uint8
+    pin_b = _png_pinned("b64_out", 4 * m, torch.uint8)
+    pin_b.copy_(enc.view(-1), non_blocking=True)
+    torch.cuda.current_stream(dev).synchronize()
+    arr = pin_b.numpy()
+    if pad:
+        arr[4 * m - pad :] = ord("=")
+    return arr.tobytes()
+
+
+def _png_assemble(w: int, h: int, c: int, stream, adler: int, gpu_stream=None) -> bytes:
+    """PNG file around a raw deflate ``stream``: zlib header 78 01 + Adler-32.
+
+    With ``gpu_stream`` (the same deflate bytes on the device), the PNG is
+    built on the device and its base64 encoding is returned instead.
+    """
     nbytes = len(stream)
     k = max(1, min(_PNG_IDAT_PIECES, nbytes >> 16))
     cuts = [nbytes * i // k for i in range(k + 1)]
@@ -841,16 +888,21 @@ def _png_assemble(w: int, h: int, c: int, stream, adler: int) -> bytes:
         parts.append(b"IDAT")
         if i == 0:
             parts.append(zhdr)
-        parts.append(p)
+        parts.append(p if gpu_stream is None else (cuts[i], cuts[i + 1]))
         if i == k - 1:
             parts.append(tail)
         parts.append(struct.pack(">I", crc))
     parts.append(_png_chunk(b"IEND", b""))
+    if gpu_stream is not None:
+        return _b64_gpu(parts, stream, gpu_stream)
     return b"".join(parts)
 
 
-def _encode_png_tensor(image: Any, compress_level: int = 1) -> Optional[bytes]:
-    """Encode a uint8 L/RGB/RGBA image tensor as PNG; None when not eligible."""
+def _encode_png_tensor(image: Any, compress_level: int = 1, b64: bool = False) -> Optional[bytes]:
+    """Encode a uint8 L/RGB/RGBA image tensor as PNG; None when not eligible.
+
+    With ``b64`` the base64 encoding of the PNG is returned.
+    """
     if not _fast_png_enabled() or not isinstance(image, torch.Tensor):
         return None
     # The filter step is a handful of device kernels on CUDA; on CPU tensors
@@ -873,11 +925,11 @@ def _encode_png_tensor(image: Any, compress_level: int = 1) -> Optional[bytes]:
     scan_g = _png_filter_scanlines(image)
     if _gpu_deflate_enabled() and scan_g.numel() <= _PNG_GPU_MAX_BYTES:
         try:
-            stream, adler = _png_gpu_deflate(scan_g)
+            stream, adler, stream_g = _png_gpu_deflate(scan_g)
         except RuntimeError as e:  # Huffman limit failure: use the zlib writer
             logger.warning(f"GPU PNG deflate failed ({e}); using zlib")
         else:
-            return _png_assemble(w, h, c, stream, adler)
+            return _png_assemble(w, h, c, stream, adler, stream_g if b64 else None)
     scan = scan_g.cpu().numpy()
     data = memoryview(scan.reshape(-1))
     row_bytes = 1 + w * c
@@ -935,6 +987,8 @@ def _encode_png_tensor(image: Any, compress_level: int = 1) -> Optional[bytes]:
         parts.append(payload)
         parts.append(struct.pack(">I", crc))
     parts.append(_png_chunk(b"IEND", b""))
+    if b64:
+        return base64.b64encode(b"".join(parts))
     return b"".join(parts)
 
 
@@ -1092,6 +1146,23 @@ def image_to_bytes(image: torch.Tensor, format: str = "PNG", quality: int = 95) 
     if dump_dir:
         return _dump_image_to_bytes(dump_dir, image, format, quality)
     return _image_to_bytes(image, format, quality)
+
+
+def image_to_b64(image: torch.Tensor, format: str = "PNG", quality: int = 95) -> bytes:
+    """``base64.b64encode(image_to_bytes(image, format, quality))``.
+
+    For CUDA PNG tensors the PNG is assembled and base64-encoded on the
+    device; every GPU read of ``image`` is finished when this returns.
+    """
+    if not os.environ.get("TRTLLM_VISUALGEN_DUMP_DIR") and format.upper() not in (
+        "JPEG",
+        "JPG",
+        "WEBP",
+    ):
+        data = _encode_png_tensor(image, b64=True)
+        if data is not None:
+            return data
+    return base64.b64encode(image_to_bytes(image, format, quality))
 
 
 def _image_to_bytes(image: torch.Tensor, format: str, quality: int) -> bytes:
