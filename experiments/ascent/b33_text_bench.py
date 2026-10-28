@@ -214,6 +214,113 @@ def compare(a, b):
     return out
 
 
+def _gemm_rows_k(name, shapes):
+    """(M, K) of a GEMM op's activation from profiler input shapes, else None."""
+    try:
+        if name in ("aten::mm", "aten::bmm", "aten::matmul") and len(shapes[0]) >= 2:
+            a = shapes[0]
+        elif name == "aten::addmm" and len(shapes[1]) >= 2:
+            a = shapes[1]
+        elif name == "aten::linear" and len(shapes[0]) >= 2:
+            a = shapes[0]
+        else:
+            return None
+    except (IndexError, TypeError):
+        return None
+    m = 1
+    for d in a[:-1]:
+        m *= d
+    return m, a[-1]
+
+
+def _row_of(name, shapes):
+    """Census-style text-stream row for a leaf op with GPU time."""
+    mk = _gemm_rows_k(name, shapes)
+    if mk is not None:
+        m, k = mk
+        if k == 20480:
+            return "txt_in GEMM (nvjet, K=20480)"
+        if m <= 16:
+            return "time/ref_time_in + modulation GEMVs (nvjet, M<=16)"
+        return "txt block GEMMs (nvjet BF16: qkv, attn_out, gate_up, down)"
+    low = name.lower()
+    if "attention" in low or "flash" in low or "fmha" in low or "sdpa" in low:
+        return "txt attention"
+    return "other (Triton/elementwise: norm, RoPE, adaLN, SwiGLU, copies)"
+
+
+def kprof(model, inputs, prepared, batched):
+    """CUPTI kernel trace (torch.profiler) of 3 steady requests per path, same process.
+
+    per_step = main's per-step text stream (16 x M=T); batched = this branch. Reports per
+    request: GPU ms per census row (leaf op self device time), kernel table (time, calls),
+    GPU-busy ms (union of kernel intervals) and wall ms.
+    """
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity, profile
+
+    reps = 3
+    paths = [("per_step_main", lambda: per_step_request(model, inputs, prepared))]
+    if batched:
+        paths.append(("batched_branch", lambda: batched_request(model, inputs, prepared)))
+    out = {"requests_per_path": reps, "text_len": T_A, "steps": STEPS}
+    for name, fn in paths:
+        for _ in range(3):
+            fn()
+        torch.cuda.synchronize()
+        walls = []
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+            for _ in range(reps):
+                torch.cuda.synchronize()
+                t = time.perf_counter()
+                fn()
+                torch.cuda.synchronize()
+                walls.append((time.perf_counter() - t) * 1e3)
+        rows = {}
+        for ev in prof.key_averages(group_by_input_shape=True):
+            dev = getattr(ev, "self_device_time_total", None)
+            if dev is None:
+                dev = getattr(ev, "self_cuda_time_total", 0)
+            if ev.device_type != DeviceType.CPU or dev <= 0:
+                continue
+            r = _row_of(ev.key, ev.input_shapes)
+            rows.setdefault(r, [0.0, 0])
+            rows[r][0] += dev / 1e3 / reps
+            rows[r][1] += ev.count / reps
+        kernels, intervals = {}, []
+        for ev in prof.events():
+            if ev.device_type != DeviceType.CUDA:
+                continue
+            k = kernels.setdefault(ev.name[:90], [0.0, 0])
+            k[0] += (ev.time_range.end - ev.time_range.start) / 1e3 / reps
+            k[1] += 1 / reps
+            intervals.append((ev.time_range.start, ev.time_range.end))
+        intervals.sort()
+        busy, cur = 0.0, None
+        for s, e in intervals:
+            if cur is None or s > cur[1]:
+                if cur is not None:
+                    busy += cur[1] - cur[0]
+                cur = [s, e]
+            else:
+                cur[1] = max(cur[1], e)
+        if cur is not None:
+            busy += cur[1] - cur[0]
+        top = sorted(kernels.items(), key=lambda kv: -kv[1][0])[:15]
+        res = {
+            "rows_ms_per_request": {r: {"ms": round(v[0], 4), "ops": round(v[1], 1)} for r, v in sorted(rows.items())},
+            "kernel_sum_ms_per_request": round(sum(v[0] for v in kernels.values()), 4),
+            "kernel_launches_per_request": round(sum(v[1] for v in kernels.values()), 1),
+            "gpu_busy_ms_per_request": round(busy / 1e3 / reps, 4),
+            "wall_ms_per_request": [round(w, 3) for w in walls],
+            "top_kernels": [{"name": n, "ms": round(v[0], 4), "calls": round(v[1], 1)} for n, v in top],
+        }
+        log(name, json.dumps(res, indent=1))
+        out[name] = res
+    out["passed"] = True
+    return out
+
+
 def main():
     torch.manual_seed(0)
     log("building model")
@@ -296,6 +403,10 @@ def main():
             torch.cuda.cudart().cudaProfilerStop()
             log("wall ms per request (under nsys)", json.dumps(wall))
             print(json.dumps({"passed": True, "profiled": True, "requests_per_path": reps, "wall_ms": wall}))
+            return
+
+        if MODE == "kprof":
+            print(json.dumps(kprof(model, inputs, prepared, batched)))
             return
 
         # check
