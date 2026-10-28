@@ -281,6 +281,17 @@ def _sm120_cutlass_qkv(
         out = torch.empty((rows, columns), device=activation.device, dtype=torch.bfloat16)
         planes_view = out.view(3, rows, width)
 
+        if strided.batched():
+            # Idea 82: the three planes as ONE batched (L=3) Pingpong launch on the current
+            # stream (no side-stream fork), bitwise equal to the per-plane launches.
+            strided.gemm_qkv3(
+                activation, weight, activation_scale, weight_scale, qkv_scale, out
+            )
+            return qknorm_rope(
+                planes_view[0], planes_view[1], planes_view[2], out,
+                q_norm, k_norm, cos_sin, positions, planar=True,
+            )
+
         def gemm_plane(i: int) -> None:
             strided.gemm_into(
                 activation,
@@ -1567,6 +1578,12 @@ def _sm120_qkv_planar_gemms(
     rows = activation.shape[0]
     segment_scale = weight_scale.numel() // 3
     out = torch.empty((rows, columns), device=activation.device, dtype=torch.bfloat16)
+
+    if strided.batched():
+        # Idea 82: the three planes as ONE batched (L=3) Pingpong launch on the current stream
+        # (no side-stream fork), bitwise equal to the per-plane launches below.
+        strided.gemm_qkv3(activation, weight, activation_scale, weight_scale, qkv_scale, out)
+        return out
 
     def gemm_plane(i: int) -> None:
         strided.gemm_into(
