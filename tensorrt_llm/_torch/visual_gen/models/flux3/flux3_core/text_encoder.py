@@ -15,14 +15,29 @@ from torch import Tensor
 
 from tensorrt_llm.logger import logger
 
+from . import text_rms_norm as _fused_norm
 
-@torch.library.custom_op("trtllm::flux3_text_rms_norm", mutates_args=())
-def _text_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
-    """Preserve Qwen's eager RMSNorm reduction and BF16 rounding under compile."""
+
+def _text_rms_norm_eager(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     normalized = x.float()
     variance = normalized.pow(2).mean(-1, keepdim=True)
     normalized = normalized * torch.rsqrt(variance + eps)
     return weight * normalized.to(x.dtype)
+
+
+@torch.library.custom_op("trtllm::flux3_text_rms_norm", mutates_args=())
+def _text_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    """Preserve Qwen's eager RMSNorm reduction and BF16 rounding under compile.
+
+    CUDA BF16 inputs with last dim 128/2560 take an exact 3-kernel path
+    (text_rms_norm.py, bitwise equal to the eager body); kill switch
+    TRTLLM_FLUX3_TEXT_FUSED_NORM=0.
+    """
+    if _fused_norm.enabled() and _fused_norm.supports(x, weight):
+        _fused_norm.CALLS["fused"] += 1
+        return _fused_norm.rms_norm(x, weight, eps)
+    _fused_norm.CALLS["eager"] += 1
+    return _text_rms_norm_eager(x, weight, eps)
 
 
 @_text_rms_norm.register_fake
