@@ -458,6 +458,12 @@ def _compile(device: torch.device, warps: int, use_pdl: bool, extra_defines=()):
         )
     _MODULES[key] = fn
     COMPILE_SECONDS[key] = time.perf_counter() - t0
+    from tensorrt_llm.logger import logger
+
+    logger.info(
+        f"flux3 sm120 adaln nvfp4 warp kernel built for {key} in {COMPILE_SECONDS[key]:.3f} s"
+        f" ({NUM_REGS[key]} regs)"
+    )
     return fn
 
 
