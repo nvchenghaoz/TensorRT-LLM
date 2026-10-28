@@ -457,6 +457,22 @@ def adaln_nvfp4_quant(
     With store_x_mod=False the returned x_mod is allocated but NOT written (uninitialized): only
     for callers whose consumers read the NVFP4 data alone (x_mod as shape metadata).
     """
+    return _dispatch(x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod)
+
+
+# warp (default): SM120 warp-per-row kernel (flux3_sm120_adaln_nvfp4, bitwise to the Triton
+# kernel) where it supports the call; triton: always the Triton kernel above (main's path).
+_IMPL = os.environ.get("TRTLLM_FLUX3_ADALN_NVFP4_IMPL", "warp").strip().lower()
+
+
+def _dispatch(x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod):
+    if _IMPL == "warp":
+        from . import flux3_sm120_adaln_nvfp4 as warp_impl
+
+        if warp_impl.supported(x, select, scale, shift, weight, bias):
+            return warp_impl.launch(
+                x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod=store_x_mod
+            )
     return _launch(
         x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod=store_x_mod
     )
