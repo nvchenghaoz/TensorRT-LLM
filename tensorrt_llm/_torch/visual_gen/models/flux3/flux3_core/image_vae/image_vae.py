@@ -472,7 +472,7 @@ class Flux3ImageVAE(nn.Module):
         z = self.normalize(z)
         return z
 
-    def compile_decoder(self, triton_group_norm: bool = False) -> None:
+    def compile_decoder(self, triton_group_norm: bool = False, channels_last: bool = True) -> None:
         """torch.compile the decoder in place (state_dict keys are unchanged).
 
         Inductor lowers each GroupNorm into split reductions and fuses the
@@ -481,14 +481,22 @@ class Flux3ImageVAE(nn.Module):
         compiled during pipeline warmup. Compilation is lazy (first decode).
         triton_group_norm=True keeps Flux3GroupNorm's Triton kernels in the graph.
 
-        layout_optimization is off: channels_last convs measured 126.5 ms per
-        1024^2 fp32 decode on SM120 versus 95.6 ms with NCHW (eager 169.4 ms).
+        channels_last=True stores the decoder's conv weights channels_last, so cuDNN
+        runs its NHWC kernels on NHWC activations end to end without nchwToNhwc /
+        nhwcToNchw reformats around every conv, and traces GroupNorm as per-channel
+        var_mean + exact group combine (group_norm_channel_stats), which Inductor
+        reduces coalesced on NHWC data. aten GroupNorm's (N, G, C/G*H*W) view is a
+        strided reduction on channels_last data (bf16 1024^2 decode on SM120: GN
+        reductions 5.8 -> 21.5 ms). Inductor's own layout_optimization stays off.
         """
         for m in self.decoder.modules():
             if isinstance(m, Flux3GroupNorm):
                 m.triton_under_compile = triton_group_norm
+                m.channel_stats_under_compile = channels_last
             elif isinstance(m, Flux3ImageUpsample) and not m._subpixel_ready:
                 m.refresh_subpixel()  # weights were not loaded through load_state_dict
+        if channels_last:
+            self.decoder.to(memory_format=torch.channels_last)
         dtype = next(self.decoder.parameters()).dtype
         options = {"layout_optimization": False}
         if dtype != torch.float32:
