@@ -21,6 +21,63 @@ _BlockScaledQKMode = Literal["mxfp8", "nvfp4"]
 # kernel saves (S=512: BF16 SDPA 0.053 ms vs FP8 0.161 ms with quantize), so short
 # calls run unquantized BF16 SDPA.
 _FP8_MIN_SEQ_LEN = 1024
+# head_dim 128 E4M3 calls run the FLUX.3 fmha_v2 variant (fmha_v2_flux3.py: same math,
+# bitwise equal to the stock kernel); set TRTLLM_FMHA_V2_FLUX3=0 to use the stock kernel.
+_USE_FMHA_V2_FLUX3 = os.environ.get("TRTLLM_FMHA_V2_FLUX3", "1") != "0"
+
+
+def run_fmha_v2_fp8_sm12x(
+    q_fp8: torch.Tensor,
+    k_fp8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    output: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    *,
+    scale_bmm1_d: torch.Tensor,
+    scale_bmm2_d: torch.Tensor,
+    causal: bool,
+    return_lse: bool = False,
+    lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The one entry to FlashInfer's SM120 FP8 fmha_v2 (contiguous E4M3 BSHD Q/K/V, BF16 out)."""
+    if _USE_FMHA_V2_FLUX3 and head_dim == 128:
+        from .fmha_v2_flux3 import fmha_v2_flux3_d128
+
+        return fmha_v2_flux3_d128(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            output,
+            num_heads,
+            head_dim,
+            seq_len,
+            scale_bmm1_d=scale_bmm1_d,
+            scale_bmm2_d=scale_bmm2_d,
+            causal=causal,
+            lse=lse if return_lse else None,
+        )
+    from flashinfer.prefill import fmha_v2_prefill_sm120
+
+    fmha_v2_prefill_sm120(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        output,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax=1.0,
+        scale_bmm1=1.0,
+        scale_bmm2=1.0,
+        scale_bmm1_d=scale_bmm1_d,
+        scale_bmm2_d=scale_bmm2_d,
+        causal=causal,
+        return_lse=return_lse,
+        lse=lse,
+    )
+    return output
 
 
 class FlashInferAttention(AttentionBackend):
@@ -413,9 +470,7 @@ class FlashInferAttention(AttentionBackend):
                 dtype=torch.float32,
                 device=q.device,
             )
-        from flashinfer.prefill import fmha_v2_prefill_sm120
-
-        fmha_v2_prefill_sm120(
+        run_fmha_v2_fp8_sm12x(
             q_fp8,
             k_fp8,
             v_fp8,
@@ -423,9 +478,6 @@ class FlashInferAttention(AttentionBackend):
             self.num_heads,
             self.head_dim,
             sequence_length,
-            scale_softmax=1.0,
-            scale_bmm1=1.0,
-            scale_bmm2=1.0,
             scale_bmm1_d=scale_bmm1,
             scale_bmm2_d=v_descale,
             causal=is_causal,
