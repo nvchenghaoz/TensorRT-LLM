@@ -309,7 +309,20 @@ elif args.mode == "kernels":
     conv_like = {k: (cnt[k], round(dur[k] / 1e3, 3)) for k in cnt
                  if any(s in k.lower() for s in ("conv", "xmma", "cudnn", "implicit", "gemm", "cutlass", "sm80", "sm90", "sm100", "sm120"))}
     tf32 = {k: v for k, v in conv_like.items() if "tf32" in k.lower() or "f32f32_f32f32" in k.lower()}
+    aten_gn = {k: cnt[k] for k in cnt if ("group_norm" in k or "RowwiseMoments" in k) and "triton_" not in k}
+    fr = f_after3.get("frames", {})
+    verdict = {"counters_unchanged": f_warm == f_after3}
+    if args.decode_dtype is not None:
+        # Only conv_out (3 output channels) stays fp32 -> at most one TF32 conv launch.
+        verdict["only_conv_out_tf32"] = sum(v[0] for v in tf32.values()) <= 1
+    if comp:
+        verdict["one_frame"] = fr.get("total", 0) == 1 and fr.get("ok", 0) == 1
+        verdict["no_graph_break"] = not f_after3.get("graph_break")
+    else:
+        verdict["gn_30_fused"] = gn_one.get("fused", 0) == 30 and gn_one.get("aten", 0) == 0
+        verdict["no_aten_gn_kernels"] = not aten_gn
     log(json.dumps({"compiled": comp, "decode_dtype": args.decode_dtype, "total_launches": sum(cnt.values()),
+                    "verdict": verdict, "aten_gn_kernels": aten_gn, "passed": all(verdict.values()),
                     "gpu_total_ms": sum(dur.values()) / 1e3,
                     "RowwiseMoments": match("RowwiseMoments"), "native_group_norm": match("group_norm"),
                     "nchwToNhwc": match("nchwToNhwc"),
