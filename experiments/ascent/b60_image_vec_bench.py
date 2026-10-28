@@ -142,13 +142,19 @@ def per_step_request(model, inputs, keep=False):
     return outs
 
 
-def batched_request(model, inputs, keep=False):
+def step_tensors(inputs):
     sched = scheduler()
     ts = inputs["x_image_timesteps"]
     targets = sched.sigmas[1 : len(sched.timesteps) + 1].to(
         device=ts.device, dtype=inputs["x_text_timesteps"].dtype
     )
     image_ts = sched.timesteps.to(device=ts.device, dtype=ts.dtype)
+    return image_ts, targets
+
+
+def batched_request(model, inputs, keep=False, staged=None):
+    sched = scheduler()
+    image_ts, targets = staged if staged is not None else step_tensors(inputs)
     prep = model.prepare_flow_map_image(image_ts, targets, **inputs)
     assert prep is not None, "prepare_flow_map_image fell back"
     lengths = dict(inputs["layout"])["image"]
@@ -227,6 +233,38 @@ def time_fn(fn, iters):
         torch.cuda.synchronize()
         ts.append(a.elapsed_time(b))
     return ts
+
+
+GRAPH_K = 10
+
+
+def graph_samples(fn, samples):
+    """CUDA graph of GRAPH_K back-to-back requests; each sample = one replay timed with CUDA
+    events, reported per request (ruling: K >= 10 calls per graph, no trimming)."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(GRAPH_K):
+            fn()
+    torch.cuda.synchronize()
+    for _ in range(3):
+        g.replay()
+    torch.cuda.synchronize()
+    out = []
+    for _ in range(samples):
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a.record()
+        g.replay()
+        b.record()
+        torch.cuda.synchronize()
+        out.append(a.elapsed_time(b) / GRAPH_K)
+    return out, g
 
 
 def stats(ts):
@@ -333,31 +371,61 @@ def main():
         log("warmed")
 
         if MODE == "bench":
-            fn = (lambda: batched_request(model, inputs)) if batched else (
-                lambda: per_step_request(model, inputs))
+            staged = step_tensors(inputs)
+            per_fn = lambda: per_step_request(model, inputs)  # noqa: E731
+            bat_fn = lambda: batched_request(model, inputs, staged=staged)  # noqa: E731
+            fn = bat_fn if batched else per_fn
+            # Graph mode (served engine runs the denoiser under CUDA graphs): GPU time only.
             restore(inputs, snap)
-            st = stats(time_fn(fn, ITERS))
-            log("this tree's path:", "batched" if batched else "per-step", json.dumps(st))
+            graphs = {"this": graph_samples(fn, 1)[1]}
+            if batched:
+                graphs["per_step"] = graph_samples(per_fn, 1)[1]
+            t_soak = time.time()
+            while time.time() - t_soak < 10.0:
+                for g in graphs.values():
+                    g.replay()
+                torch.cuda.synchronize()
+            log("warm-soaked 10 s")
+
+            def replay(g):
+                a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                a.record()
+                g.replay()
+                b.record()
+                torch.cuda.synchronize()
+                return a.elapsed_time(b) / GRAPH_K
+
+            st = stats([replay(graphs["this"]) for _ in range(ITERS)])
+            log("graph, this tree's path:", "batched" if batched else "per-step", json.dumps(st))
             extra = {}
             if batched:
                 ab = {"A_per_step": [], "B_batched": [], "A2_per_step": []}
+                for _ in range(ITERS):
+                    ab["A_per_step"].append(replay(graphs["per_step"]))
+                    ab["B_batched"].append(replay(graphs["this"]))
+                    ab["A2_per_step"].append(replay(graphs["per_step"]))
+                extra["graph_interleaved"] = {k: stats(v) for k, v in ab.items()}
+                log("graph interleaved A/B/A", json.dumps(extra["graph_interleaved"]))
+            # Eager (launch-bound) numbers, informational.
+            restore(inputs, snap)
+            extra["eager_this_tree"] = stats(time_fn(fn, ITERS))
+            if batched:
+                ab = {"A_per_step": [], "B_batched": [], "A2_per_step": []}
                 restore(inputs, snap)
-                for it in range(ITERS):
-                    for key, f in (("A_per_step", lambda: per_step_request(model, inputs)),
-                                   ("B_batched", lambda: batched_request(model, inputs)),
-                                   ("A2_per_step", lambda: per_step_request(model, inputs))):
-                        ab[key] += time_fn(f, 1)
-                    if it % 20 == 0:
-                        log("interleaved iter", it)
-                extra = {k: stats(v) for k, v in ab.items()}
-                log("interleaved A/B/A", json.dumps(extra))
+                for _ in range(ITERS):
+                    ab["A_per_step"] += time_fn(per_fn, 1)
+                    ab["B_batched"] += time_fn(bat_fn, 1)
+                    ab["A2_per_step"] += time_fn(per_fn, 1)
+                extra["eager_interleaved"] = {k: stats(v) for k, v in ab.items()}
+            log("eager", json.dumps(extra))
             assert unchanged(inputs, snap)
             print(json.dumps({
                 "batch": {"1": {"kernel_ms": st["median_ms"], "noise_floor": st["noise"]}},
                 "output": {"class": "reordered" if batched else "exact"},
                 "path": "batched" if batched else "per_step",
+                "timing": f"CUDA graph of {GRAPH_K} requests, per request, median of {ITERS}",
                 "steps": STEPS, "image_tokens": N_IMG,
-                "interleaved": extra,
+                **extra,
             }))
             return
 
