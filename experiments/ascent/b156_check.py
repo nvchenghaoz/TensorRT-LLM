@@ -50,7 +50,7 @@ class main_path:
     """Context: disable the transpose path (main's Upsample/decoder code)."""
 
     def __enter__(self):
-        self.orig = iv.Flux3ImageUpsample.transpose_path
+        self.orig = iv.Flux3ImageUpsample.__dict__["transpose_path"]  # the staticmethod object
         iv.Flux3ImageUpsample.transpose_path = staticmethod(lambda x: False)
 
     def __exit__(self, *a):
