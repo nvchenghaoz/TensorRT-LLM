@@ -4,8 +4,11 @@ Module = attn_nvfp4_out_module's: (*load_trim_levers(ROUTED_LEVERS), "nvfp4_out"
 guard sends it to the 4-warp kernel; on the branch it runs G3 with the NVFP4 epilogue.
 
 Labels (2048^2, T=512 text):
-  t2i-2048 / i2i-2048  CUDA graph of the step's 32 nvfp4_out calls: 4 x S_img (image mode blocks)
-                       + 28 x S_full (single blocks); t2i 16384 / 16896, i2i 32768 / 33280.
+  t2i-2048 / i2i-2048  CUDA graph of the step's FP8 attention calls (knowledge 316 call map):
+                       n_bf16 G3 BF16-out calls at 16384 (unforked; the same kernel in both
+                       trees), 4 nvfp4_out at 16384 (image mode blocks 1-4) and 28 nvfp4_out at
+                       S_full (single blocks): t2i 1 + 4 @16384 + 28 @16896; i2i 6 + 4 @16384 +
+                       28 @33280.
   fork-t2i / fork-i2i  served-order fork pair at S_full, 4 pairs per graph replay, reported per
                        pair: fork event, FMHA (current stream), then the side-stream CUTLASS
                        SwiGLU gate_up (M=S_full, N=18432, K=3072, NVFP4) waiting on the event,
@@ -31,7 +34,11 @@ import b186_nfo as b  # noqa: E402
 
 log = b.log
 
-CHAINS = {"t2i-2048": (16384, 16896), "i2i-2048": (32768, 33280), "s4176-1024": (4096, 4176)}
+# label -> (G3 BF16-out calls at S_img (unchanged by the branch), S_img, S_full); per step every
+# label also runs 4 nfo calls at S_img + 28 nfo calls at S_full (knowledge 316 call map:
+# t2i 5 x 16384 + 28 x 16896, i2i 10 x 16384 + 28 x 33280).
+CHAINS = {"t2i-2048": (1, 16384, 16896), "i2i-2048": (6, 16384, 33280),
+          "s4176-1024": (1, 4096, 4176)}
 FORKS = {"fork-t2i": 16896, "fork-i2i": 33280}
 HIDDEN, MLP2 = 3072, 2 * 9216
 
@@ -99,21 +106,31 @@ def main():
     lev = (*lib.load_trim_levers(tuple(lib.ROUTED_LEVERS), sample["k"], sample["v"]), "nvfp4_out")
     t0 = time.time()
     mod = lib.get_flux3_d128_module(tuple(lev))
+    bmod = lib.get_flux3_d128_module(tuple(lev[:-1]))  # the served G3 BF16-out module
     log(f"[build] {lev} {time.time() - t0:.1f}s")
     gscale = torch.tensor([448.0 * 6.0 / 8.0], dtype=torch.float32, device="cuda")
     out = {"batch": {}, "single_call_ms": {}, "census": {}, "levers": list(lev)}
     gen = torch.Generator(device="cuda").manual_seed(1234)
     for lab in labels:
         if lab in CHAINS:
-            s_img, s_full = CHAINS[lab]
+            n_bf16, s_img, s_full = CHAINS[lab]
             inps = {S: b.make_qkv(S, 900 + S, False) for S in (s_img, s_full)}
             outs = {S: b.NfoOut(S, post=4096) for S in (s_img, s_full)}
             call = {S: (lambda S=S: b.call_nfo(lib, mod, inps[S], outs[S], gscale)) for S in inps}
+            obf = torch.empty((1, s_img, b.H, b.D), device="cuda", dtype=torch.bfloat16)
+
+            def bf16_call(S=s_img, o=obf):
+                b.call_bf16(lib, bmod, inps[S], o)
+
+            bf16_call()
+            out["census"][f"bf16_S{s_img}"] = b.names(bf16_call)
             for S in inps:
                 call[S]()
                 out["census"][f"S{S}"] = b.names(call[S])
 
-            def body(c=call, si=s_img, sf=s_full):
+            def body(c=call, si=s_img, sf=s_full, nb=n_bf16):
+                for _ in range(nb):
+                    bf16_call()
                 for _ in range(4):
                     c[si]()
                 for _ in range(28):
@@ -133,8 +150,9 @@ def main():
                     log(f"[{lab}] round {r} single S{S} {m1:.4f} ms noise {n1:.4f}")
             m, nf = stats(allts)
             out["batch"][lab] = {"kernel_ms": round(m, 4), "noise_floor": round(nf, 4),
-                                 "calls": 32, "S_img": s_img, "S_full": s_full}
-            del inps, outs, call
+                                 "bf16_calls": n_bf16, "nfo_calls": 32, "S_img": s_img,
+                                 "S_full": s_full}
+            del inps, outs, call, obf
         else:
             from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_swiglu_fp4_cutlass as swc
 
