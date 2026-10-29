@@ -72,6 +72,9 @@ typedef long long i64;
 #ifndef PW_X2
 #define PW_X2 1
 #endif
+#ifndef X_POLICY
+#define X_POLICY 0
+#endif
 // LN_ID=1: the LayerNorm affine is the identity (weight == 1.0 bf16, bias == +0.0 bf16,
 // verified on the host by register_identity_affine). fmul(n, 1.0f) == n for every n
 // (--ftz=false), so only the +0.0f add stays (it still maps -0 to +0): bitwise to LN_ID=0.
@@ -233,8 +236,22 @@ flux3_adaln_nvfp4_warp(const uint4 *__restrict__ x, const u8 *__restrict__ sel,
   }
   const uint4 *xr = x + (i64)row * (DIM / 8);
   uint4 v[12];
+#if X_POLICY
+  // L2 evict_last (fraction 1.0 for X_POLICY 1, 0.5 for 2) on the x row: the block-end gated
+  // residual re-reads x after the GEMMs, so keeping part of it L2-resident speeds that up.
+  // Cache hints change no value.
+  unsigned long long pol;
+  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, %1;"
+               : "=l"(pol) : "f"(X_POLICY == 1 ? 1.0f : 0.5f));
+#pragma unroll
+  for (int i = 0; i < 12; ++i)
+    asm volatile("ld.global.L1::evict_last.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=r"(v[i].x), "=r"(v[i].y), "=r"(v[i].z), "=r"(v[i].w)
+                 : "l"(xr + i * 32 + lane), "l"(pol));
+#else
 #pragma unroll
   for (int i = 0; i < 12; ++i) v[i] = xr[i * 32 + lane];
+#endif
 
   // ---- Inductor's looped Welford per slot (chunks c = 0, 1, 2), then the in-thread combine
   // of the 4 slots of each virtual thread k = 2 g + l0 (slot j = column 4 l0 + j of v[.]) ----
@@ -426,6 +443,13 @@ flux3_adaln_nvfp4_warp(const uint4 *__restrict__ x, const u8 *__restrict__ sel,
 # register allocation, never the instruction math, so every config is bitwise to every other.
 _DEFAULT_WARPS = 1
 _DEFAULT_DEFINES = ("MINB=12",)
+# L2 policy of the 12 x loads (TRTLLM_FLUX3_ADALN_WARP_X_POLICY): 0 = plain loads (the previous
+# build, same module key and cubin), 1 = evict_last fraction 1.0, 2 = evict_last fraction 0.5
+# (default). Exact: a cache hint changes no value. Fraction 0.5 keeps x L2-resident for the
+# block-end gated residual while giving the GEMMs back less L2 than fraction 1.0 (fact 1713).
+_X_POLICY = int(os.environ.get("TRTLLM_FLUX3_ADALN_WARP_X_POLICY", "2").strip() or "0")
+if _X_POLICY not in (0, 1, 2):
+    raise ValueError(f"TRTLLM_FLUX3_ADALN_WARP_X_POLICY must be 0, 1 or 2, got {_X_POLICY}")
 _MODULES = {}
 COMPILE_SECONDS = {}
 NUM_REGS = {}
@@ -576,10 +600,13 @@ def launch(
     outs=None,
     warps=_DEFAULT_WARPS,
     use_pdl=False,
-    extra_defines=_DEFAULT_DEFINES,
+    extra_defines=None,
 ):
     """Same contract as flux3_adaln_quant._launch: returns (x_mod, fp4 [M, D/2] u8, sf 128x4)."""
     from cuda.bindings import driver
+
+    if extra_defines is None:
+        extra_defines = _DEFAULT_DEFINES + ((f"X_POLICY={_X_POLICY}",) if _X_POLICY else ())
 
     d = x.shape[-1]
     m = x.numel() // d
