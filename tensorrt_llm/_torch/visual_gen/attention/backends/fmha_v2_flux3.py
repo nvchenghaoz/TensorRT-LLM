@@ -140,13 +140,22 @@ def gen_flux3_d128_spec(levers: Sequence[str] = DEFAULT_LEVERS, min_blocks: int 
             raise RuntimeError("could not set kv_loop_step=128 in the generated kernel")
         for mask in ("causal_mask", "sliding_or_chunked_causal_mask", "custom_mask"):
             text = text.replace(f"#if 1 // {mask}\n", f"#if 0 // {mask}\n")
+    launcher_name = f"run_{kernel}_nl_tiled"
+    if "g3" in levers:
+        marker = "\n#endif // tiled\n"
+        pos = text.rfind(marker)
+        if pos < 0:
+            raise RuntimeError("could not place the g3 kernel in the generated kernel file")
+        snippet = _G3_SNIPPET.format(kname=f"{kernel}_kernel_nl_tiled", launcher=f"run_{kernel}")
+        text = text[:pos] + "\n" + snippet + text[pos:]
+        launcher_name = f"run_{kernel}_g3_nl_tiled"
     kernel_path = gen_dir / "generated" / f"{kernel}.cu"
     write_if_different(kernel_path, text)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[12])
     nvcc_flags.append(f"-I{fmha_v2_src_dir}")
     nvcc_flags.append("-Wno-deprecated-gpu-targets")
-    nvcc_flags.append(f"-DFMHA_FLUX3_D128_LAUNCHER=run_{kernel}_nl_tiled")
+    nvcc_flags.append(f"-DFMHA_FLUX3_D128_LAUNCHER={launcher_name}")
     for name in sorted(set(levers)):
         if _LEVER_FLAGS[name][1]:
             nvcc_flags.append(_LEVER_FLAGS[name][1])
@@ -262,3 +271,53 @@ import os as _os_st  # noqa: E402
 
 if _os_st.environ.get("TRTLLM_FMHA_V2_FLUX3_ST", "1") != "0":
     ROUTED_LEVERS = (*ROUTED_LEVERS, "softmax_trim")
+
+# g3 (FMHA_FLUX3_G3, fused_multihead_flash_attention_kernel_flux3_g3.h, padding mask only; bitwise
+# vs the same lever set without g3): 1 CTA/SM, 384 threads = 3 groups x the unchanged 4-warp 64-row
+# tile (192 Q rows per CTA) over one TMA/mbarrier K/V ring. Unsupported calls (causal, LSE, GQA,
+# ...) fall back to the 4-warp launcher of the same module. TRTLLM_FMHA_V2_FLUX3_G3=0 drops it.
+_LEVER_FLAGS["g3"] = ("g3", "-DFMHA_FLUX3_G3=1")
+
+_G3_SNIPPET = r"""
+// ---- FLUX.3 G3 shared-K/V variant (lever g3) ----
+#include <fused_multihead_flash_attention_kernel_flux3_g3.h>
+
+extern "C"
+__global__ __launch_bounds__(384, 1)
+void {kname}_g3(const __grid_constant__ bert::Fused_multihead_attention_params_v2 params,
+                const __grid_constant__ CUtensorMap tm_k,
+                const __grid_constant__ CUtensorMap tm_v){{
+  fused_multihead_attention::device_flash_attention_nl_tiled_flux3_g3<Kernel_traits_nl_tiled>(
+      params, &tm_k, &tm_v);
+}}
+
+void {launcher}_g3_nl_tiled(
+    const bert::Fused_multihead_attention_params_v2 &params,
+    const Launch_params &launch_params,
+    cudaStream_t stream){{
+  namespace g3 = fused_multihead_attention::flux3_g3;
+  if( !g3::supported(params, launch_params) ) {{
+    {launcher}_nl_tiled(params, launch_params, stream);
+    return;
+  }}
+  CUtensorMap tm_k, tm_v;
+  g3::make_map(&tm_k, params.k_ptr, (int)params.b, (int)params.s, (int)params.h_kv, 128,
+               (int64_t)params.k_stride_in_bytes, 64, CU_TENSOR_MAP_SWIZZLE_64B);
+  g3::make_map(&tm_v, params.v_ptr, (int)params.b, (int)params.s, (int)params.h_kv, 128,
+               (int64_t)params.v_stride_in_bytes, 128, CU_TENSOR_MAP_SWIZZLE_128B);
+  constexpr int smem_size = g3::Layout<Kernel_traits_nl_tiled>::SMEM_BYTES;
+  static bool attr_set = false;
+  if( !attr_set ) {{
+    FMHA_CHECK_CUDA(cudaFuncSetAttribute({kname}_g3,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         smem_size));
+    attr_set = true;
+  }}
+  int q_tiles = ((int)params.s + 63) / 64;
+  dim3 grid((q_tiles + g3::GROUPS - 1) / g3::GROUPS, params.h, params.b);
+  {kname}_g3<<<grid, g3::THREADS, smem_size, stream>>>(params, tm_k, tm_v);
+}}
+"""
+
+if _os_st.environ.get("TRTLLM_FMHA_V2_FLUX3_G3", "1") != "0":
+    ROUTED_LEVERS = (*ROUTED_LEVERS, "g3")
