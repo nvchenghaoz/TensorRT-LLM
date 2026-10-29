@@ -439,9 +439,23 @@ def mode_ab(args):
     print(json.dumps(res))
 
 
+def mode_ncu(args):
+    """Launch order for profile_kernels: A S4176, B S4176, A S4096, B S4096 (one call each)."""
+    inp = {S: make_inp(S, 1 + S) for S in (4176, 4096)}
+    lib, lev_a, lev_b, ma, mb = modules(inp[4176])
+    outs = {S: torch.empty((1, S, H, D), device="cuda", dtype=torch.bfloat16) for S in inp}
+    torch.cuda.synchronize()
+    for S in (4176, 4096):
+        for mod in (ma, mb):
+            call_lib(lib, mod, inp[S], outs[S])
+    torch.cuda.synchronize()
+    print(json.dumps({"order": ["A_4176", "B_4176", "A_4096", "B_4096"],
+                      "levers_A": list(lev_a), "levers_B": list(lev_b)}))
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", required=True, choices=["pair", "check", "ab"])
+    p.add_argument("--mode", required=True, choices=["pair", "check", "ab", "ncu"])
     p.add_argument("--soak-s", type=float, default=10.0)
     p.add_argument("--blocks", type=int, default=16)
     p.add_argument("--block", type=int, default=25)
@@ -457,7 +471,7 @@ def main():
     except Exception as exc:  # noqa: BLE001
         log(f"[ancestry] git unavailable: {exc}")
     log(f"device {torch.cuda.get_device_name()} mode {args.mode}")
-    {"pair": mode_pair, "check": mode_check, "ab": mode_ab}[args.mode](args)
+    {"pair": mode_pair, "check": mode_check, "ab": mode_ab, "ncu": mode_ncu}[args.mode](args)
 
 
 if __name__ == "__main__":
