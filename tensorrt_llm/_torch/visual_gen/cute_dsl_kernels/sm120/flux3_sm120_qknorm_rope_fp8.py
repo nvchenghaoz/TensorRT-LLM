@@ -843,18 +843,19 @@ def _qknorm_rope_fp8_vec_kernel(
             _cp_async_commit()
     factor = cutlass.Float32(0.0)
     if cutlass.const_expr(mode == 2):
-        loaded = []
+        # Plane by plane: load this plane's <= 3 partials, fold them in the same order, reduce the
+        # warp, then the next plane (keeps only 3 loaded values live; max is order-free anyway).
         for p in cutlass.range_constexpr(3):
+            loaded = []
             for i in cutlass.range_constexpr(3):
                 pidx = tidx + i * 384
                 x = cutlass.Float32(_AMAX_INIT)
                 if pidx < n_part:
                     x = (parts + p * n_part + pidx).load()
                 loaded.append(x)
-        for p in cutlass.range_constexpr(3):
             part_amax = cutlass.Float32(_AMAX_INIT)
             for i in cutlass.range_constexpr(3):
-                part_amax = _max_f32(part_amax, loaded[p * 3 + i])
+                part_amax = _max_f32(part_amax, loaded[i])
             for delta in (16, 8, 4, 2, 1):
                 part_amax = _max_f32(
                     part_amax,
@@ -868,24 +869,27 @@ def _qknorm_rope_fp8_vec_kernel(
             plane_amax = _max_f32(plane_amax, red[plane * 12 + w])
         _, factor = _scale_factor(plane_amax, min_scale)
         if cta == 0:
-            if tidx == 0:
-                out_scales = cute.make_tensor(scales, cute.make_layout(8))
-                descales = []
-                factors = []
-                for p in cutlass.range_constexpr(3):
+            # scales[0..7] written by 5 threads (same expressions as one thread would use):
+            # thread p < 3 -> scales[p], scales[4 + p]; thread 3 -> scales[3]; thread 4 -> [7].
+            out_scales = cute.make_tensor(scales, cute.make_layout(8))
+            for p in cutlass.range_constexpr(3):
+                if tidx == p:
                     amax_p = cutlass.Float32(_AMAX_INIT)
                     for w in cutlass.range_constexpr(12):
                         amax_p = _max_f32(amax_p, red[p * 12 + w])
                     s_p, f_p = _scale_factor(amax_p, min_scale)
+                    out_scales[p] = s_p
+                    out_scales[4 + p] = f_p
+            if tidx == 3:
+                descales = []
+                for p in cutlass.range_constexpr(2):
+                    amax_p = cutlass.Float32(_AMAX_INIT)
+                    for w in cutlass.range_constexpr(12):
+                        amax_p = _max_f32(amax_p, red[p * 12 + w])
+                    s_p, _ = _scale_factor(amax_p, min_scale)
                     descales.append(s_p)
-                    factors.append(f_p)
-                out_scales[0] = descales[0]
-                out_scales[1] = descales[1]
-                out_scales[2] = descales[2]
                 out_scales[3] = _mul_rn(_mul_rn(descales[0], descales[1]), sm_scale)
-                out_scales[4] = factors[0]
-                out_scales[5] = factors[1]
-                out_scales[6] = factors[2]
+            if tidx == 4:
                 out_scales[7] = cutlass.Float32(0.0)
     amax = cutlass.Float32(_AMAX_INIT)
     if warp < 8:
