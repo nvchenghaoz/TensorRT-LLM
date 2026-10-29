@@ -246,9 +246,10 @@ def graph_table() -> list:
 
 
 def _out_like(xq: Tensor, cout: int) -> Tensor:
+    # allocate channels_last directly (empty(...).contiguous(CL) would copy the whole output)
     n, _, h, w = xq.shape
-    return torch.empty((n, cout, h, w), dtype=torch.bfloat16, device=xq.device).contiguous(
-        memory_format=_CL
+    return torch.empty(
+        (n, cout, h, w), dtype=torch.bfloat16, device=xq.device, memory_format=_CL
     )
 
 
@@ -295,8 +296,8 @@ def fp8_conv3x3(
 def _(xq, s_x, wq, s_w, bias=None, residual=None):
     n, _, h, w = xq.shape
     return torch.empty(
-        (n, wq.shape[0], h, w), dtype=torch.bfloat16, device=xq.device
-    ).contiguous(memory_format=_CL)
+        (n, wq.shape[0], h, w), dtype=torch.bfloat16, device=xq.device, memory_format=_CL
+    )
 
 
 # --------------------------------------------------------------------------- weight prep

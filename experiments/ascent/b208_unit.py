@@ -151,6 +151,11 @@ for name, cin, cout, hw, epis in SHAPES:
         del scratch
         # timing, fixed plan, vs aten bf16 conv (main's op: conv with bias; +res add for sbr)
         restore()
+        kout = torch.empty_like(out0)
+        kvp = gr.variant_pack(xq, s_x, wq, s_w, b, r, kout)
+        t_kern = time_fn(lambda: gr.run(kvp))  # fixed plan, no op dispatch / allocation
+        del kvp, kout
+        restore()
         t_fp8 = time_fn(call)
         if r is not None:
             t_aten = time_fn(lambda: F.conv2d(h_bf, w, b, padding=1).add_(r))
@@ -185,7 +190,8 @@ for name, cin, cout, hw, epis in SHAPES:
         layout_ok = outs[0].is_contiguous(memory_format=CL) and outs[0].dtype == torch.bfloat16
         ok = tol_ok and rep_ok and inputs_ok and layout_ok
         all_ok &= ok
-        row = {"shape": name, "epi": epi, **gr.describe(), "fp8_ms": t_fp8, "aten_bf16_ms": t_aten,
+        row = {"shape": name, "epi": epi, **gr.describe(), "fp8_ms": t_fp8, "fp8_kernel_ms": t_kern,
+               "aten_bf16_ms": t_aten,
                "speedup": t_aten["med"] / t_fp8["med"], "max_abs_err_vs_fp32": float(err.amax()),
                "max_err_over_tol": worst, "max_abs_err_vs_fp64": err64, "max_abs_ref": float(mx),
                "tol_ok": tol_ok, "repeat_bitwise": rep_ok, "inputs_unchanged": inputs_ok,
@@ -193,7 +199,8 @@ for name, cin, cout, hw, epis in SHAPES:
                "plan_times_ms": {k: round(v, 4) for k, v in plan_times.items()}}
         emit(row)
         table.append({k: row[k] for k in ("shape", "epi", "plan", "plan_name", "build_s", "speedup", "ok")}
-                     | {"fp8_med": round(t_fp8["med"], 4), "aten_med": round(t_aten["med"], 4)})
+                     | {"fp8_med": round(t_fp8["med"], 4), "fp8_kernel_med": round(t_kern["med"], 4),
+                        "aten_med": round(t_aten["med"], 4)})
         del outs, out0, ref32, ref64, o, err, tol, mag
     del conv32, conv64
     torch.cuda.empty_cache()
