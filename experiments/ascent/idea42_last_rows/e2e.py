@@ -44,6 +44,8 @@ EDITS = {
 }
 SEQ = [("t2i", "A"), ("i2i", "A"), ("t2i", "B"), ("i2i", "B"),
        ("t2i", "A"), ("i2i", "A"), ("t2i", "A"), ("i2i", "A")]
+if os.environ.get("E2E_SEQ") == "short":
+    SEQ = [("t2i", "A"), ("i2i", "A")]  # census under nsys: one request per case
 SEEDS = {"A": 42, "B": 7}
 
 
