@@ -50,8 +50,8 @@ class main_path:
     """Context: disable the transpose path (main's Upsample/decoder code)."""
 
     def __enter__(self):
-        self.orig = iv.Flux3ImageUpsample.__dict__["transpose_path"]  # the staticmethod object
-        iv.Flux3ImageUpsample.transpose_path = staticmethod(lambda x: False)
+        self.orig = iv.Flux3ImageUpsample.__dict__["transpose_path"]
+        iv.Flux3ImageUpsample.transpose_path = lambda self, x: False
 
     def __exit__(self, *a):
         iv.Flux3ImageUpsample.transpose_path = self.orig
@@ -128,9 +128,10 @@ def unit():
         r64 = blk64(x_nb.double() + b_up.double().view(1, -1, 1, 1))
         ef, em = (yf.double() - r64).abs(), (ym.double() - r64).abs()
         up_bf16 = copy.deepcopy(vae.decoder.up[lvl + 1].upsample).to(torch.bfloat16)
-        decoder_folds_here = bool(up_bf16.fold_bias_into_shortcut)
-        up_bf16.fold_bias_into_shortcut = True  # helper math is checked at both levels
-        rec = {"case": f"fold_up{lvl}.block0_{C}@{H}", "decoder_folds_here": decoder_folds_here,
+        # helper math is checked at both levels; the decoder folds only where its
+        # upsample takes the transpose path
+        rec = {"case": f"fold_up{lvl}.block0_{C}@{H}",
+               "decoder_folds_here": bool(vae.decoder.up[lvl + 1].upsample.use_transpose),
                "can_fold": iv._can_fold_input_bias(blk, up_bf16, x_nb),
                "fold_vs_fp64_max": ef.max().item(), "main_vs_fp64_max": em.max().item(),
                "fold_vs_fp64_mean": ef.mean().item(), "main_vs_fp64_mean": em.mean().item(),

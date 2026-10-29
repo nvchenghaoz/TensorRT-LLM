@@ -276,9 +276,11 @@ class Flux3ImageUpsample(nn.Module):
     at load (state_dict keys are unchanged) and follow .to(dtype/device).
     """
 
-    # transpose path: the decoder may pass the bias-free output to the next block and fold
-    # this conv's bias into that block's 1x1 nin_shortcut (_resnet_block_with_input_bias).
-    fold_bias_into_shortcut = True
+    # Per instance: False keeps the sub-pixel conv + interleave on every input (see
+    # transpose_path). On the transpose path the decoder may pass the bias-free output
+    # to the next block and fold this conv's bias into its 1x1 nin_shortcut
+    # (_resnet_block_with_input_bias).
+    use_transpose = True
 
     def __init__(self, in_channels: int):
         super().__init__()
@@ -306,13 +308,13 @@ class Flux3ImageUpsample(nn.Module):
         self.transpose_weight = _subpixel_transpose_weight(w4).to(self.transpose_weight.device)
         self._subpixel_ready = True
 
-    @staticmethod
-    def transpose_path(x: Tensor) -> bool:
+    def transpose_path(self, x: Tensor) -> bool:
         """Low-precision channels_last input (the compiled bf16 decode): one stride-2 4x4
         conv_transpose2d (cuDNN dgrad writes the interleaved NHWC output directly).
         fp32 and NCHW inputs keep the sub-pixel conv + interleave below."""
         return (
-            x.dim() == 4
+            self.use_transpose
+            and x.dim() == 4
             and x.dtype in (torch.bfloat16, torch.float16)
             and x.is_contiguous(memory_format=torch.channels_last)
         )
@@ -432,8 +434,7 @@ def _can_fold_input_bias(block: nn.Module, upsample: Flux3ImageUpsample, x: Tens
         return False
     b_up = upsample.conv.bias
     return (
-        upsample.fold_bias_into_shortcut
-        and nin.kernel_size == (1, 1)
+        nin.kernel_size == (1, 1)
         and nin.stride == (1, 1)
         and nin.padding == (0, 0)
         and nin.groups == 1
@@ -455,8 +456,9 @@ def _resnet_block_with_input_bias(block: Flux3ImageResnetBlock, x_nb: Tensor, b_
 
     Accuracy caveat: the shortcut conv output is rounded (by cuDNN) BEFORE bias' is
     added. Where W_nin @ b_in largely cancels nin(x_nb), that rounding acts on a much
-    larger value than in nin(x_nb + b_in), so the fold is applied only where it was
-    measured to be accurate (Flux3ImageUpsample.fold_bias_into_shortcut)."""
+    larger value than in nin(x_nb + b_in). On the FLUX.3 VAE (bf16 trunk vs the fp32
+    decode) the fold into up[1].block[0] kept main's accuracy; the fold into
+    up[0].block[0] cost ~0.3 dB PSNR, so that upsample keeps the sub-pixel path."""
     x = x_nb + b_in.view(1, -1, 1, 1)
     h = block.norm1.forward_silu(x)
     h = block.conv1(h)
@@ -518,11 +520,12 @@ class Flux3ImageDecoder(nn.Module):
             up.attn = attn
             if i_level != 0:
                 up.upsample = Flux3ImageUpsample(block_in)
-                # The upsample into the full-resolution level keeps its bias on x (no
-                # fold into up[0].block[0].nin_shortcut): on the FLUX.3 VAE, folding
-                # there cost ~0.3 dB PSNR vs the fp32 decode (bf16 trunk), folding into
-                # up[1].block[0] did not (see _resnet_block_with_input_bias).
-                up.upsample.fold_bias_into_shortcut = i_level != 1
+                # The upsample into the full-resolution level keeps the sub-pixel path:
+                # its output feeds up[0].block[0].nin_shortcut, and there the bias fold
+                # cost ~0.3 dB PSNR vs the fp32 decode (bf16 trunk), while without the
+                # fold Inductor materializes x + bias in a separate 0.7 ms pass, which
+                # cancels the saved interleave.
+                up.upsample.use_transpose = i_level != 1
             self.up.insert(0, up)
 
         self.norm_out = Flux3GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
