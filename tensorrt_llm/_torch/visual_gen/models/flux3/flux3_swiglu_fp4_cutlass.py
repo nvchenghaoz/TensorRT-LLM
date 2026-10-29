@@ -50,15 +50,34 @@ def tile_sched() -> str:
 
 
 @functools.cache
-def get_module_static():
-    """StaticPersistentScheduler build (main's module, same name)."""
-    return gen_spec().build_and_load()
+def epi_vec() -> bool:
+    """TRTLLM_FLUX3_SM120_SWIGLU_EPI_VEC: 1 (default) = 16-B FP4 / u16 SF epilogue stores
+    (FLUX3_EPI_VEC=1, separate JIT module names, bitwise equal); 0 = main's modules byte for byte."""
+    value = os.environ.get("TRTLLM_FLUX3_SM120_SWIGLU_EPI_VEC", "1").strip()
+    if value not in ("0", "1"):
+        raise ValueError(f"TRTLLM_FLUX3_SM120_SWIGLU_EPI_VEC must be 0 or 1, got {value!r}")
+    return value == "1"
 
 
 @functools.cache
-def get_module_dynamic():
+def _build(suffix: str, flags: tuple[str, ...]):
+    return gen_spec(suffix, flags).build_and_load()
+
+
+def get_module_static(vec: bool | None = None):
+    """StaticPersistentScheduler build (main's module, same name, when vec is off)."""
+    if vec is None:
+        vec = epi_vec()
+    return _build("_ev", ("-DFLUX3_EPI_VEC=1",)) if vec else _build("", ())
+
+
+def get_module_dynamic(vec: bool | None = None):
     """CLC dynamic persistent scheduler build (cutlass::gemm::PersistentScheduler on Sm120)."""
-    return gen_spec("_dyn", ("-DFLUX3_TILESCHED=1",)).build_and_load()
+    if vec is None:
+        vec = epi_vec()
+    if vec:
+        return _build("_dyn_ev", ("-DFLUX3_TILESCHED=1", "-DFLUX3_EPI_VEC=1"))
+    return _build("_dyn", ("-DFLUX3_TILESCHED=1",))
 
 
 def get_module():
