@@ -404,9 +404,13 @@ flux3_adaln_nvfp4_warp(const uint4 *__restrict__ x, const u8 *__restrict__ sel,
 }
 """
 
-# 4 warps (rows) per CTA, registers capped at 128 (4 CTAs/SM): 12.7 us vs 13.5 us uncapped
-# (246 regs) at M=4176, L2-hot (job 1520); caps below 128 spill (>26 us).
-_DEFAULT_DEFINES = ("MINB=4",)
+# Launch bounds: 1 warp (row) per CTA, MINB=12 -> 167 registers, 0 B local (12 warps/SM). The
+# previous default (4 warps, MINB=4: 128 regs + a 24 B spill frame, 16 warps/SM) ran 15.1-15.2
+# us/call vs 12.4-12.6 here at M=4176 select with a gated-residual stand-in writing x before each
+# call (branch 183 jobs 2038/2044, bitwise at every tested M/form/gs). Launch bounds change only
+# register allocation, never the instruction math, so every config is bitwise to every other.
+_DEFAULT_WARPS = 1
+_DEFAULT_DEFINES = ("MINB=12",)
 _MODULES = {}
 COMPILE_SECONDS = {}
 NUM_REGS = {}
@@ -522,7 +526,7 @@ def launch(
     eps,
     store_x_mod=True,
     outs=None,
-    warps=4,
+    warps=_DEFAULT_WARPS,
     use_pdl=False,
     extra_defines=_DEFAULT_DEFINES,
 ):
