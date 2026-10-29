@@ -55,6 +55,10 @@ def head_info():
         "grep_defines": sh(f"grep -n '_DEFAULT_DEFINES = (\"MINB=12\",)' {REL}"),
         "grep_warps": sh(f"grep -n '_DEFAULT_WARPS = 1' {REL}"),
         "x_policy_attr": getattr(wk, "_X_POLICY", None),
+        "ln_id_attr": getattr(wk, "_LN_ID", None),
+        "anc_8b147623": sh("git merge-base --is-ancestor 8b147623 HEAD; echo rc=$?"),
+        "diff_stat_8b147623": sh("git diff --stat 8b147623..HEAD"),
+        "diff_8b147623_non_experiments": sh("git diff 8b147623..HEAD -- . ':(exclude)experiments'"),
     }
     for k, val in info.items():
         print("INFO", k, val, flush=True)
@@ -70,6 +74,12 @@ def heavy(*shape):
 
 W = (1.0 + 0.3 * torch.randn(D, device=dev, generator=g)).to(torch.bfloat16)
 B = (0.2 * torch.randn(D, device=dev, generator=g)).to(torch.bfloat16)
+# identity affine (the served pre_norm): registered -> launch() adds LN_ID=1 (landing 84)
+W1 = torch.ones(D, device=dev, dtype=torch.bfloat16)
+B0 = torch.zeros(D, device=dev, dtype=torch.bfloat16)
+if hasattr(wk, "register_identity_affine"):
+    wk.register_identity_affine(W1, B0)
+AFF = {"ln0": (W, B), "ln1": (W1, B0)}
 
 
 def make_cases():
@@ -111,9 +121,10 @@ def defs_for(xp):
     return tuple(wk._DEFAULT_DEFINES) + ((f"X_POLICY={xp}",) if xp else ())
 
 
-def call(args, gs_t, store, xp, outs=None):
+def call(args, gs_t, store, xp, outs=None, aff="ln0"):
     x, sel, sc, sh_ = args
-    return wk.launch(x, sel, sc, sh_, W, B, gs_t, EPS, store_x_mod=store,
+    w, b = AFF[aff]
+    return wk.launch(x, sel, sc, sh_, w, b, gs_t, EPS, store_x_mod=store,
                      outs=outs if outs is not None else poisoned(x), extra_defines=defs_for(xp))
 
 
@@ -157,11 +168,12 @@ def nvrtc_build(src, defines, warps=1):
     }, cubin
 
 
-def module_attrs(xp):
+def module_attrs(xp, ln_id=False):
     from cuda.bindings import driver
 
-    key = (0, wk._DEFAULT_WARPS, False, defs_for(xp))
-    wk._compile(torch.device("cuda", 0), wk._DEFAULT_WARPS, False, defs_for(xp))
+    defs = defs_for(xp) + (("LN_ID=1",) if ln_id else ())
+    key = (0, wk._DEFAULT_WARPS, False, defs)
+    wk._compile(torch.device("cuda", 0), wk._DEFAULT_WARPS, False, defs)
     fn = wk._MODULES[key]
     attr = driver.CUfunction_attribute
     return {
@@ -174,7 +186,7 @@ def module_attrs(xp):
 
 
 def main_src():
-    for rev in ("69eac46e", "HEAD~1", "HEAD~2"):
+    for rev in ("8b147623",):
         txt = sh(f"git show {rev}:{REL}")
         if "_SRC = r\"\"\"" in txt and "X_POLICY" not in txt:
             ns = {}
@@ -193,24 +205,31 @@ def run_check():
     # ---- PTX / ptxas / cubin ----
     builds = {}
     cubins = {}
-    for xp in (0, 1, 2):
-        builds[f"X{xp}"], cubins[f"X{xp}"] = nvrtc_build(wk._SRC, defs_for(xp))
     rev, ms = main_src()
-    if ms is not None:
-        builds["main"], cubins["main"] = nvrtc_build(ms["src"], ("MINB=12",))
-        builds["main"]["rev"] = rev
-        report["X0_cubin_eq_main"] = cubins["X0"] == cubins["main"]
-        ok_all &= report["X0_cubin_eq_main"]
-    else:
-        report["X0_cubin_eq_main"] = None
-        print("WARN main source not found", flush=True)
-    for xp in (0, 1, 2):
-        builds[f"X{xp}"].update(module_attrs(xp))
+    ptx_ok = True
+    for ln in (0, 1):
+        lnd = ("LN_ID=1",) if ln else ()
+        sfx = f"_ln{ln}"
+        for xp in (0, 1, 2):
+            builds[f"X{xp}{sfx}"], cubins[f"X{xp}{sfx}"] = nvrtc_build(wk._SRC, defs_for(xp) + lnd)
+        if ms is not None:
+            builds[f"main{sfx}"], cubins[f"main{sfx}"] = nvrtc_build(ms["src"], ("MINB=12",) + lnd)
+            builds[f"main{sfx}"]["rev"] = rev
+            report[f"X0_cubin_eq_main{sfx}"] = cubins[f"X0{sfx}"] == cubins[f"main{sfx}"]
+            ok_all &= report[f"X0_cubin_eq_main{sfx}"]
+        else:
+            report[f"X0_cubin_eq_main{sfx}"] = None
+            ok_all = False
+            print("WARN main source not found", flush=True)
+        for xp in (0, 1, 2):
+            builds[f"X{xp}{sfx}"].update(module_attrs(xp, bool(ln)))
+        ptx_ok &= (builds[f"X2{sfx}"]["createpolicy"] == 1
+                   and builds[f"X2{sfx}"]["cache_hint_loads"] == 12
+                   and builds[f"X0{sfx}"]["createpolicy"] == 0
+                   and builds[f"X0{sfx}"]["cache_hint_loads"] == 0)
     for k, v in builds.items():
         print("BUILD", k, json.dumps(v), flush=True)
     report["builds"] = builds
-    ptx_ok = (builds["X2"]["createpolicy"] == 1 and builds["X2"]["cache_hint_loads"] == 12
-              and builds["X0"]["createpolicy"] == 0 and builds["X0"]["cache_hint_loads"] == 0)
     report["ptx_counts_ok"] = ptx_ok
     ok_all &= ptx_ok
     report["default_extra_defines"] = list(defs_for(wk._X_POLICY))
@@ -222,21 +241,22 @@ def run_check():
             x = args[0]
             gs = gs_for(x)
             pristine = [a.clone() if a is not None else None for a in args]
-            for gname, gsv in (("gs", gs), ("gs_sat4x", float(torch.tensor(gs * 4.0, dtype=torch.float32)))):
-                gs_t = torch.tensor([gsv], dtype=torch.float32, device=dev)
-                for store in (True, False):
-                    ref = call(args, gs_t, store, 0)
-                    for xp in (2, 1):
-                        if not same(call(args, gs_t, store, xp), ref):
-                            bad.append(f"{name}|{gname}|store{int(store)}|X{xp}")
-                    print(name, gname, "store", int(store), "bitwise X2/X1 vs X0:",
-                          not any(b.startswith(f"{name}|{gname}|store{int(store)}|") for b in bad),
-                          flush=True)
+            for aff in ("ln1", "ln0"):
+                for gname, gsv in (("gs", gs), ("gs_sat4x", float(torch.tensor(gs * 4.0, dtype=torch.float32)))):
+                    gs_t = torch.tensor([gsv], dtype=torch.float32, device=dev)
+                    for store in (True, False):
+                        tag = f"{name}|{aff}|{gname}|store{int(store)}|"
+                        ref = call(args, gs_t, store, 0, aff=aff)
+                        for xp in (2, 1):
+                            if not same(call(args, gs_t, store, xp, aff=aff), ref):
+                                bad.append(tag + f"X{xp}")
+                        print(tag, "bitwise X2/X1 vs X0:",
+                              not any(b.startswith(tag) for b in bad), flush=True)
             inp_ok = all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
             ok_all &= inp_ok
             report[f"{name}|inputs_unchanged"] = inp_ok
         report["bitwise_failures"] = bad[:50]
-        report["n_bitwise_cases"] = len(cases) * 2 * 2 * 2
+        report["n_bitwise_cases"] = len(cases) * 2 * 2 * 2 * 2
         report["n_bitwise_failures"] = len(bad)
         ok_all &= not bad
 
@@ -245,27 +265,34 @@ def run_check():
         for name, args in cases:
             if name not in ("select_M4176", "mode_M4096", "mode_M4256", "select_M80"):
                 continue
-            x = args[0]
-            gs_t = torch.tensor([gs_for(x)], dtype=torch.float32, device=dev)
-            ref = call(args, gs_t, True, 0)
-            pristine = [a.clone() if a is not None else None for a in args]
-            outs = poisoned(x)
-            first = None
-            eq0 = eqref = inp = True
-            for it in range(23):
-                if it % 8 == 0:
-                    inp &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
-                    for o in outs:
-                        o.view(torch.uint8).fill_(0xCD)
-                o = call(args, gs_t, True, 2, outs=outs)
-                cur = tuple(t.clone() for t in o)
-                if first is None:
-                    first = cur
-                eq0 &= same(cur, first)
-                eqref &= same(cur, ref)
-            inp &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
-            rep[name] = {"eq_iter0": eq0, "eq_ref_X0": eqref, "inputs_unchanged": inp}
-            ok_all &= eq0 and eqref and inp
+            for aff in ("ln1", "ln0"):
+                x = args[0]
+                gs_t = torch.tensor([gs_for(x)], dtype=torch.float32, device=dev)
+                ref = call(args, gs_t, True, 0, aff=aff)
+                pristine = [a.clone() if a is not None else None for a in args]
+                pw = [t.clone() for t in AFF[aff]]
+                outs = poisoned(x)
+                first = None
+                eq0 = eqref = inp = True
+                for it in range(23):
+                    if it % 8 == 0:
+                        inp &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
+                        for o in outs:
+                            o.view(torch.uint8).fill_(0xCD)
+                    o = call(args, gs_t, True, 2, outs=outs, aff=aff)
+                    cur = tuple(t.clone() for t in o)
+                    if first is None:
+                        first = cur
+                    eq0 &= same(cur, first)
+                    eqref &= same(cur, ref)
+                inp &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
+                inp &= all(torch.equal(a, p) for a, p in zip(AFF[aff], pw))
+                rep[f"{name}|{aff}"] = {"eq_iter0": eq0, "eq_ref_X0": eqref, "inputs_unchanged": inp}
+                ok_all &= eq0 and eqref and inp
+        # LN_ID=1 launches must really have been built (identity registered)
+        ln1_keys = [str(k) for k in wk._MODULES if "LN_ID=1" in k[3]]
+        report["ln_id1_modules"] = ln1_keys
+        ok_all &= bool(ln1_keys) and any("X_POLICY=2" in k for k in ln1_keys)
         report["repeat"] = rep
         print("REPEAT", json.dumps(rep), flush=True)
 
@@ -273,14 +300,15 @@ def run_check():
         disp_ok = True
         saved = wk._X_POLICY
         for name, args in cases:
-            x = args[0]
-            gs_t = torch.tensor([gs_for(x)], dtype=torch.float32, device=dev)
-            wk._X_POLICY = 0
-            a = torch.ops.trtllm.flux3_adaln_nvfp4_quant(x, args[1], args[2], args[3], W, B, gs_t, EPS, True)
-            a = tuple(t.clone() for t in a)
-            wk._X_POLICY = 2
-            b = torch.ops.trtllm.flux3_adaln_nvfp4_quant(x, args[1], args[2], args[3], W, B, gs_t, EPS, True)
-            disp_ok &= same(a, b)
+            for w_, b_ in AFF.values():
+                x = args[0]
+                gs_t = torch.tensor([gs_for(x)], dtype=torch.float32, device=dev)
+                wk._X_POLICY = 0
+                a = torch.ops.trtllm.flux3_adaln_nvfp4_quant(x, args[1], args[2], args[3], w_, b_, gs_t, EPS, True)
+                a = tuple(t.clone() for t in a)
+                wk._X_POLICY = 2
+                b = torch.ops.trtllm.flux3_adaln_nvfp4_quant(x, args[1], args[2], args[3], w_, b_, gs_t, EPS, True)
+                disp_ok &= same(a, b)
         wk._X_POLICY = saved
         report["public_op_X2_eq_X0"] = disp_ok
         report["modules_built"] = [str(k) for k in wk._MODULES]
