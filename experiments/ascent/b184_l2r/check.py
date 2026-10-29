@@ -100,6 +100,20 @@ def run_op(ins, discard, keep_v):
 
 
 def op_suite(results):
+    """Run the op cases under main's default STATIC_QK (on) and with it off."""
+    default = qr8.STATIC_QK
+    try:
+        for static in (default, not default):
+            qr8.STATIC_QK = static
+            sub = {}
+            op_suite_one(sub)
+            for k, v in sub.items():
+                results[f"{k}{'' if static else '__static_off'}"] = v
+    finally:
+        qr8.STATIC_QK = default
+
+
+def op_suite_one(results):
     g = torch.Generator(device="cuda").manual_seed(244)
     recs = []
     cases = []

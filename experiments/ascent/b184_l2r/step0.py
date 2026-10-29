@@ -320,8 +320,10 @@ def pair():
         )
         return c["residual"] + (attn_y + mlp_y)
 
+    r_served = bool(getattr(f8r, "FP8R_QKV_FP8_DIRECT", False))
+
     def step():
-        if HAS_BRANCH:
+        if r_served:
             fp8r_direct(r_sets[0])
         else:
             fp8r_main(r_sets[0])
