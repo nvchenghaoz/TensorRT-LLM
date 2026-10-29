@@ -80,6 +80,9 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import qkv_forward as _
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     qkv_fp8_attention_forward as _primsts_qkv_fp8_attention,
 )
+from tensorrt_llm._torch.visual_gen.models.flux3.flux3_fp8r_qkv import (
+    sm120_fp8r_qkv_fp8_attention as _fp8r_qkv_fp8_attention,
+)
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_adaln_quant import (
     adaln_nvfp4_input,
     prepare_adaln_nvfp4,
@@ -536,9 +539,12 @@ class Flux3Attention(Attention):
         timestep: Tensor | None = None,
         side_gate_up: tuple | None = None,
         attn_nvfp4_out: Tensor | None = None,
+        v_live: bool = True,
     ):
         """QKV -> QK-norm -> RoPE -> attention, returning the pre-out-projection
-        result [B, S, H*D] (and v [B, H, S, D] when need_v, for PAG). Fused path
+        result [B, S, H*D] (and v [B, H, S, D] when need_v, for PAG). v_live=False: the caller
+        never reads the returned v (PAG off), so the FP8-direct paths may drop its BF16 lines from
+        L2 (its contents are then undefined). Fused path
         does QK-norm+RoPE in one kernel; unfused uses eager rms_norm + rotary.
         side_gate_up (primsts.sm120_side_gate_up_args): also return the block's packed
         gate_up (packed, scales), run on a side stream beside attention, or None when the
@@ -548,21 +554,34 @@ class Flux3Attention(Attention):
         b, s = hidden_states.shape[:2]
         cos, sin = freqs[0], freqs[1]
         projection_input = hidden_states if quantized is None else quantized
+        full_sequence = sample_bounds is None or (
+            _ATTEND_SINGLE_SEGMENT_FAST_PATH
+            and b == 1
+            and len(sample_bounds) == 1
+            and sample_bounds[0][0] == 0
+            and sample_bounds[0][1] == s
+        )
+
+        if side_gate_up is None:
+            # FP8R QKV straight to E4M3 + the same fmha_v2 call (bitwise to the path below).
+            direct_r = _fp8r_qkv_fp8_attention(
+                self, projection_input, freqs, full_sequence, need_v and v_live
+            )
+            if direct_r is not None:
+                attn, v = direct_r
+                if need_v:
+                    v = v.view(b, s, self.local_num_key_value_heads, self.head_dim).transpose(1, 2)
+                    return attn, v  # [B, H, S, D] for apply_flux3_pag
+                return attn
 
         direct = _primsts_qkv_fp8_attention(
             self,
             projection_input,
             freqs,
-            sample_bounds is None
-            or (
-                _ATTEND_SINGLE_SEGMENT_FAST_PATH
-                and b == 1
-                and len(sample_bounds) == 1
-                and sample_bounds[0][0] == 0
-                and sample_bounds[0][1] == s
-            ),
+            full_sequence,
             side_gate_up,
             attn_nvfp4_out if side_gate_up is not None else None,
+            need_v and v_live,
         )
         if direct is not None:
             # NVFP4 QKV straight to E4M3 + the same fmha_v2 call (bitwise to the path below).
@@ -1099,6 +1118,7 @@ class Flux3SingleStreamBlock(nn.Module):
                 side_gate_up=side_args,
                 # PAG reads the BF16 attention output: keep main's path when it is on.
                 attn_nvfp4_out=sm120_attn_nvfp4_out_weight(self) if pag_strength <= 0.0 else None,
+                v_live=pag_strength > 0.0,  # apply_flux3_pag reads v only when PAG is on
             )
         else:
             attn, v = self.attn.attn_pre_out(
@@ -1108,6 +1128,7 @@ class Flux3SingleStreamBlock(nn.Module):
                 quantized=quantized,
                 sample_bounds=sample_bounds,
                 timestep=timestep,
+                v_live=pag_strength > 0.0,
             )
         attn = apply_flux3_pag(attn, v, pag_strength, sample_bounds, pag_samples)
 
@@ -1228,6 +1249,7 @@ class _Flux3FP8RSingleStreamBlock(Flux3SingleStreamBlock):
             quantized=quantized,
             sample_bounds=sample_bounds,
             timestep=timestep,
+            v_live=pag_strength > 0.0,  # apply_flux3_pag reads v only when PAG is on
         )
         attn = apply_flux3_pag(attn, v, pag_strength, sample_bounds, pag_samples)
         combined_shape = combined.shape

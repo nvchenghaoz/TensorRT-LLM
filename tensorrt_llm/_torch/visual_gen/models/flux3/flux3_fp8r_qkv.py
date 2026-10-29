@@ -51,6 +51,16 @@ def _sm120_fp8r_qknorm_rope_eligible(attn: nn.Module) -> bool:
     return heads % 4 == 0 and fused.weight.shape[0] == 3 * heads * 128 and not fused.swiglu
 
 
+def _fp8r_qkv_gemm(activation, weight, activation_scale, weight_scale) -> torch.Tensor:
+    return torch._scaled_mm(
+        activation,
+        weight.t(),
+        scale_a=activation_scale.reshape(-1, 1),
+        scale_b=weight_scale.reshape(1, -1),
+        out_dtype=torch.bfloat16,
+    )
+
+
 @torch.library.custom_op(
     "trtllm::flux3_sm120_fp8r_qkv_qknorm_rope", mutates_args=(), device_types="cuda"
 )
@@ -78,13 +88,7 @@ def fp8r_qkv_qknorm_rope(
 
     from .flux3_primsts import _token_positions
 
-    out = torch._scaled_mm(
-        activation,
-        weight.t(),
-        scale_a=activation_scale.reshape(-1, 1),
-        scale_b=weight_scale.reshape(1, -1),
-        out_dtype=torch.bfloat16,
-    )
+    out = _fp8r_qkv_gemm(activation, weight, activation_scale, weight_scale)
     width = out.shape[1] // 3
     positions = _token_positions(out.shape[0], out.device)
     dst = torch.empty_like(out) if planar else out
@@ -161,3 +165,136 @@ _FP8R_QKV_CONTIGUOUS = False
 # (v copied inside the pass), so the three .contiguous() copies above go. Same values (bitwise).
 # Takes precedence over _FP8R_QKV_CONTIGUOUS; module-level for A/B in one process.
 _FP8R_QKV_PLANAR = False
+
+# Idea 244 stage R (idea 238): the FP8R QKV straight to per-tensor E4M3. Main runs the GEMM, the
+# in-place BF16 qknorm_rope pass, then fp8_sm12x's K1 amax + K2 quantize on the strided q/k/v
+# views inside visual_gen_fp8_attention_sm120. Here the same GEMM output goes to
+# flux3_sm120_qknorm_rope_fp8 on its packed q|k|v column views (bitwise qknorm_rope + K1/K2) and
+# the same fmha_v2 call runs through visual_gen_fp8_attention_sm120_prequant. v stays the GEMM's
+# BF16 column view (for PAG). TRTLLM_FLUX3_FP8R_QKV_FP8_DIRECT=0 keeps main's path; module-level
+# (Dynamo guards on it), read at trace time.
+FP8R_QKV_FP8_DIRECT = os.environ.get("TRTLLM_FLUX3_FP8R_QKV_FP8_DIRECT", "1").strip() != "0"
+
+
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_fp8r_qkv_rope_fp8", mutates_args=(), device_types="cuda"
+)
+def fp8r_qkv_rope_fp8(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    cos_sin: torch.Tensor,
+    sm_scale: float,
+    keep_v: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(qkv8 [3, M, W] E4M3, scales [8] FP32, gemm [M, 3*W] BF16 packed GEMM output).
+
+    The FP8R QKV GEMM (_fp8r_qkv_gemm, as fp8r_qkv_qknorm_rope runs it), then qknorm_rope_fp8
+    on the packed q, k, v column views (row stride 3*W). gemm[:, 2W:] is v; gemm's q/k columns
+    are never read again (qknorm_rope_fp8 may drop them from L2, contents undefined), nor v's
+    when keep_v is False.
+    """
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_qknorm_rope_fp8 import (
+        qknorm_rope_fp8,
+    )
+
+    from .flux3_primsts import _token_positions
+
+    out = _fp8r_qkv_gemm(activation, weight, activation_scale, weight_scale)
+    width = out.shape[1] // 3
+    qkv8, scales = qknorm_rope_fp8(
+        out[:, :width],
+        out[:, width:2 * width],
+        out[:, 2 * width:],
+        q_norm.detach(),
+        k_norm.detach(),
+        cos_sin.detach(),
+        _token_positions(out.shape[0], out.device),
+        sm_scale,
+        discard_qk=True,
+        keep_v=keep_v,
+    )
+    return qkv8, scales, out
+
+
+@fp8r_qkv_rope_fp8.register_fake
+def _fp8r_qkv_rope_fp8_fake(
+    activation, weight, activation_scale, weight_scale, q_norm, k_norm, cos_sin, sm_scale,
+    keep_v=True,
+):
+    rows, columns = activation.shape[0], weight.shape[0]
+    return (
+        activation.new_empty((3, rows, columns // 3), dtype=torch.float8_e4m3fn),
+        activation.new_empty((8,), dtype=torch.float32),
+        activation.new_empty((rows, columns), dtype=torch.bfloat16),
+    )
+
+
+def sm120_fp8r_qkv_fp8_attention(
+    attn: nn.Module,
+    x,
+    freqs: tuple[torch.Tensor, ...],
+    full_sequence: bool,
+    v_live: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """(attention output [B, S, H*D] BF16, v [B, S, W] BF16 view of the GEMM output) or None.
+
+    Covers exactly the calls where main runs primsts.qkv_forward's _sm120_fp8r_qkv_forward
+    (packed, non-planar) and then one FlashInferAttention FP8 (non-causal, no LSE) call on the
+    whole [B, S] q/k/v with S >= the backend's FP8 minimum; anything else returns None.
+    """
+    if not FP8R_QKV_FP8_DIRECT or not full_sequence or _FP8R_QKV_PLANAR or _FP8R_QKV_CONTIGUOUS:
+        return None
+    if getattr(attn, "_flux3_primsts_nvfp4_qkv", None) is not None:
+        return None
+    if not getattr(attn, "_flux3_sm120_fp8r_qknorm_rope", False):
+        return None
+    if not isinstance(x, (torch.Tensor, Fp8RowwiseQuantizedTensor)):
+        return None
+    from .primsts import _fp8_direct_backend, original_input
+
+    backend = _fp8_direct_backend(attn)
+    if backend is None:
+        return None
+    adapter = attn._flux3_sm120_fp8_qkv
+    original = original_input(x)
+    if original.dim() != 3:
+        return None
+    batch, seq_len = original.shape[0], original.shape[1]
+    cos, sin = freqs[0], freqs[1]
+    if not adapter.can_run(original) or cos.numel() != original.numel() // original.shape[-1] * 128:
+        return None
+    if sin.shape != cos.shape:
+        return None
+    if seq_len < backend._fp8_min_seq_len or seq_len <= 0:
+        return None
+    heads = adapter.weight.shape[0] // 3 // 128
+    if heads != backend.num_heads:
+        return None
+    from tensorrt_llm._torch.visual_gen.attention.backends.fp8_sm12x import (
+        visual_gen_fp8_attention_sm120_prequant,
+    )
+
+    data, scales = adapter.activation(x)
+    if len(freqs) > 2:
+        cos_sin = freqs[2]
+    else:
+        cos_sin = torch.cat((cos.reshape(-1, 128)[:, ::2], sin.reshape(-1, 128)[:, ::2]), dim=-1)
+    qkv8, fp8_scales, gemm = fp8r_qkv_rope_fp8(
+        data,
+        adapter.weight,
+        scales,
+        adapter.scale,
+        attn.norm_q.weight.contiguous(),
+        attn.norm_k.weight.contiguous(),
+        cos_sin.float().contiguous(),
+        backend.scale,
+        bool(v_live),
+    )
+    width = gemm.shape[-1] // 3
+    v = gemm[:, 2 * width:].reshape(batch, seq_len, width)
+    output = visual_gen_fp8_attention_sm120_prequant(qkv8, fp8_scales, batch, heads)
+    return output.flatten(2), v
