@@ -457,6 +457,30 @@ def adaln_nvfp4_quant(
     With store_x_mod=False the returned x_mod is allocated but NOT written (uninitialized): only
     for callers whose consumers read the NVFP4 data alone (x_mod as shape metadata).
     """
+    return _dispatch(x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod)
+
+
+# warp: SM120 warp-per-row kernel (flux3_sm120_adaln_nvfp4) at every M where it supports the
+# call, else the Triton kernel above. It is REORDERED vs Triton: fp4/SF bitwise in probes,
+# x_mod off by 1 bf16 ulp on ~1e-6 of elements; in-model 15.3 us/call vs 19.0 at M=4176.
+# triton: always the Triton kernel above (the previous path, byte for byte).
+# auto (default): per M class. warp only for M > _AUTO_WARP_MIN_ROWS (served M=4176); at
+# M=4096 the in-model census tied (15.12 vs 15.17 us, inside noise), so it stays on Triton.
+_IMPL = os.environ.get("TRTLLM_FLUX3_ADALN_NVFP4_IMPL", "auto").strip().lower()
+_AUTO_WARP_MIN_ROWS = 4096
+
+
+def _dispatch(x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod):
+    use_warp = _IMPL == "warp" or (
+        _IMPL == "auto" and x.numel() // x.shape[-1] > _AUTO_WARP_MIN_ROWS
+    )
+    if use_warp:
+        from . import flux3_sm120_adaln_nvfp4 as warp_impl
+
+        if warp_impl.supported(x, select, scale, shift, weight, bias):
+            return warp_impl.launch(
+                x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod=store_x_mod
+            )
     return _launch(
         x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod=store_x_mod
     )
