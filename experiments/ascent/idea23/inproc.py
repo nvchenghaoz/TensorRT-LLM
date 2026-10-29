@@ -408,6 +408,160 @@ def bench():
     print(json.dumps(res))
 
 
+def loadavg1():
+    try:
+        return float(open("/proc/loadavg").read().split()[0])
+    except Exception:  # noqa: BLE001
+        return -1.0
+
+
+def wait_load(limit=2.0, max_wait=600.0, poll=15.0):
+    t0 = time.time()
+    while True:
+        la = loadavg1()
+        log(f"load average (1 min) = {la:.2f}")
+        if la < limit:
+            return la, True
+        if time.time() - t0 > max_wait:
+            log(f"LOAD_TOO_HIGH: 1-min load {la:.2f} never fell below {limit} in {max_wait:.0f} s")
+            return la, False
+        time.sleep(poll)
+
+
+def stats(v):
+    v = list(v)
+    q = statistics.quantiles(sorted(v), n=10)
+    med = statistics.median(v)
+    mean = statistics.fmean(v)
+    return {"n": len(v), "mean": mean, "median": med, "p10": q[0], "p90": q[-1],
+            "rel_std": statistics.pstdev(v) / mean, "p10_p90_over_median": (q[-1] - q[0]) / med}
+
+
+def ibench():
+    """Both arms interleaved in ONE process on ONE pipeline instance.
+
+    Arm A = main's _load_image_pixels / pack_i2i_image_condition / _prepare_i2i (copied
+    verbatim above). Arm B = this tree's functions. In the base tree arm B is main's code
+    too (an A/A), in the branch tree it is the change. Per case: N_ARM_WARM warmups per arm,
+    then N_ROUNDS rounds per arm alternating A,B,A,B..., each round ROUND_ITERS timed
+    iterations of that arm. i2i alternates the two frozen references within each round.
+    Then one untimed interleaved sequence of the same shape: every transformer input at the
+    first denoise call must be bitwise equal between arms and to iteration 0.
+    """
+    from tensorrt_llm._torch.visual_gen.models.flux3 import pipeline_flux3 as flux3
+
+    n_arm_warm = int(os.environ.get("N_ARM_WARM", "10"))
+    n_rounds = int(os.environ.get("N_ROUNDS", "20"))
+    round_iters = int(os.environ.get("ROUND_ITERS", "10"))
+    la_wait, load_ok = wait_load()
+    if not load_ok:
+        print(json.dumps({"LOAD_TOO_HIGH": True, "load1": la_wait}))
+        sys.exit(3)
+    pipe = load_pipe()
+    probe = Probe(pipe)
+    refs = find_refs()
+    cand_load = flux3._load_image_pixels
+    cand_prep = type(pipe)._prepare_i2i
+
+    def use(arm):
+        if arm == "A":
+            flux3._load_image_pixels = ref_load_image_pixels
+            pipe._prepare_i2i = types.MethodType(ref_prepare_i2i, pipe)
+        else:
+            flux3._load_image_pixels = cand_load
+            pipe.__dict__.pop("_prepare_i2i", None)
+        want_load = ref_load_image_pixels if arm == "A" else cand_load
+        want_prep = ref_prepare_i2i if arm == "A" else cand_prep
+        assert flux3._load_image_pixels is want_load, "loader swap failed"
+        assert pipe._prepare_i2i.__func__ is want_prep, "_prepare_i2i swap failed"
+
+    # Requests are rebuilt from the immutable reference bytes (pristine inputs) every call.
+    def req(kind):
+        if kind == "t2i":
+            return make_req(*T2I)
+        return make_req(PROMPTS[kind][0], PROMPTS[kind][1], refs[kind])
+
+    cases = {"i2i-2048": ["A", "B"], "t2i-2048": ["t2i"]}
+    load_at = {}
+    times = {c: {"A": [], "B": []} for c in cases}
+    per_ref = {c: {"A": {}, "B": {}} for c in cases}
+    rounds = {c: {"A": [], "B": []} for c in cases}
+    for case, kinds in cases.items():
+        for i in range(n_arm_warm):
+            for arm in "AB":
+                use(arm)
+                span(pipe, probe, req(kinds[i % len(kinds)]))
+        load_at[f"{case}_start"] = loadavg1()
+        log(f"{case}: timed section starts, load1={load_at[case + '_start']:.2f}")
+        for r in range(2 * n_rounds):
+            arm = "AB"[r % 2]
+            use(arm)
+            rt = []
+            for j in range(round_iters):
+                kind = kinds[j % len(kinds)]
+                g, _ = span(pipe, probe, req(kind))
+                rt.append(g)
+                per_ref[case][arm].setdefault(kind, []).append(g)
+            times[case][arm].extend(rt)
+            rounds[case][arm].append(statistics.median(rt))
+            if r % 8 == 0:
+                log(f"{case} round {r} arm {arm}: median {statistics.median(rt):.2f} ms")
+        load_at[f"{case}_end"] = loadavg1()
+        log(f"{case}: timed section ends, load1={load_at[case + '_end']:.2f}")
+    # Untimed interleaved sequence of the same shape, bitwise.
+    probe.capture = True
+    first = {}
+    seq_bad = []
+    n_seq = 0
+    for case, kinds in cases.items():
+        for r in range(2 * (n_rounds + 1)):
+            arm = "AB"[r % 2]
+            use(arm)
+            for j in range(round_iters if r >= 2 else n_arm_warm):
+                kind = kinds[j % len(kinds)]
+                span(pipe, probe, req(kind))
+                kw = probe.kwargs
+                n_seq += 1
+                if kind not in first:
+                    first[kind] = kw
+                    continue
+                f = first[kind]
+                good = kw.keys() == f.keys() and all(
+                    same(kw[n][0], f[n][0]) and kw[n][1] == f[n][1] for n in kw)
+                if not good:
+                    seq_bad.append((case, r, arm, j))
+    probe.capture = False
+    use("B")
+    seq_ok = not seq_bad
+    log(f"untimed interleaved sequence: {n_seq} calls, ok={seq_ok}, bad={seq_bad[:10]}")
+    out = {"batch": {}, "output": {"class": "exact"}, "arms": {}, "per_reference": {},
+           "round_ratio_B_over_A": {}}
+    for case in cases:
+        sa, sb = stats(times[case]["A"]), stats(times[case]["B"])
+        out["arms"][case] = {"A_main_copy": sa, "B_tree": sb}
+        out["per_reference"][case] = {
+            arm: {k: stats(v) for k, v in per_ref[case][arm].items()} for arm in "AB"}
+        ratios = [b / a for a, b in zip(rounds[case]["A"], rounds[case]["B"])]
+        rq = statistics.quantiles(sorted(ratios), n=10)
+        out["round_ratio_B_over_A"][case] = {"median": statistics.median(ratios),
+                                             "p10": rq[0], "p90": rq[-1], "n": len(ratios)}
+        # Pair JSON: this tree's own code (arm B). Noise = (p90-p10)/median of one input:
+        # the max over the references, since the two references are different inputs.
+        nf = max(stats(v)["p10_p90_over_median"] for v in per_ref[case]["B"].values())
+        out["batch"][case] = {"step_ms": sb["median"], "noise_floor": nf,
+                              "noise_floor_pooled_refs": sb["p10_p90_over_median"]}
+    out.update({
+        "untimed_interleaved_bitwise_ok": seq_ok, "untimed_calls": n_seq,
+        "untimed_bad": seq_bad[:20], "load1": {"before_load_wait": la_wait, **load_at},
+        "load_ok": all(v < 4 for k, v in load_at.items() if k.endswith("_start")),
+        "n_arm_warm": n_arm_warm, "n_rounds_per_arm": n_rounds, "round_iters": round_iters,
+        "measure": "Flux3Pipeline.infer entry (ref PNG bytes in) -> first transformer forward, "
+                   "after cuda sync there; served engine.json pipeline, 2048^2; arms A (main's "
+                   "functions copied) and B (tree) interleaved by rounds in one process",
+    })
+    print(json.dumps(out))
+
+
 def check():
     import torch._dynamo.utils as dyn_utils
 
@@ -542,4 +696,4 @@ def check():
 
 
 if __name__ == "__main__":
-    {"unit": unit, "bench": bench, "check": check}[MODE]()
+    {"unit": unit, "bench": bench, "ibench": ibench, "check": check}[MODE]()
