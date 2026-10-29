@@ -445,7 +445,9 @@ def _resnet_block_with_input_bias(block: Flux3ImageResnetBlock, x_nb: Tensor, b_
     """block(x_nb + b_in) for a block with a 1x1 nin_shortcut, without materializing
     x_nb + b_in: the norm1 path adds b_in as it loads x_nb (fused under torch.compile),
     and nin(x_nb + b_in) = nin(x_nb) + W_nin @ b_in, so the shortcut conv reads x_nb with
-    bias' = b_nin + W_nin[:, :, 0, 0] @ b_in (summed in fp64, rounded once)."""
+    bias' = b_nin + W_nin[:, :, 0, 0] @ b_in (summed in fp64). bias' is kept in fp32 and
+    added to the fp32 conv result before its one rounding, like the original bias add (a
+    bias' rounded to bf16 would be a per-channel constant error on every pixel)."""
     x = x_nb + b_in.view(1, -1, 1, 1)
     h = block.norm1.forward_silu(x)
     h = block.conv1(h)
@@ -453,8 +455,9 @@ def _resnet_block_with_input_bias(block: Flux3ImageResnetBlock, x_nb: Tensor, b_
     h = block.conv2(h)
     nin = block.nin_shortcut
     w = nin.weight
-    b_fold = (nin.bias.double() + torch.mv(w[:, :, 0, 0].double(), b_in.double())).to(nin.bias.dtype)
-    s = nn.functional.conv2d(x_nb, w, b_fold)
+    b_fold = (nin.bias.double() + torch.mv(w[:, :, 0, 0].double(), b_in.double())).float()
+    s = nn.functional.conv2d(x_nb, w, None)
+    s = (s.float() + b_fold.view(1, -1, 1, 1)).to(x_nb.dtype)
     return s + h
 
 
