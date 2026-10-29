@@ -1098,8 +1098,13 @@ def qkv_fp8_attention_forward(
     full_sequence: bool,
     side_gate_up: tuple | None = None,
     attn_nvfp4_out: torch.Tensor | None = None,
+    v_live: bool = True,
 ) -> tuple | None:
     """(attention output [B, S, H*D] BF16, planar BF16 QKV GEMM output [M, 3W]) or None.
+
+    Only the GEMM output's v plane is defined on return (its q/k lines may be dropped from L2,
+    flux3_sm120_qknorm_rope_fp8.L2DISCARD); v_live=False (the caller never reads v: PAG off)
+    lets v's lines go too.
 
     With side_gate_up (sm120_side_gate_up_args) the result gets a third item, the block's packed
     gate_up (packed, scales), forked onto a side stream right before FMHA
@@ -1163,6 +1168,7 @@ def qkv_fp8_attention_forward(
         original,
         x.quantized_by if isinstance(x, NVFP4Activation) else None,
         backend.scale,
+        bool(v_live),
     )
     if side_gate_up is not None:
         from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (

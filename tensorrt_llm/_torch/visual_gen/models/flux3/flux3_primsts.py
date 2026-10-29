@@ -1923,11 +1923,14 @@ def nvfp4_qkv_rope_fp8_impl(
     positions: torch.Tensor,
     qkv_scale: torch.Tensor,
     sm_scale: float,
+    keep_v: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(qkv8 [3, M, W] E4M3, scales [8] FP32, gemm [M, 3W] BF16 planar GEMM output).
 
     Same GEMMs as main's route; then flux3_sm120_qknorm_rope_fp8 instead of the in-place BF16
-    norm/RoPE pass + fp8_sm12x K1/K2. gemm.view(3, M, W)[2] is v, the plane main hands PAG."""
+    norm/RoPE pass + fp8_sm12x K1/K2. gemm.view(3, M, W)[2] is v, the plane main hands PAG.
+    Nothing reads gemm's q/k planes afterwards: qknorm_rope_fp8 may drop them from L2
+    (discard_qk; contents undefined). keep_v=False (PAG off) lets it drop v's lines too."""
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_qknorm_rope_fp8 import (
         qknorm_rope_fp8,
     )
@@ -1951,6 +1954,8 @@ def nvfp4_qkv_rope_fp8_impl(
         cos_sin.detach(),
         positions.detach(),
         sm_scale,
+        discard_qk=True,
+        keep_v=keep_v,
     )
     return qkv8, scales, out
 
@@ -1970,6 +1975,7 @@ def nvfp4_qkv_rope_fp8_prepared(
     original: torch.Tensor,
     source_weight: torch.Tensor | None,
     sm_scale: float,
+    keep_v: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """nvfp4_qkv_prepared + fp8_sm12x's quantize, straight from the NVFP4 QKV GEMM to E4M3.
 
@@ -1991,6 +1997,7 @@ def nvfp4_qkv_rope_fp8_prepared(
         _token_positions(activation.shape[0], activation.device),
         qkv_scale,
         sm_scale,
+        keep_v,
     )
 
 
@@ -2007,6 +2014,7 @@ def _nvfp4_qkv_rope_fp8_prepared_fake(
     original,
     source_weight,
     sm_scale,
+    keep_v=True,
 ):
     rows, columns = activation.shape[0], weight.shape[0]
     return (

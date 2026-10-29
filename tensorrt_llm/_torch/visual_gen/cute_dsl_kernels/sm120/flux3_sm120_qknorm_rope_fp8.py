@@ -95,6 +95,16 @@ STATIC_QK = os.environ.get("TRTLLM_FLUX3_QKV_FP8_STATIC_QK", "1").strip() != "0"
 _SQRT_128 = 11.313708498984761  # fp32 rounds it to 0x41350517 (as cutlass.Float32 does)
 _STATIC_MARGIN = 1.0 + 2.0 ** -6
 
+# L2 discard of the dead BF16 planes (idea 244 stage D; VEC kernel only). VEC mode 2 is the last
+# reader of the GEMM's BF16 q/k planes (and of v when the caller passes keep_v=False, i.e. PAG
+# off). Right after a row's 128-B lines are consumed, mode 2 issues discard.global.L2 on them, so
+# the dirty lines are dropped without a DRAM writeback. Values written are unchanged (the planes
+# are only read here; their contents become undefined afterwards). TRTLLM_FLUX3_QKV_FP8_L2DISCARD=0
+# compiles main's kernel. Module-level, read per call (one process can compare).
+L2DISCARD = os.environ.get("TRTLLM_FLUX3_QKV_FP8_L2DISCARD", "1").strip() != "0"
+# Arm E (diagnostic, default off): mode 2's BF16 loads carry an L2::evict_first cache policy.
+L2HINT = os.environ.get("TRTLLM_FLUX3_QKV_FP8_L2HINT", "0").strip() == "1"
+
 
 def _fold_grid(device: torch.device, configured: int, per_sm: int = _FOLD_CTAS_PER_SM) -> int:
     if configured > 0:
@@ -600,6 +610,35 @@ def _cp_async16(saddr: cutlass.Int32, gaddr: cutlass.Int64, *, loc=None, ip=None
 
 
 @dsl_user_op
+def _cp_async16_ef(saddr: cutlass.Int32, gaddr: cutlass.Int64, *, loc=None, ip=None) -> None:
+    """_cp_async16 with an L2::evict_first cache policy (arm E)."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int32(saddr).ir_value(loc=loc, ip=ip), cutlass.Int64(gaddr).ir_value(loc=loc, ip=ip)],
+        "{\n.reg .b64 p;\ncreatepolicy.fractional.L2::evict_first.b64 p, 1.0;\n"
+        "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, p;\n}",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _discard_l2(gaddr: cutlass.Int64, *, loc=None, ip=None) -> None:
+    """discard.global.L2 of the 128-B line at gaddr (128-B aligned): dropped, no writeback."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(gaddr).ir_value(loc=loc, ip=ip)],
+        "discard.global.L2 [$0], 128;",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _asm_void(text: str, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None, [], text, "", has_side_effects=True, is_align_stack=False,
@@ -626,6 +665,22 @@ def _ld_global_v4(gaddr: cutlass.Int64, *, loc=None, ip=None):
         llvm.StructType.get_literal([T.i32()] * 4),
         [cutlass.Int64(gaddr).ir_value(loc=loc, ip=ip)],
         "ld.global.nc.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return [cutlass.Int32(llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def _ld_global_v4_ef(gaddr: cutlass.Int64, *, loc=None, ip=None):
+    """_ld_global_v4 with an L2::evict_first cache policy (arm E)."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [cutlass.Int64(gaddr).ir_value(loc=loc, ip=ip)],
+        "{\n.reg .b64 p;\ncreatepolicy.fractional.L2::evict_first.b64 p, 1.0;\n"
+        "ld.global.nc.L2::cache_hint.v4.b32 {$0, $1, $2, $3}, [$4], p;\n}",
         "=r,=r,=r,=r,l",
         has_side_effects=False,
         is_align_stack=False,
@@ -807,8 +862,13 @@ def _qknorm_rope_fp8_vec_kernel(
     src_ld: cutlass.Constexpr,
     mode: cutlass.Constexpr,
     static_qk: cutlass.Constexpr,
+    discard: cutlass.Constexpr = 0,
+    hint: cutlass.Constexpr = 0,
 ):
     """_qknorm_rope_fp8_fold_kernel with vectorized, pipelined data movement (same arithmetic).
+
+    mode 2 only: discard bit 0 drops each consumed q/k 128-B source line from L2
+    (discard.global.L2), bit 1 the v lines; hint 1 loads with an L2::evict_first policy.
 
     Warp w < 8 (plane w // 4, heads (w % 4) * per_warp ..): its row slice is per_warp // 2 head
     pairs of 512 B, one 16-B cp.async per lane each, into a per-warp ring of per_warp // 2 slots;
@@ -857,9 +917,14 @@ def _qknorm_rope_fp8_vec_kernel(
         if warp < 8:
             # Row cta's head pairs go in flight before the partial re-reduce below.
             for s0 in cutlass.range_constexpr(stages):
-                _cp_async16(
-                    s_lane + s0 * 512, g_lane + cutlass.Int64(cta) * (src_ld * 2) + s0 * 512
-                )
+                if cutlass.const_expr(mode == 2 and hint == 1):
+                    _cp_async16_ef(
+                        s_lane + s0 * 512, g_lane + cutlass.Int64(cta) * (src_ld * 2) + s0 * 512
+                    )
+                else:
+                    _cp_async16(
+                        s_lane + s0 * 512, g_lane + cutlass.Int64(cta) * (src_ld * 2) + s0 * 512
+                    )
                 _cp_async_commit()
     factor = cutlass.Float32(0.0)
     if cutlass.const_expr(mode == 2 and static_qk):
@@ -1023,11 +1088,22 @@ def _qknorm_rope_fp8_vec_kernel(
                                 rot_even.to(cutlass.Float32), rot_odd.to(cutlass.Float32), factor
                             )
                 _syncwarp()
+                if cutlass.const_expr(mode == 2 and (discard & 1) == 1):
+                    # Every lane's chunk of this head pair landed (wait_group + syncwarp): drop
+                    # its 4 lines, one lane per 128 B.
+                    if lane % 8 == 0:
+                        _discard_l2(g_lane + cutlass.Int64(row) * (src_ld * 2) + sj * 512)
                 if next_row < rows:
-                    _cp_async16(
-                        s_lane + sj * 512,
-                        g_lane + cutlass.Int64(next_row) * (src_ld * 2) + sj * 512,
-                    )
+                    if cutlass.const_expr(mode == 2 and hint == 1):
+                        _cp_async16_ef(
+                            s_lane + sj * 512,
+                            g_lane + cutlass.Int64(next_row) * (src_ld * 2) + sj * 512,
+                        )
+                    else:
+                        _cp_async16(
+                            s_lane + sj * 512,
+                            g_lane + cutlass.Int64(next_row) * (src_ld * 2) + sj * 512,
+                        )
                 _cp_async_commit()
                 if cutlass.const_expr(mode == 2):
                     _st_global_b64(d_row + sj * 256 + lane * 8, stage64[warp * 32 + lane])
@@ -1036,7 +1112,10 @@ def _qknorm_rope_fp8_vec_kernel(
             g_row = g_lane + cutlass.Int64(row) * (src_ld * 2)
             words = []
             for c in cutlass.range_constexpr(stages):
-                words.append(_ld_global_v4(g_row + c * 512))
+                if cutlass.const_expr(mode == 2 and hint == 1):
+                    words.append(_ld_global_v4_ef(g_row + c * 512))
+                else:
+                    words.append(_ld_global_v4(g_row + c * 512))
             if cutlass.const_expr(mode == 1):
                 for c in cutlass.range_constexpr(stages):
                     for i in cutlass.range_constexpr(4):
@@ -1050,6 +1129,12 @@ def _qknorm_rope_fp8_vec_kernel(
                         _e4m3x4(words[c][0], words[c][1], factor),
                         _e4m3x4(words[c][2], words[c][3], factor),
                     )
+                if cutlass.const_expr((discard & 2) == 2):
+                    # The stores above consumed every lane's loaded words: drop the v lines.
+                    _syncwarp()
+                    if lane % 8 == 0:
+                        for c in cutlass.range_constexpr(stages):
+                            _discard_l2(g_row + c * 512)
     if cutlass.const_expr(mode == 1):
         for delta in (16, 8, 4, 2, 1):
             amax = _max_f32(amax, cute.arch.shuffle_sync_op(amax, delta, kind=nvvm.ShflKind.bfly))
@@ -1093,11 +1178,13 @@ def _launch_vec(
     src_ld: cutlass.Constexpr,
     mode: cutlass.Constexpr,
     static_qk: cutlass.Constexpr,
+    discard: cutlass.Constexpr,
+    hint: cutlass.Constexpr,
     stream,
 ):
     _qknorm_rope_fp8_vec_kernel(
         src, k_off, v_off, dst, parts, scales, q_norm, k_norm, cos_sin, positions, rows, n_part,
-        sm_scale, min_scale, heads, src_ld, mode, static_qk,
+        sm_scale, min_scale, heads, src_ld, mode, static_qk, discard, hint,
     ).launch(
         grid=[grid, 1, 1], block=[12 * 32, 1, 1], stream=stream,
         min_blocks_per_mp=_VEC_CTAS_PER_SM,
@@ -1113,10 +1200,21 @@ def _vec_supported(q, k, v, heads, src_ld) -> bool:
     )
 
 
-def _fold_pass(mode, key_base, args, rows, n_part, grid, sm_scale, vec=False, static_qk=False):
+def _lines_aligned(q, k, v, src_ld) -> bool:
+    """Every warp's row slice (heads // 4 heads of 256 B) starts on a 128-B line in all planes."""
+    return (src_ld * 2) % 128 == 0 and all(t.data_ptr() % 128 == 0 for t in (q, k, v))
+
+
+def _fold_pass(mode, key_base, args, rows, n_part, grid, sm_scale, vec=False, static_qk=False,
+               discard=0, hint=0):
     static_qk = bool(vec and static_qk)
+    # discard / hint (VEC mode 2 only; 0 = main's kernel): see _qknorm_rope_fp8_vec_kernel.
+    if not vec or mode != 2:
+        discard, hint = 0, 0
     # Main's keys unchanged; the static-Q/K VEC kernels get their own entries.
     key = key_base + (("vec" if vec else "fold"), mode) + (("static_qk",) if static_qk else ())
+    if discard or hint:
+        key = key + ("l2", discard, hint)
     stream = cutlass_torch.current_stream()
     compiled = _COMPILED.get(key)
     src, k_off, v_off, dst, parts, scales, qn, kn, cs, pos = args
@@ -1129,7 +1227,7 @@ def _fold_pass(mode, key_base, args, rows, n_part, grid, sm_scale, vec=False, st
         if vec:
             compiled = cute.compile(
                 _launch_vec, src, k_off, v_off, dst, parts, scales, qn, kn, cs, pos, *rt, heads,
-                src_ld, mode, static_qk, stream,
+                src_ld, mode, static_qk, discard, hint, stream,
             )
         else:
             compiled = cute.compile(
@@ -1199,11 +1297,18 @@ def qknorm_rope_fp8(
     positions: torch.Tensor,
     sm_scale: float,
     external_partials: torch.Tensor | None = None,
+    discard_qk: bool = False,
+    keep_v: bool = True,
+    static_qk: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-tensor E4M3 of (norm+RoPE(q), norm+RoPE(k), v) from the BF16 GEMM output.
 
     external_partials: optional FP32 [3, n_part] amax partials from another producer (plan 1233,
     e.g. a GEMM epilogue); mode 1 is then skipped and only the folded mode 2 runs.
+    discard_qk: the caller never reads the BF16 q/k rows again; with L2DISCARD the VEC mode 2
+    drops their L2 lines (no writeback) and q/k's contents become undefined. keep_v=False (with
+    discard_qk) does the same for v. Outputs are unchanged either way.
+    static_qk: None = the module's STATIC_QK; False keeps main's dynamic Q/K amax for this call.
 
     q, k, v: BF16 [M, W] row-major views sharing one row stride (W = H*128, H % 4 == 0).
     Returns (qkv8, scales): qkv8 float8_e4m3fn [3, M, W] (contiguous q, k, v planes) and FP32
@@ -1252,11 +1357,16 @@ def qknorm_rope_fp8(
         part_ptr = make_ptr(cutlass.Float32, fold_parts.data_ptr(), assumed_align=16)
         ptrs = (src, *common, dst, part_ptr, scale_ptr, qn, kn, cs, pos)
         # Static Q/K scale: VEC with this call's own mode 1 only (read per call).
-        static_qk = bool(STATIC_QK and vec and external_partials is None)
+        use_static = STATIC_QK if static_qk is None else bool(static_qk)
+        static_qk = bool(use_static and vec and external_partials is None)
         if external_partials is None:
             _fold_pass(1, key_base, ptrs, rows, n_part, n_part, sm_scale, vec, static_qk)
         grid2 = max(1, min(rows, _fold_grid(device, _FOLD_GRID2, per_sm)))
-        _fold_pass(2, key_base, ptrs, rows, n_part, grid2, sm_scale, vec, static_qk)
+        discard = 0
+        if vec and discard_qk and L2DISCARD and _lines_aligned(q, k, v, src_ld):
+            discard = 1 if keep_v else 3
+        _fold_pass(2, key_base, ptrs, rows, n_part, grid2, sm_scale, vec, static_qk, discard,
+                   1 if (vec and L2HINT) else 0)
         return qkv8, scales
     partials = torch.empty(3 * rows * _PARTS_PER_ROW, dtype=torch.float32, device=device)
     part_ptr = make_ptr(cutlass.Float32, partials.data_ptr(), assumed_align=16)
