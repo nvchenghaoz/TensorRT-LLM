@@ -376,8 +376,12 @@ log("census", json.dumps({k: v for k, v in res.items() if k.startswith("census")
 passed = all(gates.values())
 res["gates"] = gates
 on = st["ON"]
-res["batch"] = {"1": {"kernel_ms": on["median_ms"], "step_ms": on["median_ms"],
-                      "noise_floor": max(v["noise_floor"] for v in st.values())}}
+# kernel_ms (declared before run 3): per-decode GPU kernel-time sum (torch.profiler, 20 warm decodes,
+# median), the kernel_time measure; host load (load avg 36-71) inflates the CUDA-event wall time,
+# which stays reported in "timing" / event_ms.
+ks = res["kernel_sum_on"]
+res["batch"] = {"1": {"kernel_ms": ks["median_ms"], "event_ms": on["median_ms"],
+                      "noise_floor": ks["noise_floor"], "event_noise_floor": on["noise_floor"]}}
 if ARM == "cand":
     res["output"] = {"class": "precision",
                      "error_vs_fp32_R": {"psnr_min_db": psnr_min,
