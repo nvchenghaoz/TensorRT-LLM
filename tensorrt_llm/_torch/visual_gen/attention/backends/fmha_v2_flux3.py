@@ -321,3 +321,12 @@ void {launcher}_g3_nl_tiled(
 
 if _os_st.environ.get("TRTLLM_FMHA_V2_FLUX3_G3", "1") != "0":
     ROUTED_LEVERS = (*ROUTED_LEVERS, "g3")
+
+# q_regs (FMHA_FLUX3_Q_REGS, noloop_tiled.h + flux3_g3.h; bitwise vs the same levers without it):
+# with resident Q, the 2 x MMAS_K Q A-fragments are read from smem once (4-warp: on the first KV
+# step; G3: after the Q load) and stay in registers instead of an LDSM per KV step.
+# TRTLLM_FMHA_V2_FLUX3_QR=0 drops it from the routed set.
+_LEVER_FLAGS["q_regs"] = ("qr", "-DFMHA_FLUX3_Q_REGS=1")
+
+if _os_st.environ.get("TRTLLM_FMHA_V2_FLUX3_QR", "1") != "0":
+    ROUTED_LEVERS = (*ROUTED_LEVERS, "q_regs")
