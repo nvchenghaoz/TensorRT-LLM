@@ -157,6 +157,12 @@ def child(jt):
             self.inner = inner
             self.name = name
 
+        def __getattr__(self, attr):
+            try:
+                return super().__getattr__(attr)
+            except AttributeError:
+                return getattr(self.inner, attr)
+
         def forward(self, x, freqs, mod, *a, **k):
             t = getattr(self.inner, "_orig_mod", self.inner)
             key = (self.name, tuple(x.shape))
@@ -169,6 +175,12 @@ def child(jt):
                     "tail_pair": bool(getattr(t, "_sm120_tail_pair", False)),
                     "side_gate_up": int(getattr(t, "_sm120_side_gate_up", 0) or 0),
                 }
+                try:
+                    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_adaln_quant as aq
+
+                    routes[key]["x_mod_unread"] = bool(aq._x_mod_unread(t, x, freqs))
+                except Exception as e:  # noqa: BLE001
+                    routes[key]["x_mod_unread"] = f"err {e}"[:80]
             return self.inner(x, freqs, mod, *a, **k)
 
     def wrap_list(lst, prefix):
@@ -204,7 +216,8 @@ def child(jt):
     def compact(rs):
         out = {}
         for r in rs.values():
-            k = f"{r['route']} | {r['type']} M={r['M']} tail_pair={r['tail_pair']} side={r['side_gate_up']}"
+            k = (f"{r['route']} | {r['type']} M={r['M']} tail_pair={r['tail_pair']} "
+                 f"side={r['side_gate_up']} x_mod_unread={r.get('x_mod_unread')}")
             out.setdefault(k, []).append(r["block"])
         return {k: (len(v), v[0] + ".." + v[-1] if len(v) > 1 else v[0]) for k, v in out.items()}
 
