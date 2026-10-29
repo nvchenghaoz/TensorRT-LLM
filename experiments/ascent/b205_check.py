@@ -2,11 +2,12 @@
 flux3_vae::subpixel_up_conv ON vs OFF (OFF = use_fused_bias_op False at up[2], up[3] = main's aten
 dgrad path + bias fold / bias pass). Seeds 0-7, real checkpoint VAE, one process.
 
-Order (top lead ruling 7093): the same-process bf16 control (OFF vs OFF + 1e-5 latent perturbation,
-code of diag b198_site_diag.py @0b6b9f6d) runs FIRST; T_u8 = max over seeds of its u8_max is written
-to $AUTO_DEV_ARTIFACTS/b1_control.json before any ON arm runs.
+Order: the same-process bf16 control (OFF vs OFF + 1e-5 latent perturbation, code of diag
+b198_site_diag.py @0b6b9f6d) runs FIRST and is REPORT-ONLY (written to $AUTO_DEV_ARTIFACTS/b1_control.json
+before any ON arm runs; its T_u8 is printed, never gated).
 Declared gates (passed holds only these):
-- B1: bf16 decoder, both sites ON vs OFF: max u8_max <= T_u8 AND min PSNR >= 60.0 dB.
+- B1 (frozen from control 2233 only, top lead 7107): bf16 decoder, both sites ON vs OFF, seeds 0-7:
+  max u8_max <= 6 AND min PSNR >= 65.0 dB.
 - B2: served FP8 vs fp32 eager R: mean_abs(mean over seeds) <= 1.05x OFF's; PSNR min >= OFF's - 0.3 dB.
 - A: fp32 eager decode shas (seeds 0-7) and the fp32 compiled Dynamo FX graph sha equal ON vs OFF.
 - per op: at U1 (up[3]) and U2 (up[2]), max_abs of the op's bf16 output vs fp64 conv_transpose2d + bias
@@ -205,7 +206,8 @@ with torch.inference_mode():
     out["B1_control"] = {"rows": ctrl_rows, "agg": agg(ctrl_rows), "T_u8": T_u8}
     with open(os.path.join(ART, "b1_control.json"), "w") as f:
         json.dump(out["B1_control"], f)
-    log("B1 CONTROL (OFF vs OFF+1e-5, before any ON arm)", json.dumps(out["B1_control"]["agg"]), "T_u8", T_u8,
+    log("B1 CONTROL (report-only; OFF vs OFF+1e-5, before any ON arm)", json.dumps(out["B1_control"]["agg"]),
+        "T_u8", T_u8, "| frozen B1 thresholds: u8_max <= 6, PSNR min >= 65.0 dB (control 2233: u8 6, 65.3 dB)",
         "written", os.path.join(ART, "b1_control.json"))
     del v
     torch.cuda.empty_cache()
@@ -219,8 +221,9 @@ with torch.inference_mode():
         torch.cuda.empty_cache()
     del O
     b1 = out["B1_both_vs_OFF"]["agg"]
-    gates["B1_u8_max_le_T_u8"] = b1["u8_max"] <= T_u8
-    gates["B1_psnr_min_ge_60"] = b1["psnr_min"] >= 60.0
+    # Frozen from control 2233 only (area lead / top lead 7107); this job's control is report-only.
+    gates["B1_u8_max_le_6"] = b1["u8_max"] <= 6
+    gates["B1_psnr_min_ge_65.0"] = b1["psnr_min"] >= 65.0
 
     # ------------------------------------------------ fp32 eager R + gate A
     ref = build(False, None, (2, 3))
