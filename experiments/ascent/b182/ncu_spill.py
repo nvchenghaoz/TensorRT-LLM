@@ -19,15 +19,24 @@ for r in rows[1:]:
     rec = {hdr[i]: r[i] for i in want}
     out.append(rec)
     print(json.dumps(rec), flush=True)
-spill_cols = [h for h in (hdr[i] for i in want) if "spilling" in h or "local" in h]
-bad = []
+COUNTS = ("derived__local_spilling_requests", "sass__inst_executed_local_loads",
+          "sass__inst_executed_local_stores", "sass__inst_executed_register_spilling_mem_local",
+          "smsp__sass_inst_executed_op_local_ld.sum", "smsp__sass_inst_executed_op_local_st.sum",
+          "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum",
+          "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum")
+spill_cols = [h for h in COUNTS if h in hdr]
+reg_cols = [h for h in hdr if "registers" in h or "stack" in h]
+bad, summary = [], []
 for rec in out:
+    s = {"grid": rec.get("Grid Size"), **{h: rec.get(h) for h in reg_cols},
+         **{h: rec.get(h) for h in spill_cols}}
+    summary.append(s)
     for h in spill_cols:
-        v = rec.get(h, "").replace(",", "")
+        v = (rec.get(h) or "").replace(",", "")
         try:
             if float(v) != 0.0:
                 bad.append((h, v))
         except ValueError:
             pass
 print(json.dumps({"passed": not bad and bool(out), "launches": len(out), "nonzero_local": bad[:20],
-                  "local_columns": spill_cols}))
+                  "count_columns": spill_cols, "per_launch": summary[:4]}))
