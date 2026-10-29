@@ -55,10 +55,13 @@ _quant = fp8_sm12x.quantize_qkv_e4m3
 _qr8 = qr8.qknorm_rope_fp8
 
 
-def _count_fold(mode, key_base, args, rows, n_part, grid, sm_scale, vec=False, discard=0, hint=0):
-    k = f"{'vec' if vec else 'fold'}{mode}_d{discard}_h{hint}_ld{key_base[2]}"
+def _count_fold(mode, key_base, args, rows, n_part, grid, sm_scale, vec=False, static_qk=False,
+                discard=0, hint=0):
+    k = (f"{'vec' if vec else 'fold'}{mode}_d{discard}_h{hint}_ld{key_base[2]}"
+         f"_s{int(bool(static_qk))}")
     counts[k] = counts.get(k, 0) + 1
-    return _fold_pass(mode, key_base, args, rows, n_part, grid, sm_scale, vec, discard, hint)
+    return _fold_pass(mode, key_base, args, rows, n_part, grid, sm_scale, vec, static_qk,
+                      discard, hint)
 
 
 def _count_quant(*a, **k):
