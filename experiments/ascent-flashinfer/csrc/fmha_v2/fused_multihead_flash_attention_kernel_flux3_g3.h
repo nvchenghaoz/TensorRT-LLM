@@ -100,7 +100,9 @@ inline __device__ void mbar_wait(uint32_t bar, uint32_t phase) {
 inline __device__ void tma_load_4d(uint32_t dst, CUtensorMap const* map, uint32_t bar, int c0,
                                    int c1, int c2, int c3) {
   asm volatile(
-      "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes "
+      // CTA-local destination: the .shared::cluster form makes the compiler add a per-copy
+      // "is this my CTA" check with a CALL slow path (8 B of stack) in a non-cluster launch.
+      "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes "
       "[%0], [%1, {%2, %3, %4, %5}], [%6];\n" ::"r"(dst),
       "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(bar)
       : "memory");

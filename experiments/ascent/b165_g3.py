@@ -216,10 +216,12 @@ def mode_pair(args):
                       "output_sha": hashlib.sha256(ref.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()}))
 
 
-def modules():
+def modules(sample=None):
     from tensorrt_llm._torch.visual_gen.attention.backends import fmha_v2_flux3 as lib
 
     lev_b = tuple(lib.ROUTED_LEVERS)
+    if sample is not None and hasattr(lib, "load_trim_levers"):
+        lev_b = tuple(lib.load_trim_levers(lev_b, sample["k"], sample["v"]))
     if "g3" not in lev_b:
         lev_b = (*lev_b, "g3")
     lev_a = tuple(x for x in lev_b if x != "g3")
@@ -277,6 +279,16 @@ def resource_usage(lib, levers):
                 if "padding" not in n and "causal" not in n and "custom" not in n}
             out["sass_stl_ldl"] = {n: sum(("STL" in x or "LDL" in x) for x in b)
                                    for n, b in funcs.items() if "_g3" in n}
+            ctx = []
+            for n, b in funcs.items():
+                if "_g3" not in n:
+                    continue
+                out["sass_g3_lines"] = len(b)
+                for i, x in enumerate(b):
+                    if "STL" in x or "LDL" in x:
+                        ctx.append(f"--- line {i}")
+                        ctx += b[max(0, i - 6):i + 4]
+            out["sass_stl_ldl_ctx"] = ctx[:400]
         except Exception as exc:  # noqa: BLE001
             out["sass_error"] = str(exc)
         break
@@ -284,7 +296,7 @@ def resource_usage(lib, levers):
 
 
 def mode_check(args):
-    lib, lev_a, lev_b, ma, mb = modules()
+    lib, lev_a, lev_b, ma, mb = modules(make_inp(4176, 7))
     failures = []
     res = {"levers_A": list(lev_a), "levers_B": list(lev_b), "per_S": {}}
     for S in args.seqs:
@@ -358,20 +370,51 @@ def mode_check(args):
 
 
 def mode_ab(args):
-    lib, lev_a, lev_b, ma, mb = modules()
     inputs = pass_inputs()
+    lib, lev_a, lev_b, ma, mb = modules(inputs[4176])
+    snaps = {S: snap(inputs[S]) for S in inputs}
     gA, fA = capture(lambda inp, o: call_lib(lib, ma, inp, o), inputs)
+    gA2, fA2 = capture(lambda inp, o: call_lib(lib, ma, inp, o), inputs)
     gB, fB = capture(lambda inp, o: call_lib(lib, mb, inp, o), inputs)
-    log(f"[graph A] {json.dumps(graph_kernels(gA))}")
-    log(f"[graph B] {json.dumps(graph_kernels(gB))}")
-    n = soak([gA, gB], args.soak_s)
+    kA, kB = graph_kernels(gA), graph_kernels(gB)
+    log(f"[graph A] {json.dumps(kA)}")
+    log(f"[graph B] {json.dumps(kB)}")
+    for S in inputs:
+        restore(inputs[S], snaps[S])
+    n = soak([gA, gA2, gB], args.soak_s)
     log(f"[soak] {n}")
-    smp = timed([("A", gA), ("B", gB)], args.blocks, args.block)
-    sA, sB = summary(smp["A"]), summary(smp["B"])
+    smp = timed([("A", gA), ("A2", gA2), ("B", gB)], args.blocks, args.block)
+    sA, sA2, sB = summary(smp["A"]), summary(smp["A2"]), summary(smp["B"])
     sP = summary([b / a for a, b in zip(smp["A"], smp["B"])])
-    eq = torch.equal(fA.view(torch.int16), fB.view(torch.int16))
-    res = {"A_per_call_us": sA["p50"] / K * 1e3, "B_per_call_us": sB["p50"] / K * 1e3,
-           "A": sA, "B": sB, "paired_ratio_B_over_A": sP, "graph_outputs_bitwise_equal": eq}
+    sAA = summary([b / a for a, b in zip(smp["A"], smp["A2"])])
+    # untimed replica: same soak count and sample count, every replay == replay 0
+    for S in inputs:
+        restore(inputs[S], snaps[S])
+    for _ in range(n):
+        for g in (gA, gA2, gB):
+            g.replay()
+    torch.cuda.synchronize()
+    refs, bad = {}, 0
+    for i in range(args.blocks * args.block):
+        for nm, g, f in (("A", gA, fA), ("A2", gA2, fA2), ("B", gB, fB)):
+            g.replay()
+            if nm not in refs:
+                torch.cuda.synchronize()
+                refs[nm] = f.clone()
+            elif (i + 1) % 25 == 0:
+                torch.cuda.synchronize()
+                bad += int(not torch.equal(f.view(torch.int16), refs[nm].view(torch.int16)))
+    torch.cuda.synchronize()
+    eq = torch.equal(refs["A"].view(torch.int16), refs["B"].view(torch.int16))
+    inok = all(unchanged(inputs[S], snaps[S]) for S in inputs)
+    res = {"levers_A": list(lev_a), "levers_B": list(lev_b), "kernels_A": kA, "kernels_B": kB,
+           "A_per_call_us": sA["p50"] / K * 1e3, "A2_per_call_us": sA2["p50"] / K * 1e3,
+           "B_per_call_us": sB["p50"] / K * 1e3,
+           "A": sA, "A2": sA2, "B": sB, "paired_ratio_B_over_A": sP,
+           "paired_ratio_AA": sAA, "graph_outputs_bitwise_equal": eq,
+           "replica_mismatches": bad, "inputs_unchanged": inok}
+    log(f"[ab] B/A {sP['p50']:.4f} [{sP['p10']:.4f}, {sP['p90']:.4f}]  A/A {sAA['p50']:.4f} "
+        f"[{sAA['p10']:.4f}, {sAA['p90']:.4f}]")
     # per-S graphs
     for S in sorted(set(SEQ)):
         inp = inputs[S]
@@ -406,6 +449,13 @@ def main():
     p.add_argument("--seqs", type=int, nargs="+",
                    default=[4176, 4096, 4100, 4160, 4256, 40, 4224])
     args = p.parse_args()
+    try:
+        lg = subprocess.run(["git", "log", "--oneline", "-3"], capture_output=True, text=True)
+        anc = subprocess.run(["git", "merge-base", "--is-ancestor", "0b4693c4", "HEAD"],
+                             capture_output=True, text=True)
+        log(f"[ancestry] {lg.stdout.strip()!r}; is-ancestor 0b4693c4 rc={anc.returncode}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"[ancestry] git unavailable: {exc}")
     log(f"device {torch.cuda.get_device_name()} mode {args.mode}")
     {"pair": mode_pair, "check": mode_check, "ab": mode_ab}[args.mode](args)
 
