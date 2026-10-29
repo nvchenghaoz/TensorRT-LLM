@@ -47,6 +47,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
 )
 from tensorrt_llm.logger import logger
 
+from . import flux3_fp8r_gemm as _fp8r_gemm
 from .flux3_fp8r_qkv import _sm120_fp8r_qknorm_rope_eligible, _sm120_fp8r_qkv_forward
 from .nvfp4_metadata import register_nvfp4_owner
 
@@ -518,6 +519,9 @@ class PreparedFP8Sm120(PreparedFP8):
 
     def gemm(self, data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """The rowwise-scaled FP8 GEMM alone (no SwiGLU), BF16 [M, N]."""
+        if _fp8r_gemm.enabled():
+            # Idea 122: SM120 CUTLASS FP8-rowwise GEMM, bitwise equal to torch._scaled_mm.
+            return torch.ops.trtllm.flux3_sm120_fp8r_gemm(data, self.weight, scales, self.scale)
         return torch._scaled_mm(
             data,
             self.weight.t(),
@@ -735,6 +739,8 @@ def prepare_sm120_fp8_excluded_block(block: nn.Module) -> bool:
         )
         block.ff.down_proj._flux3_primsts_fp8 = PreparedFP8Sm120(block.ff.down_proj.weight)
     attn._flux3_sm120_fp8r_qknorm_rope = _sm120_fp8r_qknorm_rope_eligible(attn)
+    # Idea 122 (TRTLLM_FLUX3_FP8R_GEMM): build the FP8R GEMM and rebind the FP8R QKV op, at load.
+    _fp8r_gemm.install(attn._flux3_sm120_fp8_qkv.weight.device)
     return True
 
 

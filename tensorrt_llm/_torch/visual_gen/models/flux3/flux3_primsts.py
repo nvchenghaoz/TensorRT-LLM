@@ -491,12 +491,18 @@ def _nvfp4_out_pair_fake(
     )
 
 
-def _fp8r_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def _fp8r_linear(
+    x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, slot: int = 0
+) -> torch.Tensor:
     """PreparedFP8Sm120.forward for a 2D BF16 input: fp8r quantize + rowwise cuBLASLt GEMM."""
+    from . import flux3_fp8r_gemm
     from .fp8 import quantize_fp8r
 
     data, scales = quantize_fp8r(x)
     scales = scales.float().reshape(-1).contiguous()
+    if flux3_fp8r_gemm.enabled():
+        # Idea 122: SM120 CUTLASS FP8-rowwise GEMM, bitwise equal to torch._scaled_mm.
+        return flux3_fp8r_gemm.gemm(data.contiguous(), weight, scales, scale, slot=slot)
     return torch._scaled_mm(
         data.contiguous(),
         weight.t(),
@@ -524,7 +530,7 @@ def fp8r_out_pair(
     return _sm120_tail_pair(
         attn.device,
         lambda: _fp8r_linear(down_input, down_weight, down_scale),
-        lambda: _fp8r_linear(attn, attn_weight, attn_scale),
+        lambda: _fp8r_linear(attn, attn_weight, attn_scale, slot=1),
     )
 
 
@@ -557,6 +563,11 @@ def fp8r_out_pair_q(
     attn_weight, attn_scale = attn_weight.detach(), attn_scale.detach()
 
     def launch_down() -> torch.Tensor:
+        from . import flux3_fp8r_gemm
+
+        if flux3_fp8r_gemm.enabled():
+            # Idea 122: SM120 CUTLASS FP8-rowwise GEMM, bitwise equal to torch._scaled_mm.
+            return flux3_fp8r_gemm.gemm(down_data, down_weight, down_scales, down_scale)
         return torch._scaled_mm(
             down_data,
             down_weight.t(),
@@ -568,7 +579,7 @@ def fp8r_out_pair_q(
     return _sm120_tail_pair(
         attn.device,
         launch_down,
-        lambda: _fp8r_linear(attn, attn_weight, attn_scale),
+        lambda: _fp8r_linear(attn, attn_weight, attn_scale, slot=1),
     )
 
 
