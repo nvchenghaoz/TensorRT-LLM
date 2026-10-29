@@ -54,8 +54,9 @@ def build(lib, sample):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--repeats", type=int, default=100)
-    p.add_argument("--sizes", default="16384,16896,16900,33280,33300,4096,4100,4176")
-    p.add_argument("--chains", default="16384:16896,16384:33280,4096:4176")
+    # served (T=80): 16384, 16464, 32848; T=512 shapes 16896/33280 and unaligned 16900 kept
+    p.add_argument("--sizes", default="16384,16464,32848,16896,33280,16900,4096,4100,4176")
+    p.add_argument("--chains", default="16384:16464,16384:32848,4096:4176")
     args = p.parse_args()
     from tensorrt_llm._torch.visual_gen.attention.backends import fmha_v2_flux3 as lib
 

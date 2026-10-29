@@ -7,8 +7,8 @@ Labels (2048^2, T=512 text):
   t2i-2048 / i2i-2048  CUDA graph of the step's FP8 attention calls (knowledge 316 call map):
                        n_bf16 G3 BF16-out calls at 16384 (unforked; the same kernel in both
                        trees), 4 nvfp4_out at 16384 (image mode blocks 1-4) and 28 nvfp4_out at
-                       S_full (single blocks): t2i 1 + 4 @16384 + 28 @16896; i2i 6 + 4 @16384 +
-                       28 @33280.
+                       S_full (single blocks): t2i 1 + 4 @16384 + 28 @16464; i2i 6 + 4 @16384 +
+                       28 @32848 (served T=80).
   fork-t2i / fork-i2i  served-order fork pair at S_full, 4 pairs per graph replay, reported per
                        pair: fork event, FMHA (current stream), then the side-stream CUTLASS
                        SwiGLU gate_up (M=S_full, N=18432, K=3072, NVFP4) waiting on the event,
@@ -37,9 +37,11 @@ log = b.log
 # label -> (G3 BF16-out calls at S_img (unchanged by the branch), S_img, S_full); per step every
 # label also runs 4 nfo calls at S_img + 28 nfo calls at S_full (knowledge 316 call map:
 # t2i 5 x 16384 + 28 x 16896, i2i 10 x 16384 + 28 x 33280).
-CHAINS = {"t2i-2048": (1, 16384, 16896), "i2i-2048": (6, 16384, 33280),
+# Served T=80 text (knowledge 384): single blocks run S = 16384 + 80 = 16464 (t2i) and
+# 32768 + 80 = 32848 (i2i); 16896/33280 (T=512) are never launched in the served pass.
+CHAINS = {"t2i-2048": (1, 16384, 16464), "i2i-2048": (6, 16384, 32848),
           "s4176-1024": (1, 4096, 4176)}
-FORKS = {"fork-t2i": 16896, "fork-i2i": 33280}
+FORKS = {"fork-t2i": 16464, "fork-i2i": 32848}
 HIDDEN, MLP2 = 3072, 2 * 9216
 
 
