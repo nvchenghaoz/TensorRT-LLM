@@ -80,9 +80,18 @@ def lat(s, eps=0.0):
     return z
 
 
+# Plans as committed in the branch's subpixel_conv.PLAN_NAME (no-op when the tree already has them).
+spc.PLAN_NAME.setdefault((512, 512, 256), "eng1_k24=1")
+spc.PLAN_NAME.setdefault((512, 512, 128), "eng1_k24=4")
+log("PLAN_NAME", {str(k): v for k, v in spc.PLAN_NAME.items()})
+
+
 def set_levels(vae, levels):
+    # ON: op path; OFF: main's aten conv_transpose2d path. Same meaning in the branch tree
+    # (fused_op_path checked first) and in main's tree (transpose_path checked first).
     for lvl in (2, 3):
         vae.decoder.up[lvl].upsample.use_fused_bias_op = lvl in levels
+        vae.decoder.up[lvl].upsample.use_transpose = lvl not in levels
     assert vae.decoder.up[1].upsample.use_fused_bias_op and not vae.decoder.up[1].upsample.use_transpose
 
 
@@ -191,6 +200,9 @@ def census(vae, z):
             "fp8_conv3x3_calls": opc.get("flux3_vae::fp8_conv3x3", 0),
             "subpixel_up_conv_calls": opc.get("flux3_vae::subpixel_up_conv", 0),
             "scaled_mm_calls": opc.get("aten::_scaled_mm", 0),
+            "scaled_mm_named_kernels": sum(v for k, v in kc.items() if "scaled_mm" in k),
+            "attn_fp8_pv_flags": [bool(m._fp8_pv) for m in vae.decoder.modules()
+                                  if type(m).__name__ == "Flux3ImageAttnBlock"],
             "strided_dgrad_kernels": sum(v for k, v in kc.items() if "strided_dgrad" in k),
             "upsample_related_kernels": up_rows}
 
@@ -343,6 +355,8 @@ with torch.inference_mode():
 
 out["gates"] = gates
 out["report_only"] = {"fp8_ON_scaled_mm_calls": out["fp8_ON"]["census"]["scaled_mm_calls"],
+                      "fp8_ON_scaled_mm_named_kernels": out["fp8_ON"]["census"]["scaled_mm_named_kernels"],
+                      "fp8_ON_attn_fp8_pv_flags": out["fp8_ON"]["census"]["attn_fp8_pv_flags"],
                       "fp8_OFF_census": {k: out["fp8_OFF"]["census"][k] for k in
                                          ("kernels", "kernel_sum_ms", "strided_dgrad_kernels", "subpixel_up_conv_calls")},
                       "fp8_ON_census": {k: ce[k] for k in
