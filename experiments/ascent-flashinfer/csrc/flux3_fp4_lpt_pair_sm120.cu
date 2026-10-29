@@ -30,6 +30,10 @@
 // a CTA claims at most one tile ahead of the tile its MMA warps are working on. The counter lives in
 // the caller's workspace and is reset by the args kernel that precedes every GEMM launch (stream
 // ordered, CUDA-graph safe; the GEMM waits for the args kernel via griddepcontrol.wait).
+// The raster argument picks how a linear tile index maps to (m, n) within a group: CUTLASS's
+// grouped default AlongM walks every M tile of one N column first, so at M=33280 a wave streams
+// down's 153 MB A operand (over the 128 MB L2) once per N column; AlongN walks the 24 N tiles of
+// one M panel first, so each A panel is read from DRAM about once.
 #include <cuda_fp16.h>
 
 #include <cstddef>
@@ -401,10 +405,15 @@ void check_operand(TensorView a, TensorView b, TensorView sfa, TensorView sfb, T
 // mode: 0 = static round-robin (stock group order), 1 = dynamic longest-first (atomic counter,
 // each CTA claims one tile ahead), 2 = dynamic, claimed when the mainloop DMA warp asks for it.
 // grid_ctas: 0 = one persistent CTA per SM; >0 overrides the persistent grid (diagnostics).
+// raster: 0 = AlongM (CUTLASS's grouped default: M fastest within an N column), 1 = AlongN (N
+// fastest within an M panel, so one wave reuses each A panel across all N tiles from L2).
+// max_swizzle: CUTLASS max_swizzle_size (1 = none). raster=0, max_swizzle=1 is main's order.
+// Only which CTA computes which output tile (and when) changes; each tile's MMA sequence over K
+// and its epilogue are the same, so outputs are bitwise identical across raster settings.
 void lpt_pair(TensorView a0, TensorView b0, TensorView sfa0, TensorView sfb0, TensorView alpha0,
               TensorView out0, TensorView a1, TensorView b1, TensorView sfa1, TensorView sfb1,
               TensorView alpha1, TensorView out1, TensorView workspace, int64_t mode,
-              int64_t grid_ctas) {
+              int64_t grid_ctas, int64_t raster, int64_t max_swizzle) {
   using namespace flux3_lpt;
   check_operand(a0, b0, sfa0, sfb0, alpha0, out0);
   check_operand(a1, b1, sfa1, sfb1, alpha1, out1);
@@ -412,6 +421,9 @@ void lpt_pair(TensorView a0, TensorView b0, TensorView sfa0, TensorView sfb0, Te
   CHECK_DEVICE(a0, workspace);
   TVM_FFI_ICHECK(mode >= 0 && mode <= 2)
       << "mode must be 0 (static), 1 (dynamic, one tile ahead) or 2 (dynamic, on demand)";
+  TVM_FFI_ICHECK(raster == 0 || raster == 1) << "raster must be 0 (AlongM) or 1 (AlongN)";
+  TVM_FFI_ICHECK(max_swizzle == 1 || max_swizzle == 2 || max_swizzle == 4 || max_swizzle == 8)
+      << "max_swizzle must be 1, 2, 4 or 8";
 
   PairInputs in{};
   TensorView const* as[2] = {&a0, &a1};
@@ -470,6 +482,10 @@ void lpt_pair(TensorView a0, TensorView b0, TensorView sfa0, TensorView sfb0, Te
       hw_info};
   arguments.scheduler.tile_counter = mode >= 1 ? args_layout.counter : nullptr;
   arguments.scheduler.on_demand = mode == 2 ? 1 : 0;
+  using SchedulerRasterOptions = decltype(arguments.scheduler.raster_order);
+  arguments.scheduler.raster_order =
+      raster == 1 ? SchedulerRasterOptions::AlongN : SchedulerRasterOptions::AlongM;
+  arguments.scheduler.max_swizzle_size = static_cast<int>(max_swizzle);
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha = 0.0f;
   fusion_args.beta = 0.0f;
