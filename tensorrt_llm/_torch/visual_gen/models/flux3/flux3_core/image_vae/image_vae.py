@@ -40,7 +40,12 @@ def swish(x: Tensor) -> Tensor:
 
 
 def group_norm_channel_stats(
-    x: Tensor, num_groups: int, weight: Tensor, bias: Tensor, eps: float
+    x: Tensor,
+    num_groups: int,
+    weight: Tensor,
+    bias: Tensor,
+    eps: float,
+    acc_dtype: torch.dtype | None = None,
 ) -> Tensor:
     """GroupNorm from per-channel statistics (same math as F.group_norm, reordered).
 
@@ -52,11 +57,16 @@ def group_norm_channel_stats(
     computed in fp32 and the output has x's dtype. Statistics accumulate in fp32 for
     low-precision inputs (the served bf16 trunk) and in fp64 for fp32 inputs (the fp32
     reference decoder), so neither is less accurate than aten's fp32 group statistics.
+    acc_dtype overrides that choice (the compiled fp32 encoder uses fp32, as aten's
+    GroupNorm does: SM120 fp64 runs at ~1/64 of the fp32 rate).
     """
     n, c = x.shape[:2]
     g = num_groups
     xf = x.float()
-    acc = torch.float64 if x.dtype == torch.float32 else torch.float32
+    if acc_dtype is not None:
+        acc = acc_dtype
+    else:
+        acc = torch.float64 if x.dtype == torch.float32 else torch.float32
     red = tuple(range(2, x.dim()))
     var_c, mean_c = torch.var_mean(x.to(acc), dim=red, correction=0)
     mean_c = mean_c.view(n, g, c // g)
@@ -92,6 +102,8 @@ class Flux3GroupNorm(nn.GroupNorm):
     triton_under_compile = False
     # Per instance: True traces group_norm_channel_stats instead of aten GroupNorm.
     channel_stats_under_compile = False
+    # Per instance: accumulation dtype of group_norm_channel_stats (None: its default).
+    channel_stats_acc_dtype = None
 
     def _fused(self, x: Tensor) -> bool:
         if torch.compiler.is_compiling() and not self.triton_under_compile:
@@ -100,7 +112,9 @@ class Flux3GroupNorm(nn.GroupNorm):
 
     def _unfused(self, x: Tensor) -> Tensor:
         if self.channel_stats_under_compile and torch.compiler.is_compiling():
-            return group_norm_channel_stats(x, self.num_groups, self.weight, self.bias, self.eps)
+            return group_norm_channel_stats(
+                x, self.num_groups, self.weight, self.bias, self.eps, self.channel_stats_acc_dtype
+            )
         return super().forward(x)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -750,8 +764,19 @@ class Flux3ImageVAE(nn.Module):
         m = self.bn.running_mean.view(1, -1, 1, 1)
         return z * s + m
 
+    # Set by compile_encoder(channels_last=True): encode() hands the compiled encoder a
+    # canonical channels_last input (one graph for every input layout) and gets its
+    # moments back in the contiguous layout the eager encoder returns.
+    _encoder_channels_last = False
+
     def encode(self, x: Tensor) -> Tensor:
-        moments = self.encoder(x)
+        if self._encoder_channels_last and x.dim() == 4:
+            # clone(memory_format=...) always yields the canonical channels_last strides,
+            # so the zeros warmup input and a decoded HWC reference share one graph.
+            moments = self.encoder(x.clone(memory_format=torch.channels_last))
+            moments = moments.contiguous()
+        else:
+            moments = self.encoder(x)
         mean = torch.chunk(moments, 2, dim=1)[0]
 
         z = rearrange(
@@ -808,6 +833,34 @@ class Flux3ImageVAE(nn.Module):
             # Keep low-precision intermediate rounding identical to eager casts.
             options["emulate_precision_casts"] = True
         self.decoder.compile(dynamic=False, options=options)
+
+    def compile_encoder(self, channels_last: bool = True, fp32_channel_stats: bool = True) -> None:
+        """torch.compile the encoder in place (state_dict keys are unchanged).
+
+        Mirrors compile_decoder: channels_last=True stores the encoder's conv weights
+        channels_last and encode() feeds it a channels_last input, so cuDNN runs NHWC
+        kernels end to end (no nchwToNhwc reformat per conv), GroupNorm is traced as
+        group_norm_channel_stats, and Inductor fuses conv bias adds, GN apply + swish,
+        residual adds, the downsample pad and the mid-block attention's scale + softmax
+        + bf16 cast into its own kernels. The math stays fp32 (TF32 cuDNN convs, as
+        eager). fp32_channel_stats=True accumulates the GN statistics in fp32 (aten
+        GroupNorm's accumulation) instead of fp64, which SM120 runs at ~1/64 rate.
+        Shapes are static: the served resolution compiles at warmup (first encode).
+        """
+        for m in self.encoder.modules():
+            if isinstance(m, Flux3GroupNorm):
+                m.triton_under_compile = False
+                m.channel_stats_under_compile = channels_last
+                m.channel_stats_acc_dtype = (
+                    torch.float32 if channels_last and fp32_channel_stats else None
+                )
+        if channels_last:
+            self.encoder.to(memory_format=torch.channels_last)
+        self._encoder_channels_last = channels_last
+        options = {"layout_optimization": False}
+        if next(self.encoder.parameters()).dtype != torch.float32:
+            options["emulate_precision_casts"] = True
+        self.encoder.compile(dynamic=False, options=options)
 
     def decode(self, z: Tensor) -> Tensor:
         z = self.inv_normalize(z)
