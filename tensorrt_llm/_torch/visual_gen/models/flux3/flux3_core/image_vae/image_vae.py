@@ -276,6 +276,10 @@ class Flux3ImageUpsample(nn.Module):
     at load (state_dict keys are unchanged) and follow .to(dtype/device).
     """
 
+    # transpose path: the decoder may pass the bias-free output to the next block and fold
+    # this conv's bias into that block's 1x1 nin_shortcut (_resnet_block_with_input_bias).
+    fold_bias_into_shortcut = True
+
     def __init__(self, in_channels: int):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
@@ -428,7 +432,8 @@ def _can_fold_input_bias(block: nn.Module, upsample: Flux3ImageUpsample, x: Tens
         return False
     b_up = upsample.conv.bias
     return (
-        nin.kernel_size == (1, 1)
+        upsample.fold_bias_into_shortcut
+        and nin.kernel_size == (1, 1)
         and nin.stride == (1, 1)
         and nin.padding == (0, 0)
         and nin.groups == 1
@@ -445,9 +450,13 @@ def _resnet_block_with_input_bias(block: Flux3ImageResnetBlock, x_nb: Tensor, b_
     """block(x_nb + b_in) for a block with a 1x1 nin_shortcut, without materializing
     x_nb + b_in: the norm1 path adds b_in as it loads x_nb (fused under torch.compile),
     and nin(x_nb + b_in) = nin(x_nb) + W_nin @ b_in, so the shortcut conv reads x_nb with
-    bias' = b_nin + W_nin[:, :, 0, 0] @ b_in (summed in fp64). bias' is kept in fp32 and
-    added to the fp32 conv result before its one rounding, like the original bias add (a
-    bias' rounded to bf16 would be a per-channel constant error on every pixel)."""
+    bias' = b_nin + W_nin[:, :, 0, 0] @ b_in (summed in fp64, kept in fp32 and added to
+    the conv output as its bias add is, before the one rounding to the trunk dtype).
+
+    Accuracy caveat: the shortcut conv output is rounded (by cuDNN) BEFORE bias' is
+    added. Where W_nin @ b_in largely cancels nin(x_nb), that rounding acts on a much
+    larger value than in nin(x_nb + b_in), so the fold is applied only where it was
+    measured to be accurate (Flux3ImageUpsample.fold_bias_into_shortcut)."""
     x = x_nb + b_in.view(1, -1, 1, 1)
     h = block.norm1.forward_silu(x)
     h = block.conv1(h)
@@ -509,6 +518,11 @@ class Flux3ImageDecoder(nn.Module):
             up.attn = attn
             if i_level != 0:
                 up.upsample = Flux3ImageUpsample(block_in)
+                # The upsample into the full-resolution level keeps its bias on x (no
+                # fold into up[0].block[0].nin_shortcut): on the FLUX.3 VAE, folding
+                # there cost ~0.3 dB PSNR vs the fp32 decode (bf16 trunk), folding into
+                # up[1].block[0] did not (see _resnet_block_with_input_bias).
+                up.upsample.fold_bias_into_shortcut = i_level != 1
             self.up.insert(0, up)
 
         self.norm_out = Flux3GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)

@@ -128,7 +128,9 @@ def unit():
         r64 = blk64(x_nb.double() + b_up.double().view(1, -1, 1, 1))
         ef, em = (yf.double() - r64).abs(), (ym.double() - r64).abs()
         up_bf16 = copy.deepcopy(vae.decoder.up[lvl + 1].upsample).to(torch.bfloat16)
-        rec = {"case": f"fold_up{lvl}.block0_{C}@{H}",
+        decoder_folds_here = bool(up_bf16.fold_bias_into_shortcut)
+        up_bf16.fold_bias_into_shortcut = True  # helper math is checked at both levels
+        rec = {"case": f"fold_up{lvl}.block0_{C}@{H}", "decoder_folds_here": decoder_folds_here,
                "can_fold": iv._can_fold_input_bias(blk, up_bf16, x_nb),
                "fold_vs_fp64_max": ef.max().item(), "main_vs_fp64_max": em.max().item(),
                "fold_vs_fp64_mean": ef.mean().item(), "main_vs_fp64_mean": em.mean().item(),
