@@ -3,32 +3,40 @@
 """SM120 FP8-rowwise GEMM for FLUX.3's FP8R (BF16 checkpoint-excluded) blocks (idea 122).
 
 FlashInfer overlay entry ``csrc/flux3_fp8r_gemm_sm120.cu`` (module ``flux3_fp8r_gemm_sm120``):
-a CUTLASS SM120 E4M3 x E4M3 GEMM with FP32 accumulation, a CLC persistent tile scheduler, >= 4
-smem stages, PDL, and an EVT epilogue BF16(s_outer * (s_inner * acc)) with separate FP32 RN
-multiplies. It replaces torch._scaled_mm (PyTorch's SM120 rowwise CUTLASS kernel, 2 smem stages)
-at image.0's 4 GEMM sites when TRTLLM_FLUX3_FP8R_GEMM=1 (default); 0 restores torch._scaled_mm.
+a CUTLASS SM120 E4M3 x E4M3 GEMM with FP32 accumulation, CLC persistent tile scheduler, PDL, and
+an EVT epilogue BF16(w_scale * (x_scale * acc)) with two separate FP32 RN multiplies. The served
+arm is Pingpong 128x128x64 with 5 smem stages; torch._scaled_mm (PyTorch's SM120 rowwise CUTLASS
+kernel) is Cooperative 128x128x128 with 2 stages. Same per-element k32 MMA chain and the same
+epilogue association, so the output is bitwise equal to torch._scaled_mm (idea 122 STEP 0(c)).
 
-The module is JIT-built and its workspace allocated at model load (``preload``); a call never
-builds or allocates anything but its output.
+TRTLLM_FLUX3_FP8R_GEMM=1 (default) routes image.0's 4 FP8R GEMMs here:
+- gate_up: primsts.PreparedFP8Sm120.gemm (through the custom op trtllm::flux3_sm120_fp8r_gemm);
+- QKV: flux3_fp8r_qkv.fp8r_qkv_qknorm_rope is rebound at prepare time (``install``) to
+  trtllm::flux3_sm120_fp8r_qkv_qknorm_rope_cg, the same op with this GEMM (no text change there);
+- down / attn_out: flux3_primsts.fp8r_out_pair_q's launch_down and _fp8r_linear.
+TRTLLM_FLUX3_FP8R_GEMM=0 keeps torch._scaled_mm at all 4 sites and rebinds nothing.
+The module is JIT-built at prepare time (``install``); a call never builds.
 """
 
 from __future__ import annotations
 
 import os
+from collections import Counter
 from functools import lru_cache
 
 import torch
 
-# Arm: 0 = Cooperative 128x128x64 (A), 1 = Pingpong 128x128x64 (C), 2 = Cooperative 128x128x128.
-ARM = int(os.environ.get("TRTLLM_FLUX3_FP8R_GEMM_ARM", "0"))
-# Epilogue association per weight shape (N, K) -> order (1: sw*(sx*acc), 0: sx*(sw*acc)), chosen
-# to match torch._scaled_mm bitwise (it runs N=3072 transposed, which swaps the two scales).
-ORDER_DEFAULT = 1
-ORDER_BY_N = {3072: 0}
+# Arm: 0 = Cooperative 128x128x64, 1 = Pingpong 128x128x64 (served), 2 = Cooperative 128x128x128,
+# 3 = Cooperative 128x256x64, 4 = Cooperative 256x128x64 (3/4: order 1 only).
+ARM = int(os.environ.get("TRTLLM_FLUX3_FP8R_GEMM_ARM", "1"))
+# Epilogue association: 1 -> BF16(w_scale * (x_scale * acc)), bitwise equal to torch._scaled_mm on
+# every image.0 shape (0 -> BF16(x_scale * (w_scale * acc)) differs in ~5e-6 of elements by 1 ulp).
+ORDER = 1
 
 _WORKSPACE_BYTES = 1024 * 1024
-_WORKSPACES: dict[int, torch.Tensor] = {}
-ROUTES = {"count": 0}
+_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
+# Routed calls by weight N (counted in the op bodies, i.e. in the worker process).
+ROUTES: Counter = Counter()
 
 
 @lru_cache(maxsize=1)
@@ -68,7 +76,7 @@ def workspace(device: torch.device, slot: int = 0) -> torch.Tensor:
 
 
 def preload(device: torch.device) -> None:
-    """Build the module and allocate the workspace at model load."""
+    """Build the module and allocate the workspaces at model load."""
     if not enabled():
         return
     mod = module()
@@ -77,10 +85,6 @@ def preload(device: torch.device) -> None:
         raise RuntimeError(f"FP8R GEMM workspace {need} B exceeds {_WORKSPACE_BYTES} B")
     workspace(device, 0)
     workspace(device, 1)
-
-
-def order_for(n: int) -> int:
-    return ORDER_BY_N.get(int(n), ORDER_DEFAULT)
 
 
 def gemm(
@@ -96,10 +100,10 @@ def gemm(
 ) -> torch.Tensor:
     """BF16 [M, N] = rowwise-scaled FP8 GEMM, same contract as torch._scaled_mm(a, w.t(), ...).
 
-    activation E4M3 [M, K] contiguous, weight E4M3 [N, K] contiguous, activation_scale FP32 [M]
-    (any shape with M elements), weight_scale FP32 [N].
+    activation E4M3 [M, K] contiguous, weight E4M3 [N, K] contiguous, activation_scale FP32 with
+    M elements, weight_scale FP32 with N elements. Current stream; allocates only the output.
     """
-    m, k = activation.shape
+    m = activation.shape[0]
     n = weight.shape[0]
     if out is None:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=activation.device)
@@ -111,7 +115,96 @@ def gemm(
         out,
         workspace(activation.device, slot),
         int(ARM if arm is None else arm),
-        int(order_for(n) if order is None else order),
+        int(ORDER if order is None else order),
     )
-    ROUTES["count"] += 1
+    ROUTES[int(n)] += 1
     return out
+
+
+@torch.library.custom_op("trtllm::flux3_sm120_fp8r_gemm", mutates_args=(), device_types="cuda")
+def fp8r_gemm_op(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """torch._scaled_mm(activation, weight.t(), rowwise scales, bf16) through the overlay GEMM."""
+    return gemm(
+        activation.contiguous(),
+        weight.contiguous(),
+        activation_scale.float().reshape(-1).contiguous(),
+        weight_scale.float().reshape(-1).contiguous(),
+    )
+
+
+@fp8r_gemm_op.register_fake
+def _fp8r_gemm_op_fake(activation, weight, activation_scale, weight_scale):
+    return activation.new_empty((activation.shape[0], weight.shape[0]), dtype=torch.bfloat16)
+
+
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_fp8r_qkv_qknorm_rope_cg", mutates_args=(), device_types="cuda"
+)
+def fp8r_qkv_qknorm_rope_cg(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    cos_sin: torch.Tensor,
+    planar: bool = False,
+) -> torch.Tensor:
+    """flux3_fp8r_qkv.fp8r_qkv_qknorm_rope with its torch._scaled_mm replaced by ``gemm``
+    (bitwise equal); the QK-norm/RoPE pass and its arguments are exactly the original's."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_qknorm_rope import (
+        qknorm_rope,
+    )
+
+    from .flux3_primsts import _token_positions
+
+    out = gemm(
+        activation.contiguous(),
+        weight.contiguous(),
+        activation_scale.float().reshape(-1).contiguous(),
+        weight_scale.float().reshape(-1).contiguous(),
+    )
+    width = out.shape[1] // 3
+    positions = _token_positions(out.shape[0], out.device)
+    dst = torch.empty_like(out) if planar else out
+    return qknorm_rope(
+        out[:, :width],
+        out[:, width:2 * width],
+        out[:, 2 * width:],
+        dst,
+        q_norm.detach(),
+        k_norm.detach(),
+        cos_sin.detach(),
+        positions,
+        planar=planar,
+    )
+
+
+@fp8r_qkv_qknorm_rope_cg.register_fake
+def _fp8r_qkv_qknorm_rope_cg_fake(
+    activation, weight, activation_scale, weight_scale, q_norm, k_norm, cos_sin, planar=False
+):
+    return activation.new_empty((activation.shape[0], weight.shape[0]), dtype=torch.bfloat16)
+
+
+# The original flux3_fp8r_qkv.fp8r_qkv_qknorm_rope, saved exactly once by install().
+_ORIGINAL_QKV_OP = None
+
+
+def install(device: torch.device) -> bool:
+    """Build at load and rebind the FP8R QKV op (idempotent). Returns True when routed."""
+    global _ORIGINAL_QKV_OP
+    if not enabled():
+        return False
+    preload(device)
+    from . import flux3_fp8r_qkv
+
+    if _ORIGINAL_QKV_OP is None:
+        _ORIGINAL_QKV_OP = flux3_fp8r_qkv.fp8r_qkv_qknorm_rope
+    flux3_fp8r_qkv.fp8r_qkv_qknorm_rope = fp8r_qkv_qknorm_rope_cg
+    return True
