@@ -88,6 +88,15 @@ class NVFP4Activation(NamedTuple):
 PrimsTSInput = torch.Tensor | Fp8RowwiseQuantizedTensor | NVFP4Activation
 
 
+class NVFP4AttnOut(NamedTuple):
+    """An attention output held only as attn_out's NVFP4 activation (written by the FMHA epilogue,
+    TRTLLM_FLUX3_ATTN_NVFP4_OUT): data uint8 [B, S, H*D/2], scales flat 128x4 E4M3 bytes. Exactly
+    nvfp4_quantize_prepared(attn, attn_out weight) of the BF16 attention output it replaces."""
+
+    data: torch.Tensor
+    scales: torch.Tensor
+
+
 def original_input(x: PrimsTSInput) -> torch.Tensor:
     return x.original if isinstance(x, (Fp8RowwiseQuantizedTensor, NVFP4Activation)) else x
 
@@ -835,7 +844,32 @@ def prepare_sm120_tail_pair(block: nn.Module) -> bool:
         and getattr(block.attn_out, "_flux3_primsts_nvfp4", None) is not None
         else 0
     )
+    block._sm120_attn_nvfp4_out = _sm120_attn_nvfp4_out_eligible(block)
     return block._sm120_tail_pair
+
+
+def _sm120_attn_nvfp4_out_eligible(block: nn.Module) -> bool:
+    """Static switch of the FMHA NVFP4 output epilogue (TRTLLM_FLUX3_ATTN_NVFP4_OUT): NVFP4
+    tail-pair blocks with the side-stream gate_up whose pair runs as the one-launch LPT kernel."""
+    if not getattr(block, "_sm120_side_gate_up", 0):
+        return False
+    from . import flux3_sm120_lpt_pair as lpt
+    from .flux3_primsts import _sm120_linear_backend, attn_nvfp4_out_enabled
+
+    return bool(
+        attn_nvfp4_out_enabled()
+        and lpt.enabled()
+        and _sm120_linear_backend() == "cutlass"
+        and getattr(block.attn_out, "_flux3_primsts_nvfp4", None) is not None
+    )
+
+
+def sm120_attn_nvfp4_out_weight(block: nn.Module) -> torch.Tensor | None:
+    """attn_out's NVFP4 weight when the block's FMHA may write attn_out's activation (the
+    fp8-direct side-gate_up call), else None. Callers must not read the BF16 attention output."""
+    if not getattr(block, "_sm120_attn_nvfp4_out", False):
+        return None
+    return block.attn_out._flux3_primsts_nvfp4.weight
 
 
 def _side_gate_up_mode() -> int:
@@ -883,6 +917,23 @@ def sm120_tail_pair_forward(
     _sm120_tail_pair flag is set. gate_up runs exactly as in _flux3_gated_mlp_forward, unless
     ``gate_up`` (packed, scales) was already computed beside attention.
     """
+    if isinstance(attn, NVFP4AttnOut):
+        # The FMHA already wrote attn_out's NVFP4 activation (sm120_attn_nvfp4_out_weight).
+        from .flux3_primsts import nvfp4_out_pair_prequant
+
+        out = block.attn_out._flux3_primsts_nvfp4
+        down = block.ff.down_proj._flux3_primsts_nvfp4
+        packed, output_scales = gate_up
+        return nvfp4_out_pair_prequant(
+            packed,
+            down.weight,
+            output_scales,
+            down.scale,
+            attn.data.reshape(-1, attn.data.shape[-1]),
+            attn.scales,
+            out.weight,
+            out.scale,
+        )
     original = original_input(mlp_input)
     attn_2d = attn.reshape(-1, attn.shape[-1]).contiguous()
     out = getattr(block.attn_out, "_flux3_primsts_nvfp4", None)
@@ -1040,6 +1091,7 @@ def qkv_fp8_attention_forward(
     freqs: tuple[torch.Tensor, ...],
     full_sequence: bool,
     side_gate_up: tuple | None = None,
+    attn_nvfp4_out: torch.Tensor | None = None,
 ) -> tuple | None:
     """(attention output [B, S, H*D] BF16, planar BF16 QKV GEMM output [M, 3W]) or None.
 
@@ -1114,6 +1166,17 @@ def qkv_fp8_attention_forward(
         up_data, up_weight, up_scales, up_weight_scale, inverse_scale, up_original, source, mode = (
             side_gate_up
         )
+        if attn_nvfp4_out is not None and batch == 1:
+            # attn_out's NVFP4 activation straight from the FMHA epilogue (sm120_attn_nvfp4_out).
+            from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
+                fp8_prequant_attention_nvfp4_out_side_gate_up,
+            )
+
+            fp4, sf, packed, packed_scales = fp8_prequant_attention_nvfp4_out_side_gate_up(
+                qkv8, fp8_scales, batch, heads, up_data, up_weight, up_scales, up_weight_scale,
+                inverse_scale, up_original, source, mode, attn_nvfp4_out,
+            )
+            return NVFP4AttnOut(fp4, sf), gemm, (packed, packed_scales)
         output, packed, packed_scales = fp8_prequant_attention_side_gate_up(
             qkv8, fp8_scales, batch, heads, up_data, up_weight, up_scales, up_weight_scale,
             inverse_scale, up_original, source, mode,

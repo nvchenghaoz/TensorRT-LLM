@@ -124,6 +124,9 @@ def sm120_linear_preload(device: torch.device) -> None:
         from . import flux3_sm120_lpt_pair
 
         flux3_sm120_lpt_pair.preload(device)
+        if flux3_sm120_lpt_pair.enabled() and attn_nvfp4_out_enabled():
+            # The FMHA nvfp4_out variant module (attn_out's activation from the FMHA epilogue).
+            attn_nvfp4_out_module()
     from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_swiglu_fp4_cutlass
 
     if flux3_swiglu_fp4_cutlass.enabled():
@@ -1574,6 +1577,211 @@ def _fp8_prequant_attention_side_gate_up_fake(
     attn = torch.empty((batch, rows // batch, heads, width // heads), dtype=torch.bfloat16,
                        device=qkv8.device)
     return attn, packed, packed_scales
+
+
+@lru_cache(maxsize=1)
+def attn_nvfp4_out_enabled() -> bool:
+    """TRTLLM_FLUX3_ATTN_NVFP4_OUT: the FP8-direct FMHA of NVFP4 tail-pair blocks writes attn_out's
+    NVFP4 activation (FP4 + 128x4 SF) from its epilogue instead of BF16 O + a quantize launch
+    (fmha_v2_flux3 lever nvfp4_out; bitwise to main). '0' = main's path."""
+    import os
+
+    return os.environ.get("TRTLLM_FLUX3_ATTN_NVFP4_OUT", "1").strip() != "0"
+
+
+def attn_nvfp4_out_module(key: torch.Tensor | None = None, value: torch.Tensor | None = None):
+    """The routed fmha_v2 flux3 module plus lever nvfp4_out: the levers main's
+    run_fmha_v2_fp8_sm12x picks for these K/V (load_trim_levers), or ROUTED_LEVERS at preload."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import fmha_v2_flux3 as fx
+
+    levers = fx.ROUTED_LEVERS
+    if key is not None and value is not None:
+        levers = fx.load_trim_levers(levers, key, value)
+    return fx.get_flux3_d128_module((*levers, "nvfp4_out"))
+
+
+def _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight):
+    """visual_gen_fp8_attention_sm120_prequant's fmha_v2 call (routed levers + nvfp4_out) writing
+    nvfp4_quantize_prepared(O, attn_weight) directly: (fp4 [B, S, W/2] uint8, sf flat uint8)."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import fmha_v2_flux3 as fx
+
+    _, rows, width = qkv8.shape
+    seq_len = rows // batch
+    head_dim = width // heads
+    q8, k8, v8 = (plane.view(batch, seq_len, heads, head_dim) for plane in qkv8.unbind(0))
+    fp4 = torch.empty((batch, seq_len, width // 2), dtype=torch.uint8, device=qkv8.device)
+    sf = torch.empty((fx.nvfp4_scale_bytes(rows, width),), dtype=torch.uint8, device=qkv8.device)
+    fx.fmha_v2_flux3_d128_nvfp4_out(
+        q8, k8, v8, fp4, sf, nvfp4_owner(attn_weight).inverse_scale, heads, head_dim, seq_len,
+        scale_bmm1_d=scales[3:4], scale_bmm2_d=scales[2:3], module=attn_nvfp4_out_module(k8, v8),
+    )
+    return fp4, sf
+
+
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_fp8_prequant_attention_nvfp4_out_side_gate_up",
+    mutates_args=(),
+    device_types="cuda",
+)
+def fp8_prequant_attention_nvfp4_out_side_gate_up(
+    qkv8: torch.Tensor,
+    scales: torch.Tensor,
+    batch: int,
+    heads: int,
+    up_activation: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_activation_scale: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    output_inverse_scale: torch.Tensor,
+    original: torch.Tensor,
+    source_weight: torch.Tensor | None,
+    mode: int,
+    attn_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fp8_prequant_attention_side_gate_up whose FMHA writes attn_out's NVFP4 activation
+    (nvfp4_quantize_prepared(O, attn_weight): fp4 [B, S, W/2], 128x4 sf) instead of BF16 O. The
+    fork, side stream, gate_up kernel and join are fp8_prequant_attention_side_gate_up's.
+    Returns (fp4, sf, packed, packed_scales), bitwise to the two ops plus the quantize."""
+    device = qkv8.device
+    owner = nvfp4_owner(up_weight)
+    up_activation, up_activation_scale = _prepared_activation(
+        up_activation, up_activation_scale, original, source_weight, up_weight
+    )
+    if not _side_gate_up_supported(device, mode, up_activation, up_weight):
+        SIDE_GATE_UP_COUNTERS["sync_fallback"] += 1
+        fp4, sf = _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight)
+        packed, packed_scales = nvfp4_swiglu_packed(
+            up_activation, up_weight, up_activation_scale, up_weight_scale,
+            owner.input_global_scale, owner.weight_global_scale, output_inverse_scale,
+        )
+        return fp4, sf, packed, packed_scales
+    launch_gate_up, join, outputs = _side_gate_up_fork(
+        device, mode, up_activation, up_weight, up_activation_scale, up_weight_scale,
+        output_inverse_scale, owner,
+    )
+    if side_gate_up_order() == "fmha_first":
+        launch_gate_up.fork()
+        fp4, sf = _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight)
+        launch_gate_up.enqueue()
+    else:
+        launch_gate_up()
+        fp4, sf = _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight)
+    join()
+    return fp4, sf, *outputs
+
+
+@fp8_prequant_attention_nvfp4_out_side_gate_up.register_fake
+def _fp8_prequant_attention_nvfp4_out_side_gate_up_fake(
+    qkv8, scales, batch, heads, up_activation, up_weight, up_activation_scale, up_weight_scale,
+    output_inverse_scale, original, source_weight, mode, attn_weight,
+):
+    _, rows, width = qkv8.shape
+    packed, packed_scales = _nvfp4_swiglu_packed_fake(
+        up_activation, up_weight, up_activation_scale, up_weight_scale, 1.0, 1.0,
+        output_inverse_scale,
+    )
+    fp4 = torch.empty((batch, rows // batch, width // 2), dtype=torch.uint8, device=qkv8.device)
+    sf = qkv8.new_empty((((rows + 127) // 128) * 128 * ((width // 16 + 3) // 4) * 4,),
+                        dtype=torch.uint8)
+    return fp4, sf, packed, packed_scales
+
+
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_nvfp4_out_pair_prequant", mutates_args=(), device_types="cuda"
+)
+def nvfp4_out_pair_prequant(
+    down_activation: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_activation_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    attn_data: torch.Tensor,
+    attn_scales: torch.Tensor,
+    attn_weight: torch.Tensor,
+    attn_weight_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """nvfp4_out_pair with attn_out's activation already quantized (attn_data [M, K/2] uint8,
+    attn_scales: 128x4 sf, as nvfp4_quantize_prepared returns them): the same LPT launch (or, with
+    TRTLLM_FLUX3_SM120_PAIR_KERNEL=0 / a non-cutlass backend, the same two-stream pair) minus the
+    quantize."""
+    down_owner = nvfp4_owner(down_weight)
+    attn_owner = nvfp4_owner(attn_weight)
+    down_weight, down_weight_scale = down_weight.detach(), down_weight_scale.detach()
+    attn_weight, attn_weight_scale = attn_weight.detach(), attn_weight_scale.detach()
+    data, scales = attn_data.detach(), attn_scales.detach()
+
+    if _sm120_linear_backend() == "cutlass":
+        from . import flux3_sm120_lpt_pair as lpt
+
+        if lpt.enabled():
+            from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_nvfp4 import (
+                _scalar,
+            )
+
+            device = data.device
+            rows_down = down_activation.shape[0]
+            rows_attn = data.shape[0]
+            down_out = torch.empty(
+                (rows_down, down_weight.shape[0]), device=device, dtype=torch.bfloat16
+            )
+            attn_out = torch.empty(
+                (rows_attn, attn_weight.shape[0]), device=device, dtype=torch.bfloat16
+            )
+            lpt.run(
+                down_activation.detach(),
+                down_weight,
+                down_activation_scale.detach(),
+                down_weight_scale,
+                _scalar(device, down_owner.input_global_scale * down_owner.weight_global_scale),
+                down_out,
+                data,
+                attn_weight,
+                scales,
+                attn_weight_scale,
+                _scalar(device, attn_owner.input_global_scale * attn_owner.weight_global_scale),
+                attn_out,
+            )
+            return attn_out, down_out
+
+    def launch_down() -> torch.Tensor:
+        return _sm120_cutlass_linear(
+            down_activation.detach(),
+            down_weight,
+            down_activation_scale.detach(),
+            down_weight_scale,
+            down_owner.input_global_scale,
+            down_owner.weight_global_scale,
+        )
+
+    def launch_attn() -> torch.Tensor:
+        return _sm120_cutlass_linear(
+            data,
+            attn_weight,
+            scales,
+            attn_weight_scale,
+            attn_owner.input_global_scale,
+            attn_owner.weight_global_scale,
+        )
+
+    return _sm120_tail_pair(data.device, launch_down, launch_attn)
+
+
+@nvfp4_out_pair_prequant.register_fake
+def _nvfp4_out_pair_prequant_fake(
+    down_activation,
+    down_weight,
+    down_activation_scale,
+    down_weight_scale,
+    attn_data,
+    attn_scales,
+    attn_weight,
+    attn_weight_scale,
+):
+    return (
+        attn_data.new_empty((attn_data.shape[0], attn_weight.shape[0]), dtype=torch.bfloat16),
+        attn_data.new_empty(
+            (down_activation.shape[0], down_weight.shape[0]), dtype=torch.bfloat16
+        ),
+    )
 
 
 @fp8_attention_side_gate_up.register_fake

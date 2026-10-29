@@ -206,6 +206,55 @@ def fmha_v2_flux3_d128(
     return out
 
 
+# nvfp4_out (FMHA_FLUX3_NVFP4_OUT, fmha/flux3_nvfp4_out.h + noloop_tiled.h epilogue): the module
+# also exports run_nvfp4_out, which writes FP4 [B*S, H*D/2] + 128x4-swizzled E4M3 SF (FlashInfer
+# cute-dsl nvfp4_quantize of the BF16 O, bitwise) instead of BF16 O. Its plain run() still stores
+# BF16 O (the same kernel, fp4 pointer null). Not in ROUTED_LEVERS: callers add it.
+_LEVER_FLAGS["nvfp4_out"] = ("nfo", "-DFMHA_FLUX3_NVFP4_OUT=1")
+
+
+def nvfp4_scale_bytes(rows: int, width: int) -> int:
+    """Bytes of the flat 128x4-swizzled E4M3 scale buffer for an [rows, width] NVFP4 tensor."""
+    return ((rows + 127) // 128 * 128) * ((width // 16 + 3) // 4 * 4)
+
+
+def fmha_v2_flux3_d128_nvfp4_out(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    fp4: torch.Tensor,
+    sf: torch.Tensor,
+    global_scale: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    *,
+    scale_bmm1_d: Optional[torch.Tensor],
+    scale_bmm2_d: Optional[torch.Tensor],
+    module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fmha_v2_flux3_d128 (non-causal, no LSE) with the nvfp4_out epilogue: writes fp4 (uint8
+    [B*S, H*D/2]) and sf (uint8, nvfp4_scale_bytes(B*S, H*D)) instead of BF16 O. Bitwise equal to
+    FlashInfer nvfp4_quantize(O, global_scale, layout_128x4, cute-dsl) of the same module's BF16 O.
+    global_scale is a float32 device tensor of one element. module must carry lever nvfp4_out."""
+    if head_dim != 128 or query.dtype != torch.float8_e4m3fn:
+        raise ValueError("fmha_v2_flux3_d128_nvfp4_out supports E4M3 head_dim 128 only.")
+    module.run_nvfp4_out(
+        query,
+        key,
+        value,
+        fp4,
+        sf,
+        global_scale,
+        scale_bmm1_d,
+        scale_bmm2_d,
+        num_heads,
+        head_dim,
+        seq_len,
+    )
+    return fp4, sf
+
+
 # softmax_trim (FMHA_FLUX3_SOFTMAX_TRIM, softmax.h; bitwise vs base2): P packs to FP8 without the
 # multiply by scale_softmax (requires scale_softmax == 1, as fmha_v2_flux3_d128 passes) and the
 # row max reduces as a depth-4 fmaxf tree. TRTLLM_FMHA_V2_FLUX3_ST=0 drops it from the routed set.

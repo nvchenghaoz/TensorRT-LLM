@@ -54,6 +54,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     NVFP4Activation,
+    NVFP4AttnOut,
     convert_excluded_blocks_to_nvfp4,
     nvfp4_mlp_forward,
     original_input,
@@ -66,6 +67,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     shared_nvfp4_input,
     sm120_fp8_mlp_forward,
     sm120_fp8_shared_input,
+    sm120_attn_nvfp4_out_weight,
     sm120_side_gate_up_args,
     sm120_tail_pair_forward,
     verify_nvfp4_coverage,
@@ -533,13 +535,16 @@ class Flux3Attention(Attention):
         sample_bounds: Bounds | None = None,
         timestep: Tensor | None = None,
         side_gate_up: tuple | None = None,
+        attn_nvfp4_out: Tensor | None = None,
     ):
         """QKV -> QK-norm -> RoPE -> attention, returning the pre-out-projection
         result [B, S, H*D] (and v [B, H, S, D] when need_v, for PAG). Fused path
         does QK-norm+RoPE in one kernel; unfused uses eager rms_norm + rotary.
         side_gate_up (primsts.sm120_side_gate_up_args): also return the block's packed
         gate_up (packed, scales), run on a side stream beside attention, or None when the
-        attention call is not the covered FP8 SM12x one (the caller then runs gate_up)."""
+        attention call is not the covered FP8 SM12x one (the caller then runs gate_up).
+        attn_nvfp4_out (primsts.sm120_attn_nvfp4_out_weight, with side_gate_up): the covered
+        call may return the result as primsts.NVFP4AttnOut (attn_out's NVFP4 activation)."""
         b, s = hidden_states.shape[:2]
         cos, sin = freqs[0], freqs[1]
         projection_input = hidden_states if quantized is None else quantized
@@ -557,6 +562,7 @@ class Flux3Attention(Attention):
                 and sample_bounds[0][1] == s
             ),
             side_gate_up,
+            attn_nvfp4_out if side_gate_up is not None else None,
         )
         if direct is not None:
             # NVFP4 QKV straight to E4M3 + the same fmha_v2 call (bitwise to the path below).
@@ -921,6 +927,7 @@ class Flux3ModeBlock(nn.Module):
                 sample_bounds=sample_bounds,
                 timestep=timestep,
                 side_gate_up=side_args,
+                attn_nvfp4_out=sm120_attn_nvfp4_out_weight(self),
             )
         else:
             attn = self.attn.attn_pre_out(
@@ -948,9 +955,8 @@ class Flux3ModeBlock(nn.Module):
             )
             if pair is not None:
                 attn_y, mlp_y = pair
-                output = attn_y.reshape(*attn.shape[:-1], -1) + mlp_y.reshape(
-                    *mlp_shape[:-1], -1
-                )
+                attn_lead = (attn.data if isinstance(attn, NVFP4AttnOut) else attn).shape[:-1]
+                output = attn_y.reshape(*attn_lead, -1) + mlp_y.reshape(*mlp_shape[:-1], -1)
             else:
                 mlp_out = _flux3_gated_mlp_forward(self.ff, mlp_input).reshape(*mlp_shape[:-1], -1)
                 output = _primsts_linear_forward(self.attn_out, attn) + mlp_out
@@ -1091,6 +1097,8 @@ class Flux3SingleStreamBlock(nn.Module):
                 sample_bounds=sample_bounds,
                 timestep=timestep,
                 side_gate_up=side_args,
+                # PAG reads the BF16 attention output: keep main's path when it is on.
+                attn_nvfp4_out=sm120_attn_nvfp4_out_weight(self) if pag_strength <= 0.0 else None,
             )
         else:
             attn, v = self.attn.attn_pre_out(
@@ -1124,9 +1132,8 @@ class Flux3SingleStreamBlock(nn.Module):
             )
             if pair is not None:
                 attn_y, mlp_y = pair
-                output = attn_y.reshape(*attn.shape[:-1], -1) + mlp_y.reshape(
-                    *combined_shape[:-1], -1
-                )
+                attn_lead = (attn.data if isinstance(attn, NVFP4AttnOut) else attn).shape[:-1]
+                output = attn_y.reshape(*attn_lead, -1) + mlp_y.reshape(*combined_shape[:-1], -1)
             else:
                 mlp_out = _flux3_gated_mlp_forward(self.ff, mlp_input).reshape(
                     *combined_shape[:-1], -1
