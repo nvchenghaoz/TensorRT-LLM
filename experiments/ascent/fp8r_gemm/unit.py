@@ -288,4 +288,4 @@ def killswitch():
 if __name__ == "__main__":
     t0 = time.time()
     {"bench": bench, "check": check, "killswitch": killswitch}[sys.argv[1]]()
-    log(f"done {time.time() - t0:.1f}s")
+    print(f"done {time.time() - t0:.1f}s", file=sys.stderr, flush=True)
