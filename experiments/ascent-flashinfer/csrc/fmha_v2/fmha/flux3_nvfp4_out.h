@@ -245,10 +245,13 @@ inline __device__ void store_from_smem(Params const& params, Gmem_tile_o const& 
 }
 
 // Zero this head's SF columns of the padded rows [B*S, round_up(B*S, 128)). Called by every CTA;
-// only the CTAs of the last Q tile of the last batch write.
+// only the CTAs of the last Q tile of the last batch write. nthreads is the number of threads
+// sharing tidx's index space (0: blockDim.x, the 4-warp kernel; 128 for a G3 group, whose tidx is
+// group-local while blockDim.x is 384).
 template <typename Params>
 inline __device__ void zero_padding(Params const& params, int q_tile_rows, int q_loop, int bidb,
-                                    int bidh, int tidx) {
+                                    int bidh, int tidx, int nthreads = 0) {
+  int const stride = nthreads > 0 ? nthreads : int(blockDim.x);
   int const total = params.b * params.s;
   int const last_q_loop = (params.s + q_tile_rows - 1) / q_tile_rows - 1;
   if (bidb != params.b - 1 || q_loop != last_q_loop) {
@@ -259,7 +262,7 @@ inline __device__ void zero_padding(Params const& params, int q_tile_rows, int q
   int const padded_cols = ((params.h * params.dv / 16) + 3) & ~3;
   uint8_t* sf = reinterpret_cast<uint8_t*>(params.flux3_sf_ptr);
   int const n = (padded_rows - total) * cols_per_head;
-  for (int i = tidx; i < n; i += blockDim.x) {
+  for (int i = tidx; i < n; i += stride) {
     int const row = total + i / cols_per_head;
     int const col = bidh * cols_per_head + i % cols_per_head;
     sf[sf_offset_128x4(row, col, padded_cols)] = 0;
