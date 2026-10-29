@@ -375,10 +375,11 @@ flux3_adaln_nvfp4_warp(const uint4 *__restrict__ x, const u8 *__restrict__ sel,
   // ---- pointwise modulate + NVFP4 quantize ----
   const float gs = *gs_ptr;
   const float fp4_max_rcp = rcp_approx(6.0f);
-  bool s = false;
-  if (has_select) s = sel[row] != 0;
-  const uint4 *scr = (const uint4 *)(scale + (s ? scale_rs : 0));
-  const uint4 *shr = (const uint4 *)(shift + (s ? shift_rs : 0));
+  // Table row index: a bool select (0/1) or a u8 chunk index into a K-row table. Row r of the
+  // table is at r * row_stride; bool 0/1 gives the same addresses as before.
+  const int r = has_select ? (int)sel[row] : 0;
+  const uint4 *scr = (const uint4 *)(scale + (i64)r * scale_rs);
+  const uint4 *shr = (const uint4 *)(shift + (i64)r * shift_rs);
   uint4 *xo = xmod + (i64)row * (DIM / 8);
   u32 *fo = fp4 + (i64)row * (DIM / 8);
 #pragma unroll
@@ -575,7 +576,7 @@ def supported(x, select, scale, shift, weight, bias) -> bool:
         return False
     if select is not None:
         if not (
-            select.dtype == torch.bool
+            select.dtype in (torch.bool, torch.uint8)
             and select.is_contiguous()
             and select.numel() == x.numel() // d
             and scale.dim() == 3

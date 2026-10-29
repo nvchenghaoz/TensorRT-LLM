@@ -618,7 +618,34 @@ _IMPL = os.environ.get("TRTLLM_FLUX3_ADALN_NVFP4_IMPL", "auto").strip().lower()
 _AUTO_WARP_MIN_ROWS = 4096
 
 
+def _index_fallback(x, select, scale, shift, weight, bias, global_scale, eps):
+    """u8 index form where the warp kernel cannot run: the Triton kernel reads its select as
+    bool (index 2 would read row 1), so gather the rows and run the unfused math instead."""
+    from .flux3_primsts import nvfp4_quantize
+
+    d = x.shape[-1]
+    idx = select.reshape(1, -1, 1).long()
+    rows = torch.arange(scale.shape[1], device=x.device).view(1, 1, -1)
+    one_hot = idx == rows  # [1, S, K]
+    sc, sh = scale[:, 0:1], shift[:, 0:1]
+    for k in range(1, scale.shape[1]):
+        sc = torch.where(one_hot[..., k : k + 1], scale[:, k : k + 1], sc)
+        sh = torch.where(one_hot[..., k : k + 1], shift[:, k : k + 1], sh)
+    norm = torch.nn.functional.layer_norm(x, (d,), weight, bias, eps)
+    x_mod = ((1 + sc) * norm + sh).contiguous()
+    data, scales = nvfp4_quantize(x_mod.reshape(-1, d), global_scale)
+    return x_mod, data, scales
+
+
 def _dispatch(x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod):
+    if select is not None and select.dtype == torch.uint8:
+        from . import flux3_sm120_adaln_nvfp4 as warp_impl
+
+        if warp_impl.supported(x, select, scale, shift, weight, bias):
+            return warp_impl.launch(
+                x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod=store_x_mod
+            )
+        return _index_fallback(x, select, scale, shift, weight, bias, global_scale, eps)
     use_warp = _IMPL == "warp" or (
         _IMPL == "auto" and x.numel() // x.shape[-1] > _AUTO_WARP_MIN_ROWS
     )
@@ -772,7 +799,19 @@ def adaln_nvfp4_input(block, x: torch.Tensor, mod: tuple, eps: float, freqs=()):
         return None
     if len(mod) == 4:
         shift, scale, _, select = mod
-        if not (
+        if select.dtype == torch.uint8:
+            # K-row tables + a u8 chunk index (i2i: image, image_cond, text). Only the warp
+            # kernel reads the index as a row number; _dispatch keeps it off the Triton kernel.
+            rows = shift.shape[1] if shift.dim() == 3 else 0
+            if not (
+                2 <= rows <= 255
+                and _row_ok(shift, rows, d)
+                and _row_ok(scale, rows, d)
+                and select.shape == (1, x.shape[1], 1)
+                and select.is_contiguous()
+            ):
+                return None
+        elif not (
             _row_ok(shift, 2, d)
             and _row_ok(scale, 2, d)
             and select.dtype == torch.bool
