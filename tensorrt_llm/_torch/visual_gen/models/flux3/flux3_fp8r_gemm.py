@@ -35,8 +35,10 @@ ORDER = 1
 
 _WORKSPACE_BYTES = 1024 * 1024
 _WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
-# Routed calls by weight N (counted in the op bodies, i.e. in the worker process).
+# Routed calls by weight N (counted in the op bodies, i.e. in the worker process), logged every
+# _LOG_EVERY calls (one request routes 64: 16 block-steps x gate_up, QKV, down, attn_out).
 ROUTES: Counter = Counter()
+_LOG_EVERY = 640
 
 
 @lru_cache(maxsize=1)
@@ -118,6 +120,11 @@ def gemm(
         int(ORDER if order is None else order),
     )
     ROUTES[int(n)] += 1
+    total = sum(ROUTES.values())
+    if total % _LOG_EVERY == 0:
+        from tensorrt_llm.logger import logger
+
+        logger.info(f"flux3_fp8r_gemm routed calls by N after {total}: {dict(ROUTES)}")
     return out
 
 

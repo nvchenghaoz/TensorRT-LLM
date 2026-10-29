@@ -252,7 +252,8 @@ def check():
     env = dict(os.environ, TRTLLM_FLUX3_FP8R_GEMM="0")
     r = subprocess.run([sys.executable, os.path.abspath(__file__), "killswitch"], env=env,
                        capture_output=True, text=True, timeout=900)
-    last = (r.stdout.strip().splitlines() or ["{}"])[-1]
+    lines = [ln for ln in r.stdout.strip().splitlines() if ln.startswith("{")]
+    last = (lines or ["{}"])[-1]
     try:
         ks = json.loads(last)
     except json.JSONDecodeError:
