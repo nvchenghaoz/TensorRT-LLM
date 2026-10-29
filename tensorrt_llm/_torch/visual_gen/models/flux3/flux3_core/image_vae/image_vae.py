@@ -369,14 +369,20 @@ class Flux3ImageUpsample(nn.Module):
             wt = wt.to(x.dtype)
         return nn.functional.conv_transpose2d(x, wt, None, stride=2, padding=1)
 
+    def fused_op_path(self, x: Tensor) -> bool:
+        """bf16 channels_last input on a use_fused_bias_op instance: flux3_vae::subpixel_up_conv
+        (conv + bias in one cuDNN FE graph). Takes precedence over transpose_path, which
+        stays the fallback when the op cannot run."""
+        return self.use_fused_bias_op and _spc.can_use(x, self.transpose_weight, self.conv.bias)
+
     def forward(self, x: Tensor) -> Tensor:
         if not self._subpixel_ready:
             self.refresh_subpixel()
+        if self.fused_op_path(x):
+            return torch.ops.flux3_vae.subpixel_up_conv(x, self.transpose_weight, self.conv.bias)
         if self.transpose_path(x):
             b = self.conv.bias
             return self.forward_nobias(x) + b.to(x.dtype).view(1, -1, 1, 1)
-        if self.use_fused_bias_op and _spc.can_use(x, self.transpose_weight, self.conv.bias):
-            return torch.ops.flux3_vae.subpixel_up_conv(x, self.transpose_weight, self.conv.bias)
         w4, b4 = self.subpixel_weight, self.subpixel_bias
         if w4.dtype != x.dtype:
             w4, b4 = w4.to(x.dtype), b4.to(x.dtype)
@@ -582,7 +588,12 @@ class Flux3ImageDecoder(nn.Module):
                 up.upsample.use_transpose = i_level != 1
                 # That upsample instead adds its bias in the conv's fp32 epilogue (one
                 # cuDNN FE graph writing the interleaved output, bf16 channels_last only).
-                up.upsample.use_fused_bias_op = i_level == 1
+                # up[2] / up[3] (512 ch at 256^2 / 128^2) too, unless FLUX3_UP_FE_DGRAD_EXTRA=0:
+                # there the op replaces aten dgrad + its strided_dgrad helpers (and up[2]'s
+                # bias fold into up[1].block[0]); aten stays the fallback (use_transpose).
+                up.upsample.use_fused_bias_op = i_level == 1 or (
+                    _spc.UP_FE_DGRAD_EXTRA and i_level in _spc.UP_FE_DGRAD_EXTRA_LEVELS
+                )
             self.up.insert(0, up)
 
         self.norm_out = Flux3GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
@@ -619,7 +630,11 @@ class Flux3ImageDecoder(nn.Module):
             if i_level != 0:
                 upsample = self.up[i_level].upsample
                 nxt = self.up[i_level - 1].block[0]
-                if upsample.transpose_path(h) and _can_fold_input_bias(nxt, upsample, h):
+                if (
+                    not upsample.fused_op_path(h)
+                    and upsample.transpose_path(h)
+                    and _can_fold_input_bias(nxt, upsample, h)
+                ):
                     # The next block's 1x1 shortcut is an extern conv that would force
                     # x + bias to be materialized; pass it the bias-free upsample output
                     # and fold the bias into its own bias instead.

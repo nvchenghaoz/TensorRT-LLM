@@ -41,7 +41,15 @@ _CL = torch.channels_last
 # (C_in, C_out, H) -> exact plan name of the fixed plan (measured on SM120, idea 227 STEP 0).
 PLAN_NAME: Dict[tuple, str] = {
     (256, 256, 512): "eng1_k24=1",  # up[1]: 1.556 ms (main fprop + interleave 2.269 ms)
+    (512, 512, 256): "eng1_k24=1",  # up[2]: 1.451 ms (main aten dgrad + helpers 1.598 ms)
+    (512, 512, 128): "eng1_k24=4",  # up[3]: 0.395 ms (main aten dgrad + helpers + bias 0.464 ms)
 }
+
+# Decoder up levels (besides up[1], which always uses the op) whose transpose-path upsample
+# runs this op instead of aten conv_transpose2d (+ bias fold / bias pass). Idea 279 STEP 0
+# (job 2216). FLUX3_UP_FE_DGRAD_EXTRA=0 restores the aten path at those levels.
+UP_FE_DGRAD_EXTRA = os.environ.get("FLUX3_UP_FE_DGRAD_EXTRA", "1") != "0"
+UP_FE_DGRAD_EXTRA_LEVELS = (2, 3)
 
 _lock = threading.Lock()
 _graphs: Dict[tuple, "_UpGraph"] = {}
