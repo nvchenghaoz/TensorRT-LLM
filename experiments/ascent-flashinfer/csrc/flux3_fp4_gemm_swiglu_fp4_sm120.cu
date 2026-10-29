@@ -153,6 +153,14 @@ __device__ __forceinline__ bool div_safe(float a, float b) {
 #ifndef FLUX3_TILESCHED
 #define FLUX3_TILESCHED 0
 #endif
+// Epilogue store width. 0 (default): main's layout, one 8-B FP4 store and one SF byte per
+// (lane, scale block). 1: N permutation (8, 2, 8):(1, 64, 8), so each warp owns 64 contiguous
+// accumulator columns = two ADJACENT scale blocks (block_col even, +1); each lane keeps both
+// blocks' bytes in registers and issues one 16-B FP4 store and one u16 SF store. Same bytes to
+// the same addresses, same per-column K chain (bitwise).
+#ifndef FLUX3_EPI_VEC
+#define FLUX3_EPI_VEC 0
+#endif
 
 struct SwigluParts {
   float prod;
@@ -264,9 +272,16 @@ class SwigluFp4Epilogue {
     int const q = lane & 3;
     int const row_base = static_cast<int>(m_coord) * BM;
     int const col_base = static_cast<int>(n_coord) * BN;
+#if FLUX3_EPI_VEC == 1
+    static_assert(MMA_N == 8, "EPI_VEC: each warp owns exactly two adjacent scale blocks");
+#endif
 
     CUTLASS_PRAGMA_UNROLL
     for (int mi = 0; mi < MMA_M; ++mi) {
+#if FLUX3_EPI_VEC == 1
+      uint2 vec_v[2];
+      uint32_t vec_sf[2];
+#endif
       CUTLASS_PRAGMA_UNROLL
       for (int nb = 0; nb < MMA_N / 4; ++nb) {
         float h[2][4];
@@ -358,6 +373,42 @@ class SwigluFp4Epilogue {
         uint32_t word_b1 = __shfl_xor_sync(0xffffffffu, word_a[1], 2);
 
         int const hh_store = q & 1;
+#if FLUX3_EPI_VEC == 1
+        {
+          uint32_t a = hh_store ? word_a[1] : word_a[0];
+          uint32_t b = hh_store ? word_b1 : word_b0;
+          vec_v[nb].x = __byte_perm(a, b, 0x5140);
+          vec_v[nb].y = __byte_perm(a, b, 0x7362);
+          vec_sf[nb] = hh_store ? enc[1] : enc[0];
+        }
+      }
+      {
+        // Row depends on (mi, hh) only; nb = 0 and 1 are block_col (even) and block_col + 1.
+        int const hh_store = q & 1;
+        int const row = row_base + get<0>(tCcD(2 * hh_store, mi, 0));
+        int const col = col_base + get<1>(tCcD(0, mi, 0));
+        int const block_col = col >> 5;
+        if (row < params.rows_padded) {
+          if (q < 2) {
+            uint4 v;
+            v.x = vec_v[0].x;
+            v.y = vec_v[0].y;
+            v.z = vec_v[1].x;
+            v.w = vec_v[1].y;
+            *reinterpret_cast<uint4*>(params.out + static_cast<int64_t>(row) * params.out_row_bytes +
+                                      block_col * 8) = v;
+          } else {
+            int64_t const idx = (block_col & 3) + (block_col >> 2) * 512 + (row & 31) * 16 +
+                                ((row & 127) >> 5) * 4 +
+                                static_cast<int64_t>(row >> 7) * 128 * params.sf_cols;
+            *reinterpret_cast<uint16_t*>(params.out_sf + idx) =
+                static_cast<uint16_t>(vec_sf[0] | (vec_sf[1] << 8));
+          }
+        }
+      }
+    }
+  }
+#else
         int const row = row_base + get<0>(tCcD(2 * hh_store, mi, nb * 4));
         int const col = col_base + get<1>(tCcD(0, mi, nb * 4));
         int const block_col = col >> 5;
@@ -380,6 +431,7 @@ class SwigluFp4Epilogue {
       }
     }
   }
+#endif
 
  private:
   Params params;
@@ -410,7 +462,13 @@ using StockBuilder = cutlass::gemm::collective::CollectiveBuilder<
 
 // N permutation: logical (atom col 8, warp 2, rep 4) -> col i + 32*w + 8*r, so each warp owns 32
 // contiguous accumulator columns (one 16-output scale block of the interleaved weight).
+#if FLUX3_EPI_VEC == 1
+// EPI_VEC: (atom col 8, warp 2, rep 8) -> col i + 64*w + 8*r, so each warp owns 64 contiguous
+// columns (two adjacent scale blocks per lane row; see FLUX3_EPI_VEC).
+using PermTileN = Layout<Shape<_8, _2, _8>, Stride<_1, _64, _8>>;
+#else
 using PermTileN = Layout<Shape<_8, _2, _4>, Stride<_1, _32, _8>>;
+#endif
 using TiledMma = decltype(cute::make_tiled_mma(
     cute::rr_blockscaled_op_selector_sm120<typename StockBuilder::ElementA,
                                            typename StockBuilder::ElementB, float,
@@ -476,6 +534,12 @@ void flux3_swiglu_fp4_gemm(TensorView a, TensorView b, TensorView sfa, TensorVie
   TVM_FFI_ICHECK_EQ(out.size(0), rows_padded);
   TVM_FFI_ICHECK_EQ(out.size(1), n / 4);
   TVM_FFI_ICHECK_EQ(out_sf.numel(), rows_padded * (n / 32));
+#if FLUX3_EPI_VEC == 1
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0 && (n / 4) % 16 == 0)
+      << "EPI_VEC: out must be 16-B aligned with 16-B rows";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(out_sf.data_ptr()) % 2 == 0)
+      << "EPI_VEC: out_sf must be 2-B aligned";
+#endif
 
   using Sm1xxBlkScaledConfig = typename CollectiveMainloop::Sm1xxBlkScaledConfig;
   typename Gemm::Arguments args;
