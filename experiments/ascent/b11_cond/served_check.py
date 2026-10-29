@@ -54,7 +54,10 @@ args = VisualGenArgs(
     model=CKPT,
     pipeline_config=pipeline_config,
     parallel_config={"tp_size": 1},
-    torch_compile_config={"enable": True, "enable_fullgraph": False, "enable_autotune": True},
+    # noautotune: fixed GEMM tactics (main's generic NVFP4 route autotunes per process, so its
+    # i2i output is not bitwise stable across processes; for cross-tree bitwise compares only).
+    torch_compile_config={"enable": True, "enable_fullgraph": False,
+                          "enable_autotune": "noautotune" not in sys.argv[3:]},
     compilation_config={"resolutions": [[2048, 2048]], "num_frames": [1], "modes": ["t2i", "i2i"]},
     **engine,
 )

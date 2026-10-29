@@ -875,21 +875,6 @@ def _cond_primsts_enabled() -> bool:
     return os.environ.get("TRTLLM_FLUX3_COND_PRIMSTS", "1").strip() != "0"
 
 
-def _cond_attn_nfo_mode() -> str:
-    """TRTLLM_FLUX3_COND_ATTN_NFO: the prepared cond blocks' attention-out route.
-    nfo / 1: FMHA NVFP4-out epilogue + side-stream gate_up (as image 1-4);
-    side: BF16-out FMHA + side-stream gate_up, attn_out quantized in the LPT pair;
-    off / 0: BF16-out FMHA, sequential gate_up, attn_out quantized in the pair."""
-    value = os.environ.get("TRTLLM_FLUX3_COND_ATTN_NFO", "side").strip().lower()
-    if value in ("1", "nfo", "on"):
-        return "nfo"
-    if value in ("0", "off", "none"):
-        return "off"
-    if value == "side":
-        return "side"
-    raise ValueError(f"TRTLLM_FLUX3_COND_ATTN_NFO must be nfo, side or off, got {value!r}")
-
-
 def _flux3_select_mod(mod: tuple) -> Tuple[Tensor, Tensor, Tensor]:
     """Return per-token-broadcastable (shift, scale, gate) from a 3- or 4-tuple.
 
@@ -2179,7 +2164,11 @@ class Flux3Model(BaseDiffusionModel):
                 weight_dicts = loader.get_linear_weights(module, name, weights)
                 if weight_dicts:
                     if type(module.quant_method) is NVFP4LinearMethod and name.startswith(
-                        ("content_mode_blocks.image.", "content_mode_blocks.image_cond.", "single_blocks.")
+                        (
+                            "content_mode_blocks.image.",
+                            "content_mode_blocks.image_cond.",
+                            "single_blocks.",
+                        )
                     ):
                         module._flux3_nvfp4_missing_input_scale = all(
                             "input_scale" not in shard for shard in weight_dicts
@@ -2286,20 +2275,21 @@ class Flux3Model(BaseDiffusionModel):
             for name, block in blocks
             if prepare_sm120_tail_pair(getattr(block, "_orig_mod", block))
         ]
-        nfo = _cond_attn_nfo_mode()
         for name, block in cond:
+            # prepare_sm120_tail_pair -> _sm120_attn_nvfp4_out_eligible reads this static flag
+            # (TRTLLM_FLUX3_COND_ATTN_NFO opt-out of the FMHA NVFP4-out epilogue).
             target = getattr(block, "_orig_mod", block)
+            target._flux3_cond_stream = True
             if prepare_sm120_tail_pair(target):
                 paired.append(name)
-                if nfo != "nfo":
-                    # BF16-out FMHA + attn_out's own NVFP4 quantize in the pair.
-                    target._sm120_attn_nvfp4_out = False
-                    if nfo == "off":
-                        target._sm120_side_gate_up = 0
         if cond:
+            nfo = [
+                bool(getattr(getattr(b, "_orig_mod", b), "_sm120_attn_nvfp4_out", False))
+                for _, b in cond
+            ]
             logger.info(
                 "FLUX.3 i2i reference stream on the prepared NVFP4 block route "
-                f"(TRTLLM_FLUX3_COND_PRIMSTS, attn out {nfo}, dynamic Q/K amax): "
+                f"(TRTLLM_FLUX3_COND_PRIMSTS; dynamic Q/K amax; FMHA NVFP4-out {nfo}): "
                 f"{[name for name, _ in cond]}"
             )
         if paired:
