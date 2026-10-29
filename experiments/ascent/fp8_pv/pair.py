@@ -42,6 +42,7 @@ p = argparse.ArgumentParser()
 p.add_argument("root")
 p.add_argument("--warmup", type=int, default=10)
 p.add_argument("--iters", type=int, default=60)
+p.add_argument("--emu", action="store_true", help="cand: also build/time MAINEMU in-process")
 args = p.parse_args()
 WARMUP, ITERS = args.warmup, args.iters
 ART = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp/fp8pv_art")
@@ -263,7 +264,7 @@ fr_warm = frames()
 on_frames_added = fr_warm.get("frames", {}).get("total", 0) - fr_pre.get("frames", {}).get("total", 0)
 log("ON warm; frames added", on_frames_added)
 EMU = None
-if ARM == "cand":
+if ARM == "cand" and args.emu:
     EMU = build(force_pv=False)
     for _ in range(WARMUP):
         decode(EMU)
@@ -353,9 +354,23 @@ def census(vae, n=3):
             "top": [(k[:90], cnt[k] // n, round(dur[k] / 1e3 / n, 4)) for k, _ in dur.most_common(14)]}
 
 
+def kernel_sum_stats(vae, n=20):
+    vals = []
+    for _ in range(n):
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            decode(vae)
+            torch.cuda.synchronize()
+        vals.append(sum(ev.device_time_total for ev in prof.events()
+                        if ev.device_type == torch.autograd.DeviceType.CUDA) / 1e3)
+    return stats(vals)
+
+
 res["census_on"] = census(ON)
+res["kernel_sum_on"] = kernel_sum_stats(ON)
 if EMU is not None:
     res["census_emu"] = census(EMU)
+    res["kernel_sum_emu"] = kernel_sum_stats(EMU)
+log("kernel sums", json.dumps({k: v for k, v in res.items() if k.startswith("kernel_sum")}))
 log("census", json.dumps({k: v for k, v in res.items() if k.startswith("census")})[:5000])
 
 passed = all(gates.values())
@@ -367,10 +382,14 @@ if ARM == "cand":
     res["output"] = {"class": "precision",
                      "error_vs_fp32_R": {"psnr_min_db": psnr_min,
                                          "lpips_max": max(r["on_vs_R"].get("lpips", -1) for r in seeds),
-                                         "u8_max": max(r["on_vs_R"]["u8_max"] for r in seeds)},
-                     "main_emu_error_vs_fp32_R": {"psnr_min_db": min(r["emu_vs_R"]["psnr_db"] for r in seeds),
-                                                  "lpips_max": max(r["emu_vs_R"].get("lpips", -1) for r in seeds)},
-                     "on_minus_emu_ms": round(st["ON"]["median_ms"] - st["EMU"]["median_ms"], 4)}
+                                         "u8_max": max(r["on_vs_R"]["u8_max"] for r in seeds)}}
+    if EMU is not None:
+        res["output"].update({
+            "main_emu_error_vs_fp32_R": {"psnr_min_db": min(r["emu_vs_R"]["psnr_db"] for r in seeds),
+                                         "lpips_max": max(r["emu_vs_R"].get("lpips", -1) for r in seeds)},
+            "on_minus_emu_ms": round(st["ON"]["median_ms"] - st["EMU"]["median_ms"], 4),
+            "on_minus_emu_kernel_sum_ms": round(res["kernel_sum_on"]["median_ms"]
+                                                - res["kernel_sum_emu"]["median_ms"], 4)})
 else:
     res["output"] = {"class": "precision", "note": "main's served FP8 decoder (the base)",
                      "error_vs_fp32_R": {"psnr_min_db": psnr_min}}
