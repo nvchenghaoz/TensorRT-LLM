@@ -418,6 +418,25 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
   if (active) {
     Gmem_tile_o gmem_o(params, binfo, tidx, q_loop * Gmem_tile_o::ROWS, 0);
     Smem_tile_o smem_o(smem_ + group * L::O_BYTES, tidx);
+#if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
+    // NVFP4 output epilogue (fmha/flux3_nvfp4_out.h), per group: the 4-warp kernel's loop with
+    // its __syncthreads() replaced by the group's named barrier. run_nvfp4_out passes the FP4
+    // buffer as o_ptr, so this path must never reach gmem_o.store. All indices are group-local
+    // (tidx 0..127, smem_o at the group's O region, gmem_o at the group's q_loop).
+    if (params.flux3_fp4_ptr != nullptr) {
+#pragma unroll
+      for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii) {
+        smem_o.store(acc_o, ii);
+        named_bar_sync(1 + group, 128);
+        fmha::flux3_nvfp4::store_from_smem(params, gmem_o, smem_o, ii, bidb, bidh, tidx);
+        if (ii < Gmem_tile_o::LOOPS - 1) {
+          named_bar_sync(1 + group, 128);
+        }
+      }
+      fmha::flux3_nvfp4::zero_padding(params, Gmem_tile_o::ROWS, q_loop, bidb, bidh, tidx, 128);
+      return;
+    }
+#endif  // FMHA_FLUX3_NVFP4_OUT
 #pragma unroll
     for (int ii = 0; ii < Gmem_tile_o::LOOPS; ++ii) {
       smem_o.store(acc_o, ii);
@@ -473,12 +492,8 @@ inline void make_map(CUtensorMap* map, void const* ptr, int b, int s, int h, int
 
 inline bool supported(bert::Fused_multihead_attention_params_v2 const& params,
                       bert::Fused_multihead_attention_launch_params const& launch_params) {
-#if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
-  // G3's epilogue writes BF16 through Gmem_tile_o only. An NVFP4-out module hands its FP4 buffer
-  // (B*S*H*D/2 bytes) to the kernel as o_ptr, so a G3 store there would overrun it 4x: every
-  // call of such a module takes the 4-warp launcher, which carries the NVFP4 store.
-  return false;
-#endif
+  // NVFP4-out modules (FMHA_FLUX3_NVFP4_OUT): the G3 epilogue branches on params.flux3_fp4_ptr
+  // like the 4-warp kernel and writes FP4 + SF per group (never BF16 into the FP4 o_ptr).
   if (launch_params.attention_mask_type != fmha::Attention_mask_type::PADDING) return false;
   if (params.has_alibi || params.softmax_stats_ptr != nullptr) return false;
   if (params.cu_q_seqlens != nullptr || params.cu_kv_seqlens != nullptr) return false;
