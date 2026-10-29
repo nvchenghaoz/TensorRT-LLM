@@ -124,6 +124,10 @@ def sm120_linear_preload(device: torch.device) -> None:
         from . import flux3_sm120_lpt_pair
 
         flux3_sm120_lpt_pair.preload(device)
+        # The pair with the gated residual in attn_out's epilogue (zeroed workspace: flags/epoch).
+        from . import flux3_sm120_lpt_pair_residual
+
+        flux3_sm120_lpt_pair_residual.preload(device)
         if flux3_sm120_lpt_pair.enabled() and attn_nvfp4_out_enabled():
             # The FMHA nvfp4_out variant module (attn_out's activation from the FMHA epilogue).
             attn_nvfp4_out_module()

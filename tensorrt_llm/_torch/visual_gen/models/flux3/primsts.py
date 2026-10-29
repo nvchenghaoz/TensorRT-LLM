@@ -856,7 +856,19 @@ def prepare_sm120_tail_pair(block: nn.Module) -> bool:
         else 0
     )
     block._sm120_attn_nvfp4_out = _sm120_attn_nvfp4_out_eligible(block)
+    block._sm120_pair_residual = _sm120_pair_residual_eligible(block)
     return block._sm120_tail_pair
+
+
+def _sm120_pair_residual_eligible(block: nn.Module) -> bool:
+    """Static switch of sm120_tail_pair_residual_forward (TRTLLM_FLUX3_SM120_PAIR_RESIDUAL): NVFP4
+    tail-pair blocks whose pair runs as the one-launch LPT kernel."""
+    out = getattr(block.attn_out, "_flux3_primsts_nvfp4", None)
+    if not block._sm120_tail_pair or out is None:
+        return False
+    from . import flux3_sm120_lpt_pair_residual as lptr
+
+    return bool(lptr.available(out.weight.device))
 
 
 def _sm120_attn_nvfp4_out_eligible(block: nn.Module) -> bool:
@@ -1015,6 +1027,76 @@ def sm120_tail_pair_forward(
         out.weight,
         out.scale,
     )
+
+
+def sm120_tail_pair_residual_forward(
+    block: nn.Module,
+    attn: torch.Tensor,
+    mlp_input: PrimsTSInput,
+    gate_up: tuple[torch.Tensor, torch.Tensor] | None,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    gate_index: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """``x + gate[gate_index] * (attn_out(attn) + ff(mlp_input))`` (shaped like x) as ONE LPT
+    pair launch with the gated residual in attn_out's epilogue
+    (flux3_sm120_lpt_pair_residual.py), or None (caller runs sm120_tail_pair_forward + the
+    Inductor residual). NVFP4 tail-pair blocks only; gate is a [1, R, D] row table with a
+    [1, S, 1] bool/uint8 row index, or a [1, 1, D] row without one.
+    """
+    if not getattr(block, "_sm120_pair_residual", False):
+        return None
+    from . import flux3_sm120_lpt_pair_residual as lptr
+
+    out = block.attn_out._flux3_primsts_nvfp4
+    width = out.weight.shape[0]
+    rows = x.numel() // width if x.shape[-1] == width else -1
+    if rows <= 0 or x.dtype != torch.bfloat16 or not lptr.gate_form(gate, gate_index, rows, width):
+        return None
+    down = block.ff.down_proj._flux3_primsts_nvfp4
+    if isinstance(attn, NVFP4AttnOut):
+        packed, output_scales = gate_up
+        data = attn.data.reshape(-1, attn.data.shape[-1])
+        scales = attn.scales
+    else:
+        attn_rows = attn.numel() // attn.shape[-1]
+        if attn_rows != rows or not out.can_run(attn):
+            return None
+        if gate_up is not None:
+            packed, output_scales = gate_up
+        else:
+            up = block.ff.gate_up_proj._flux3_primsts_nvfp4
+            original = original_input(mlp_input)
+            if not up.can_run(original):
+                return None
+            act, act_scales = up.activation(mlp_input)
+            packed, output_scales = nvfp4_swiglu_prepared(
+                act,
+                up.weight,
+                act_scales,
+                up.scale,
+                down.inverse_scale,
+                original,
+                mlp_input.quantized_by if isinstance(mlp_input, NVFP4Activation) else None,
+            )
+        data = attn.reshape(-1, attn.shape[-1]).contiguous()
+        scales = None
+    if data.shape[0] != rows or packed.shape[0] != rows:
+        return None
+    y = lptr.nvfp4_out_pair_residual(
+        packed,
+        down.weight,
+        output_scales,
+        down.scale,
+        data,
+        scales,
+        out.weight,
+        out.scale,
+        x,
+        gate,
+        gate_index,
+    )
+    return y.reshape(x.shape)
 
 
 def linear_forward(layer: Linear, x: PrimsTSInput) -> torch.Tensor:
