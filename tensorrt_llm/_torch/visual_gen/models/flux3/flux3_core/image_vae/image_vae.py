@@ -115,6 +115,10 @@ class Flux3GroupNorm(nn.GroupNorm):
 
 
 class Flux3ImageAttnBlock(nn.Module):
+    # Set per instance by compile_decoder(fp8_convs=True) when the FP8 convs are on:
+    # P.V runs as an e4m3 _scaled_mm (output class precision; see _attention_tc).
+    _fp8_pv = False
+
     def __init__(self, in_channels: int):
         super().__init__()
         self.in_channels = in_channels
@@ -134,7 +138,7 @@ class Flux3ImageAttnBlock(nn.Module):
 
         b, c, h, w = q.shape
         if q.is_cuda:
-            return self._attention_tc(q, k, v)
+            return self._attention_tc(q, k, v, self._fp8_pv)
         q = rearrange(q, "b c h w -> b 1 (h w) c")
         k = rearrange(k, "b c h w -> b 1 (h w) c")
         v = rearrange(v, "b c h w -> b 1 (h w) c")
@@ -143,7 +147,7 @@ class Flux3ImageAttnBlock(nn.Module):
         return rearrange(h_, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
 
     @staticmethod
-    def _attention_tc(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def _attention_tc(q: Tensor, k: Tensor, v: Tensor, fp8_pv: bool = False) -> Tensor:
         """Single-head attention over h*w tokens on bf16 tensor cores.
 
         SDPA on the rearranged (non-contiguous, d=512) q/k/v takes the MATH path,
@@ -153,6 +157,13 @@ class Flux3ImageAttnBlock(nn.Module):
         GEMM with fp32 accumulation, written directly in the b c (h w) layout.
         q/k/v are rounded to bf16 (a no-op on the bf16 trunk); the output keeps the
         input dtype.
+
+        fp8_pv=True (served FP8 decoder, b == 1; output class precision): the softmax
+        writes the UNNORMALIZED E = exp(z - rowmax z) as e4m3 (E * 448, E <= 1) and keeps
+        l = sum E in fp32 from the unrounded E; V is quantized per channel (amax / 448).
+        O^T = P V^T then runs as one rowwise-scaled e4m3 _scaled_mm (fp32 accumulation,
+        scale_a = 1 / (448 l) [T, 1], scale_b = s_v [1, c], one bf16 rounding in the
+        epilogue), written [T, c] row-major = channels_last [b, c, h, w].
         """
         b, c, h, w = q.shape
         dt = q.dtype
@@ -160,6 +171,19 @@ class Flux3ImageAttnBlock(nn.Module):
         k = k.reshape(b, c, h * w).to(torch.bfloat16)
         v = v.reshape(b, c, h * w).to(torch.bfloat16)
         s = torch.bmm(q.transpose(1, 2), k, out_dtype=torch.float32)
+        if fp8_pv and b == 1:
+            fp8 = torch.float8_e4m3fn
+            z = s[0] * (c**-0.5)
+            e = torch.exp(z - z.amax(dim=-1, keepdim=True))
+            scale_a = 1.0 / (448.0 * e.sum(dim=-1, keepdim=True))  # [T, 1] fp32
+            pq = (e * 448.0).to(fp8)
+            vf = v[0].float()  # [c, T]
+            s_v = (vf.abs().amax(dim=-1, keepdim=True) / 448.0).clamp(min=1e-30)  # [c, 1]
+            vq = (vf / s_v).clamp(-448.0, 448.0).to(fp8).contiguous()  # [c, T] row-major
+            o_t = torch._scaled_mm(
+                pq, vq.t(), scale_a, s_v.reshape(1, c), out_dtype=torch.bfloat16
+            )  # [T, c]
+            return o_t.t().reshape(b, c, h, w).to(dt)
         p = torch.softmax(s * (c**-0.5), dim=-1).to(torch.bfloat16)
         o = torch.bmm(v, p.transpose(1, 2))
         return o.reshape(b, c, h, w).to(dt)
@@ -759,8 +783,10 @@ class Flux3ImageVAE(nn.Module):
                 m.refresh_subpixel()  # weights were not loaded through load_state_dict
         if channels_last:
             self.decoder.to(memory_format=torch.channels_last)
-        if fp8_convs:
-            _fp8c.prepare_fp8_convs(self.decoder)
+        n_fp8 = _fp8c.prepare_fp8_convs(self.decoder) if fp8_convs else 0
+        for m in self.decoder.modules():
+            if isinstance(m, Flux3ImageAttnBlock):
+                m._fp8_pv = n_fp8 > 0
         dtype = next(self.decoder.parameters()).dtype
         options = {"layout_optimization": False}
         if dtype != torch.float32:
