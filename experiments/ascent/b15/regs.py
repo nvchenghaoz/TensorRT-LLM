@@ -65,8 +65,78 @@ def main():
         lb = driver.cuFuncGetAttribute(
             driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fn)[1]
         regs[str(key)] = {"regs": int(n), "local_bytes": int(lb)}
-    print(json.dumps({"passed": True, "warp_kernel": regs, "t2i_form_sha256": out,
-                      "bool_cubin_sha256": cubins}), flush=True)
+    forms = forms_check()
+    print(json.dumps({"passed": bool(forms.pop("_all_repeat_ok")), "warp_kernel": regs,
+                      "t2i_form_sha256": out, "bool_cubin_sha256": cubins, "forms": forms}),
+          flush=True)
+
+
+def forms_check(reps=20):
+    """Untimed repeated calls through the custom op (served dispatch) of every head form at the
+    served shapes; each call compared bitwise with call 0; output sha256 comparable across trees.
+      row   : select None, [1,1,D] rows (mode blocks: image 1-4, image_cond 0-4) at M=16384, 16464
+      bool  : [1,2,D] tables + bool select (t2i single blocks) at M=16464
+      triton: the Triton kernel forced (_launch) for row/bool at M=16464 (fallback unchanged)
+      index : [1,3,D] tables + u8 index (i2i single blocks) at M=32848 (candidate tree only)"""
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_adaln_quant as aq
+
+    d = 3072
+    res, all_ok = {}, True
+    g = torch.Generator(device="cuda").manual_seed(11)
+    w = torch.ones(d, dtype=torch.bfloat16, device="cuda")
+    b = torch.zeros(d, dtype=torch.bfloat16, device="cuda")
+    warp.register_identity_affine(w, b)
+    gs = torch.tensor([168.0], device="cuda")
+
+    def run(tag, fn, inputs):
+        nonlocal all_ok
+        snap = [t.clone() for t in inputs]
+        first = [t.clone() for t in fn()]
+        ok = True
+        for _ in range(reps - 1):
+            ok &= all(torch.equal(a, c) for a, c in zip(fn(), first))
+        torch.cuda.synchronize()
+        ok &= all(torch.equal(a, c) for a, c in zip(inputs, snap))
+        h = hashlib.sha256()
+        for t in first:
+            h.update(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        res[tag] = {"repeat_bitwise": bool(ok), "sha256": h.hexdigest()}
+        all_ok &= ok
+
+    for m in (16384, 16464):
+        x = torch.randn(1, m, d, generator=g, device="cuda").to(torch.bfloat16)
+        sc = (torch.randn(1, 1, d, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
+        sh = (torch.randn(1, 1, d, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
+        for store in (True, False):
+            # store=False leaves x_mod unwritten: compare fp4/SF only
+            run(f"row_M{m}_store{int(store)}",
+                lambda: torch.ops.trtllm.flux3_adaln_nvfp4_quant(
+                    x, None, sc, sh, w, b, gs, 1e-6, store)[(0 if store else 1):],
+                [x, sc, sh])
+        if m == 16464:
+            sc2 = (torch.randn(1, 2, d, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
+            sh2 = (torch.randn(1, 2, d, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
+            sel = (torch.arange(m, device="cuda") >= 16384).view(1, m, 1)
+            run("bool_M16464", lambda: torch.ops.trtllm.flux3_adaln_nvfp4_quant(
+                x, sel, sc2, sh2, w, b, gs, 1e-6, True), [x, sc2, sh2, sel])
+            run("triton_row_M16464", lambda: aq._launch(x, None, sc, sh, w, b, gs, 1e-6),
+                [x, sc, sh])
+            run("triton_bool_M16464", lambda: aq._launch(x, sel, sc2, sh2, w, b, gs, 1e-6),
+                [x, sc2, sh2, sel])
+    if "SEL_INDEX" in warp._SRC:
+        m = 32848
+        x = torch.randn(1, m, d, generator=g, device="cuda").to(torch.bfloat16)
+        sc3 = (torch.randn(1, 3, d, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
+        sh3 = (torch.randn(1, 3, d, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
+        ar = torch.arange(m, device="cuda")
+        idx = ((ar >= 16384).to(torch.uint8) + (ar >= 32768).to(torch.uint8)).view(1, m, 1)
+        for store in (True, False):
+            run(f"index_M32848_store{int(store)}",
+                lambda: torch.ops.trtllm.flux3_adaln_nvfp4_quant(
+                    x, idx, sc3, sh3, w, b, gs, 1e-6, store)[(0 if store else 1):],
+                [x, sc3, sh3, idx])
+    res["_all_repeat_ok"] = all_ok
+    return res
 
 
 if __name__ == "__main__":
