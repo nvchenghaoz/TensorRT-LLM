@@ -92,6 +92,15 @@ using ArmB = typename Fp8RowwiseSm120<cutlass::gemm::KernelTmaWarpSpecializedCoo
                                       cutlass::epilogue::TmaWarpSpecializedCooperative, 128, 128,
                                       128, OuterW>::Gemm;
 
+template <bool OuterW>
+using ArmD = typename Fp8RowwiseSm120<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                                      cutlass::epilogue::TmaWarpSpecializedCooperative, 128, 256,
+                                      64, OuterW>::Gemm;
+template <bool OuterW>
+using ArmE = typename Fp8RowwiseSm120<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                                      cutlass::epilogue::TmaWarpSpecializedCooperative, 256, 128,
+                                      64, OuterW>::Gemm;
+
 template <class Gemm>
 typename Gemm::Arguments make_args(void const* a, void const* b, void* d, int m, int n, int k) {
   using GK = typename Gemm::GemmKernel;
@@ -175,6 +184,10 @@ void fp8r_gemm(TensorView a, TensorView b, TensorView sx, TensorView sw, TensorV
     if (order) FLUX3_FP8R_RUN(ArmC, true); else FLUX3_FP8R_RUN(ArmC, false);
   } else if (arm == 2) {
     if (order) FLUX3_FP8R_RUN(ArmB, true); else FLUX3_FP8R_RUN(ArmB, false);
+  } else if (arm == 3) {
+    FLUX3_FP8R_RUN(ArmD, true);
+  } else if (arm == 4) {
+    FLUX3_FP8R_RUN(ArmE, true);
   } else {
     TVM_FFI_ICHECK(false) << "bad arm " << arm;
   }
@@ -206,10 +219,16 @@ int64_t smem_of() {
 int64_t fp8r_stages(int64_t arm) {
   return arm == 0   ? stages_of<ArmA<true>>()
          : arm == 1 ? stages_of<ArmC<true>>()
-                    : stages_of<ArmB<true>>();
+         : arm == 2 ? stages_of<ArmB<true>>()
+         : arm == 3 ? stages_of<ArmD<true>>()
+                    : stages_of<ArmE<true>>();
 }
 int64_t fp8r_smem(int64_t arm) {
-  return arm == 0 ? smem_of<ArmA<true>>() : arm == 1 ? smem_of<ArmC<true>>() : smem_of<ArmB<true>>();
+  return arm == 0   ? smem_of<ArmA<true>>()
+         : arm == 1 ? smem_of<ArmC<true>>()
+         : arm == 2 ? smem_of<ArmB<true>>()
+         : arm == 3 ? smem_of<ArmD<true>>()
+                    : smem_of<ArmE<true>>();
 }
 
 }  // namespace flux3_fp8r_sm120

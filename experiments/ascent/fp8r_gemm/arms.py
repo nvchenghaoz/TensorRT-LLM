@@ -17,6 +17,7 @@ import step0  # noqa: E402
 M = 4096
 SHAPES = step0.SHAPES
 ARMS = [int(a) for a in os.environ.get("ARMS", "0,1,2").split(",")]
+ORDERS = [int(a) for a in os.environ.get("ORDERS", "1,0").split(",")]
 log = step0.log
 
 
@@ -50,7 +51,7 @@ def build():
                     log("[res] " + line.strip()[:300])
     except Exception as e:  # noqa: BLE001
         log(f"[res] cuobjdump failed {e!r}")
-    for arm in (0, 1, 2):
+    for arm in ARMS:
         log(f"[arm {arm}] stages={mod.fp8r_stages(arm)} smem={mod.fp8r_smem(arm)} "
             f"ws={mod.fp8r_workspace_size(4096, 18432, 3072, arm)}")
     return fg
@@ -96,7 +97,7 @@ def main():
             a, w, sa, sb = real_inputs(m, n, k, gen)
             ref = ref_mm(a, w, sa, sb)
             for arm in ARMS:
-                for order in (1, 0):
+                for order in ORDERS:
                     out = torch.full((m, n), -1, dtype=torch.int16, device="cuda").view(torch.bfloat16)
                     fg.gemm(a, w, sa, sb, arm=arm, order=order, out=out)
                     torch.cuda.synchronize()
