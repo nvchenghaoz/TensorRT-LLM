@@ -3,6 +3,7 @@
 
 """FLUX.3 PrimsTS weight preparation and dispatch."""
 
+import functools
 import math
 import os
 from typing import NamedTuple
@@ -871,7 +872,20 @@ def _sm120_attn_nvfp4_out_eligible(block: nn.Module) -> bool:
         and lpt.enabled()
         and _sm120_linear_backend() == "cutlass"
         and getattr(block.attn_out, "_flux3_primsts_nvfp4", None) is not None
+        # Inputs: block._flux3_cond_stream (static, set at prepare for the i2i reference-stream
+        # blocks content_mode_blocks.image_cond) and TRTLLM_FLUX3_COND_ATTN_NFO. A subordinate
+        # opt-out only: it can turn nfo off for cond blocks, never on.
+        and (not getattr(block, "_flux3_cond_stream", False) or _cond_attn_nfo_enabled())
     )
+
+
+@functools.lru_cache(maxsize=None)
+def _cond_attn_nfo_enabled() -> bool:
+    """TRTLLM_FLUX3_COND_ATTN_NFO for the prepared image_cond blocks (M = 16384 at 2048^2).
+    0 (default): BF16-out FMHA + side gate_up, attn_out quantized inside the LPT pair (branch 11
+    STEP 0: 8.51 ms/block vs 9.05 ms with the 4-warp nvfp4_out kernel, bitwise equal outputs).
+    1: follow the global FMHA NVFP4-out switch (attn_nvfp4_out_enabled) like image 1-4."""
+    return os.environ.get("TRTLLM_FLUX3_COND_ATTN_NFO", "0").strip() not in ("", "0")
 
 
 def sm120_attn_nvfp4_out_weight(block: nn.Module) -> torch.Tensor | None:
@@ -1173,6 +1187,8 @@ def qkv_fp8_attention_forward(
         x.quantized_by if isinstance(x, NVFP4Activation) else None,
         backend.scale,
         bool(v_live),
+        # False (i2i reference-stream blocks): dynamic Q/K amax, as main's generic route there.
+        bool(getattr(attn, "_flux3_static_qk", True)),
     )
     if side_gate_up is not None:
         from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (

@@ -869,6 +869,12 @@ FLUX3_BROADCAST_ADALN = True
 FLUX3_TEXT_STEP_BROADCAST = True
 
 
+def _cond_primsts_enabled() -> bool:
+    """TRTLLM_FLUX3_COND_PRIMSTS (default 1): prepare the i2i reference-stream mode blocks
+    (content_mode_blocks.image_cond) for the SM120 NVFP4 block route; 0 keeps main's route."""
+    return os.environ.get("TRTLLM_FLUX3_COND_PRIMSTS", "1").strip() != "0"
+
+
 def _flux3_select_mod(mod: tuple) -> Tuple[Tensor, Tensor, Tensor]:
     """Return per-token-broadcastable (shift, scale, gate) from a 3- or 4-tuple.
 
@@ -2158,7 +2164,11 @@ class Flux3Model(BaseDiffusionModel):
                 weight_dicts = loader.get_linear_weights(module, name, weights)
                 if weight_dicts:
                     if type(module.quant_method) is NVFP4LinearMethod and name.startswith(
-                        ("content_mode_blocks.image.", "single_blocks.")
+                        (
+                            "content_mode_blocks.image.",
+                            "content_mode_blocks.image_cond.",
+                            "single_blocks.",
+                        )
                     ):
                         module._flux3_nvfp4_missing_input_scale = all(
                             "input_scale" not in shard for shard in weight_dicts
@@ -2207,6 +2217,30 @@ class Flux3Model(BaseDiffusionModel):
         for block in self.single_blocks:
             prepare_fp8_block(block)
             prepare_nvfp4_block(block)
+        # i2i reference stream (content_mode_blocks.image_cond, M = reference tokens): its NVFP4
+        # checkpoint blocks take the same prepared NVFP4 block route as image 1-4. A BF16
+        # checkpoint-excluded cond block is left alone (no FP8R / NVFP4 conversion: never in the
+        # excluded-NVFP4 or FP8R lists below). TRTLLM_FLUX3_COND_PRIMSTS=0 keeps main's route.
+        cond = (
+            [
+                (f"content_mode_blocks.image_cond.{i}", block)
+                for i, block in enumerate(self.content_mode_blocks["image_cond"])
+            ]
+            if _cond_primsts_enabled() and "image_cond" in self.content_mode_blocks
+            else []
+        )
+        for _, block in cond:
+            target = getattr(block, "_orig_mod", block)
+            # Main's generic cond route quantizes Q/K with the dynamic per-tensor amax.
+            target.attn._flux3_static_qk = False
+            prepare_fp8_block(target)
+            prepare_nvfp4_block(target)
+        cond = [
+            (name, block)
+            for name, block in cond
+            if getattr(getattr(block, "_orig_mod", block).attn, "_flux3_primsts_nvfp4_qkv", None)
+            is not None
+        ]
         blocks = (
             [
                 (f"content_mode_blocks.image.{i}", block)
@@ -2216,8 +2250,8 @@ class Flux3Model(BaseDiffusionModel):
             else []
         )
         blocks.extend((f"single_blocks.{i}", block) for i, block in enumerate(self.single_blocks))
-        verify_nvfp4_coverage(blocks)
-        fused_adaln = prepare_adaln_nvfp4(blocks, Flux3SingleStreamBlock, Flux3ModeBlock)
+        verify_nvfp4_coverage(blocks + cond)
+        fused_adaln = prepare_adaln_nvfp4(blocks + cond, Flux3SingleStreamBlock, Flux3ModeBlock)
         if fused_adaln:
             logger.info(f"FLUX.3 fused LN+adaLN+NVFP4 quantize (exact): {fused_adaln}")
         quant = self.model_config.quant_config
@@ -2241,6 +2275,23 @@ class Flux3Model(BaseDiffusionModel):
             for name, block in blocks
             if prepare_sm120_tail_pair(getattr(block, "_orig_mod", block))
         ]
+        for name, block in cond:
+            # prepare_sm120_tail_pair -> _sm120_attn_nvfp4_out_eligible reads this static flag
+            # (TRTLLM_FLUX3_COND_ATTN_NFO opt-out of the FMHA NVFP4-out epilogue).
+            target = getattr(block, "_orig_mod", block)
+            target._flux3_cond_stream = True
+            if prepare_sm120_tail_pair(target):
+                paired.append(name)
+        if cond:
+            nfo = [
+                bool(getattr(getattr(b, "_orig_mod", b), "_sm120_attn_nvfp4_out", False))
+                for _, b in cond
+            ]
+            logger.info(
+                "FLUX.3 i2i reference stream on the prepared NVFP4 block route "
+                f"(TRTLLM_FLUX3_COND_PRIMSTS; dynamic Q/K amax; FMHA NVFP4-out {nfo}): "
+                f"{[name for name, _ in cond]}"
+            )
         if paired:
             logger.info(f"FLUX.3 SM120 down || attn_out two-stream tail pair: {paired}")
         from tensorrt_llm._torch.visual_gen.models.flux3.flux3_adaln_fp8r import (
