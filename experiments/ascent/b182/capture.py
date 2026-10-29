@@ -41,7 +41,14 @@ def log(*a):
 from tensorrt_llm._torch.visual_gen.attention.backends.fp8_sm12x import (  # noqa: E402
     _MIN_SCALING_FACTOR,
 )
+from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120 import (  # noqa: E402
+    flux3_sm120_qknorm_rope_fp8 as qr8,
+)
 from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_primsts as fp  # noqa: E402
+
+HAS_STATIC = hasattr(qr8, "STATIC_QK")
+if HAS_STATIC:
+    qr8.STATIC_QK = False  # (b) = main's per-tensor route; the static kernel runs as (dk)
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_gemm_config import (  # noqa: E402
     autotune_context,
 )
@@ -151,9 +158,8 @@ def analyze(cap):
     out = cap["out"]
     M = out.shape[0]
     W = out.shape[1] // 3
-    q = out[:, :W]
-    k = out[:, W:2 * W]
-    v = out[:, 2 * W:]
+    planes = out.view(3, M, W)  # planar GEMM output: three contiguous [M, W] planes
+    q, k, v = planes[0], planes[1], planes[2]
     qr = rot_ref(q, cap["qn"], cap["cs"], cap["pos"])
     kr = rot_ref(k, cap["kn"], cap["cs"], cap["pos"])
     sm = cap["sm_scale"]
@@ -197,6 +203,23 @@ def analyze(cap):
                 "max_rot_over_B": max(amq / Bq, amk / Bk),
                 "sat_d": satq + satk, "rel_d": rel(od, ref)})
     res["d_over_b"] = res["rel_d"] / rb
+    if HAS_STATIC:
+        # (dk) this branch's static kernel on the same planes: bytes vs torch (d), its rel_l2
+        qr8.STATIC_QK = True
+        k8s, ks = qr8.qknorm_rope_fp8(q, k, v, cap["qn"], cap["kn"], cap["cs"], cap["pos"], sm)
+        qr8.STATIC_QK = False
+        ksc = ks.float()
+        u8_ = torch.uint8
+        res["dk_q_bytes_eq_d"] = bool(torch.equal(k8s[0].view(u8_), qd.view(u8_)))
+        res["dk_k_bytes_eq_d"] = bool(torch.equal(k8s[1].view(u8_), kd.view(u8_)))
+        res["dk_q_match"] = float((k8s[0].view(u8_) == qd.view(u8_)).float().mean())
+        res["dk_v_eq_b"] = bool(torch.equal(k8s[2].view(u8_), v8.view(u8_)))
+        res["dk_scales_eq_d"] = bool(ksc[0].item() == sdq.item() and ksc[1].item() == sdk.item()
+                                     and ksc[2].item() == s2)
+        odk = sdpa(k8s[0].float() * ksc[0].item(), k8s[1].float() * ksc[1].item(),
+                   k8s[2].float() * ksc[2].item(), sm)
+        res["rel_dk"] = rel(odk, ref)
+        res["dk_over_b"] = res["rel_dk"] / rb
     tiny = 2.0 ** -6
     res["subn_q_b"] = float(((qr.float() * fq).abs() < tiny).float().mean())
     res["subn_q_d"] = float(((qr.float() * fdq).abs() < tiny).float().mean())
@@ -291,7 +314,17 @@ for tag, prompt, seed in PROMPTS:
     summ = {"tag": tag, "T": T, "routed": state["n"], "n_caps": len(caps),
             "mean_d_over_b": sum(db) / len(db), "max_d_over_b": max(db),
             "min_d_over_b": min(db), "sat_d_total": sum(c["sat_d"] for c in caps),
-            "n_d_worse": sum(1 for x in db if x > 1.0)}
+            "n_d_worse": sum(1 for x in db if x > 1.0),
+            "mean_rel_b": sum(c["rel_b"] for c in caps) / len(caps),
+            "bt_bytes_match_q_min": min(c["bt_bytes_match_q"] for c in caps),
+            "bt_scales_match_all": all(c["bt_scales_match"] for c in caps)}
+    if HAS_STATIC:
+        dk = [c["dk_over_b"] for c in caps]
+        summ.update({"mean_dk_over_b": sum(dk) / len(dk), "max_dk_over_b": max(dk),
+                     "dk_bytes_eq_d_all": all(c["dk_q_bytes_eq_d"] and c["dk_k_bytes_eq_d"]
+                                              for c in caps),
+                     "dk_v_eq_b_all": all(c["dk_v_eq_b"] for c in caps),
+                     "dk_scales_eq_d_all": all(c["dk_scales_eq_d"] for c in caps)})
     for r in RS:
         x = [c[f"b{r}_over_b"] for c in caps]
         summ[f"mean_b{r}_over_b"] = sum(x) / len(x)
