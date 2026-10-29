@@ -162,7 +162,7 @@ def stat(v):
 
 def capture(fn_seq, stream):
     with torch.cuda.stream(stream):
-        for f in fn_seq[:6]:
+        for f in fn_seq:  # every distinct call compiles/loads outside capture
             f()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
