@@ -7,9 +7,11 @@ SwiGLU gate_up is not routed (identical in both trees) and not in the unit.
 
 Cases (one CUDA graph each = one denoise step's routed GEMM calls, NSETS=2 input sets per M
 alternating, so A + W + out per call exceed the 128 MB L2):
-  t2i-2048: 28 single blocks @ M 16896 + 4 image mode blocks @ M 16384 (QKV3 + tail pair each)
+  Served single-block M (T=80, knowledge 384): t2i 16464, i2i 32848 (BENCH_SINGLE_MS overrides,
+  e.g. "16896,33280" for the old T=512 shapes).
+  t2i-2048: 28 single blocks @ M 16464 + 4 image mode blocks @ M 16384 (QKV3 + tail pair each)
             + image.0 FP8R (QKV, gate_up, down, attn_out) @ M 16384.
-  i2i-2048: 28 single blocks @ M 33280 + 4 image mode blocks (1-4) @ M 16384 + image.0 FP8R
+  i2i-2048: 28 single blocks @ M 32848 + 4 image mode blocks (1-4) @ M 16384 + image.0 FP8R
             @ M 16384 (knowledge 316: image_cond mode blocks are never primsts-prepared, so they
             take the generic linear route, not these GEMMs; the M=512 text blocks stay < 8192).
 Inputs: NVFP4 quantized from BF16 normals (flashinfer nvfp4_quantize, 128x4 scales, per-plane
@@ -266,16 +268,18 @@ def main():
     log(f"preload {time.time() - t0:.0f}s")
     g = torch.Generator(device="cuda")
     g.manual_seed(2048)
-    sets = {m: [nvfp4_inputs(m, g) for _ in range(NSETS)] for m in (16384, 16896, 33280)}
+    m_t2i, m_i2i = (int(v) for v in os.environ.get("BENCH_SINGLE_MS", "16464,32848").split(","))
+    log(f"single-block M: t2i {m_t2i}, i2i {m_i2i}; mode blocks + image.0 FP8R M 16384")
+    sets = {m: [nvfp4_inputs(m, g) for _ in range(NSETS)] for m in (16384, m_t2i, m_i2i)}
     f8 = fp8r_inputs(16384, g)
     pristine = [t.clone() for t in tensors_of(sets, f8)]
     refs = references(sets, f8)
     log(f"references from main's modules: {len(refs)} buffers ({time.time() - t0:.0f}s)")
-    outs = {"t2i-2048": case_outputs(sets, f8, 16896, 16384),
-            "i2i-2048": case_outputs(sets, f8, 33280, 16384)}
+    outs = {"t2i-2048": case_outputs(sets, f8, m_t2i, 16384),
+            "i2i-2048": case_outputs(sets, f8, m_i2i, 16384)}
     cases = {
-        "t2i-2048": case_calls(sets, f8, 16896, 28, 16384, 4),
-        "i2i-2048": case_calls(sets, f8, 33280, 28, 16384, 4),
+        "t2i-2048": case_calls(sets, f8, m_t2i, 28, 16384, 4),
+        "i2i-2048": case_calls(sets, f8, m_i2i, 28, 16384, 4),
     }
     graphs = {k: capture(v) for k, v in cases.items()}
     log(f"captured {list(graphs)} ({time.time() - t0:.0f}s)")
@@ -323,6 +327,7 @@ def main():
                       "reference": "main modules direct: gemm_qkv3_pingpong (QKV3_RASTER/"
                                    "SWIZZLE, own workspace), lpt.module().lpt_pair (sched_mode, "
                                    "own workspace), fg.gemm(arm=1, slot 1)",
+                      "shapes": {"t2i_single_M": m_t2i, "i2i_single_M": m_i2i, "mode_M": 16384},
                       "unit": "one CUDA graph replay = one denoise step's QKV3 + tail-pair calls "
                               "(28 single + 4 image mode blocks) + image.0's 4 FP8R GEMMs"}))
     sys.stdout.flush()
