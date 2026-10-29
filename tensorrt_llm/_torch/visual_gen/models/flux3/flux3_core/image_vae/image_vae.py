@@ -12,6 +12,7 @@ from torch import Tensor
 
 from . import decoder_tail_triton as _tail
 from . import fp8_conv as _fp8c
+from . import subpixel_conv as _spc
 from .decoder_tail_triton import (
     add_norm_swish_conv_out_3x3,
     can_use_conv_out_kernel,
@@ -306,6 +307,11 @@ class Flux3ImageUpsample(nn.Module):
     # to the next block and fold this conv's bias into its 1x1 nin_shortcut
     # (_resnet_block_with_input_bias).
     use_transpose = True
+    # Per instance: True runs a bf16 channels_last input off the transpose path as one
+    # cuDNN FE graph (flux3_vae::subpixel_up_conv: stride-2 dgrad + fp32 bias epilogue),
+    # writing conv + bias straight into the interleaved output (no interleave pass, no
+    # separate x + bias pass, no bias fold). fp32 / NCHW inputs keep the path below.
+    use_fused_bias_op = False
 
     def __init__(self, in_channels: int):
         super().__init__()
@@ -360,6 +366,8 @@ class Flux3ImageUpsample(nn.Module):
         if self.transpose_path(x):
             b = self.conv.bias
             return self.forward_nobias(x) + b.to(x.dtype).view(1, -1, 1, 1)
+        if self.use_fused_bias_op and _spc.can_use(x, self.transpose_weight, self.conv.bias):
+            return torch.ops.flux3_vae.subpixel_up_conv(x, self.transpose_weight, self.conv.bias)
         w4, b4 = self.subpixel_weight, self.subpixel_bias
         if w4.dtype != x.dtype:
             w4, b4 = w4.to(x.dtype), b4.to(x.dtype)
@@ -563,6 +571,9 @@ class Flux3ImageDecoder(nn.Module):
                 # fold Inductor materializes x + bias in a separate 0.7 ms pass, which
                 # cancels the saved interleave.
                 up.upsample.use_transpose = i_level != 1
+                # That upsample instead adds its bias in the conv's fp32 epilogue (one
+                # cuDNN FE graph writing the interleaved output, bf16 channels_last only).
+                up.upsample.use_fused_bias_op = i_level == 1
             self.up.insert(0, up)
 
         self.norm_out = Flux3GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
