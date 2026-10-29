@@ -18,7 +18,11 @@ Declared gates (the passed flag holds only these):
    base: repeat bitwise, latent unchanged, no recompile after warmup.
    cand: ON and OFF repeat bitwise, latent unchanged, no Dynamo recompile and no cuDNN FE plan build
    after warmup, 28 convs prepared on ON and prepare_fp8_convs not called on OFF, ON PSNR vs fp32 R
-   >= 40 dB on seeds 0-2, decoder fused-tail kernel (_conv3x3_to3_gather_kernel) in the ON census.
+   >= 40 dB on seeds 0-2, decoder fused-tail kernel (_conv3x3_to3_gather_kernel) in the ON census,
+   28 flux3_vae::fp8_conv3x3 calls per ON decode (profiler CPU op events, per-site shapes listed),
+   and (main 0f76026a's upsample-bias fold) up[1].block[0] on the FP8 path with
+   _resnet_block_with_input_bias(x_nb, b_up) within 5% (max abs / max |ref|) of the FP8 block on
+   the materialized x_nb + b_up.
 Last stdout line: pair evidence JSON (batch.1.kernel_ms = this arm's timed decoder median).
 """
 
@@ -45,7 +49,7 @@ WARMUP, ITERS = args.warmup, args.iters
 ART = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp/b218_art")
 os.makedirs(ART, exist_ok=True)
 XCHG = "/tmp/b218_xchg"
-MAIN = "1185e8f970fa1f56c64deb4efbaae6f5d939e02c"
+MAIN = "0f76026a2d3a75fe5d3c56234a6ed1a6ffb1f200"
 torch._dynamo.config.cache_size_limit = 64
 T0 = time.time()
 
@@ -304,24 +308,56 @@ else:
         on_vs_off.append({"seed": s, **cmp(outs_on[s], outs_off[s])})
     log("ON vs R", json.dumps(acc_on))
     log("OFF vs R", json.dumps(acc_off))
+    # landing 69's bias fold into up[1].block[0] (_resnet_block_with_input_bias) on the FP8
+    # path, eager: fold(x_nb, b_up) vs the FP8 block on the materialized x_nb + b_up (same
+    # norm1 input; only the shortcut rounding differs) and vs the FP8 block on x_nb alone.
+    fold = {"helper_present": hasattr(iv, "_resnet_block_with_input_bias")}
+    if fold["helper_present"]:
+        blk = ON.decoder.up[1].block[0]
+        b_up = ON.decoder.up[2].upsample.conv.bias
+        gx = torch.Generator(device="cuda").manual_seed(7)
+        x_nb = torch.randn(1, blk.in_channels, 512, 512, device="cuda", generator=gx).to(torch.bfloat16)
+        x_nb = x_nb.contiguous(memory_format=torch.channels_last)
+        with torch.inference_mode():
+            y_fold = iv._resnet_block_with_input_bias(blk, x_nb, b_up).float()
+            y_mat = blk(x_nb + b_up.view(1, -1, 1, 1)).float()
+            y_nob = blk(x_nb).float()
+        mx = y_mat.abs().max().item()
+        fold.update({"block_fp8": bool(blk._fp8), "max_abs_ref": mx,
+                     "rel_fold_vs_materialized": (y_fold - y_mat).abs().max().item() / mx,
+                     "rel_no_bias_vs_materialized": (y_nob - y_mat).abs().max().item() / mx})
+        fold["ok"] = fold["block_fp8"] and fold["rel_fold_vs_materialized"] <= 0.05
+        del y_fold, y_mat, y_nob, x_nb
+    log("fold", json.dumps(fold))
     no_new_plans &= n_plans() == pl0
     # ON census (one warm decode)
     from collections import Counter
 
     from torch.profiler import ProfilerActivity, profile
 
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         decode(ON)
         torch.cuda.synchronize()
-    cnt, dur = Counter(), Counter()
+    cnt, dur, fp8_sites = Counter(), Counter(), Counter()
     for ev in prof.events():
         if ev.device_type == torch.autograd.DeviceType.CUDA:
             cnt[ev.name] += 1
             dur[ev.name] += ev.device_time_total
+        elif ev.name == "flux3_vae::fp8_conv3x3":
+            shp = ev.input_shapes or []
+            try:
+                xs, ws = shp[0], shp[2]
+                tag = (f"{xs[1]}->{ws[0]}@{xs[2]} bias={bool(len(shp) > 4 and shp[4])} "
+                       f"res={bool(len(shp) > 5 and shp[5])}")
+            except Exception:  # noqa: BLE001
+                tag = str(shp)[:80]
+            fp8_sites[tag] += 1
+    n_fp8_calls = sum(fp8_sites.values())
     tail = {k: cnt[k] for k in cnt if "conv3x3_to3_gather" in k}
     fp8k = {k[:120]: (cnt[k], round(dur[k] / 1e3, 3)) for k in cnt
             if any(t in k.lower() for t in ("e4m3", "fp8", "f8"))}
     census = {"total_launches": sum(cnt.values()), "gpu_total_ms": round(sum(dur.values()) / 1e3, 3),
+              "fp8_conv3x3_calls_per_decode": n_fp8_calls, "fp8_conv3x3_sites": dict(fp8_sites),
               "tail_kernel": tail, "fp8_kernels": fp8k,
               "fp8_kernel_launches": sum(v[0] for v in fp8k.values()),
               "top": [(k[:120], cnt[k], round(dur[k] / 1e3, 3)) for k, _ in dur.most_common(20)]}
@@ -344,7 +380,9 @@ else:
     gates = {"on_repeat_bitwise": on_rep, "off_repeat_bitwise": off_rep, "inputs_unchanged": on_inp and off_inp,
              "no_recompile_after_warmup": no_recompile, "no_cudnn_plan_build_after_warmup": no_new_plans,
              "n_prepared_28": n_prepared == 28 and n_fp8_blocks == 14, "off_prepare_not_called": not off_prep_called,
-             "on_psnr_vs_fp32_R_ge_40dB": psnr_min_on >= 40.0, "tail_kernel_in_on_census": bool(tail)}
+             "on_psnr_vs_fp32_R_ge_40dB": psnr_min_on >= 40.0, "tail_kernel_in_on_census": bool(tail),
+             "fp8_conv3x3_calls_per_decode_28": n_fp8_calls == 28,
+             "fold_block_fp8_ok": bool(fold.get("ok", not fold["helper_present"]))}
     res.update({"batch": {"1": {"kernel_ms": st["ON"]["median_ms"], "step_ms": st["ON"]["median_ms"],
                                 "noise_floor": max(st["ON"]["noise_floor"], st["OFF"]["noise_floor"])}},
                 "output": {"class": "precision",
@@ -357,6 +395,7 @@ else:
                 "gates": gates, "n_prepared": n_prepared, "n_fp8_blocks": n_fp8_blocks,
                 "cudnn_plans": fc.graph_table() if fc else None,
                 "on_vs_fp32_R": acc_on, "off_vs_fp32_R": acc_off, "on_vs_off": on_vs_off,
-                "cross_arm": cross, "census_on": census, "passed": bool(all(gates.values()))})
+                "cross_arm": cross, "census_on": census, "fold_check": fold,
+                "passed": bool(all(gates.values()))})
 res["wall_s"] = round(time.time() - T0, 1)
 print(json.dumps(res, default=str), flush=True)

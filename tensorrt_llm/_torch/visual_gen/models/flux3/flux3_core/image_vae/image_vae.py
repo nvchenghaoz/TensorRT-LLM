@@ -485,6 +485,18 @@ def _resnet_block_with_input_bias(block: Flux3ImageResnetBlock, x_nb: Tensor, b_
     decode) the fold into up[1].block[0] kept main's accuracy; the fold into
     up[0].block[0] cost ~0.3 dB PSNR, so that upsample keeps the sub-pixel path."""
     x = x_nb + b_in.view(1, -1, 1, 1)
+    if block._fp8:
+        # FP8 GN->conv path (prepare_fp8_convs): norm1 still sees x_nb + b_in (fused into
+        # gn_swish_fp8); the folded shortcut s (same math as below) enters conv2's
+        # epilogue as the residual.
+        hq, sx = block._fp8_conv2_input(x)
+        nin = block.nin_shortcut
+        w = nin.weight
+        b_fold = (nin.bias.double() + torch.mv(w[:, :, 0, 0].double(), b_in.double())).float()
+        s = nn.functional.conv2d(x_nb, w, None)
+        s = (s.float() + b_fold.view(1, -1, 1, 1)).to(x_nb.dtype)
+        c2 = block.conv2
+        return _fp8c.fp8_conv3x3(hq, sx, c2.fp8_wq, c2.fp8_sw, c2.bias, s)
     h = block.norm1.forward_silu(x)
     h = block.conv1(h)
     h = block.norm2.forward_silu(h)

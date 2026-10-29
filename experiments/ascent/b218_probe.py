@@ -8,7 +8,7 @@ Last stdout line: JSON {"passed": true, ...} (a report; passed only means the pr
 import json
 import subprocess
 
-MAIN = "1185e8f970fa1f56c64deb4efbaae6f5d939e02c"
+MAIN = "0f76026a2d3a75fe5d3c56234a6ed1a6ffb1f200"
 OLD = "b8afb8d1"
 PATHS = ["tensorrt_llm/_torch/visual_gen/models/flux3/flux3_core/image_vae/",
          "tensorrt_llm/_torch/visual_gen/modules/vae/",
