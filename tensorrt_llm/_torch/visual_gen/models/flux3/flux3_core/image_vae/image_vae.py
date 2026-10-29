@@ -245,6 +245,28 @@ def _subpixel_upsample_weights(weight: Tensor, bias: Tensor) -> tuple[Tensor, Te
     return w4.contiguous(), b4.contiguous()
 
 
+# conv_transpose2d(stride 2, padding 1) tap k of a 4-tap axis reads 2x2 phase a, tap p.
+# Output o = 2m + a reads input i with k = o + 1 - 2i: a=0 -> k=1 (i=m, p=1) and
+# k=3 (i=m-1, p=0); a=1 -> k=2 (i=m, p=0) and k=0 (i=m+1, p=1).
+_TRANSPOSE_TAPS = ((1, 1), (0, 1), (1, 0), (0, 0))
+
+
+def _subpixel_transpose_weight(w4: Tensor) -> Tensor:
+    """Sub-pixel W4 [4C_out, C_in, 2, 2] -> conv_transpose2d weight Wt [C_in, C_out, 4, 4].
+
+    A pure permutation of W4's values (no new rounding): nearest-2x + conv3x3(pad 1)
+    == conv_transpose2d(x, Wt, b, stride=2, padding=1), and the phase interleave is
+    done by the transposed conv's strided output indexing.
+    """
+    co, ci = w4.shape[0] // 4, w4.shape[1]
+    w6 = w4.detach().reshape(2, 2, co, ci, 2, 2)  # [a, b, o, i, p, q]
+    wt = w4.new_empty(ci, co, 4, 4)
+    for ky, (a, p) in enumerate(_TRANSPOSE_TAPS):
+        for kx, (b, q) in enumerate(_TRANSPOSE_TAPS):
+            wt[:, :, ky, kx] = w6[a, b, :, :, p, q].transpose(0, 1)
+    return wt.contiguous()
+
+
 class Flux3ImageUpsample(nn.Module):
     """nearest-2x upsample + 3x3 conv, computed as one sub-pixel 2x2 conv.
 
@@ -254,6 +276,12 @@ class Flux3ImageUpsample(nn.Module):
     at load (state_dict keys are unchanged) and follow .to(dtype/device).
     """
 
+    # Per instance: False keeps the sub-pixel conv + interleave on every input (see
+    # transpose_path). On the transpose path the decoder may pass the bias-free output
+    # to the next block and fold this conv's bias into its 1x1 nin_shortcut
+    # (_resnet_block_with_input_bias).
+    use_transpose = True
+
     def __init__(self, in_channels: int):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
@@ -261,6 +289,9 @@ class Flux3ImageUpsample(nn.Module):
             "subpixel_weight", torch.zeros(4 * in_channels, in_channels, 2, 2), persistent=False
         )
         self.register_buffer("subpixel_bias", torch.zeros(4 * in_channels), persistent=False)
+        self.register_buffer(
+            "transpose_weight", torch.zeros(in_channels, in_channels, 4, 4), persistent=False
+        )
         self._subpixel_ready = False
         self.register_load_state_dict_post_hook(Flux3ImageUpsample._after_load)
 
@@ -274,11 +305,36 @@ class Flux3ImageUpsample(nn.Module):
         w4, b4 = _subpixel_upsample_weights(self.conv.weight, self.conv.bias)
         self.subpixel_weight = w4.to(self.subpixel_weight.device)
         self.subpixel_bias = b4.to(self.subpixel_bias.device)
+        self.transpose_weight = _subpixel_transpose_weight(w4).to(self.transpose_weight.device)
         self._subpixel_ready = True
+
+    def transpose_path(self, x: Tensor) -> bool:
+        """Low-precision channels_last input (the compiled bf16 decode): one stride-2 4x4
+        conv_transpose2d (cuDNN dgrad writes the interleaved NHWC output directly).
+        fp32 and NCHW inputs keep the sub-pixel conv + interleave below."""
+        return (
+            self.use_transpose
+            and x.dim() == 4
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.is_contiguous(memory_format=torch.channels_last)
+        )
+
+    def forward_nobias(self, x: Tensor) -> Tensor:
+        """transpose_path only: the upsample WITHOUT its bias (conv.bias is added by
+        the caller), [n, C, 2h, 2w] channels_last."""
+        if not self._subpixel_ready:
+            self.refresh_subpixel()
+        wt = self.transpose_weight
+        if wt.dtype != x.dtype:
+            wt = wt.to(x.dtype)
+        return nn.functional.conv_transpose2d(x, wt, None, stride=2, padding=1)
 
     def forward(self, x: Tensor) -> Tensor:
         if not self._subpixel_ready:
             self.refresh_subpixel()
+        if self.transpose_path(x):
+            b = self.conv.bias
+            return self.forward_nobias(x) + b.to(x.dtype).view(1, -1, 1, 1)
         w4, b4 = self.subpixel_weight, self.subpixel_bias
         if w4.dtype != x.dtype:
             w4, b4 = w4.to(x.dtype), b4.to(x.dtype)
@@ -371,6 +427,51 @@ class Flux3ImageEncoder(nn.Module):
         return h
 
 
+def _can_fold_input_bias(block: nn.Module, upsample: Flux3ImageUpsample, x: Tensor) -> bool:
+    """block's 1x1 nin_shortcut can absorb the upsample bias (see _resnet_block_with_input_bias)."""
+    nin = getattr(block, "nin_shortcut", None)
+    if not isinstance(block, Flux3ImageResnetBlock) or nin is None:
+        return False
+    b_up = upsample.conv.bias
+    return (
+        nin.kernel_size == (1, 1)
+        and nin.stride == (1, 1)
+        and nin.padding == (0, 0)
+        and nin.groups == 1
+        and nin.bias is not None
+        and b_up is not None
+        and nin.weight.dtype == x.dtype
+        and nin.bias.dtype == x.dtype
+        and b_up.dtype == x.dtype
+        and upsample.transpose_weight.dtype == x.dtype
+    )
+
+
+def _resnet_block_with_input_bias(block: Flux3ImageResnetBlock, x_nb: Tensor, b_in: Tensor) -> Tensor:
+    """block(x_nb + b_in) for a block with a 1x1 nin_shortcut, without materializing
+    x_nb + b_in: the norm1 path adds b_in as it loads x_nb (fused under torch.compile),
+    and nin(x_nb + b_in) = nin(x_nb) + W_nin @ b_in, so the shortcut conv reads x_nb with
+    bias' = b_nin + W_nin[:, :, 0, 0] @ b_in (summed in fp64, kept in fp32 and added to
+    the conv output as its bias add is, before the one rounding to the trunk dtype).
+
+    Accuracy caveat: the shortcut conv output is rounded (by cuDNN) BEFORE bias' is
+    added. Where W_nin @ b_in largely cancels nin(x_nb), that rounding acts on a much
+    larger value than in nin(x_nb + b_in). On the FLUX.3 VAE (bf16 trunk vs the fp32
+    decode) the fold into up[1].block[0] kept main's accuracy; the fold into
+    up[0].block[0] cost ~0.3 dB PSNR, so that upsample keeps the sub-pixel path."""
+    x = x_nb + b_in.view(1, -1, 1, 1)
+    h = block.norm1.forward_silu(x)
+    h = block.conv1(h)
+    h = block.norm2.forward_silu(h)
+    h = block.conv2(h)
+    nin = block.nin_shortcut
+    w = nin.weight
+    b_fold = (nin.bias.double() + torch.mv(w[:, :, 0, 0].double(), b_in.double())).float()
+    s = nn.functional.conv2d(x_nb, w, None)
+    s = (s.float() + b_fold.view(1, -1, 1, 1)).to(x_nb.dtype)
+    return s + h
+
+
 class Flux3ImageDecoder(nn.Module):
     def __init__(
         self,
@@ -419,6 +520,12 @@ class Flux3ImageDecoder(nn.Module):
             up.attn = attn
             if i_level != 0:
                 up.upsample = Flux3ImageUpsample(block_in)
+                # The upsample into the full-resolution level keeps the sub-pixel path:
+                # its output feeds up[0].block[0].nin_shortcut, and there the bias fold
+                # cost ~0.3 dB PSNR vs the fp32 decode (bf16 trunk), while without the
+                # fold Inductor materializes x + bias in a separate 0.7 ms pass, which
+                # cancels the saved interleave.
+                up.upsample.use_transpose = i_level != 1
             self.up.insert(0, up)
 
         self.norm_out = Flux3GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
@@ -440,15 +547,28 @@ class Flux3ImageDecoder(nn.Module):
         # run as one kernel (the sum x + r is never stored).
         last = self.up[0].block[self.num_res_blocks]
         fuse_tail = _tail.FUSE_NORM_PROLOGUE and len(self.up[0].attn) == 0
+        up_bias = None  # pending upsample bias, folded into the next block's shortcut
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
                 if fuse_tail and i_level == 0 and i_block == self.num_res_blocks:
                     break
-                h = self.up[i_level].block[i_block](h)
+                if up_bias is not None:
+                    h = _resnet_block_with_input_bias(self.up[i_level].block[i_block], h, up_bias)
+                    up_bias = None
+                else:
+                    h = self.up[i_level].block[i_block](h)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
             if i_level != 0:
-                h = self.up[i_level].upsample(h)
+                upsample = self.up[i_level].upsample
+                nxt = self.up[i_level - 1].block[0]
+                if upsample.transpose_path(h) and _can_fold_input_bias(nxt, upsample, h):
+                    # The next block's 1x1 shortcut is an extern conv that would force
+                    # x + bias to be materialized; pass it the bias-free upsample output
+                    # and fold the bias into its own bias instead.
+                    h, up_bias = upsample.forward_nobias(h), upsample.conv.bias
+                else:
+                    h = upsample(h)
 
         norm, conv = self.norm_out, self.conv_out
         if fuse_tail:
