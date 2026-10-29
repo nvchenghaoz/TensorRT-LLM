@@ -48,7 +48,12 @@ def run_fmha_v2_fp8_sm12x(
 ) -> torch.Tensor:
     """The one entry to FlashInfer's SM120 FP8 fmha_v2 (contiguous E4M3 BSHD Q/K/V, BF16 out)."""
     if _USE_FMHA_V2_FLUX3 and head_dim == 128:
-        from .fmha_v2_flux3 import ROUTED_LEVERS, fmha_v2_flux3_d128, get_flux3_d128_module
+        from .fmha_v2_flux3 import (
+            ROUTED_LEVERS,
+            fmha_v2_flux3_d128,
+            get_flux3_d128_module,
+            load_trim_levers,
+        )
 
         if (
             _USE_FMHA_V2_FLUX3_B2
@@ -70,7 +75,7 @@ def run_fmha_v2_fp8_sm12x(
                 scale_bmm2_d=scale_bmm2_d,
                 causal=False,
                 lse=None,
-                module=get_flux3_d128_module(ROUTED_LEVERS),
+                module=get_flux3_d128_module(load_trim_levers(ROUTED_LEVERS, k_fp8, v_fp8)),
             )
         return fmha_v2_flux3_d128(
             q_fp8,

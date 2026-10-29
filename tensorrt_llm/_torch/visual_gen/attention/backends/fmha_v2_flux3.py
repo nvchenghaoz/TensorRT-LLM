@@ -50,7 +50,14 @@ _LEVER_FLAGS = {
     # unit_alpha (FMHA_FLUX3_SKIP_UNIT_ALPHA, fragment.h, base2 only): a warp whose 2x16 rows
     #   all keep their running max (alpha == 1.0f) skips the O rescale (bitwise vs base2).
     "unit_alpha": ("ua", "-DFMHA_FLUX3_SKIP_UNIT_ALPHA=1"),
+    # load_trim (FMHA_FLUX3_LOAD_TRIM, gmem_tile_qkv_packed.h; bitwise): the K/V LDGSTS skip the
+    #   always-true column predicate, compute row predicates only on the last partial KV step and
+    #   use the compile-time row stride LOAD_TRIM_STRIDE_BYTES (H_kv 24 x D 128 x E4M3). Calls
+    #   with another K/V stride run the module without it (load_trim_levers).
+    "load_trim": ("ldt", "-DFMHA_FLUX3_LOAD_TRIM=1"),
 }
+
+LOAD_TRIM_STRIDE_BYTES = 3072
 
 # The lever set main runs.
 DEFAULT_LEVERS: tuple[str, ...] = ("mask_skip", "resident_q")
@@ -78,6 +85,22 @@ def _routed_vx4() -> tuple[str, ...]:
 
 
 ROUTED_LEVERS = ROUTED_LEVERS + _routed_vx4()
+
+# load_trim (exact) joins the routed set; TRTLLM_FMHA_V2_FLUX3_LDT=0 drops it.
+if os.environ.get("TRTLLM_FMHA_V2_FLUX3_LDT", "1") != "0":
+    ROUTED_LEVERS = (*ROUTED_LEVERS, "load_trim")
+
+
+def load_trim_levers(levers: tuple[str, ...], key: torch.Tensor, value: torch.Tensor):
+    """The levers to run for these K/V: load_trim only when both row strides (contiguous
+    [B, S, H_kv, D] E4M3) equal the stride the trimmed kernel is compiled for."""
+    if "load_trim" not in levers:
+        return levers
+    kb = key.shape[-2] * key.shape[-1] * key.element_size()
+    vb = value.shape[-2] * value.shape[-1] * value.element_size()
+    if kb == LOAD_TRIM_STRIDE_BYTES and vb == LOAD_TRIM_STRIDE_BYTES:
+        return levers
+    return tuple(name for name in levers if name != "load_trim")
 
 
 def gen_flux3_d128_spec(levers: Sequence[str] = DEFAULT_LEVERS, min_blocks: int = 0):
