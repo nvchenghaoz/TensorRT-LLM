@@ -79,6 +79,21 @@ for j, b in enumerate(tr.content_mode_blocks["image_cond"]):
     })
 log("cond route", json.dumps(cond_route))
 
+if "fixedref" in sys.argv[3:]:
+    # Cross-process bitwise comparisons: the VAE (cuDNN frontend plans) is not bitwise stable
+    # across processes, so replace the encoded reference latent by a fixed seeded tensor of the
+    # same shape/dtype (deterministic on every process); compare denoise latents only.
+    _orig_encode = pipe.vae.encode
+
+    def _fixed_encode(image, *a, **k):
+        out = _orig_encode(image, *a, **k)  # [B, C, h, w]
+        g = torch.Generator(device=out.device).manual_seed(1234)
+        fixed = torch.randn(out.shape, generator=g, device=out.device, dtype=torch.float32)
+        return fixed.to(out.dtype)
+
+    pipe.vae.encode = _fixed_encode
+    log("fixedref: VAE-encoded reference latents replaced by a seeded tensor")
+
 pngs = sorted(glob.glob(os.path.join(INPUTS_DIR, "*.png")))
 REFS = {k: open(p, "rb").read() for k, p in zip(("B", "C"), pngs[:2])}
 PROMPTS = {
