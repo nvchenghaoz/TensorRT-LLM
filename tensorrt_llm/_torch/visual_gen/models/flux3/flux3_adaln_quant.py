@@ -691,7 +691,23 @@ def prepare_adaln_nvfp4(blocks, single_cls, mode_cls) -> list[str]:
         target._flux3_adaln_nvfp4 = enabled
         if enabled:
             names.append(name)
+            _register_identity_ln(target.pre_norm)
     return names
+
+
+def _register_identity_ln(norm) -> None:
+    """Register pre_norm's affine with the warp kernel's LN_ID path iff weight is bitwise 1.0
+    (bf16 0x3F80) and bias bitwise +0.0 everywhere (a -0.0 bias does not qualify)."""
+    from . import flux3_sm120_adaln_nvfp4 as warp_impl
+
+    w, b = norm.weight, norm.bias
+    if not (w.is_cuda and b.is_cuda and w.dtype == torch.bfloat16 and b.dtype == torch.bfloat16):
+        return
+    wi, bi = w.detach().view(torch.int16), b.detach().view(torch.int16)
+    if torch.equal(wi, torch.full_like(wi, 0x3F80)) and not bool(bi.any()):
+        warp_impl.register_identity_affine(w, b)
+    else:
+        warp_impl.unregister_identity_affine(w, b)
 
 
 def _row_ok(t: torch.Tensor, rows: int, d: int) -> bool:

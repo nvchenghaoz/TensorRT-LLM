@@ -40,6 +40,7 @@ driver API on torch's current stream (CUDA-graph capturable).
 """
 
 import ctypes
+import os
 import time
 
 import torch
@@ -70,6 +71,12 @@ typedef long long i64;
 #endif
 #ifndef PW_X2
 #define PW_X2 1
+#endif
+// LN_ID=1: the LayerNorm affine is the identity (weight == 1.0 bf16, bias == +0.0 bf16,
+// verified on the host by register_identity_affine). fmul(n, 1.0f) == n for every n
+// (--ftz=false), so only the +0.0f add stays (it still maps -0 to +0): bitwise to LN_ID=0.
+#ifndef LN_ID
+#define LN_ID 0
 #endif
 #define DIM 3072
 #define SFC 192
@@ -362,14 +369,22 @@ flux3_adaln_nvfp4_warp(const uint4 *__restrict__ x, const u8 *__restrict__ sel,
     const int vi = i * 32 + lane;  // 16-byte column index: columns 256 i + 8 lane .. +7
     const uint4 sc = scr[vi];
     const uint4 sh = shr[vi];
+#if !LN_ID
     const uint4 wv = lnw[vi];
     const uint4 bv = lnb[vi];
+#endif
     u32 xmw[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
+#if LN_ID
+      const u32 xw = word(v[i], k);
+      const float t0 = __fadd_rn(__fmul_rn(__fsub_rn(bf_lo(xw), mu), rstd), 0.0f);
+      const float t1 = __fadd_rn(__fmul_rn(__fsub_rn(bf_hi(xw), mu), rstd), 0.0f);
+#else
       const u32 xw = word(v[i], k), ww = word(wv, k), bw = word(bv, k);
       const float t0 = __fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(bf_lo(xw), mu), rstd), bf_lo(ww)), bf_lo(bw));
       const float t1 = __fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(bf_hi(xw), mu), rstd), bf_hi(ww)), bf_hi(bw));
+#endif
 #if PW_X2
       const u32 t50 = cvt_bf16x2(t1, t0);
       const u32 s1p = add_bf16x2(word(sc, k), 0x3F803F80u);
@@ -414,6 +429,39 @@ _DEFAULT_DEFINES = ("MINB=12",)
 _MODULES = {}
 COMPILE_SECONDS = {}
 NUM_REGS = {}
+
+# LN_ID (exact): launch() builds the LN_ID=1 variant (no lnw/lnb loads, no weight multiply) only
+# for a (weight, bias) pair registered by register_identity_affine, i.e. verified bitwise 1.0 /
+# +0.0 by the caller outside capture, and unchanged since (same data_ptr and _version).
+# TRTLLM_FLUX3_ADALN_LN_ID=0 restores the affine launch byte for byte.
+_LN_ID = os.environ.get("TRTLLM_FLUX3_ADALN_LN_ID", "1").strip().lower() not in (
+    "0",
+    "off",
+    "false",
+    "",
+)
+_IDENTITY_AFFINE = {}
+
+
+def _version_of(t: torch.Tensor):
+    try:
+        return t._version
+    except RuntimeError:  # inference tensors carry no version counter
+        return None
+
+
+def register_identity_affine(weight: torch.Tensor, bias: torch.Tensor) -> None:
+    """Record (weight, bias) as an identity LayerNorm affine (caller verified the bits)."""
+    _IDENTITY_AFFINE[(weight.data_ptr(), bias.data_ptr())] = (_version_of(weight), _version_of(bias))
+
+
+def unregister_identity_affine(weight: torch.Tensor, bias: torch.Tensor) -> None:
+    _IDENTITY_AFFINE.pop((weight.data_ptr(), bias.data_ptr()), None)
+
+
+def is_identity_affine(weight: torch.Tensor, bias: torch.Tensor) -> bool:
+    ver = _IDENTITY_AFFINE.get((weight.data_ptr(), bias.data_ptr()))
+    return ver is not None and ver == (_version_of(weight), _version_of(bias))
 
 
 def _check(result):
@@ -543,6 +591,8 @@ def launch(
         sf = torch.empty((padded * _SF_COLS,), dtype=torch.uint8, device=x.device)
     else:
         out, fp4, sf = outs
+    if _LN_ID and is_identity_affine(weight, bias):
+        extra_defines = tuple(extra_defines) + ("LN_ID=1",)
     fn = _compile(x.device, warps, use_pdl, extra_defines)
     grid = (padded + warps - 1) // warps
     stream = torch.cuda.current_stream(x.device).cuda_stream
