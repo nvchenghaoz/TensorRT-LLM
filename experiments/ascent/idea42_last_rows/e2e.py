@@ -115,6 +115,11 @@ def run_config(ckpt, name, extra_env, ref_b64):
     json.dump(args, open(ypath, "w"))
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in env_over.items()})
+    extra_env = dict(extra_env)
+    if extra_env.pop("FRESH_CACHE", None):
+        # A cold Inductor / Triton cache: this server compiles and autotunes from scratch.
+        env["TORCHINDUCTOR_CACHE_DIR"] = tempfile.mkdtemp(prefix="idea42_inductor_")
+        env["TRITON_CACHE_DIR"] = tempfile.mkdtemp(prefix="idea42_triton_")
     env.update(extra_env)
     env["TORCH_LOGS"] = "recompiles"
     s = socket.socket()
@@ -200,7 +205,8 @@ def run_config(ckpt, name, extra_env, ref_b64):
 
 def main():
     ckpt = sys.argv[1]
-    envs = [a.split("=", 1) for a in sys.argv[2:] if "=" in a]
+    # Each extra argument is one more server: KEY=VAL[,KEY=VAL...] (FRESH_CACHE=1: cold caches).
+    envs = [dict(kv.split("=", 1) for kv in a.split(",")) for a in sys.argv[2:] if "=" in a]
     try:
         sha = subprocess.run(["git", "-C", WT, "rev-parse", "HEAD"], capture_output=True,
                              text=True).stdout.strip()
@@ -210,8 +216,9 @@ def main():
     log(f"tree {WT} sha {sha}; reference {ref_path} sha256 {hashlib.sha256(ref).hexdigest()}")
     ref_b64 = base64.b64encode(ref).decode()
     results = [run_config(ckpt, "default", {}, ref_b64)]
-    for k, v in envs:
-        results.append(run_config(ckpt, f"{k}={v}", {k: v}, ref_b64))
+    for env in envs:
+        results.append(run_config(ckpt, ",".join(f"{k}={v}" for k, v in env.items()), env,
+                                  ref_b64))
     same = all(r["digests"] == results[0]["digests"] for r in results)
     passed = all(r["repeat_ok"] and len(r["outputs"]) == len(SEQ) for r in results)
     print(json.dumps({"passed": bool(passed), "configs_equal": bool(same), "git_sha": sha,

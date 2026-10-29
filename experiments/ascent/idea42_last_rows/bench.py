@@ -1,11 +1,14 @@
 """Idea 42: last single block (single_blocks[27]) computes only the rows the final layer reads.
 
-Unit = block 27's tail as served on main 8f606f93 (B=1, NVFP4 tail-pair block, side gate_up mode 3,
-FMHA NVFP4-out, 4-warp nfo kernel), synthetic tensors at the served shapes, no model load:
+Unit = block 27's tail as served on main e0d4536c (B=1, NVFP4 tail-pair block, side gate_up mode 3,
+FMHA NVFP4-out), synthetic tensors at the served shapes, no model load:
   attention+gate_up : trtllm::flux3_sm120_fp8_prequant_attention_nvfp4_out_side_gate_up
                       (FMHA over qkv8 [3, S, 3072] E4M3 || packed-SwiGLU gate_up on a side stream)
-  pair              : trtllm::flux3_sm120_nvfp4_out_pair_prequant (down K=9216 || attn_out K=3072)
-  residual          : residual + gate * (attn_y + mlp_y) (torch.compile, as Inductor fuses it)
+  tail, t2i         : trtllm::flux3_sm120_nvfp4_out_pair_residual (landing 7: the pair with
+                      x + gate[select] * (attn_y + mlp_y) in attn_out's epilogue; [1, 2, D] gate
+                      table + [1, S, 1] bool select)
+  tail, i2i         : trtllm::flux3_sm120_nvfp4_out_pair_prequant + residual + gate * (attn_y +
+                      mlp_y) (torch.compile, as Inductor fuses it; per-token [1, S, D] gate)
 Base tree (main): all S rows. Branch (STEP 1, as primsts.qkv_fp8_attention_forward(keep_rows=n)):
 FMHA still on all S rows, the side gate_up on the first n = 16384 rows (the final layer's image
 rows), the attention output's first n rows into the pair at M=n, residual at n.
@@ -89,14 +92,37 @@ def make_case(S, w, seed):
     q8, k8, v8, scales = quantize_qkv_e4m3(q, k, v, 1.0 / math.sqrt(HD))
     qkv8 = torch.stack([t.reshape(S, HID) for t in (q8, k8, v8)])
     residual = torch.randn(1, S, HID, device="cuda", dtype=torch.bfloat16, generator=g)
-    gate = torch.randn(1, S, HID, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1
+    if S < 2 * N_KEEP:
+        # t2i: the [1, 2, D] gate table + [1, S, 1] bool select (True on the text rows), as main
+        # hands the single blocks; main's tail takes the fused pair + gated residual (landing 7).
+        gate = torch.randn(1, 2, HID, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1
+        select = (torch.arange(S, device="cuda") >= N_KEEP).view(1, S, 1)
+    else:
+        # i2i: a per-token [1, S, D] gate (3 chunks); main's tail is the pair + Inductor residual.
+        gate = torch.randn(1, S, HID, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1
+        select = None
     del qkv, q, k, v, q8, k8, v8
     return dict(S=S, x=x, up_data=up_data, up_sf=up_sf, qkv8=qkv8, scales=scales,
-                residual=residual, gate=gate)
+                residual=residual, gate=gate, select=select)
 
 
 def inputs(c):
-    return [c[k] for k in ("x", "up_data", "up_sf", "qkv8", "scales", "residual", "gate")]
+    keys = ("x", "up_data", "up_sf", "qkv8", "scales", "residual", "gate", "select")
+    return [c[k] for k in keys if c[k] is not None]
+
+
+def _fused_residual(packed, psf, fp4, sf, w, x, gate, index):
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_sm120_lpt_pair_residual as lptr
+
+    up, down, out = w
+    rows = x.numel() // HID
+    if not (lptr.available(x.device) and lptr.gate_form(gate, index, rows, HID)):
+        return None
+    y = lptr.nvfp4_out_pair_residual(
+        packed, down.weight, psf, down.scale, fp4.reshape(-1, fp4.shape[-1]), sf, out.weight,
+        out.scale, x, gate, index,
+    )
+    return y.reshape(x.shape)
 
 
 @torch.compile(dynamic=False, options={"emulate_precision_casts": True})
@@ -120,13 +146,22 @@ def unit(c, w, cut):
             MODE, out.weight,
         )
         fp4, sf = fp4[:, :n], sf[: n * sf_cols]
-        residual, gate = c["residual"][:, :n], c["gate"][:, :n]
+        residual = c["residual"][:, :n]
+        if c["select"] is not None:
+            gate, index = c["gate"], c["select"][:, :n]
+        else:
+            gate, index = c["gate"][:, :n], None
     else:
         fp4, sf, packed, psf = fp.fp8_prequant_attention_nvfp4_out_side_gate_up(
             c["qkv8"], c["scales"], 1, HEADS, c["up_data"], up.weight, c["up_sf"], up.scale,
             down.inverse_scale, c["x"], up.weight, MODE, out.weight,
         )
-        residual, gate = c["residual"], c["gate"]
+        residual, gate, index = c["residual"], c["gate"], c["select"]
+    fused = _fused_residual(packed, psf, fp4, sf, w, residual, gate, index)
+    if fused is not None:
+        return dict(fp4=fp4, sf=sf, packed=packed, psf=psf, res=fused)
+    if index is not None:
+        gate = torch.where(index, gate[:, 1:2], gate[:, 0:1])
     attn_y, mlp_y = fp.nvfp4_out_pair_prequant(
         packed, down.weight, psf, down.scale, fp4.reshape(-1, fp4.shape[-1]), sf, out.weight,
         out.scale,
@@ -156,7 +191,9 @@ def bench():
     res = {}
     for label, S in CASES.items():
         c = make_case(S, w, 1000 + S)
-        graph, _ = capture(lambda: unit(c, w, cut), stream)
+        graph, outs = capture(lambda: unit(c, w, cut), stream)
+        route = "pair + Inductor residual" if "attn_y" in outs else "fused pair + gated residual"
+        del outs
         for _ in range(WARM):
             graph.replay()
         torch.cuda.synchronize()
@@ -174,8 +211,8 @@ def bench():
         p10, p90 = ts[len(ts) // 10], ts[(len(ts) * 9) // 10]
         res[label] = {"kernel_ms": round(med, 4), "noise_floor": round((p90 - p10) / med, 4),
                       "p10_ms": round(p10, 4), "p90_ms": round(p90, 4), "S": S,
-                      "rows": N_KEEP if cut else S}
-        log(f"{label} S={S}: median {med:.3f} ms  p10 {p10:.3f}  p90 {p90:.3f}")
+                      "rows": N_KEEP if cut else S, "tail_route": route}
+        log(f"{label} S={S} ({route}): median {med:.3f} ms  p10 {p10:.3f}  p90 {p90:.3f}")
         del graph, c
         torch.cuda.empty_cache()
     print(json.dumps({"batch": res, "output": {"class": "exact"}, "cut": cut,

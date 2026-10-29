@@ -1330,6 +1330,16 @@ class _Flux3LastRowsSingleStreamBlock(Flux3SingleStreamBlock):
             # Not the covered route: main's block on all rows (re-runs the head), then the prefix.
             return super().forward(residual, freqs, mod, **kwargs)[:, :n]
         attn, _, gate_up = direct
+        # Main's tail on the first n rows: the fused pair + gated residual when it takes the gate
+        # form (t2i's [1, 2, D] table + select index), else the pair + the Inductor residual.
+        gate_table, gate_index = (
+            (mod[2], mod[3][:, :n]) if len(mod) == 4 else (mod_gate[:, :n], None)
+        )
+        fused = sm120_tail_pair_residual_forward(
+            self, attn, None, gate_up, residual[:, :n], gate_table, gate_index
+        )
+        if fused is not None:
+            return fused
         pair = sm120_tail_pair_forward(self, attn, None, gate_up)
         attn_y, mlp_y = pair
         output = attn_y.reshape(1, n, -1) + mlp_y.reshape(1, n, -1)
@@ -2210,10 +2220,23 @@ class Flux3Model(BaseDiffusionModel):
             logged = self.__dict__.setdefault("_flux3_last_rows_logged", set())
             if key not in logged:
                 logged.add(key)
+                from tensorrt_llm._torch.visual_gen.models.flux3 import (
+                    flux3_sm120_lpt_pair_residual as lptr,
+                )
+
+                target = self.single_blocks[last]
+                target = getattr(target, "_orig_mod", target)
+                gate, index = (mod[2], mod[3][:, :keep_rows]) if len(mod) == 4 else (mod[2], None)
+                fused = bool(
+                    getattr(target, "_sm120_pair_residual", False)
+                    and lptr.gate_form(gate[:, :keep_rows] if index is None else gate, index,
+                                       keep_rows, combined.shape[-1])
+                )
                 logger.info(
                     f"FLUX.3 single_blocks.{last}: kept rows [0, {keep_rows}) of S={offset} "
                     f"(chunks {[(mode, end - start) for mode, start, end in chunks]}; final layer "
-                    f"reads {sorted(self.final_layer)} only, checked)"
+                    f"reads {sorted(self.final_layer)} only, checked); tail at M={keep_rows}: "
+                    f"{'fused pair + gated residual' if fused else 'pair + Inductor residual'}"
                 )
         outputs = {}
         for name in self.final_layer:
