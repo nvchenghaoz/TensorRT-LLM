@@ -528,6 +528,12 @@ class Flux3Pipeline(BasePipeline):
                     self.vae.compile_decoder(fp8_convs=True)
                 else:
                     self.vae.compile_decoder()
+                # The fp32 reference encoder (i2i): compiled channels_last at the warmup
+                # i2i encode of each served resolution. TLLM_FLUX3_VAE_ENCODE_COMPILE=0
+                # keeps it eager.
+                if os.environ.get("TLLM_FLUX3_VAE_ENCODE_COMPILE", "1") != "0":
+                    logger.info("torch.compile: vae.encoder (whole module, dynamic=False)")
+                    self.vae.compile_encoder()
 
     def load_transformer_weights(self, checkpoint_dir: str) -> dict:
         package = self.pipeline_config.extra_attrs["flux3_checkpoint"]
