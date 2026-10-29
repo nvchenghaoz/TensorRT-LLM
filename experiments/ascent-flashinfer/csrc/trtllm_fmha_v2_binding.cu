@@ -72,6 +72,16 @@ extern void FMHA_FLUX3_D128_LAUNCHER(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 namespace flashinfer {
 
+#if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
+// FLUX.3 NVFP4 output epilogue pointers for the current run_nvfp4_out call (host thread-local).
+struct Flux3Nvfp4OutPtrs {
+  void* fp4 = nullptr;
+  void* sf = nullptr;
+  float const* gscale = nullptr;
+};
+static thread_local Flux3Nvfp4OutPtrs g_flux3_nvfp4_out;
+#endif
+
 static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
                               const Launch_params launch_params,
                               // types
@@ -247,6 +257,14 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
     params.enable_i2f_trick = -double(1 << 22) * double(scale_bmm2) <= -128.f &&
                               double(1 << 22) * double(scale_bmm2) >= 127.f;
   }
+
+#if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
+  // FLUX.3 NVFP4 output epilogue: set only for the duration of a run_nvfp4_out call (null = the
+  // stock BF16 O store).
+  params.flux3_fp4_ptr = g_flux3_nvfp4_out.fp4;
+  params.flux3_sf_ptr = g_flux3_nvfp4_out.sf;
+  params.flux3_fp4_gscale_ptr = g_flux3_nvfp4_out.gscale;
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -485,5 +503,45 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);
+
+#if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
+/**
+ * FLUX.3 d128 E4M3 attention with the NVFP4 output epilogue: instead of BF16 O [B, S, H, D] the
+ * kernel writes fp4 (uint8 [B*S, H*D/2], two E2M1 per byte) and sf (uint8, flat 128x4-swizzled
+ * E4M3 block scales, round_up(B*S, 128) * round_up(H*D/16, 4) bytes, padded rows zeroed), the
+ * FlashInfer cute-dsl nvfp4_quantize of the BF16 O with global scale gscale[0] (float32, device).
+ */
+void TRTLLMFMHAv2RunFlux3Nvfp4Out(TensorView q, TensorView k, TensorView v, TensorView fp4,
+                                  TensorView sf, TensorView gscale,
+                                  Optional<TensorView> scale_bmm1_d,
+                                  Optional<TensorView> scale_bmm2_d, int64_t num_heads,
+                                  int64_t head_dim, int64_t seq_len) {
+  auto count = [](TensorView const& t) {
+    int64_t n = 1;
+    for (int i = 0; i < t.ndim(); ++i) n *= t.size(i);
+    return n;
+  };
+  const int64_t rows = int64_t(q.size(0)) * q.size(1);
+  const int64_t width = num_heads * v.size(3);
+  TVM_FFI_ICHECK_EQ(count(fp4), rows * width / 2) << "fp4 must hold B*S*H*D/2 bytes";
+  TVM_FFI_ICHECK_EQ(count(sf), ((rows + 127) / 128 * 128) * (((width / 16) + 3) / 4 * 4))
+      << "sf must hold the 128x4-swizzled scale buffer";
+  TVM_FFI_ICHECK_EQ(count(gscale), 1) << "gscale must be one float32";
+  g_flux3_nvfp4_out.fp4 = fp4.data_ptr();
+  g_flux3_nvfp4_out.sf = sf.data_ptr();
+  g_flux3_nvfp4_out.gscale = static_cast<float const*>(gscale.data_ptr());
+  try {
+    // o is a placeholder (its pointer is not written on the NVFP4 path).
+    TRTLLMFMHAv2Run(q, k, v, fp4, Optional<TensorView>(), scale_bmm1_d, scale_bmm2_d, num_heads,
+                    head_dim, seq_len, 1.0f, 1.0f, 1.0f, false, true, true);
+  } catch (...) {
+    g_flux3_nvfp4_out = Flux3Nvfp4OutPtrs();
+    throw;
+  }
+  g_flux3_nvfp4_out = Flux3Nvfp4OutPtrs();
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_nvfp4_out, flashinfer::TRTLLMFMHAv2RunFlux3Nvfp4Out);
+#endif  // FMHA_FLUX3_NVFP4_OUT
 
 }  // namespace flashinfer

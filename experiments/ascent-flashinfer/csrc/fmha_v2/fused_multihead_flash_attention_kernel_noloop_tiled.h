@@ -16,6 +16,9 @@
 #include <fmha/kernel_traits.h>
 #include <fmha/utils.h>
 #include <fused_multihead_attention_kernel.h>
+#if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
+#include <fmha/flux3_nvfp4_out.h>
+#endif
 
 namespace fused_multihead_attention {
 
@@ -578,6 +581,18 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
     // Make sure the data is in shared memory.
     __syncthreads();
 
+#if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
+    // FLUX.3 NVFP4 output epilogue: FP4 + 128x4-swizzled E4M3 SF instead of BF16 O, read from
+    // smem with a block-per-lane mapping (fmha/flux3_nvfp4_out.h).
+    if (params.flux3_fp4_ptr != nullptr) {
+      fmha::flux3_nvfp4::store_from_smem(params, gmem_o, smem_o, ii, bidb, bidh, tidx);
+      if (ii < Gmem_tile_o::LOOPS - 1) {
+        __syncthreads();
+      }
+      continue;
+    }
+#endif  // FMHA_FLUX3_NVFP4_OUT
+
     // Load from shared memory.
     uint4 out[Gmem_tile_o::STGS_PER_LOOP];
     smem_o.load(out);
@@ -590,6 +605,11 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
     // Output the values.
     gmem_o.store(out, ii);
   }
+#if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
+  if (params.flux3_fp4_ptr != nullptr) {
+    fmha::flux3_nvfp4::zero_padding(params, Gmem_tile_o::ROWS, q_loop, bidb, bidh, tidx);
+  }
+#endif  // FMHA_FLUX3_NVFP4_OUT
   if (params.softmax_stats_ptr != nullptr) {
     using Mma_tile = typename Traits_p::template Mma_tile<Cta_tile_o>;
     fmha::Softmax_saver<Cta_tile_o, Mma_tile> saver(params, binfo);
