@@ -501,36 +501,37 @@ struct Gmem_tile_q_k_v {
   //     row (move_col/rewind_col alternate within the head), V loads the whole 128-byte row
   //     (one CTA per O row, o_part == 0), so col_in_bytes_ < VALID_BYTES_PER_ROW holds and
   //     col_in_bytes_ is no longer read for K/V;
-  // (b) the row predicates are all true whenever actual_seqlen_ >= ROWS (every step except the
-  //     last partial one); only that step computes them;
+  // (b) row_ + ii * ROWS_PER_LDG < ROWS always holds (row_ < ROWS_PER_LDG), so the row predicate
+  //     is ii * ROWS_PER_LDG < actual_seqlen_ - row_: one compare per LDG against a value
+  //     computed once per load, fed straight into cp.async's ignore-src predicate (no predicate
+  //     packing/unpacking, no src-size select). ignore-src zero-fills the 16 B exactly like
+  //     main's src-size 0, and every step but the last partial one has all predicates true;
   // (d) the row stride is the compile-time FMHA_FLUX3_LDT_STRIDE, so the per-LDG offsets are
   //     immediates (the launcher guarantees params.k/v_stride_in_bytes == it).
-  // The LDGSTS (cp.async 16 B, zero-fill when the predicate is false) are the same as main's.
+  // The shared-memory pointers are the ones smem_tile.store(ptrs, preds) computes.
   template <typename Smem_tile>
   inline __device__ void load_kv_trimmed(Smem_tile& smem_tile) {
-    static_assert(USE_LDGSTS && PRED_REGS == 1 && LDGS <= 4, "");
+    static_assert(USE_LDGSTS && (int)ROWS == (int)LDGS * (int)ROWS_PER_LDG, "");
     static_assert(VALID_COLS == 128 && (int)BITS_PER_ELEMENT == 8 &&
                       ((int)BYTES_PER_ROW == 64 || (int)BYTES_PER_ROW == 128) &&
                       (int)THREADS_PER_ROW * (int)BYTES_PER_LDG == (int)BYTES_PER_ROW,
                   "load_trim supports only the d128 E4M3 64x64 tiles");
-    void const* ptrs[LDGS];
+    uint32_t smem_ptrs[LDGS];
+    smem_tile.template compute_store_pointers<LDGS>(smem_ptrs);
+    int const rows_left = actual_seqlen_ - row_;
 #pragma unroll
     for (int ii = 0; ii < LDGS; ++ii) {
-      ptrs[ii] = q_k_v_ptr_ + ii * (int)ROWS_PER_LDG * (int)FMHA_FLUX3_LDT_STRIDE;
+      char const* src = q_k_v_ptr_ + ii * (int)ROWS_PER_LDG * (int)FMHA_FLUX3_LDT_STRIDE;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+      asm volatile(
+          "{\n"
+          "  .reg .pred ign;\n"
+          "  setp.le.s32 ign, %2, %3;\n"
+          "  cp.async.cg.shared.global [%0], [%1], 16, ign;\n"
+          "}\n" ::"r"(smem_ptrs[ii]),
+          "l"(src), "r"(rows_left), "r"(ii * (int)ROWS_PER_LDG));
+#endif
     }
-    uint32_t preds[PRED_REGS];
-    if (actual_seqlen_ >= (int)ROWS) {
-      // Same bit layout as pack_predicates (LDGS <= 4: bits 0..LDGS-1).
-      preds[0] = (1u << LDGS) - 1u;
-    } else {
-      uint32_t p[LDGS];
-#pragma unroll
-      for (int ii = 0; ii < LDGS; ++ii) {
-        p[ii] = row_ + ii * (int)ROWS_PER_LDG < actual_seqlen_;
-      }
-      fmha::pack_predicates(preds, p);
-    }
-    smem_tile.store(ptrs, preds);
   }
 #endif
 

@@ -75,11 +75,14 @@ def lib_mod():
     lib._LEVER_FLAGS.setdefault("ldt_p6a", ("p6a", "-DFMHA_FLUX3_LDT_PROBE_P6A=1"))
     lib._LEVER_FLAGS.setdefault("ldt_p6b", ("p6b", "-DFMHA_FLUX3_LDT_PROBE_P6B=1"))
     lib._LEVER_FLAGS.setdefault("lineinfo", ("li", "-lineinfo"))
+    if not hasattr(lib, "_B161_IMPORT_LEVERS"):
+        # The arms below set lib.ROUTED_LEVERS; derive every arm from the import-time value.
+        lib._B161_IMPORT_LEVERS = tuple(lib.ROUTED_LEVERS)
     return lib
 
 
 def main_levers(lib):
-    return tuple(x for x in lib.ROUTED_LEVERS if x != "load_trim")
+    return tuple(x for x in lib._B161_IMPORT_LEVERS if x != "load_trim")
 
 
 def arm_levers(lib, name):
@@ -87,6 +90,7 @@ def arm_levers(lib, name):
     noua = tuple(x for x in c0 if x != "unit_alpha")
     table = {
         "C0": c0,
+        "C0x": c0,  # A/A twin (same module, separate graphs)
         "noUA": noua,
         "P6a": noua + ("ldt_p6a",),
         "P6b": noua + ("ldt_p6b",),
@@ -145,12 +149,15 @@ def res_usage(so):
     return out
 
 
+PAD_FN = "128x128_output_bf16_sm120_kernel_nl_tiled"  # the padding-mask kernel (not causal/custom)
+
+
 def parse_kernel(txt):
-    """Instructions of the nl_tiled kernel function: list of (addr, opcode, full text)."""
+    """Instructions of the padding-mask nl_tiled kernel: list of (addr, opcode, full text)."""
     insts, cur = [], None
     for ln in txt.splitlines():
         if "Function :" in ln:
-            cur = "nl_tiled" in ln
+            cur = PAD_FN in ln
             continue
         if not cur:
             continue
@@ -238,9 +245,14 @@ def regions(body):
     return out
 
 
+ADDR_SRC: dict = {}
+
+
 def line_map(so, loop_range):
     """With a -lineinfo build: loop-body instruction counts per source file:line."""
+    ADDR_SRC.clear()
     tmp = os.path.join(os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp"), "b161_cubin")
+    shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp, exist_ok=True)
     subprocess.run([tool("cuobjdump"), "-xelf", "all", so], cwd=tmp, capture_output=True,
                    check=True)
@@ -253,7 +265,7 @@ def line_map(so, loop_range):
         for ln in txt.splitlines():
             s = ln.strip()
             if s.startswith(".section") or s.startswith(".text."):
-                infn = "nl_tiled" in s
+                infn = PAD_FN in s
             m = re.search(r'//## File "([^"]+)", line (\d+)', ln)
             if m:
                 cur_src = f"{os.path.basename(m.group(1))}:{m.group(2)}"
@@ -261,6 +273,7 @@ def line_map(so, loop_range):
             m = INST_RE.search(ln)
             if m and infn and cur_src:
                 a = int(m.group(1), 16)
+                ADDR_SRC[a] = cur_src
                 if loop_range and loop_range[0] <= a <= loop_range[1]:
                     b = re.sub(r"^@!?U?P[T0-9]+\s+", "", m.group(2))
                     op = b.split()[0]
@@ -272,6 +285,21 @@ def line_map(so, loop_range):
 
 
 LOAD_FILES = ("gmem_tile_qkv_packed.h", "utils.h", "smem_tile.h", "smem_tile_v.h")
+# Load-path source lines (pinned FlashInfer 0.6.18 csrc/fmha_v2/fmha): all of the Q/K/V gmem tile;
+# utils.h pack_predicates/ldgsts_ (1280-1450) and ldgdepbar/depbar/ldgsts128/Ldgsts_functor
+# (1555-1615); smem_tile.h compute_store_pointers (148-180) and move_to_next_write_buffer
+# (234-245). LDSM/PRMT/cvt helpers in utils.h are not load path.
+LOAD_RANGES = {"gmem_tile_qkv_packed.h": [(1, 10 ** 6)], "utils.h": [(1280, 1450), (1555, 1615)],
+               "smem_tile.h": [(148, 180), (234, 245)]}
+
+
+def is_load(src):
+    f, _, ln = src.partition(":")
+    try:
+        n = int(ln)
+    except ValueError:
+        return False
+    return any(a <= n <= b for a, b in LOAD_RANGES.get(f, []))
 
 
 def census_one(lib, name):
@@ -289,7 +317,7 @@ def census_one(lib, name):
                loop_hist=hist(body), loop_regions=regions(body))
     if name.endswith("li"):
         pl, plo = line_map(so, rng)
-        load = {k: v for k, v in pl.items() if k.split(":")[0] in LOAD_FILES}
+        load = {k: v for k, v in pl.items() if is_load(k)}
         res["loop_lines_load_path"] = dict(sorted(load.items(), key=lambda kv: -kv[1]))
         res["loop_lines_load_path_ops"] = {k: plo[k] for k in load}
         res["loop_load_path_total"] = sum(load.values())
@@ -303,7 +331,18 @@ def census_one(lib, name):
             for g, n in plo[k].items():
                 grp[g] = grp.get(g, 0) + n
         res["loop_load_path_by_group"] = grp
+        ARM_ADDR_SRC[name] = dict(ADDR_SRC)
+        art = os.environ.get("AUTO_DEV_ARTIFACTS")
+        if art:
+            with open(os.path.join(art, f"loop_{name}.txt"), "w") as f:
+                for a, op, t in body:
+                    src = ADDR_SRC.get(a, "?")
+                    mark = "L" if is_load(src) else " "
+                    f.write(f"{mark} {a:05x} {src:32s} {t}\n")
     return res, txt
+
+
+ARM_ADDR_SRC: dict = {}
 
 
 def mode_census(args):
@@ -342,22 +381,25 @@ def ncu_census(args):
             res[name] = dict(error=str(exc)[:300])
             continue
         log(p.stdout[-1500:], p.stderr[-1500:])
-        if p.returncode != 0 or not os.path.exists(rep + ".ncu-rep"):
-            res[name] = dict(error=f"ncu rc {p.returncode}")
+        reps = [os.path.join(art, f) for f in os.listdir(art)
+                if f.startswith(f"ncu_{name}.ncu-rep")]
+        if p.returncode != 0 or not reps:
+            res[name] = dict(error=f"ncu rc {p.returncode}, files {os.listdir(art)}")
             continue
-        q = subprocess.run([ncu, "--import", rep + ".ncu-rep", "--page", "source", "--csv",
+        q = subprocess.run([ncu, "--import", reps[0], "--page", "source", "--csv",
                             "--print-source", "sass"], capture_output=True, text=True)
+        log(f"[ncu import] rc {q.returncode} {len(q.stdout)} bytes, err {q.stderr[-500:]}")
         with open(os.path.join(art, f"ncu_{name}_source.csv"), "w") as f:
             f.write(q.stdout)
         try:
-            res[name] = summarize_ncu_source(q.stdout)
+            res[name] = summarize_ncu_source(q.stdout, ARM_ADDR_SRC.get(name))
         except Exception as exc:  # noqa: BLE001
             res[name] = dict(error=f"parse: {exc}", head=q.stdout[:800])
         log(f"[ncu {name}] {json.dumps(res[name])}")
     return res
 
 
-def summarize_ncu_source(csv_text):
+def summarize_ncu_source(csv_text, addr_src=None):
     import csv
     import io
 
@@ -368,8 +410,11 @@ def summarize_ncu_source(csv_text):
     hdr = [c.strip() for c in rows[hdr_i]]
     ia = next(i for i, c in enumerate(hdr) if "Address" in c)
     isrc = next(i for i, c in enumerate(hdr) if c == "Source")
-    iex = next(i for i, c in enumerate(hdr) if c in ("Warp Instructions Executed",
-                                                     "Instructions Executed"))
+    iex = next((i for i, c in enumerate(hdr) if c in ("Warp Instructions Executed",
+                                                      "Instructions Executed")), None)
+    if iex is None:
+        iex = next(i for i, c in enumerate(hdr)
+                   if "Instructions Executed" in c and "Thread" not in c)
     insts = []
     for r in rows[hdr_i + 1:]:
         if len(r) <= max(ia, isrc, iex):
@@ -394,7 +439,31 @@ def summarize_ncu_source(csv_text):
         if a in bset:
             by_g_loop[g] = by_g_loop.get(g, 0) + n
     loop_tot = sum(by_g_loop.values())
-    return dict(header=hdr, warp_steps=warp_steps, total_warp_inst=tot,
+    extra = {}
+    if addr_src:
+        # ncu reports absolute addresses; nvdisasm reports function-relative offsets.
+        base = min(a for a, *_ in insts)
+        per_file, per_line, load_g = {}, {}, {}
+        for a, op, _, n in insts:
+            if a not in bset:
+                continue
+            src = addr_src.get(a - base, "?:0")
+            f = src.split(":")[0]
+            per_file[f] = per_file.get(f, 0) + n
+            if is_load(src):
+                per_line[src] = per_line.get(src, 0) + n
+                g = group_of(op)
+                load_g[g] = load_g.get(g, 0) + n
+        extra = dict(
+            loop_per_warp_step_by_file={f: round(v / warp_steps, 2) for f, v in
+                                        sorted(per_file.items(), key=lambda kv: -kv[1])},
+            loop_load_files_per_warp_step_by_line={s: round(v / warp_steps, 2) for s, v in
+                                                   sorted(per_line.items(),
+                                                          key=lambda kv: -kv[1]) if v > 0},
+            loop_load_files_per_warp_step_by_group={g: round(v / warp_steps, 2) for g, v in
+                                                    sorted(load_g.items(),
+                                                           key=lambda kv: -kv[1])})
+    return dict(header=hdr, warp_steps=warp_steps, total_warp_inst=tot, **extra,
                 total_per_warp_step=round(tot / warp_steps, 2),
                 loop_per_warp_step=round(loop_tot / warp_steps, 2),
                 loop_per_warp_step_by_group={g: round(v / warp_steps, 2) for g, v in
