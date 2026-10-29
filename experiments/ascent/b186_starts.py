@@ -35,13 +35,32 @@ def child(ckpt, out_path):
 
     calls = {}
     orig = lib.fmha_v2_flux3_d128
+    orig_nfo = getattr(lib, "fmha_v2_flux3_d128_nvfp4_out", None)
+    tags = {}
+
+    def mod_tag(module):
+        if not tags:
+            base = tuple(lib.ROUTED_LEVERS)
+            for lev in (base, (*base, "nvfp4_out")):
+                try:
+                    tags[id(lib.get_flux3_d128_module(lev))] = lib._tag(lev, 0)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[child] tag map {lev}: {exc}")
+        return tags.get(id(module), str(id(module)))
 
     def counted(query, *a, module=None, **kw):
-        key = (getattr(module, "__name__", None) or str(id(module)), tuple(query.shape))
-        calls[str(key)] = calls.get(str(key), 0) + 1
+        key = str(("bf16", mod_tag(module), tuple(query.shape)))
+        calls[key] = calls.get(key, 0) + 1
         return orig(query, *a, module=module, **kw)
 
+    def counted_nfo(query, *a, module=None, **kw):
+        key = str(("nfo", mod_tag(module), tuple(query.shape)))
+        calls[key] = calls.get(key, 0) + 1
+        return orig_nfo(query, *a, module=module, **kw)
+
     lib.fmha_v2_flux3_d128 = counted
+    if orig_nfo is not None:
+        lib.fmha_v2_flux3_d128_nvfp4_out = counted_nfo
 
     engine = json.load(open(os.path.join(HERE, "..", "ascent-config", "engine.json")))
     pipeline_config = dict(engine.pop("pipeline_config", {}))
