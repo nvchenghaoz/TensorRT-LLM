@@ -245,6 +245,29 @@ def run_bench():
             times.append(s.elapsed_time(e) / calls)
             if i % 50 == 0:
                 print(ARM, "sample", i, times[-1] * 1000, "us/call", flush=True)
+        # Per-M-class detail (diagnostic): one graph per class, 64 calls each, 100 replays.
+        detail = {}
+        for cname, kk, aa, gg, oo in (("M4176_single", k1, a1, gs1, outs1),
+                                      ("M4096_mode", k2, a2, gs2, outs2)):
+            gr = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gr):
+                for _ in range(64):
+                    fused(kk, aa, gg, False, poison=False, outs=oo)
+            for _ in range(20):
+                gr.replay()
+            torch.cuda.synchronize()
+            ts = []
+            for _ in range(100):
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record()
+                gr.replay()
+                e.record()
+                e.synchronize()
+                ts.append(s.elapsed_time(e) / 64 * 1000)
+            ts.sort()
+            detail[cname] = {"us_median": statistics.median(ts), "us_p10": ts[10], "us_p90": ts[90]}
+            print(ARM, cname, json.dumps(detail[cname]), flush=True)
     # Post-timing outputs must still equal the pre-timing hash (same inputs, same op).
     stable = h(outs1[1]) == hashes["M4176_fp4"] and h(outs2[2]) == hashes["M4096_sf"]
     st = sorted(times)
@@ -258,6 +281,7 @@ def run_bench():
         "p10_ms": p10,
         "p90_ms": p90,
         "hashes": hashes,
+        "per_class": detail,
         "post_timing_outputs_stable": bool(stable),
         "note": "served mix in one CUDA graph: 448 calls M=4176 single-table + 64 calls M=4096 "
         "mode-row (store_x_mod=False, as served), x L2-hot; kernel_ms = graph time / 512; "

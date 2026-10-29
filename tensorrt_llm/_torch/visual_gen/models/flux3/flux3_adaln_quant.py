@@ -177,20 +177,17 @@ def _modq_chunk(
 ):
     # Pointwise modulate + NVFP4 quantize of one Q_BLOCK chunk (Inductor's pointwise math).
     if HAS_SELECT:
+        # Inductor loads both table rows and selects the value (where(sel, row1, row0) after the
+        # same bf16->f32 casts); loading only the selected row gives the same value.
+        sel_row = tmp11.to(tl.int64)
         tmp12 = tl.load(
-            in_ptr2 + (scale_row_stride + r0_1),
+            in_ptr2 + (sel_row * scale_row_stride + r0_1),
             r0_mask,
             eviction_policy="evict_last",
             other=0.0,
         ).to(tl.float32)
-        tmp15 = tl.load(
-            in_ptr2 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
-        ).to(tl.float32)
         tmp13 = tmp12.to(tl.bfloat16)
-        tmp14 = tmp13.to(tl.float32)
-        tmp16 = tmp15.to(tl.bfloat16)
-        tmp17 = tmp16.to(tl.float32)
-        tmp18 = tl.where(tmp11, tmp14, tmp17)
+        tmp18 = tmp13.to(tl.float32)
     else:
         tmp18 = tl.load(
             in_ptr2 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
@@ -242,19 +239,13 @@ def _modq_chunk(
     tmp60 = tmp59.to(tl.float32)
     if HAS_SELECT:
         tmp61 = tl.load(
-            in_ptr5 + (shift_row_stride + r0_1),
+            in_ptr5 + (sel_row * shift_row_stride + r0_1),
             r0_mask,
             eviction_policy="evict_last",
             other=0.0,
         ).to(tl.float32)
-        tmp64 = tl.load(
-            in_ptr5 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
-        ).to(tl.float32)
         tmp62 = tmp61.to(tl.bfloat16)
-        tmp63 = tmp62.to(tl.float32)
-        tmp65 = tmp64.to(tl.bfloat16)
-        tmp66 = tmp65.to(tl.float32)
-        tmp67 = tl.where(tmp11, tmp63, tmp66)
+        tmp67 = tmp62.to(tl.float32)
     else:
         tmp67 = tl.load(
             in_ptr5 + (r0_1), r0_mask, eviction_policy="evict_last", other=0.0
