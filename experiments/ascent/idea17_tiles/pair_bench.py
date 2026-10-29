@@ -16,6 +16,11 @@ Inputs: NVFP4 quantized from BF16 normals (flashinfer nvfp4_quantize, 128x4 scal
 global scales), FP8R from quantize_fp8r. Fixed seeds; pristine copies checked after timing.
 Timing: 5 warm replays, then ROUNDS replays per case, cases interleaved; kernel_ms = median per
 replay (one step), noise_floor = (p90 - p10) / median.
+Verification (untimed, after timing): references for every output buffer from main's modules
+called directly before capture; then the timed sequence again (5 warm + ROUNDS alternating
+rounds) with every output poisoned before each replay and compared bitwise against the
+reference and the graph's first replay, inputs checked against pristine copies before each
+replay. output.class comes from this check.
 """
 
 import json
@@ -157,6 +162,96 @@ def tensors_of(sets, f8):
     return out
 
 
+def _bits(t):
+    return t.view(torch.int16)
+
+
+def references(sets, f8):
+    """Main's modules called directly (as in check.py), each on its own workspace.
+
+    QKV3: strided.qkv_pingpong_module().gemm_qkv3_pingpong with main's raster/swizzle; pair:
+    lpt.module().lpt_pair with lpt.sched_mode() on a separate zeroed workspace; FP8R: arm 1.
+    Returns {id(out buffer): reference tensor}.
+    """
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_fp8r_gemm as fg
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_sm120_lpt_pair as lpt
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_sm120_strided_gemm as strided
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    qws = torch.zeros(strided._WORKSPACE_BYTES, dtype=torch.uint8, device=dev)
+    pws = torch.zeros(lpt._WORKSPACE_BYTES, dtype=torch.uint8, device=dev)
+    main_qkv = strided.qkv_pingpong_module()
+    main_pair = lpt.module()
+    refs = {}
+    for lst in sets.values():
+        for c in lst:
+            rq = torch.empty_like(c["qkv_out"])
+            main_qkv.gemm_qkv3_pingpong(c["a"], c["wqkv"], c["a_sf"], c["sqkv"], c["aqkv"], rq, qws,
+                                        int(strided.QKV3_RASTER), int(strided.QKV3_SWIZZLE))
+            rd = torch.empty_like(c["down_out"])
+            ra = torch.empty_like(c["attn_out"])
+            main_pair.lpt_pair(c["d"], c["wd"], c["d_sf"], c["swd"], c["alpha_d"], rd,
+                               c["a"], c["wo"], c["a_sf"], c["swo"], c["alpha_o"], ra, pws,
+                               lpt.sched_mode(), 0)
+            refs[id(c["qkv_out"])] = rq
+            refs[id(c["down_out"])] = rd
+            refs[id(c["attn_out"])] = ra
+    for name in ("qkv", "gate_up", "down", "attn_out"):
+        a, w, sa, sw, out = f8[name]
+        refs[id(out)] = fg.gemm(a, w, sa, sw, arm=1, slot=1)
+    torch.cuda.synchronize()
+    return refs
+
+
+def case_outputs(sets, f8, singles_m, mode_m):
+    outs = []
+    for m in (singles_m, mode_m):
+        for c in sets[m]:
+            outs += [c["qkv_out"], c["down_out"], c["attn_out"]]
+    outs += [v[4] for v in f8.values()]
+    return outs
+
+
+def verify(graphs, outs, refs, sets, f8, pristine, rounds):
+    """Untimed copy of the timed sequence: 5 warm replays of both graphs, then `rounds` rounds
+    alternating (t2i,i2i on even rounds, i2i,t2i on odd). Before each replay: inputs vs pristine,
+    poison every output buffer that graph writes. After: bitwise vs main reference and vs that
+    graph's first replay."""
+    names = list(graphs)
+    seq = [names] * 5 + [names if r % 2 == 0 else names[::-1] for r in range(rounds)]
+    stat = {k: {"matched": 0, "replays": 0, "match_ref": 0, "match_first": 0} for k in names}
+    first = {}
+    inputs_ok = True
+    order_log = []
+    for i, step in enumerate(seq):
+        if i % 10 == 0:
+            log(f"verify step {i}/{len(seq)}: " + " ".join(
+                f"{k}={stat[k]['matched']}/{stat[k]['replays']}" for k in names))
+        order_log.append(",".join(step))
+        for k in step:
+            if not all(torch.equal(a, b) for a, b in zip(pristine, tensors_of(sets, f8))):
+                inputs_ok = False
+            for o in outs[k]:
+                _bits(o).fill_(-1)
+            graphs[k].replay()
+            torch.cuda.synchronize()
+            eq_ref = all(torch.equal(_bits(o), _bits(refs[id(o)])) for o in outs[k])
+            if k not in first:
+                first[k] = [o.clone() for o in outs[k]]
+            eq_first = all(torch.equal(_bits(o), _bits(f)) for o, f in zip(outs[k], first[k]))
+            s = stat[k]
+            s["replays"] += 1
+            s["match_ref"] += eq_ref
+            s["match_first"] += eq_first
+            s["matched"] += eq_ref and eq_first
+    if not all(torch.equal(a, b) for a, b in zip(pristine, tensors_of(sets, f8))):
+        inputs_ok = False
+    alt = {"warm": "5 x (" + ",".join(names) + ")",
+           "rounds": f"{rounds} rounds: even {','.join(names)} / odd {','.join(names[::-1])}",
+           "first_rounds": order_log[5:9]}
+    return stat, inputs_ok, alt
+
+
 def main():
     import tensorrt_llm  # noqa: F401
 
@@ -174,6 +269,10 @@ def main():
     sets = {m: [nvfp4_inputs(m, g) for _ in range(NSETS)] for m in (16384, 16896, 33280)}
     f8 = fp8r_inputs(16384, g)
     pristine = [t.clone() for t in tensors_of(sets, f8)]
+    refs = references(sets, f8)
+    log(f"references from main's modules: {len(refs)} buffers ({time.time() - t0:.0f}s)")
+    outs = {"t2i-2048": case_outputs(sets, f8, 16896, 16384),
+            "i2i-2048": case_outputs(sets, f8, 33280, 16384)}
     cases = {
         "t2i-2048": case_calls(sets, f8, 16896, 28, 16384, 4),
         "i2i-2048": case_calls(sets, f8, 33280, 28, 16384, 4),
@@ -198,14 +297,32 @@ def main():
         if r % 10 == 0:
             log(f"round {r}: " + " ".join(f"{k}={times[k][-1]:.3f}ms" for k in names))
     ok = all(torch.equal(a, b) for a, b in zip(pristine, tensors_of(sets, f8)))
+    log("verification pass (untimed, same sequence as timing)")
+    stat, vin_ok, alt = verify(graphs, outs, refs, sets, f8, pristine, ROUNDS)
+    for k, s in stat.items():
+        log(f"verify {k}: matched {s['matched']}/{s['replays']} (ref {s['match_ref']}, "
+            f"first {s['match_first']})")
+    exact = vin_ok and ok and all(s["matched"] == s["replays"] for s in stat.values())
+    verification = {k: {"matched": f"{s['matched']}/{s['replays']}",
+                        "matched_vs_main_ref": f"{s['match_ref']}/{s['replays']}",
+                        "matched_vs_first_replay": f"{s['match_first']}/{s['replays']}",
+                        "buffers_per_replay": len(outs[k])} for k, s in stat.items()}
     batch = {}
     for k, v in times.items():
         v = sorted(v)
         med = v[len(v) // 2]
         p10, p90 = v[int(0.1 * (len(v) - 1))], v[int(0.9 * (len(v) - 1))]
-        batch[k] = {"kernel_ms": med, "noise_floor": (p90 - p10) / med}
+        batch[k] = {"kernel_ms": med, "noise_floor": (p90 - p10) / med,
+                    "verify_matched": verification[k]["matched"]}
         log(f"{k}: median {med:.3f} ms/step p10 {p10:.3f} p90 {p90:.3f}")
-    print(json.dumps({"batch": batch, "output": {"class": "exact"}, "inputs_unchanged": ok,
+    print(json.dumps({"batch": batch,
+                      "output": {"class": "exact" if exact else "mismatch"},
+                      "verification": verification, "inputs_unchanged": ok and vin_ok,
+                      "inputs_unchanged_after_timing": ok, "inputs_unchanged_in_verify": vin_ok,
+                      "alternation": alt,
+                      "reference": "main modules direct: gemm_qkv3_pingpong (QKV3_RASTER/"
+                                   "SWIZZLE, own workspace), lpt.module().lpt_pair (sched_mode, "
+                                   "own workspace), fg.gemm(arm=1, slot 1)",
                       "unit": "one CUDA graph replay = one denoise step's QKV3 + tail-pair calls "
                               "(28 single + 4 image mode blocks) + image.0's 4 FP8R GEMMs"}))
     sys.stdout.flush()
