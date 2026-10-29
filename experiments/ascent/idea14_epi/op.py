@@ -141,6 +141,44 @@ def check(strided, qr8, epi, ms):
             "Ms": ms}
 
 
+def killswitch(strided, qr8, epi, ms):
+    """Run under TRTLLM_FLUX3_QKV_EPI_FP8=0: the route never fires, the fused module is never
+    built or called, and the routed op equals main's chain byte for byte."""
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_primsts as fp
+
+    dev = torch.device("cuda")
+    fails = []
+    calls = {"fused": 0}
+    orig = epi.qkv_rope_fp8
+
+    def counted(*a, **k):
+        calls["fused"] += 1
+        return orig(*a, **k)
+
+    epi.qkv_rope_fp8 = counted
+    env = os.environ.get("TRTLLM_FLUX3_QKV_EPI_FP8")
+    if env != "0" or epi.enabled():
+        fails.append(f"kill switch not active: env={env!r} enabled={epi.enabled()}")
+    for m in ms:
+        inp = make_inputs(m, dev)
+        a, w, sfa, sfb, alpha, qn, kn, cs, pos = inp
+        if fp._qkv_epi_fp8_route(a, w, qn, kn, cs):
+            fails.append(f"M{m}: route fires with the kill switch")
+        for keep_v in (True, False):
+            ref = tuple(t.clone() for t in main_chain(strided, qr8, inp, True))
+            got = fp.nvfp4_qkv_rope_fp8_impl(a, w, sfa, sfb, qn, kn, cs, pos, alpha, SM, keep_v)
+            torch.cuda.synchronize()
+            compare(f"M{m} kv{int(keep_v)} killswitch", ref, got, fails, check_v=keep_v)
+    if calls["fused"]:
+        fails.append(f"fused route called {calls['fused']} times")
+    built = epi.module.cache_info().currsize
+    return {"passed": not fails, "fails": fails, "fused_calls": calls["fused"],
+            "fused_module_built": bool(built), "Ms": ms,
+            "compared": "TRTLLM_FLUX3_QKV_EPI_FP8=0: routed nvfp4_qkv_rope_fp8_impl vs main's "
+                        "gemm_qkv3 + qknorm_rope_fp8 chain, qkv8/scales/v bitwise; route predicate "
+                        "false; fused module never called"}
+
+
 def bench(strided, qr8, epi, ms):
     dev = torch.device("cuda")
     R = int(os.environ.get("B_R", "4"))
@@ -211,6 +249,8 @@ def main():
     log(f"modules ready {time.time() - t0:.1f}s VEC={qr8.VEC} STATIC={qr8.STATIC_QK}")
     if mode == "check":
         res = check(strided, qr8, epi, ms)
+    elif mode == "killswitch":
+        res = killswitch(strided, qr8, epi, ms)
     else:
         res = bench(strided, qr8, epi, ms)
     print(json.dumps(res), flush=True)

@@ -129,6 +129,44 @@ __device__ __forceinline__ void bar_sync(int id) {
   asm volatile("bar.sync %0, 128;" ::"r"(id) : "memory");
 }
 
+// Quad (4-lane) 4x4 transposes for wide stores. Lane q holds elements k = 0..3 of its row
+// segment; afterwards it holds element k = q of lanes s = 0..3 (in s order). Pure data movement.
+// 16-bit elements, in: A = (k0, k1), B = (k2, k3) (low half first); out: (s0, s1), (s2, s3).
+__device__ __forceinline__ uint2 quad_t16(uint32_t A, uint32_t B, int q) {
+  bool const q0 = q & 1;
+  bool const q1 = (q >> 1) & 1;
+  uint32_t const r1 = __shfl_xor_sync(0xffffffffu, q1 ? A : B, 2);
+  uint32_t const X = q1 ? B : A;
+  uint32_t const lo = (X & 0xFFFFu) | (r1 << 16);
+  uint32_t const hi = (X >> 16) | (r1 & 0xFFFF0000u);
+  uint32_t const K = q0 ? hi : lo;
+  uint32_t const R = __shfl_xor_sync(0xffffffffu, q0 ? lo : hi, 1);
+  uint32_t const a = K & 0xFFFFu, b = K >> 16, c = R & 0xFFFFu, d = R >> 16;
+  uint32_t const P = q0 ? (c | (a << 16)) : (a | (c << 16));
+  uint32_t const Q = q0 ? (d | (b << 16)) : (b | (d << 16));
+  return q1 ? make_uint2(Q, P) : make_uint2(P, Q);
+}
+// 32-bit elements e0..e3; out: element k = q of lanes s = 0..3.
+__device__ __forceinline__ uint4 quad_t32(uint32_t e0, uint32_t e1, uint32_t e2, uint32_t e3,
+                                          int q) {
+  bool const q0 = q & 1;
+  bool const q1 = (q >> 1) & 1;
+  uint32_t const y0 = __shfl_xor_sync(0xffffffffu, q1 ? e0 : e2, 2);
+  uint32_t const y1 = __shfl_xor_sync(0xffffffffu, q1 ? e1 : e3, 2);
+  uint32_t const x0 = q1 ? e2 : e0;
+  uint32_t const x1 = q1 ? e3 : e1;
+  uint32_t const a = q0 ? x1 : x0;  // lane q,     k = q
+  uint32_t const b = q0 ? y1 : y0;  // lane q ^ 2, k = q
+  uint32_t const c = __shfl_xor_sync(0xffffffffu, q0 ? x0 : x1, 1);  // lane q ^ 1
+  uint32_t const d = __shfl_xor_sync(0xffffffffu, q0 ? y0 : y1, 1);  // lane q ^ 3
+  uint32_t const P0 = q0 ? c : a, P1 = q0 ? a : c, Q0 = q0 ? d : b, Q1 = q0 ? b : d;
+  return q1 ? make_uint4(Q0, Q1, P0, P1) : make_uint4(P0, P1, Q0, Q1);
+}
+
+#ifndef FLUX3_EPI_WIDE
+#define FLUX3_EPI_WIDE 1
+#endif
+
 constexpr uint32_t kSqrt128Bits = 0x41350517u;   // fp32(sqrt(128)), as the DSL kernel's constant
 constexpr uint32_t kMarginBits = 0x3F820000u;    // fp32(1 + 2^-6)
 constexpr uint32_t kEpsBits = 0x358637BDu;       // fp32(1e-6)
@@ -269,7 +307,30 @@ class QkvFp8Epilogue {
         CUTLASS_PRAGMA_UNROLL
         for (int h = 0; h < 2; ++h) {
           int const row = row_base + get<0>(tCcD(2 * h, mi, 0));
-          if (row < rows) {
+          bool const live = row < rows;
+#if FLUX3_EPI_WIDE
+          uint32_t wv[8];
+          CUTLASS_PRAGMA_UNROLL
+          for (int ni = 0; ni < 8; ++ni) {
+            uint32_t lo = bf16_bits(alpha * acc(2 * h, mi, ni));
+            uint32_t hi = bf16_bits(alpha * acc(2 * h + 1, mi, ni));
+            if (live) {
+              amax = max_abs(amax, bits_to_f32(lo));
+              amax = max_abs(amax, bits_to_f32(hi));
+            }
+            wv[ni] = lo | (hi << 16);
+          }
+          // Quad transpose: lane q stores the 8 contiguous BF16 of ni = 4j + q
+          // (cols 8 wn + 64 j + 16 q .. + 7), one 16-B store per (row, j).
+          __nv_bfloat16* dst = params.v + static_cast<int64_t>(row) * width + n_tile * BN +
+                               (col0 & 8) + 16 * (lane & 3);
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < 2; ++j) {
+            uint4 o = quad_t32(wv[4 * j], wv[4 * j + 1], wv[4 * j + 2], wv[4 * j + 3], lane & 3);
+            if (live) *reinterpret_cast<uint4*>(dst + 64 * j) = o;
+          }
+#else
+          if (live) {
             __nv_bfloat16* dst =
                 params.v + static_cast<int64_t>(row) * width + n_tile * BN + col0;
             CUTLASS_PRAGMA_UNROLL
@@ -281,6 +342,7 @@ class QkvFp8Epilogue {
               *reinterpret_cast<uint32_t*>(dst + 16 * ni) = lo | (hi << 16);
             }
           }
+#endif
         }
       }
 #pragma unroll
@@ -309,6 +371,40 @@ class QkvFp8Epilogue {
     // Pass 1: per row slot (mi, h), the xor16-level partial of virtual lanes (q, e): chain over
     // t (ni = 2t + b), then the bit-4 add (b = 0, 1).
     float u[8][2];
+#if FLUX3_EPI_WIDE
+    // BF16(alpha * acc) once, packed (e0 low, e1 high) per (row slot, ni): the accumulators die.
+    uint32_t pk[8][8];
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < 4; ++mi) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int h = 0; h < 2; ++h) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < 8; ++ni) {
+          pk[2 * mi + h][ni] = bf16_bits(alpha * acc(2 * h, mi, ni)) |
+                               (bf16_bits(alpha * acc(2 * h + 1, mi, ni)) << 16);
+        }
+      }
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int r = 0; r < 8; ++r) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int e = 0; e < 2; ++e) {
+        float s[2];
+        CUTLASS_PRAGMA_UNROLL
+        for (int b = 0; b < 2; ++b) {
+          float a = 0.0f;
+          CUTLASS_PRAGMA_UNROLL
+          for (int t = 0; t < 4; ++t) {
+            uint32_t const w = pk[r][2 * t + b];
+            float const x = e ? __uint_as_float(w & 0xFFFF0000u) : __uint_as_float(w << 16);
+            a = fma_rn(x, x, a);
+          }
+          s[b] = a;
+        }
+        u[r][e] = add_rn(s[1], s[0]);
+      }
+    }
+#else
     CUTLASS_PRAGMA_UNROLL
     for (int mi = 0; mi < 4; ++mi) {
       CUTLASS_PRAGMA_UNROLL
@@ -330,6 +426,7 @@ class QkvFp8Epilogue {
         }
       }
     }
+#endif
     if (wn == 1) {
       CUTLASS_PRAGMA_UNROLL
       for (int r = 0; r < 8; ++r) ss_mem.part[wm][r][lane] = make_float2(u[r][0], u[r][1]);
@@ -365,6 +462,36 @@ class QkvFp8Epilogue {
     }
     uint8_t* out_plane = params.qk8 + static_cast<int64_t>(plane) * rows * width + n_tile * BN;
     int const p0 = col0 >> 1;
+#if FLUX3_EPI_WIDE
+    CUTLASS_PRAGMA_UNROLL
+    for (int r = 0; r < 8; ++r) {
+      int const row = row_base + get<0>(tCcD(2 * (r & 1), r >> 1, 0));
+      float const iv = inv[r];
+      float const* cs_row = params.cos_sin + static_cast<int64_t>(row < rows ? row : 0) * 128 + p0;
+      uint32_t hb[8];
+      CUTLASS_PRAGMA_UNROLL
+      for (int ni = 0; ni < 8; ++ni) {
+        float const cv = __ldg(cs_row + 8 * ni);
+        float const sv = __ldg(cs_row + 64 + 8 * ni);
+        float const xe = __uint_as_float(pk[r][ni] << 16);
+        float const xo = __uint_as_float(pk[r][ni] & 0xFFFF0000u);
+        float const even = mul_rn(mul_rn(iv, xe), bits_to_f32(wpair[ni] & 0xFFFFu));
+        float const odd = mul_rn(mul_rn(iv, xo), bits_to_f32(wpair[ni] >> 16));
+        float const rot_e = fma_rn(even, cv, neg_f32(mul_rn(odd, sv)));
+        float const rot_o = fma_rn(odd, cv, mul_rn(even, sv));
+        hb[ni] = e4m3x2(bf16_round(rot_e), bf16_round(rot_o), factor);
+      }
+      // Quad transpose: lane q stores the 8 contiguous E4M3 of ni = 4j + q
+      // (cols 8 wn + 64 j + 16 q .. + 7), one 8-B store per (row, j).
+      uint8_t* dst = out_plane + static_cast<int64_t>(row) * width + (col0 & 8) + 16 * (lane & 3);
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < 2; ++j) {
+        uint2 o = quad_t16(hb[4 * j] | (hb[4 * j + 1] << 16), hb[4 * j + 2] | (hb[4 * j + 3] << 16),
+                           lane & 3);
+        if (row < rows) *reinterpret_cast<uint2*>(dst + 64 * j) = o;
+      }
+    }
+#else
     CUTLASS_PRAGMA_UNROLL
     for (int mi = 0; mi < 4; ++mi) {
       CUTLASS_PRAGMA_UNROLL
@@ -390,6 +517,7 @@ class QkvFp8Epilogue {
         }
       }
     }
+#endif  // FLUX3_EPI_WIDE
 #endif
   }
 
