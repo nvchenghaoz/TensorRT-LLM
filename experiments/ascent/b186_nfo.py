@@ -232,14 +232,91 @@ def main():
     p.add_argument("--unfixed", action="store_true")
     p.add_argument("--repeats", type=int, default=100)
     p.add_argument("--san", action="store_true", help="minimal launches for compute-sanitizer")
+    p.add_argument("--heads", type=int, default=24)
+    p.add_argument("--case", default="all",
+                   help="--san only: s4096|s4100|s4176|graph|chain|census|all")
     args = p.parse_args()
+    global H, W
+    H = args.heads
+    W = H * D
     from tensorrt_llm._torch.visual_gen.attention.backends import fmha_v2_flux3 as lib
 
-    res = {"probe": probe(), "routed_levers": list(lib.ROUTED_LEVERS)}
+    res = {"probe": probe(), "routed_levers": list(lib.ROUTED_LEVERS), "heads": H}
     sample = make_qkv(4176, 7, False)
     mods = build_modules(lib, sample, args.unfixed)
     gscale = torch.tensor([448.0 * 6.0 / 8.0], dtype=torch.float32, device="cuda")
     failures, rows = [], {}
+
+    if args.san and args.case != "all":
+        # one case per process (b186_san.py runs each tool x case as its own subprocess).
+        # Heartbeat + synchronized wall time after every launch: under a kns= filter only the
+        # matched kernel is instrumented, so its launch is orders of magnitude slower than the
+        # unmatched ones -- that is the in-process proof the filter matched.
+        if args.case.startswith("s"):
+            need = (int(args.case[1:]),)
+        elif args.case in ("graph", "chain"):
+            need = (4096, 4176)
+        else:
+            need = (4096, 4100, 4176)
+        inps = {S: make_qkv(S, 100 + S, True) for S in need}
+        outs = {S: NfoOut(S) for S in inps}
+        bo = {S: torch.empty((1, S, H, D), device="cuda", dtype=torch.bfloat16) for S in inps}
+        torch.cuda.synchronize()
+        times = []
+
+        def timed(tag, fn):
+            t0 = time.time()
+            fn()
+            torch.cuda.synchronize()
+            dt = time.time() - t0
+            times.append((tag, round(dt, 4)))
+            log(f"[hb] {tag} {dt:.4f}s")
+
+        def g3(S):
+            return lambda: call_bf16(lib, mods["bf16_g3"][1], inps[S], bo[S])
+
+        def nfo(S):
+            return lambda: call_nfo(lib, mods["nfo_fix"][1], inps[S], outs[S], gscale)
+
+        out = {"mode": "san", "case": args.case, "heads": H}
+        if args.case == "census":
+            cen = {}
+            for S in need:
+                cen[f"bf16_g3_S{S}"] = names(g3(S))
+                cen[f"nfo_fix_S{S}"] = names(nfo(S))
+            out["census"] = cen
+            log(f"[census] {json.dumps(cen)}")
+        elif args.case.startswith("s"):
+            S = int(args.case[1:])
+            timed(f"g3_bf16_S{S}", g3(S))
+            timed(f"nfo_S{S}", nfo(S))
+        elif args.case == "graph":
+            fns = [g3(4176), g3(4096)]
+            for f in fns:  # eager warm (also sanitized)
+                f()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                for f in fns:
+                    f()
+            log("[hb] graph captured (g3 S4176 + g3 S4096)")
+            timed("graph_replay_x1", g.replay)
+            del g
+        elif args.case == "chain":
+            fns = [("g3_bf16_S4096", g3(4096))] + [("nfo_S4096", nfo(4096))] * 4 + \
+                [("nfo_S4176", nfo(4176))] * 28
+            for i, (tag, f) in enumerate(fns):
+                timed(f"eager{i}_{tag}", f)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                for _, f in fns:
+                    f()
+            log("[hb] chain graph captured (33 calls)")
+            timed("chain_graph_replay_x1", g.replay)
+            del g
+        out["launch_wall_s"] = times
+        print(json.dumps(out))
+        return
 
     if args.san:
         inps = {S: make_qkv(S, 100 + S, True) for S in (4096, 4100, 4176)}
