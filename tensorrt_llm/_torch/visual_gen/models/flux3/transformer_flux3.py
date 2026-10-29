@@ -112,6 +112,11 @@ DEFAULT_SEQUENCE: Dict[str, str] = {
 # backend inputs, same output values). Module-level so an A/B can toggle it.
 _ATTEND_SINGLE_SEGMENT_FAST_PATH = True
 
+# Rows (M) at which txt_mode_blocks run QKV as one F.linear on cat([wq, wk, wv]) (prepare_text_qkv_weight).
+# Bitwise to three F.linear at every M = 16*T, T = 80..960; faster only at M=1280 (16 steps x T=80,
+# -30.5 us/block) and slower at M=2560 (+3.4 us), so the route is limited to the measured-faster M.
+_P_TEXT_GEMM_ROWS = (1280, 1280)
+
 
 # =============================================================================
 # RoPE (FLUX.3-local: 2x2 rotation-matrix convention)
@@ -665,7 +670,9 @@ class Flux3Attention(Attention):
             and fused_qkv_weight is not None
             and isinstance(native_input, Tensor)
             and native_input.dtype == torch.bfloat16
-            and native_input.numel() > 32 * native_input.shape[-1]
+            and _P_TEXT_GEMM_ROWS[0] * native_input.shape[-1]
+            <= native_input.numel()
+            <= _P_TEXT_GEMM_ROWS[1] * native_input.shape[-1]
         ):
             # Exact: one F.linear on cat([wq, wk, wv]) + split views (prepare_text_qkv_weight).
             separate = F.linear(
