@@ -857,7 +857,31 @@ def prepare_sm120_tail_pair(block: nn.Module) -> bool:
     )
     block._sm120_attn_nvfp4_out = _sm120_attn_nvfp4_out_eligible(block)
     block._sm120_pair_residual = _sm120_pair_residual_eligible(block)
+    block._sm120_tail_one_launch = _sm120_tail_one_launch_eligible(block)
+    if block._sm120_tail_one_launch:
+        from . import flux3_sm120_tail_one_launch as tol
+
+        # Static M-range bucket of the one-launch tail (read in forward as a plain int).
+        block._sm120_tail_one_launch_min_m = tol.min_rows()
     return block._sm120_tail_pair
+
+
+def _sm120_tail_one_launch_eligible(block: nn.Module) -> bool:
+    """Static switch of sm120_tail_one_launch_forward (TRTLLM_FLUX3_SM120_TAIL_ONE_LAUNCH): NVFP4
+    tail-pair blocks (SM120 CUTLASS NVFP4 attn_out and down) with no TP all-reduce."""
+    if not getattr(block, "_sm120_tail_pair", False):
+        return False
+    if getattr(block, "_allreduce", None) is not None:
+        return False
+    from . import flux3_sm120_tail_one_launch as tol
+    from .flux3_primsts import _sm120_linear_backend
+
+    return bool(
+        tol.enabled()
+        and _sm120_linear_backend() == "cutlass"
+        and getattr(block.attn_out, "_flux3_primsts_nvfp4", None) is not None
+        and getattr(block.ff.down_proj, "_flux3_primsts_nvfp4", None) is not None
+    )
 
 
 def _sm120_pair_residual_eligible(block: nn.Module) -> bool:
@@ -1097,6 +1121,117 @@ def sm120_tail_pair_residual_forward(
         gate_index,
     )
     return y.reshape(x.shape)
+
+
+def _tail_one_launch_gate(
+    residual: torch.Tensor, gate: torch.Tensor, select: torch.Tensor | None, n: int
+) -> int | None:
+    """gate_mode of nvfp4_tail_one_launch for these layouts, or None (keep main's path)."""
+    if (
+        residual.dtype != torch.bfloat16
+        or not residual.is_contiguous()
+        or residual.shape[-1] != n
+        or gate.dtype != torch.bfloat16
+        or not gate.is_contiguous()
+        or gate.shape[-1] != n
+    ):
+        return None
+    rows = residual.numel() // n
+    if select is not None:
+        # [1, K, N] table + [1, S, 1] per-row index (bool: True picks row 1, as torch.where).
+        if (
+            gate.dim() != 3
+            or gate.shape[0] != 1
+            or select.dtype not in (torch.bool, torch.uint8)
+            or not select.is_contiguous()
+            or select.numel() != rows
+            or residual.dim() != 3
+            or residual.shape[0] != 1
+        ):
+            return None
+        return 1
+    if gate.numel() == n:
+        return 0
+    if gate.shape == residual.shape:
+        return 2
+    return None
+
+
+def sm120_tail_one_launch_forward(
+    block: nn.Module,
+    attn: torch.Tensor,
+    mlp_input: PrimsTSInput,
+    gate_up: tuple[torch.Tensor, torch.Tensor] | None,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    select: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """residual + gate[select] * (attn_out(attn) + ff(mlp_input)) as the one-launch SM120 block
+    tail (nvfp4_tail_one_launch: two accumulators per output tile, the residual in the epilogue),
+    bitwise equal to sm120_tail_pair_forward + the block's residual pointwise, or None (caller
+    runs main's path). Only for blocks whose _sm120_tail_one_launch flag is set and tails in its
+    static M-range bucket (default M >= 24576); gate forms: per-token [1, S, D], [1, K, D] table +
+    per-row bool/uint8 index, [1, 1, D] row. Every check runs before any work is issued."""
+    if not getattr(block, "_sm120_tail_one_launch", False):
+        return None
+    out = getattr(block.attn_out, "_flux3_primsts_nvfp4", None)
+    down = getattr(block.ff.down_proj, "_flux3_primsts_nvfp4", None)
+    if out is None or down is None:
+        return None
+    n = out.weight.shape[0]
+    gate_mode = _tail_one_launch_gate(residual, gate, select, n)
+    if gate_mode is None or down.weight.shape[0] != n:
+        return None
+    rows = residual.numel() // n
+    if rows < getattr(block, "_sm120_tail_one_launch_min_m", 1 << 30):
+        return None  # outside this route's M-range bucket: main's tail path
+    from .flux3_primsts import nvfp4_tail_one_launch
+
+    if isinstance(attn, NVFP4AttnOut):
+        # The FMHA already wrote attn_out's NVFP4 activation (sm120_attn_nvfp4_out_weight).
+        packed, output_scales = gate_up
+        attn_data = attn.data.reshape(-1, attn.data.shape[-1])
+        if attn_data.shape[0] != rows or packed.shape[0] != rows:
+            return None
+        attn_scales = attn.scales
+    else:
+        if attn.numel() // attn.shape[-1] != rows or not out.can_run(attn):
+            return None
+        if gate_up is not None:
+            packed, output_scales = gate_up
+            if packed.shape[0] != rows:
+                return None
+        else:
+            up = block.ff.gate_up_proj._flux3_primsts_nvfp4
+            original = original_input(mlp_input)
+            if original.shape[0] != rows or not up.can_run(original):
+                return None
+            data, scales = up.activation(mlp_input)
+            packed, output_scales = nvfp4_swiglu_prepared(
+                data,
+                up.weight,
+                scales,
+                up.scale,
+                down.inverse_scale,
+                original,
+                mlp_input.quantized_by if isinstance(mlp_input, NVFP4Activation) else None,
+            )
+        attn_2d = attn.reshape(-1, attn.shape[-1]).contiguous()
+        attn_data, attn_scales = nvfp4_quantize_prepared(attn_2d, out.weight)
+    return nvfp4_tail_one_launch(
+        packed,
+        down.weight,
+        output_scales,
+        down.scale,
+        attn_data,
+        attn_scales,
+        out.weight,
+        out.scale,
+        residual,
+        gate,
+        select,
+        gate_mode,
+    )
 
 
 def linear_forward(layer: Linear, x: PrimsTSInput) -> torch.Tensor:
