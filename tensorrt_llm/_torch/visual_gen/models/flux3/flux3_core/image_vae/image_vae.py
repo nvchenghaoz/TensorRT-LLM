@@ -11,6 +11,7 @@ from einops import rearrange
 from torch import Tensor
 
 from . import decoder_tail_triton as _tail
+from . import fp8_conv as _fp8c
 from .decoder_tail_triton import (
     add_norm_swish_conv_out_3x3,
     can_use_conv_out_kernel,
@@ -167,6 +168,10 @@ class Flux3ImageAttnBlock(nn.Module):
 
 
 class Flux3ImageResnetBlock(nn.Module):
+    # Set per instance by fp8_conv.prepare_fp8_convs (compile_decoder(fp8_convs=True)):
+    # conv1/conv2 then run as e4m3 cuDNN convs fed by gn_swish_fp8 (output class precision).
+    _fp8 = False
+
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.in_channels = in_channels
@@ -181,7 +186,20 @@ class Flux3ImageResnetBlock(nn.Module):
                 in_channels, out_channels, kernel_size=1, stride=1, padding=0
             )
 
+    def _fp8_conv2_input(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        """FP8 path up to conv2's quantized input: (e4m3 h, s_x)."""
+        hq, sx = _fp8c.gn_swish_fp8(x, self.norm1)
+        c1 = self.conv1
+        h = _fp8c.fp8_conv3x3(hq, sx, c1.fp8_wq, c1.fp8_sw, c1.bias, None)
+        return _fp8c.gn_swish_fp8(h, self.norm2)
+
     def forward(self, x: Tensor) -> Tensor:
+        if self._fp8:
+            hq, sx = self._fp8_conv2_input(x)
+            sc = self.nin_shortcut(x) if self.in_channels != self.out_channels else x
+            c2 = self.conv2
+            return _fp8c.fp8_conv3x3(hq, sx, c2.fp8_wq, c2.fp8_sw, c2.bias, sc)
+
         h = self.norm1.forward_silu(x)
         h = self.conv1(h)
 
@@ -199,7 +217,14 @@ class Flux3ImageResnetBlock(nn.Module):
         forward(x) == shortcut + (conv2_nobias + bias). Used by the decoder's fused tail,
         which applies the bias and residual add as it loads the conv2 output (under
         torch.compile the bias add is a separate pointwise op either way).
+        On the FP8 path conv2 runs scale-only (no bias, no residual in its epilogue).
         """
+        if self._fp8:
+            hq, sx = self._fp8_conv2_input(x)
+            sc = self.nin_shortcut(x) if self.in_channels != self.out_channels else x
+            c2 = self.conv2
+            return sc, _fp8c.fp8_conv3x3(hq, sx, c2.fp8_wq, c2.fp8_sw, None, None), c2.bias
+
         h = self.norm1.forward_silu(x)
         h = self.conv1(h)
 
@@ -667,7 +692,12 @@ class Flux3ImageVAE(nn.Module):
         z = self.normalize(z)
         return z
 
-    def compile_decoder(self, triton_group_norm: bool = False, channels_last: bool = True) -> None:
+    def compile_decoder(
+        self,
+        triton_group_norm: bool = False,
+        channels_last: bool = True,
+        fp8_convs: bool = False,
+    ) -> None:
         """torch.compile the decoder in place (state_dict keys are unchanged).
 
         Inductor lowers each GroupNorm into split reductions and fuses the
@@ -683,6 +713,11 @@ class Flux3ImageVAE(nn.Module):
         reduces coalesced on NHWC data. aten GroupNorm's (N, G, C/G*H*W) view is a
         strided reduction on channels_last data (bf16 1024^2 decode on SM120: GN
         reductions 5.8 -> 21.5 ms). Inductor's own layout_optimization stays off.
+
+        fp8_convs=True (pipeline_config vae_decode_fp8_convs; output class precision)
+        quantizes every ResnetBlock conv1/conv2 to e4m3 (per-Cout scale) and runs them as
+        cuDNN FP8 convs fed by gn_swish_fp8 (fp8_conv.prepare_fp8_convs). It needs a bf16
+        trunk and channels_last; otherwise it is a logged no-op.
         """
         for m in self.decoder.modules():
             if isinstance(m, Flux3GroupNorm):
@@ -692,6 +727,8 @@ class Flux3ImageVAE(nn.Module):
                 m.refresh_subpixel()  # weights were not loaded through load_state_dict
         if channels_last:
             self.decoder.to(memory_format=torch.channels_last)
+        if fp8_convs:
+            _fp8c.prepare_fp8_convs(self.decoder)
         dtype = next(self.decoder.parameters()).dtype
         options = {"layout_optimization": False}
         if dtype != torch.float32:

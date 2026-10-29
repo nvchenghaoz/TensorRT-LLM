@@ -15,7 +15,8 @@ first (warmup) call; the plan is FIXED per key (eng7, knob k24 measured best in 
 #1431 / job 1519), with FLUX3_FP8_CONV_AUTOTUNE=1 timing every plan instead.
 
 Exposed to torch.compile as the opaque custom op ``torch.ops.flux3_vae.fp8_conv3x3``.
-Nothing in the tree calls this yet (wiring is a follow-up).
+Wired into Flux3ImageResnetBlock (``_fp8``) by Flux3ImageVAE.compile_decoder(fp8_convs=True),
+which pipeline_config ``vae_decode_fp8_convs`` selects.
 """
 
 import os

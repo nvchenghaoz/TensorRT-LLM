@@ -348,7 +348,7 @@ def _as_image_grid(tokens: Tensor, orig_ids: Tensor) -> Tensor:
         "black-forest-labs/flux-3-image-klein-base",
         "black-forest-labs/flux-3-image-klein",
     ],
-    defaults={"variant": None, "vae_decode_dtype": None},
+    defaults={"variant": None, "vae_decode_dtype": None, "vae_decode_fp8_convs": False},
     doc="FLUX.3 image generation and editing.",
 )
 class Flux3Pipeline(BasePipeline):
@@ -521,7 +521,13 @@ class Flux3Pipeline(BasePipeline):
             # Independent of the transformer compile flag; compiled lazily at warmup decode.
             if os.environ.get("TLLM_FLUX3_VAE_COMPILE", "1") != "0":
                 logger.info("torch.compile: vae.decoder (whole module, dynamic=False)")
-                self.vae.compile_decoder()
+                if self.pipeline_config.extra_attrs.get("vae_decode_fp8_convs"):
+                    # e4m3 cuDNN convs at the ResnetBlock GN->conv sites (precision);
+                    # needs the bf16 trunk (vae_decode_dtype), else a logged no-op.
+                    logger.info("FLUX.3 VAE decoder: FP8 ResnetBlock convs (vae_decode_fp8_convs)")
+                    self.vae.compile_decoder(fp8_convs=True)
+                else:
+                    self.vae.compile_decoder()
 
     def load_transformer_weights(self, checkpoint_dir: str) -> dict:
         package = self.pipeline_config.extra_attrs["flux3_checkpoint"]
