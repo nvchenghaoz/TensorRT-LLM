@@ -70,6 +70,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     sm120_attn_nvfp4_out_weight,
     sm120_side_gate_up_args,
     sm120_tail_pair_forward,
+    sm120_tail_pair_residual_forward,
     verify_nvfp4_coverage,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import fp8_attention_side_gate_up
@@ -1032,6 +1033,13 @@ class Flux3ModeBlock(nn.Module):
                 mlp_input = Fp8RowwiseQuantizedTensor(
                     mlp_input, quantized.quantized, quantized.scales
                 )
+            if self._sm120_tail_pair and self._allreduce is None:
+                # The pair with x + mod_gate * (attn_y + mlp_y) in attn_out's epilogue.
+                fused = sm120_tail_pair_residual_forward(
+                    self, attn, mlp_input, gate_up, x, mod_gate, None
+                )
+                if fused is not None:
+                    return fused
             pair = (
                 sm120_tail_pair_forward(self, attn, mlp_input, gate_up)
                 if self._sm120_tail_pair
@@ -1211,6 +1219,15 @@ class Flux3SingleStreamBlock(nn.Module):
                 mlp_input = Fp8RowwiseQuantizedTensor(
                     mlp_input, quantized.quantized, quantized.scales
                 )
+            if self._sm120_tail_pair and self._allreduce is None:
+                # The pair with residual + mod_gate * (attn_y + mlp_y) in attn_out's epilogue,
+                # reading the gate as the [1, 2, D] table + select row index (or a [1, 1, D] row).
+                gate_table, gate_index = (mod[2], mod[3]) if len(mod) == 4 else (mod_gate, None)
+                fused = sm120_tail_pair_residual_forward(
+                    self, attn, mlp_input, gate_up, residual, gate_table, gate_index
+                )
+                if fused is not None:
+                    return fused
             pair = (
                 sm120_tail_pair_forward(self, attn, mlp_input, gate_up)
                 if self._sm120_tail_pair
