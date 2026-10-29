@@ -2206,6 +2206,15 @@ class Flux3Model(BaseDiffusionModel):
                         f"beyond the last block's kept rows [0, {keep_rows})"
                     )
                 offset += end - start
+            key = (offset, keep_rows)
+            logged = self.__dict__.setdefault("_flux3_last_rows_logged", set())
+            if key not in logged:
+                logged.add(key)
+                logger.info(
+                    f"FLUX.3 single_blocks.{last}: kept rows [0, {keep_rows}) of S={offset} "
+                    f"(chunks {[(mode, end - start) for mode, start, end in chunks]}; final layer "
+                    f"reads {sorted(self.final_layer)} only, checked)"
+                )
         outputs = {}
         for name in self.final_layer:
             parts, offset = [], 0
