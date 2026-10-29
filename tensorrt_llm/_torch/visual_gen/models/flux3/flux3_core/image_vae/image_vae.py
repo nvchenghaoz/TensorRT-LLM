@@ -196,8 +196,17 @@ class Flux3ImageResnetBlock(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if self._fp8:
             hq, sx = self._fp8_conv2_input(x)
-            sc = self.nin_shortcut(x) if self.in_channels != self.out_channels else x
             c2 = self.conv2
+            if self.in_channels != self.out_channels and c2.bias is not None:
+                # The 1x1 shortcut runs bias-free and its bias joins conv2's bias as one
+                # fp32 epilogue bias: no separate bias-add pass over the shortcut output.
+                nin = self.nin_shortcut
+                sc = nn.functional.conv2d(x, nin.weight, None)
+                bias = c2.bias.float()
+                if nin.bias is not None:
+                    bias = bias + nin.bias.float()
+                return _fp8c.fp8_conv3x3(hq, sx, c2.fp8_wq, c2.fp8_sw, bias, sc)
+            sc = self.nin_shortcut(x) if self.in_channels != self.out_channels else x
             return _fp8c.fp8_conv3x3(hq, sx, c2.fp8_wq, c2.fp8_sw, c2.bias, sc)
 
         h = self.norm1.forward_silu(x)
@@ -487,16 +496,16 @@ def _resnet_block_with_input_bias(block: Flux3ImageResnetBlock, x_nb: Tensor, b_
     x = x_nb + b_in.view(1, -1, 1, 1)
     if block._fp8:
         # FP8 GN->conv path (prepare_fp8_convs): norm1 still sees x_nb + b_in (fused into
-        # gn_swish_fp8); the folded shortcut s (same math as below) enters conv2's
-        # epilogue as the residual.
+        # gn_swish_fp8); the bias-free shortcut s enters conv2's epilogue as the residual
+        # and b_fold joins conv2's bias as one fp32 epilogue bias (no separate add pass).
         hq, sx = block._fp8_conv2_input(x)
         nin = block.nin_shortcut
         w = nin.weight
         b_fold = (nin.bias.double() + torch.mv(w[:, :, 0, 0].double(), b_in.double())).float()
         s = nn.functional.conv2d(x_nb, w, None)
-        s = (s.float() + b_fold.view(1, -1, 1, 1)).to(x_nb.dtype)
         c2 = block.conv2
-        return _fp8c.fp8_conv3x3(hq, sx, c2.fp8_wq, c2.fp8_sw, c2.bias, s)
+        bias = b_fold if c2.bias is None else c2.bias.float() + b_fold
+        return _fp8c.fp8_conv3x3(hq, sx, c2.fp8_wq, c2.fp8_sw, bias, s)
     h = block.norm1.forward_silu(x)
     h = block.conv1(h)
     h = block.norm2.forward_silu(h)

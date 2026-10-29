@@ -37,6 +37,8 @@ except Exception:  # noqa: BLE001
 
 FP8 = torch.float8_e4m3fn
 QMAX = 448.0
+# Graph-key has_bias value of an fp32 bias operand (True/1 = bf16 bias, False/0 = none).
+BIAS_FP32 = 2
 _CL = torch.channels_last
 
 # (Cin, Cout, H) -> eng7 knob k24 value of the fixed plan (fact #1431, job 1519, SM120).
@@ -127,8 +129,12 @@ class _Fp8ConvGraph:
         y = g.mul(a=y, b=t["SX"], compute_data_type=f32, name="sx")
         y = g.mul(a=y, b=t["SW"], compute_data_type=f32, name="sw")
         if has_bias:
+            # has_bias: 1 (== True) = bf16 bias operand, 2 = fp32 bias operand.
             t["B"] = g.tensor(
-                name="bias", dim=[1, cout, 1, 1], stride=[cout, 1, cout, cout], data_type=bf16
+                name="bias",
+                dim=[1, cout, 1, 1],
+                stride=[cout, 1, cout, cout],
+                data_type=f32 if has_bias == BIAS_FP32 else bf16,
             )
             y = g.add(a=y, b=t["B"], compute_data_type=f32, name="bias_add")
         if has_res:
@@ -272,11 +278,17 @@ def fp8_conv3x3(
     s_w = s_w.float().contiguous()
     n, cin, h, w = xq.shape
     cout = wq.shape[0]
+    has_bias = False
     if bias is not None:
-        bias = bias.to(torch.bfloat16).contiguous()
+        # An fp32 bias is added as fp32 in the epilogue (own key, has_bias=2); any
+        # other dtype is rounded to bf16 as before (has_bias=True, the original keys).
+        if bias.dtype == torch.float32:
+            bias, has_bias = bias.contiguous(), BIAS_FP32
+        else:
+            bias, has_bias = bias.to(torch.bfloat16).contiguous(), True
     if residual is not None:
         residual = residual.to(torch.bfloat16).contiguous(memory_format=_CL)
-    key = (n, cin, cout, h, w, bias is not None, residual is not None)
+    key = (n, cin, cout, h, w, has_bias, residual is not None)
     gr = get_graph(key, xq.device)
     out = _out_like(xq, cout)
     vp = gr.variant_pack(xq, s_x, wq, s_w, bias, residual, out)
