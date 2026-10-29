@@ -267,8 +267,8 @@ log("kernel names with 28/decode:", json.dumps({k[:100]: v for k, v in fp8_name_
 
 
 def is_fp8(name):
-    return name in fp8_name_cands or (any(t in name.lower() for t in ("e4m3", "f8f8", "fp8"))
-                                      and not name.startswith("triton_"))
+    # cuDNN FE runtime-fusion FP8 conv kernels (eng7): cudnn_generated_fort_native_*_convFwd_pointwise_*
+    return name.startswith("cudnn_generated_fort_native") and "convFwd" in name
 
 
 decs = [kern[i * per_dec:(i + 1) * per_dec] for i in range(NDEC)] if len(kern) % NDEC == 0 else []
