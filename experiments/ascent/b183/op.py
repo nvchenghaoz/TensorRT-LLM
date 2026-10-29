@@ -531,7 +531,14 @@ def run_final_check():
 def run_bench():
     nsets = 4
     single_calls, mode_calls = 28, 4
-    arm = f"v2={getattr(faq, '_V2', 'absent')}"
+    arm = f"defaults warps={getattr(wk, '_DEFAULT_WARPS', 4)} {wk._DEFAULT_DEFINES}"
+    if "old" in sys.argv[2:]:  # A arm in a fresh process: main's launch bounds (w4, MINB=4)
+        names = wk.launch.__code__.co_varnames[: wk.launch.__code__.co_argcount]
+        d = list(wk.launch.__defaults__)
+        dn = names[len(names) - len(d):]
+        d[dn.index("warps")], d[dn.index("extra_defines")] = 4, ("MINB=4",)
+        wk.launch.__defaults__ = tuple(d)
+        arm = "old: warps=4 MINB=4"
     sel_sets = make_sets(4176, "select", nsets)
     mode_sets = make_sets(4096, "mode", nsets)
 
