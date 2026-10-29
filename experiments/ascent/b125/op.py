@@ -317,7 +317,9 @@ def run_check():
     t0 = time.perf_counter()
     wk._compile(torch.device("cuda", 0), 4, False, wk._DEFAULT_DEFINES)
     report["compile_s"] = time.perf_counter() - t0
-    assert faq._IMPL == "warp", faq._IMPL
+    default_impl = faq._IMPL
+    report["default_impl"] = default_impl
+    faq._IMPL = "warp"  # force warp for the warp-kernel checks below
     with torch.inference_mode():
         for name, args in make_cases():
             x = args[0]
@@ -382,10 +384,32 @@ def run_check():
             po = torch.ops.trtllm.flux3_adaln_nvfp4_quant(args[0], args[1], args[2], args[3], W, B,
                                                          gs_t, EPS, True)
             trit_ok &= same(po, ref, True)
-        faq._IMPL = "warp"
         report["impl_triton_public_op_bitwise"] = bool(trit_ok)
         ok_all &= trit_ok
         print("impl_triton_public_op_bitwise", trit_ok, flush=True)
+        # Default (auto) per-M routing: M > 4096 -> warp kernel bitwise; M <= 4096 -> main's
+        # Triton byte for byte. Also exercised with poisoned outputs via the public op.
+        faq._IMPL = default_impl
+        auto_ok = True
+        auto_rep = {}
+        for name, args in make_cases():
+            x = args[0]
+            m = x.numel() // D
+            gs_t = torch.tensor([gs_for(x)], dtype=torch.float32, device=dev)
+            po = torch.ops.trtllm.flux3_adaln_nvfp4_quant(x, args[1], args[2], args[3], W, B,
+                                                         gs_t, EPS, True)
+            if m > 4096:
+                exp_route, ref = "warp", warp_run(args, gs_t, True)
+            else:
+                exp_route, ref = "triton", triton_ref(args, gs_t, True)
+            eq = same(po, ref, True)
+            auto_rep[name] = {"M": m, "route": exp_route, "bitwise_to_route": bool(eq)}
+            auto_ok &= eq
+        report["default_auto_routing"] = auto_rep
+        report["default_auto_routing_passed"] = bool(auto_ok)
+        ok_all &= auto_ok
+        print("default_auto_routing", auto_ok, json.dumps(auto_rep), flush=True)
+        faq._IMPL = "warp"
     report["compile_seconds"] = {str(k): v for k, v in wk.COMPILE_SECONDS.items()}
     report["num_regs"] = {str(k): v for k, v in wk.NUM_REGS.items()}
     print(json.dumps({"passed": bool(ok_all), "class": "reordered", "criterion":
@@ -400,7 +424,7 @@ def run_check():
 def run_bench():
     nsets = 4
     single_calls, mode_calls = 28, 4
-    arm = "warp" if (wk is not None and faq.__dict__.get("_IMPL") == "warp") else "triton"
+    arm = faq.__dict__.get("_IMPL", "triton") if wk is not None else "triton"
     torch.manual_seed(0)
     sets = []
     for i in range(nsets):
