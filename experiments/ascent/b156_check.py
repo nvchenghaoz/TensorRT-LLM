@@ -187,7 +187,11 @@ def decoder():
     del vae
     torch._dynamo.reset()
     torch.cuda.empty_cache()
-    # R: bf16 compiled candidate, repeated execution + Dynamo counters
+    # R: bf16 compiled candidate, repeated execution + Dynamo counters (the counters are
+    # process-cumulative and survive dynamo.reset(): clear them so A's fp32 frames do not count)
+    import torch._dynamo.utils as dyn_utils
+
+    dyn_utils.counters.clear()
     vae, dt = gn_check.build_vae(ROOT)
     set_vae_decoder_trunk_dtype(vae.decoder, torch.bfloat16)
     vae.compile_decoder()
