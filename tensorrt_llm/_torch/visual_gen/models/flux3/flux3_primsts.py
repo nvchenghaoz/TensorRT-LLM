@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -1411,13 +1412,24 @@ def fp8_attention_side_gate_up(
         device, mode, up_activation, up_weight, up_activation_scale, up_weight_scale,
         output_inverse_scale, owner,
     )
+    fmha_first = side_gate_up_order() == "fmha_first"
     if mode == 1:
-        launch_gate_up()
-        attn = attention_fmha(*attention_quantize())
+        if fmha_first:
+            launch_gate_up.fork()
+            attn = attention_fmha(*attention_quantize())
+            launch_gate_up.enqueue()
+        else:
+            launch_gate_up()
+            attn = attention_fmha(*attention_quantize())
     else:
         quantized = attention_quantize()
-        launch_gate_up()
-        attn = attention_fmha(*quantized)
+        if fmha_first:
+            launch_gate_up.fork()
+            attn = attention_fmha(*quantized)
+            launch_gate_up.enqueue()
+        else:
+            launch_gate_up()
+            attn = attention_fmha(*quantized)
     join()
     return attn, *outputs
 
@@ -1444,8 +1456,11 @@ def _side_gate_up_fork(
     current = torch.cuda.current_stream(device)
     side = _side_gate_up_stream(device, mode)
 
-    def launch():
+    def fork():
+        # Event on the current stream at this point; the side stream (gate_up) waits on it.
         side.wait_stream(current)
+
+    def enqueue():
         with torch.cuda.stream(side):
             swc.swiglu_packed(
                 up_activation, up_weight, up_activation_scale, up_weight_scale, alpha,
@@ -1453,11 +1468,31 @@ def _side_gate_up_fork(
             )
         SIDE_GATE_UP_COUNTERS["issued"] += 1
 
+    def launch():
+        fork()
+        enqueue()
+
     def join():
         current.wait_stream(side)
         SIDE_GATE_UP_COUNTERS["joined"] += 1
 
+    # fmha_first callers: fork() before the FMHA launch, enqueue() after it (same dependency,
+    # FMHA captured/enqueued first).
+    launch.fork, launch.enqueue = fork, enqueue
     return launch, join, (out_buffer[:rows], out_scale)
+
+
+def side_gate_up_order() -> str:
+    """TRTLLM_FLUX3_SIDE_GATE_UP_ORDER (idea 234): fmha_first (default) records the fork event
+    before FMHA, enqueues/captures FMHA, then enqueues the side gate_up waiting on that event, so
+    gate_up's CTAs fill FMHA's last-wave tail. gate_up_first is the previous order (gate_up
+    enqueued before FMHA). Same kernels, inputs and dependencies: outputs are bitwise."""
+    value = os.environ.get("TRTLLM_FLUX3_SIDE_GATE_UP_ORDER", "fmha_first").strip().lower()
+    if value not in ("fmha_first", "gate_up_first"):
+        raise ValueError(
+            f"TRTLLM_FLUX3_SIDE_GATE_UP_ORDER must be fmha_first or gate_up_first, got {value!r}"
+        )
+    return value
 
 
 def _side_gate_up_supported(device, mode, up_activation, up_weight) -> bool:
@@ -1515,8 +1550,13 @@ def fp8_prequant_attention_side_gate_up(
         device, mode, up_activation, up_weight, up_activation_scale, up_weight_scale,
         output_inverse_scale, owner,
     )
-    launch_gate_up()
-    attn = prequant(qkv8, scales, batch, heads)
+    if side_gate_up_order() == "fmha_first":
+        launch_gate_up.fork()
+        attn = prequant(qkv8, scales, batch, heads)
+        launch_gate_up.enqueue()
+    else:
+        launch_gate_up()
+        attn = prequant(qkv8, scales, batch, heads)
     join()
     return attn, *outputs
 
