@@ -196,6 +196,10 @@ def preload(device: torch.device) -> None:
             need = int(mod.qkv3_workspace_size(1 << 16, 3072, 3072))
             if need > _WORKSPACE_BYTES:
                 raise RuntimeError(f"batched QKV workspace {need} B exceeds {_WORKSPACE_BYTES} B")
+            # Idea 17: the 256x128x128 large-M QKV3 module (TRTLLM_FLUX3_SM120_LARGE_M_TILES).
+            from . import flux3_sm120_large_m
+
+            flux3_sm120_large_m.preload_qkv3(_WORKSPACE_BYTES)
     else:
         module()
     for slot in range(_SLOTS):
@@ -244,7 +248,22 @@ def gemm_qkv3(
     weight is the [3N, K/2] NVFP4 weight (plane p = rows [pN, (p+1)N)), weight_scale its
     swizzled scales (plane p at flat p*numel/3), alpha 3 fp32 plane scales. Current stream,
     slot-0 workspace (the slot the per-plane path's q GEMM uses), no allocation.
+    At M >= flux3_sm120_large_m.LARGE_M_MIN the 256x128x128 Cooperative kernel runs instead
+    (bitwise equal; TRTLLM_FLUX3_SM120_LARGE_M_TILES=0 keeps main's kernel at every M).
     """
+    from . import flux3_sm120_large_m
+
+    if flux3_sm120_large_m.use("qkv3", activation.shape[0]):
+        flux3_sm120_large_m.gemm_qkv3(
+            activation,
+            weight,
+            activation_scale,
+            weight_scale,
+            alpha,
+            out,
+            workspace(activation.device, 0),
+        )
+        return
     qkv_pingpong_module().gemm_qkv3_pingpong(
         activation,
         weight,
