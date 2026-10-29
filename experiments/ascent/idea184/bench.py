@@ -36,7 +36,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import PreparedNVFP4
 
 H, HEADS, D, FF = 3072, 24, 128, 9216
 SAMPLES = int(os.environ.get("IDEA184_SAMPLES", "200"))
-REPLAYS = 3
+REPLAYS = int(os.environ.get("IDEA184_REPLAYS", "3"))
 SOAK_S = float(os.environ.get("IDEA184_SOAK", "15"))
 ROUNDS = int(os.environ.get("IDEA184_ROUNDS", "60"))
 SPIN = 6_000_000
