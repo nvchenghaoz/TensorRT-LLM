@@ -440,6 +440,94 @@ def run_served_sweep():
                       "bitwise_vs_default": bitwise, "res": res}))
 
 
+def run_final_check():
+    """Submitted change: served warp kernel default launch bounds (warps, MINB) changed. Reference
+    = the previous default build (warps=4, MINB=4) launched explicitly. Compares the new default
+    (wk.launch defaults and the public op through _dispatch) at M=80/4096/4176/4256, select and
+    mode, normal and 4x-saturating gs, store on/off, 0xCD-poisoned outputs; untimed 23-iteration
+    repeat (re-poison every 8) vs iteration 0 and the reference, inputs vs pristine copies; CUDA
+    graph capture of the public op replayed twice vs eager, bitwise."""
+    info = head_info()
+    old = dict(warps=4, extra_defines=("MINB=4",))
+    print("defaults", getattr(wk, "_DEFAULT_WARPS", 4), wk._DEFAULT_DEFINES, flush=True)
+    ok_all = True
+    rep = {}
+    with torch.inference_mode():
+        cases = make_cases()
+        for name, args in cases:
+            x, sel, sc, sh = args
+            pristine = [a.clone() if a is not None else None for a in args]
+            gs = gs_for(x)
+            for gname, gsv in (("gs", gs), ("gs_sat4x", float(torch.tensor(gs * 4.0, dtype=torch.float32)))):
+                gs_t = torch.tensor([gsv], dtype=torch.float32, device=dev)
+                for store in (True, False):
+                    ref = wk.launch(x, sel, sc, sh, W, B, gs_t, EPS, store_x_mod=store,
+                                    outs=poisoned(x), **old)
+                    new = wk.launch(x, sel, sc, sh, W, B, gs_t, EPS, store_x_mod=store,
+                                    outs=poisoned(x))
+                    r = {"kernel_default_eq_old": same(new, ref)}
+                    if x.numel() // D > faq._AUTO_WARP_MIN_ROWS:
+                        po = torch.ops.trtllm.flux3_adaln_nvfp4_quant(x, sel, sc, sh, W, B, gs_t, EPS, store)
+                        # public op allocates x_mod: compare it only when stored
+                        r["public_op_eq_old"] = (same(po, ref) if store else
+                                                 torch.equal(po[1], ref[1]) and torch.equal(po[2], ref[2]))
+                    ok = all(r.values())
+                    ok_all &= ok
+                    rep[f"{name}|{gname}|store{int(store)}"] = r
+                    print(name, gname, store, ok, json.dumps(r), flush=True)
+            # repeat sequence
+            gs_t = torch.tensor([gs], dtype=torch.float32, device=dev)
+            ref = wk.launch(x, sel, sc, sh, W, B, gs_t, EPS, outs=poisoned(x), **old)
+            outs = poisoned(x)
+            first = None
+            eq0 = eqref = inp = True
+            for it in range(23):
+                if it % 8 == 0:
+                    inp &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
+                    for o in outs:
+                        o.view(torch.uint8).fill_(0xCD)
+                o = wk.launch(x, sel, sc, sh, W, B, gs_t, EPS, outs=outs)
+                cur = tuple(t.clone() for t in o)
+                first = first or cur
+                eq0 &= same(cur, first)
+                eqref &= same(cur, ref)
+            inp &= all(a is None or torch.equal(a, p) for a, p in zip(args, pristine))
+            rr = {"iters_eq_iter0": eq0, "iters_eq_old": eqref, "inputs_unchanged": inp}
+            rep[f"{name}|repeat"] = rr
+            ok_all &= all(rr.values())
+            print(name, "repeat", json.dumps(rr), flush=True)
+        # CUDA graph: public op at the served select M=4176, store on, captured once, replayed 2x.
+        name, args = [c for c in cases if c[0] == "select_M4176"][0]
+        x, sel, sc, sh = args
+        gs_t = torch.tensor([gs_for(x)], dtype=torch.float32, device=dev)
+        eager = tuple(t.clone() for t in torch.ops.trtllm.flux3_adaln_nvfp4_quant(x, sel, sc, sh, W, B, gs_t, EPS, True))
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            torch.ops.trtllm.flux3_adaln_nvfp4_quant(x, sel, sc, sh, W, B, gs_t, EPS, True)
+        torch.cuda.current_stream().wait_stream(s)
+        n_mod0 = len(wk._MODULES)
+        gr = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gr):
+            go = torch.ops.trtllm.flux3_adaln_nvfp4_quant(x, sel, sc, sh, W, B, gs_t, EPS, True)
+        g_ok = True
+        for _ in range(2):
+            for t in go:
+                t.view(torch.uint8).fill_(0xCD)
+            gr.replay()
+            torch.cuda.synchronize()
+            g_ok &= same(go, eager)
+        rep["graph_replays_eq_eager"] = g_ok
+        rep["modules_built_during_capture"] = len(wk._MODULES) - n_mod0
+        ok_all &= g_ok and rep["modules_built_during_capture"] == 0
+        rep["modules"] = {str(k): wk.NUM_REGS.get(k) for k in wk._MODULES}
+        print("graph", g_ok, rep["modules"], flush=True)
+    print(json.dumps({"passed": bool(ok_all), "info": info,
+                      "compared": "new default warp-kernel launch bounds (w1, MINB=12) vs previous "
+                                  "default build (w4, MINB=4) and vs eager/iteration 0",
+                      **rep}))
+
+
 def run_bench():
     nsets = 4
     single_calls, mode_calls = 28, 4
@@ -514,5 +602,7 @@ elif MODE == "sweep":
     run_sweep()
 elif MODE == "served_sweep":
     run_served_sweep()
+elif MODE == "final_check":
+    run_final_check()
 else:
     run_bench()

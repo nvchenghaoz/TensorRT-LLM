@@ -616,13 +616,6 @@ def adaln_nvfp4_quant(
 # M=4096 the in-model census tied (15.12 vs 15.17 us, inside noise), so it stays on Triton.
 _IMPL = os.environ.get("TRTLLM_FLUX3_ADALN_NVFP4_IMPL", "auto").strip().lower()
 _AUTO_WARP_MIN_ROWS = 4096
-# v2 of the warp kernel (flux3_sm120_adaln_nvfp4.launch_pf: persistent grid-stride rows, next row
-# cp.async-prefetched to SMEM; bitwise to the warp kernel). TRTLLM_FLUX3_ADALN_V2: 0 (default,
-# served warp kernel) | warp (v2 replaces the warp kernel wherever the warp route runs).
-# _RPW: rows per warp (0 = one resident wave). _X_POLICY: 0 plain x loads | 2 L2 evict_last 0.5.
-_V2 = os.environ.get("TRTLLM_FLUX3_ADALN_V2", "0").strip().lower()
-_V2_RPW = int(os.environ.get("TRTLLM_FLUX3_ADALN_V2_RPW", "2"))
-_V2_X_POLICY = int(os.environ.get("TRTLLM_FLUX3_ADALN_V2_X_POLICY", "0"))
 
 
 def _dispatch(x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod):
@@ -633,11 +626,6 @@ def _dispatch(x, select, scale, shift, weight, bias, global_scale, eps, store_x_
         from . import flux3_sm120_adaln_nvfp4 as warp_impl
 
         if warp_impl.supported(x, select, scale, shift, weight, bias):
-            if _V2 == "warp":
-                return warp_impl.launch_pf(
-                    x, select, scale, shift, weight, bias, global_scale, eps,
-                    store_x_mod=store_x_mod, rpw=_V2_RPW, x_policy=_V2_X_POLICY,
-                )
             return warp_impl.launch(
                 x, select, scale, shift, weight, bias, global_scale, eps, store_x_mod=store_x_mod
             )
