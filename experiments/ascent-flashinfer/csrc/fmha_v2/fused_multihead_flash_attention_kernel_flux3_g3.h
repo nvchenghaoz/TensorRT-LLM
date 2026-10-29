@@ -268,6 +268,19 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
     fmha::depbar_<USE_LDGSTS, 0>();
     named_bar_sync(1 + group, 128);
 
+#if defined(FMHA_FLUX3_Q_REGS) && FMHA_FLUX3_Q_REGS
+    // q_regs: the Q A-fragments of both 64-column chunks, loaded from smem once (bitwise equal).
+    typename Smem_tile_q::Fragment frag_q_all[2][Mma_tile_p::MMAS_K][Mma_tile_p::MMAS_M];
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+#pragma unroll
+      for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) {
+        smem_q.load(frag_q_all[c][ki], ki);
+      }
+      smem_q.move_to_next_read_buffer();
+    }
+#endif
+
     for (int step = 0; step < nsteps; ++step) {
       int const kv_loop = step * Cta_tile_p::N;
       int const slot = step % STAGES;
@@ -303,6 +316,23 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
 
       // BMM1, K columns 0..63 (stage chunk 0).
       smem_k.smem_read_buffer_ = slot * STAGE_BYTES;
+#if defined(FMHA_FLUX3_Q_REGS) && FMHA_FLUX3_Q_REGS
+#pragma unroll
+      for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) {
+        smem_k.load(frag_k[ki], ki);
+        fmha::gemm(acc_p, frag_q_all[0][ki], frag_k[ki]);
+      }
+
+      // BMM1, K columns 64..127 (stage chunk 1).
+      smem_k.smem_read_buffer_ = slot * STAGE_BYTES + K_CHUNK_BYTES;
+#pragma unroll
+      for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) {
+        smem_k.load(frag_k[ki], ki);
+        if (Cta_tile_p::VALID_K % Cta_tile_p::K == 0 || ki < BMM1_TAIL_MMAS_K_BOUND) {
+          fmha::gemm(acc_p, frag_q_all[1][ki], frag_k[ki]);
+        }
+      }
+#else
 #pragma unroll
       for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) {
         smem_q.load(frag_q[ki], ki);
@@ -322,6 +352,7 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
         }
       }
       smem_q.move_to_next_read_buffer();
+#endif
 
       softmax.unpack(acc_p);
 

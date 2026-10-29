@@ -199,8 +199,25 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   gmem_k.move_by_offset(kv_loop_start);
   gmem_v.move_by_offset(kv_loop_start);
 
+  // q_regs (FMHA_FLUX3_Q_REGS, needs resident Q and exactly 2 Q column chunks): both Q chunks
+  // are loaded in the prologue, their A-fragments are read from smem once before the KV loop and
+  // stay in registers. Same values, same MMA order (bitwise equal).
+#if defined(FMHA_FLUX3_Q_REGS) && FMHA_FLUX3_Q_REGS
+  enum {
+    Q_REGS = !RELOAD_Q_STEP && (int)Kernel_traits::BUFFERS_PER_TILE_SMEM_Q == 2 &&
+             (int)Mma_tile_p::VALID_MMAS_K == 2 * (int)Mma_tile_p::MMAS_K
+  };
+#else
+  enum { Q_REGS = 0 };
+#endif
+
   // Trigger the loads for Q.
   gmem_q.load(smem_q);
+  if constexpr (Q_REGS) {
+    gmem_q.move_col();
+    smem_q.move_to_next_write_buffer();
+    gmem_q.load(smem_q);
+  }
   // Trigger the loads for K.
   gmem_k.load(smem_k);
 
@@ -212,6 +229,20 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   gmem_k.commit(smem_k);
 
   // Declare the fragments for Q/K/V.
+  typename Smem_tile_q::Fragment frag_q_all[Q_REGS ? 2 : 1][Mma_tile_p::MMAS_K][Mma_tile_p::MMAS_M];
+  if constexpr (Q_REGS) {
+    // Wait for Q (and the first K chunk), then read both chunks' fragments once.
+    fmha::depbar_<USE_LDGSTS, 0>();
+    __syncthreads();
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+#pragma unroll
+      for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) {
+        smem_q.load(frag_q_all[c][ki], ki);
+      }
+      smem_q.move_to_next_read_buffer();
+    }
+  }
   typename Smem_tile_q::Fragment frag_q[Mma_tile_p::MMAS_K][Mma_tile_p::MMAS_M];
   typename Smem_tile_k::Fragment frag_k[Mma_tile_p::MMAS_K][Mma_tile_p::MMAS_N];
   typename Smem_tile_v::Fragment frag_v[Mma_tile_o::MMAS_K][Mma_tile_o::VALID_MMAS_N];
@@ -289,6 +320,8 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   constexpr int BMM2_TAIL_MMAS_K_BOUND = Mma_tile_o::MMAS_K;
   constexpr int BMM2_MAIN_MMAS_K_BOUND = Kernel_traits::TOTAL_BMM2_MMAS_K - BMM2_TAIL_MMAS_K_BOUND;
 
+  static_assert(!Q_REGS || BMM1_MAIN_MMAS_K_BOUND == Mma_tile_p::MMAS_K, "");
+
   for (int kv_loop = kv_loop_start; kv_loop < kv_loop_end; kv_loop += Cta_tile_p::N) {
     bool const first_step = (kv_loop == kv_loop_start);
     // It is possible that all tokens are masked out (sliding-window-attention).
@@ -311,7 +344,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
     // now MMAS_K is tiling size in D, VALID_MMAS_K is D length
     for (int bmm1_k = 0; bmm1_k < BMM1_MAIN_MMAS_K_BOUND; bmm1_k += Mma_tile_p::MMAS_K) {
       // Trigger the load for the next Q/K values
-      if (RELOAD_Q_STEP || first_step) {
+      if (!Q_REGS && (RELOAD_Q_STEP || first_step)) {
         gmem_q.move_col();
         smem_q.move_to_next_write_buffer();
         gmem_q.load(smem_q);
@@ -324,7 +357,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
       // Push the LDGDEPBAR instruction after the loads for QK.
       fmha::ldgdepbar<USE_LDGSTS>();
 
-      if (RELOAD_Q_STEP || first_step) {
+      if (!Q_REGS && (RELOAD_Q_STEP || first_step)) {
         gmem_q.commit(smem_q);
       }
       gmem_k.commit(smem_k);
@@ -337,12 +370,17 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
 // Do this part of P^T = (Q * K^T)^T.
 #pragma unroll
       for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) {
-        // Load the fragments for Q/K inner tile
-        smem_q.load(frag_q[ki], ki);
-        smem_k.load(frag_k[ki], ki);
+        if constexpr (Q_REGS) {
+          smem_k.load(frag_k[ki], ki);
+          fmha::gemm(acc_p, frag_q_all[0][ki], frag_k[ki]);
+        } else {
+          // Load the fragments for Q/K inner tile
+          smem_q.load(frag_q[ki], ki);
+          smem_k.load(frag_k[ki], ki);
 
-        // Do the math for the values already in registers.
-        fmha::gemm(acc_p, frag_q[ki], frag_k[ki]);
+          // Do the math for the values already in registers.
+          fmha::gemm(acc_p, frag_q[ki], frag_k[ki]);
+        }
       }
 
       // Make sure we are done reading the data (smem).
@@ -374,13 +412,20 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
 // Do this part of P^T = (Q * K^T)^T.
 #pragma unroll
       for (int ki = 0; ki < Mma_tile_p::MMAS_K; ++ki) {
-        // Load the fragments for Q/K inner tile
-        smem_q.load(frag_q[ki], ki);
-        smem_k.load(frag_k[ki], ki);
+        if constexpr (Q_REGS) {
+          smem_k.load(frag_k[ki], ki);
+          if (Cta_tile_p::VALID_K % Cta_tile_p::K == 0 || ki < BMM1_TAIL_MMAS_K_BOUND) {
+            fmha::gemm(acc_p, frag_q_all[1][ki], frag_k[ki]);
+          }
+        } else {
+          // Load the fragments for Q/K inner tile
+          smem_q.load(frag_q[ki], ki);
+          smem_k.load(frag_k[ki], ki);
 
-        // Do the math for the values already in registers.
-        if (Cta_tile_p::VALID_K % Cta_tile_p::K == 0 || ki < BMM1_TAIL_MMAS_K_BOUND) {
-          fmha::gemm(acc_p, frag_q[ki], frag_k[ki]);
+          // Do the math for the values already in registers.
+          if (Cta_tile_p::VALID_K % Cta_tile_p::K == 0 || ki < BMM1_TAIL_MMAS_K_BOUND) {
+            fmha::gemm(acc_p, frag_q[ki], frag_k[ki]);
+          }
         }
       }
       smem_q.move_to_next_read_buffer();
