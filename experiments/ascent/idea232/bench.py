@@ -44,6 +44,7 @@ SPIN = 6_000_000
 PAIR_SAMPLES = 200
 PAIR_SOAK_S = 20.0
 PAIR_REPLAYS = 3
+PAIR_GAP_S = float(os.environ.get("IDEA232_GAP_S", "0.15"))
 REPORT_1654 = ("/home/scratch.chengzhang/trtllm-dev-flux3-klein-20261027-125409/runner/slots/2/jobs/"
                "f4d88e022ffa4a78903d55630aa7acd4/artifacts/kernels.ncu-repz")
 
@@ -172,20 +173,49 @@ def resources():
             row["sass"] = {k[:60]: v for k, v in counts.items() if "device_kernel" in k}
         rows[arm] = row
         log(f"{arm}: {json.dumps(row)}")
-    ncu_rows = {}
-    if os.path.exists(REPORT_1654):
-        metrics = ("l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,"
-                   "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum,lts__t_sectors_srcunit_tex.sum,"
-                   "lts__t_sectors_srcunit_tex_op_write.sum,launch__registers_per_thread,"
-                   "gpu__time_duration.sum")
-        r = subprocess.run(["/usr/local/bin/ncu", "--import", REPORT_1654, "--page", "raw", "--csv",
-                            "--metrics", metrics], capture_output=True, text=True)
-        ncu_rows = {"rc": r.returncode, "csv": r.stdout[-6000:], "err": r.stderr[-800:]}
-        log("ncu import 1654:\n" + r.stdout[-6000:] + r.stderr[-800:])
-    else:
-        ncu_rows = {"missing": REPORT_1654}
-        log(f"report 1654 not reachable: {REPORT_1654}")
-    print(json.dumps({"resources": rows, "ncu_1654": ncu_rows}))
+    print(json.dumps({"resources": rows, "ncu_1654": _ncu_read(REPORT_1654)}))
+
+
+NCU_METRICS = ("gpu__time_duration.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,"
+               "l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum,lts__t_sectors_srcunit_tex.sum,"
+               "lts__t_sectors_srcunit_tex_op_read.sum,lts__t_sectors_srcunit_tex_op_write.sum,"
+               "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,"
+               "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum,launch__registers_per_thread,"
+               "launch__grid_size")
+
+
+def _ncu_read(path):
+    if not os.path.exists(path):
+        log(f"report not reachable: {path}")
+        return {"missing": path}
+    r = subprocess.run(["/usr/local/bin/ncu", "--import", path, "--page", "raw", "--csv",
+                        "--metrics", NCU_METRICS], capture_output=True, text=True)
+    import csv
+    import io
+    rows = list(csv.reader(io.StringIO(r.stdout)))
+    out = []
+    if rows:
+        hdr = rows[0]
+        for row in rows[2:]:
+            d = {h: v for h, v in zip(hdr, row) if h in NCU_METRICS.split(",") or h == "ID"}
+            name = row[hdr.index("Kernel Name")] if "Kernel Name" in hdr else ""
+            d["family"] = ("gate_up" if "SwigluFp4Epilogue" in name else
+                           "lpt_pair" if "PtrArray" in name else "qkv" if "Pingpong" in name
+                           else name[:40])
+            for k in ("lts__t_sectors_srcunit_tex.sum", "lts__t_sectors_srcunit_tex_op_read.sum",
+                      "lts__t_sectors_srcunit_tex_op_write.sum"):
+                try:
+                    d[k.replace(".sum", "_GB")] = round(float(d[k].replace(",", "")) * 32 / 1e9, 4)
+                except (KeyError, ValueError):
+                    pass
+            out.append(d)
+    log(f"ncu import {path}:\n" + json.dumps(out, indent=1) + r.stderr[-800:])
+    return {"rc": r.returncode, "rows": out}
+
+
+def ncuread():
+    paths = sys.argv[2:] or [REPORT_1654]
+    print(json.dumps({p: _ncu_read(p) for p in paths}))
 
 
 # ----------------------------------------------------------------------------------------- check
@@ -461,11 +491,15 @@ def pair():
     while time.time() - t0 < PAIR_SOAK_S:
         g.replay()
         torch.cuda.synchronize()
+        if PAIR_GAP_S:
+            time.sleep(PAIR_GAP_S)
     for (c, _), p in zip(cases, pristine):
         assert all(torch.equal(a, b) for a, b in zip(p, step0.inputs(c)))
     times = []
     for i in range(PAIR_SAMPLES):
         torch.cuda.synchronize()
+        if PAIR_GAP_S:
+            time.sleep(PAIR_GAP_S)  # cooling gap: keeps clocks off the power/thermal ramp
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         torch.cuda._sleep(SPIN)
         a.record()
@@ -487,7 +521,7 @@ def pair():
         "sched": meta["sched"], "epi_vec": meta["epi_vec"], "head": meta["head"],
         "ancestry_rc": meta["ancestry_rc"], "counters_delta_capture": d,
         "samples": PAIR_SAMPLES, "replays_per_sample": PAIR_REPLAYS, "soak_s": PAIR_SOAK_S,
-        "output": {"class": "exact"},
+        "gap_s": PAIR_GAP_S, "output": {"class": "exact"},
     }))
 
 
@@ -508,4 +542,4 @@ def ncu():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "info"
     {"info": info, "resources": resources, "check": check, "table": table, "pair": pair,
-     "ncu": ncu}[cmd]()
+     "ncu": ncu, "ncuread": ncuread}[cmd]()
