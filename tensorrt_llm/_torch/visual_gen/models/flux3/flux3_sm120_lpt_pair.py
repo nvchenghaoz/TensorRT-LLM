@@ -97,6 +97,10 @@ def preload(device: torch.device) -> None:
     if not enabled():
         return
     module()
+    # Idea 17: the 256x128x128 large-M pair module (TRTLLM_FLUX3_SM120_LARGE_M_TILES).
+    from . import flux3_sm120_large_m
+
+    flux3_sm120_large_m.preload_pair()
     workspace(device)
 
 
@@ -117,8 +121,18 @@ def run(
     grid_ctas: int = 0,
 ) -> None:
     """down_out = BF16(down_alpha * down_activation @ down_weight^T), attn_out likewise, in one
-    launch on the current stream (down's tiles first)."""
-    module().lpt_pair(
+    launch on the current stream (down's tiles first).
+
+    At M >= flux3_sm120_large_m.LARGE_M_MIN the same kernel at TileShape 256x128x128 runs
+    (bitwise equal; TRTLLM_FLUX3_SM120_LARGE_M_TILES=0 keeps main's module at every M)."""
+    from . import flux3_sm120_large_m
+
+    mod = (
+        flux3_sm120_large_m.pair_module()
+        if flux3_sm120_large_m.use("pair", down_activation.shape[0])
+        else module()
+    )
+    mod.lpt_pair(
         down_activation,
         down_weight,
         down_activation_scale,

@@ -29,6 +29,10 @@ import torch
 # Arm: 0 = Cooperative 128x128x64, 1 = Pingpong 128x128x64 (served), 2 = Cooperative 128x128x128,
 # 3 = Cooperative 128x256x64, 4 = Cooperative 256x128x64 (3/4: order 1 only).
 ARM = int(os.environ.get("TRTLLM_FLUX3_FP8R_GEMM_ARM", "1"))
+# Idea 17: unless the arm is pinned by the env above, calls with M >= LARGE_M_MIN rows (2048^2)
+# take flux3_sm120_large_m.fp8r_arm(N) (Cooperative arms 3/4, bitwise equal to arm 1 and
+# torch._scaled_mm). TRTLLM_FLUX3_SM120_LARGE_M_TILES=0 keeps ARM at every M.
+_ARM_PINNED = "TRTLLM_FLUX3_FP8R_GEMM_ARM" in os.environ
 # Epilogue association: 1 -> BF16(w_scale * (x_scale * acc)), bitwise equal to torch._scaled_mm on
 # every image.0 shape (0 -> BF16(x_scale * (w_scale * acc)) differs in ~5e-6 of elements by 1 ulp).
 ORDER = 1
@@ -82,9 +86,17 @@ def preload(device: torch.device) -> None:
     if not enabled():
         return
     mod = module()
-    need = int(mod.fp8r_workspace_size(1 << 16, 18432, 9216, ARM))
-    if need > _WORKSPACE_BYTES:
-        raise RuntimeError(f"FP8R GEMM workspace {need} B exceeds {_WORKSPACE_BYTES} B")
+    from . import flux3_sm120_large_m
+
+    arms = {ARM}
+    if not _ARM_PINNED and flux3_sm120_large_m.enabled("fp8r"):
+        arms |= {flux3_sm120_large_m.fp8r_arm(18432), flux3_sm120_large_m.fp8r_arm(3072)}
+    for arm in sorted(arms):
+        need = int(mod.fp8r_workspace_size(1 << 16, 18432, 9216, arm))
+        if need > _WORKSPACE_BYTES:
+            raise RuntimeError(
+                f"FP8R GEMM workspace {need} B (arm {arm}) exceeds {_WORKSPACE_BYTES} B"
+            )
     workspace(device, 0)
     workspace(device, 1)
 
@@ -107,6 +119,13 @@ def gemm(
     """
     m = activation.shape[0]
     n = weight.shape[0]
+    if arm is None:
+        arm = ARM
+        if not _ARM_PINNED:
+            from . import flux3_sm120_large_m
+
+            if flux3_sm120_large_m.use("fp8r", m):
+                arm = flux3_sm120_large_m.fp8r_arm(n)
     if out is None:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=activation.device)
     module().fp8r_gemm(
@@ -116,7 +135,7 @@ def gemm(
         weight_scale.reshape(-1),
         out,
         workspace(activation.device, slot),
-        int(ARM if arm is None else arm),
+        int(arm),
         int(ORDER if order is None else order),
     )
     ROUTES[int(n)] += 1
