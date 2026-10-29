@@ -33,13 +33,40 @@ def main():
         for t in (xm, fp4, sf):
             h.update(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
         out[tag] = h.hexdigest()
+    # u8 K=3 index variant (candidate tree only; the base tree has no SEL_INDEX build)
+    if "SEL_INDEX" in warp._SRC:
+        ar = torch.arange(m, device="cuda")
+        idx = ((ar >= 8192).to(torch.uint8) + (ar >= 16384).to(torch.uint8)).view(1, m, 1)
+        sc3 = torch.cat([sc, sc[:, :1] * 0.5], 1).contiguous()
+        sh3 = torch.cat([sh, sh[:, :1] * 0.5], 1).contiguous()
+        for ww, bb in ((w1, b0), (w2, b2)):
+            warp.launch(x, idx, sc3, sh3, ww, bb, gs, 1e-6, store_x_mod=False)
+        torch.cuda.synchronize()
+    # cubin sha256 of the bool-select builds (same NVRTC options as _compile)
+    from cuda.bindings import nvrtc
+
+    cubins = {}
+    for tag, defs in (("ln_id0", ("MINB=12", "X_POLICY=2")),
+                      ("ln_id1", ("MINB=12", "X_POLICY=2", "LN_ID=1"))):
+        prog = warp._check(nvrtc.nvrtcCreateProgram(warp._SRC.encode(), b"flux3_adaln_nvfp4.cu",
+                                                    0, [], []))
+        opts = [b"--gpu-architecture=sm_120a", b"--fmad=false", b"--prec-div=true",
+                b"--prec-sqrt=true", b"--ftz=false", b"-std=c++17", b"-DWARPS=1",
+                b"-DUSE_PDL=0"] + [f"-D{d_}".encode() for d_ in defs]
+        nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
+        size = warp._check(nvrtc.nvrtcGetCUBINSize(prog))
+        cub = b" " * size
+        warp._check(nvrtc.nvrtcGetCUBIN(prog, cub))
+        nvrtc.nvrtcDestroyProgram(prog)
+        cubins[tag] = hashlib.sha256(cub).hexdigest()
     regs = {}
     for key, fn in warp._MODULES.items():
         n = driver.cuFuncGetAttribute(driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, fn)[1]
         lb = driver.cuFuncGetAttribute(
             driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fn)[1]
         regs[str(key)] = {"regs": int(n), "local_bytes": int(lb)}
-    print(json.dumps({"passed": True, "warp_kernel": regs, "t2i_form_sha256": out}), flush=True)
+    print(json.dumps({"passed": True, "warp_kernel": regs, "t2i_form_sha256": out,
+                      "bool_cubin_sha256": cubins}), flush=True)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,10 @@ typedef long long i64;
 #ifndef LN_ID
 #define LN_ID 0
 #endif
+// SEL_INDEX=1: `sel` is a u8 row index into a K-row table (launch() sets it for uint8 select).
+#ifndef SEL_INDEX
+#define SEL_INDEX 0
+#endif
 #define DIM 3072
 #define SFC 192
 
@@ -375,11 +379,18 @@ flux3_adaln_nvfp4_warp(const uint4 *__restrict__ x, const u8 *__restrict__ sel,
   // ---- pointwise modulate + NVFP4 quantize ----
   const float gs = *gs_ptr;
   const float fp4_max_rcp = rcp_approx(6.0f);
-  // Table row index: a bool select (0/1) or a u8 chunk index into a K-row table. Row r of the
-  // table is at r * row_stride; bool 0/1 gives the same addresses as before.
+#if SEL_INDEX
+  // u8 chunk index into a [1, K, D] table (K = 3 on i2i): row r is at r * row_stride. Its own
+  // build (SEL_INDEX=1), so the bool-select module below stays the previous cubin.
   const int r = has_select ? (int)sel[row] : 0;
   const uint4 *scr = (const uint4 *)(scale + (i64)r * scale_rs);
   const uint4 *shr = (const uint4 *)(shift + (i64)r * shift_rs);
+#else
+  bool s = false;
+  if (has_select) s = sel[row] != 0;
+  const uint4 *scr = (const uint4 *)(scale + (s ? scale_rs : 0));
+  const uint4 *shr = (const uint4 *)(shift + (s ? shift_rs : 0));
+#endif
   uint4 *xo = xmod + (i64)row * (DIM / 8);
   u32 *fo = fp4 + (i64)row * (DIM / 8);
 #pragma unroll
@@ -621,6 +632,8 @@ def launch(
         out, fp4, sf = outs
     if _LN_ID and is_identity_affine(weight, bias):
         extra_defines = tuple(extra_defines) + ("LN_ID=1",)
+    if has_select and select.dtype == torch.uint8:
+        extra_defines = tuple(extra_defines) + ("SEL_INDEX=1",)
     fn = _compile(x.device, warps, use_pdl, extra_defines)
     grid = (padded + warps - 1) // warps
     stream = torch.cuda.current_stream(x.device).cuda_stream
