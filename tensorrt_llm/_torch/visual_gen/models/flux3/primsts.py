@@ -274,6 +274,10 @@ def prepare_nvfp4_block(block: nn.Module) -> None:
                 from .flux3_sm120_strided_gemm import preload as sm120_strided_preload
 
                 sm120_strided_preload(adapter.weight.device)
+                # Idea 14: the QKV GEMM with the E4M3 Q/K epilogue (JIT build at load).
+                from .flux3_qkv_epi_fp8 import preload as qkv_epi_fp8_preload
+
+                qkv_epi_fp8_preload(adapter.weight.device)
             continue
         prepare_nvfp4_gemm(
             adapter.weight,

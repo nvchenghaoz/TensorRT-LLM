@@ -1912,6 +1912,35 @@ def _sm120_qkv_planar_gemms(
     return out
 
 
+def _qkv_epi_fp8_route(activation, weight, q_norm, k_norm, cos_sin) -> bool:
+    """Idea 14's fused route applies exactly where main's chain is the batched QKV3 GEMM +
+    qknorm_rope_fp8 VEC/FOLD with the static Q/K scale (TRTLLM_FLUX3_QKV_EPI_FP8=0: never)."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120 import (
+        flux3_sm120_qknorm_rope_fp8 as qr8,
+    )
+
+    from . import flux3_qkv_epi_fp8
+    from . import flux3_sm120_strided_gemm as strided
+
+    if not (flux3_qkv_epi_fp8.enabled() and strided.batched()):
+        return False
+    if not (qr8.FOLD and qr8.VEC and qr8.STATIC_QK):
+        return False
+    rows, columns = activation.shape[0], weight.shape[0]
+    if not flux3_qkv_epi_fp8.covers(rows, columns, q_norm.numel()) or k_norm.numel() != 128:
+        return False
+    if (columns // 3 // 128) % 8:  # VEC's head-pair layout (main falls back otherwise)
+        return False
+    if (cos_sin.dtype != torch.float32 or cos_sin.dim() != 2 or cos_sin.shape[1] != 128
+            or cos_sin.shape[0] < rows or not cos_sin.is_contiguous()):
+        return False
+    if q_norm.dtype != torch.bfloat16 or k_norm.dtype != torch.bfloat16:
+        return False
+    if not (q_norm.is_contiguous() and k_norm.is_contiguous()):
+        return False
+    return all(t.data_ptr() % 16 == 0 for t in (q_norm, k_norm, cos_sin))
+
+
 def nvfp4_qkv_rope_fp8_impl(
     activation: torch.Tensor,
     weight: torch.Tensor,
@@ -1937,6 +1966,25 @@ def nvfp4_qkv_rope_fp8_impl(
 
     rows = activation.shape[0]
     width = weight.shape[0] // 3
+    if _qkv_epi_fp8_route(activation, weight, q_norm, k_norm, cos_sin):
+        # Idea 14: Q/K E4M3 straight from the QKV GEMM epilogue + a V-only quantize; bitwise
+        # main's qkv8/scales and gemm v plane (q/k planes of gemm undefined, as main's L2 discard).
+        # `positions` is the identity _token_positions table here (the epilogue indexes cos_sin
+        # by row).
+        from . import flux3_qkv_epi_fp8
+
+        return flux3_qkv_epi_fp8.qkv_rope_fp8(
+            activation.detach(),
+            weight.detach(),
+            activation_scale.detach(),
+            weight_scale.detach(),
+            qkv_scale.detach(),
+            q_norm.detach(),
+            k_norm.detach(),
+            cos_sin.detach(),
+            sm_scale,
+            keep_v,
+        )
     out = _sm120_qkv_planar_gemms(
         activation.detach(),
         weight.detach(),
