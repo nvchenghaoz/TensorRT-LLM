@@ -552,6 +552,46 @@ class _B64JsonSplicer:
                         headers=headers)
 
 
+_LOGGED_REF_FIELDS = ("image_reference", "video_reference", "audio_reference")
+
+
+def _ref_for_log(ref: Any) -> Any:
+    """Return ``ref`` with an inline payload replaced by its size."""
+    fmt = getattr(ref, "format", None)
+    content = getattr(ref, "content", None)
+    if fmt in ("bytes", "base64") and isinstance(content, (bytes, str)):
+        unit = "bytes" if fmt == "bytes" else "chars"
+        return ref.model_copy(update={"content": f"<{len(content)} {unit}>"})
+    return ref
+
+
+def _params_for_log(params: Any) -> Any:
+    """Return ``params`` for a log line, without inline reference payloads.
+
+    ``repr`` of a multi-megabyte ``bytes``/base64 reference builds a string
+    several times its size (and the log line copies it again), on every
+    request, even when INFO is filtered. A shallow copy with each inline
+    payload replaced by its length keeps the line informative and small.
+    ``params`` itself is not modified.
+    """
+    update = {}
+    for name in _LOGGED_REF_FIELDS:
+        refs = getattr(params, name, None)
+        if refs is None:
+            continue
+        if isinstance(refs, list):
+            new_refs = [_ref_for_log(ref) for ref in refs]
+            if any(a is not b for a, b in zip(new_refs, refs)):
+                update[name] = new_refs
+        else:
+            new_ref = _ref_for_log(refs)
+            if new_ref is not refs:
+                update[name] = new_ref
+    if not update:
+        return params
+    return params.model_copy(update=update)
+
+
 def _normalize_image_output(image) -> list:
     """Normalize image output to a list of individual images.
 
@@ -3727,7 +3767,7 @@ class OpenAIServer(_VideoRoutesMixin):
             try:
                 params = parse_visual_gen_params(request, self.generator)
                 logger.info(
-                    f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
+                    f"Generating image: {image_id} with params: {_params_for_log(params)} and prompt: {request.prompt}"
                 )
                 image_gen_start = time.perf_counter()
                 # Offload the blocking resolve/enqueue off the event loop but
@@ -3977,6 +4017,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 "Image editing is not supported by the loaded visual generation model."
             )
 
+        b64_splicer = None
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
@@ -3987,11 +4028,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     return path_error
                 params = parse_visual_gen_params(request, self.generator)
                 logger.info(
-                    f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
+                    f"Editing image: {image_id} with params: {_params_for_log(params)} and prompt: {request.prompt}"
                 )
                 image_edit_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt,
-                                                 params=params)
+                # Offload the blocking resolve/enqueue off the event loop but
+                # await it (bad params -> 400 here); then await generation.
+                handle = await asyncio.to_thread(self.generator.generate_async,
+                                                 request.prompt, params)
+                output = await handle.aresult()
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:
@@ -4017,11 +4061,11 @@ class OpenAIServer(_VideoRoutesMixin):
             pil_format = request.output_format.upper()
             ext = f".{request.output_format}"
             if request.response_format == "b64_json":
+                b64_splicer = _B64JsonSplicer()
                 data = [
                     ImageObject(
-                        b64_json=base64.b64encode(
-                            image_to_bytes(image,
-                                           format=pil_format)).decode("utf-8"),
+                        b64_json=b64_splicer.placeholder(
+                            image_to_b64(image, format=pil_format)),
                         revised_prompt=request.prompt,
                     ) for image in output_images
                 ]
@@ -4052,6 +4096,8 @@ class OpenAIServer(_VideoRoutesMixin):
             headers = build_visual_gen_timing_headers(
                 build_visual_gen_server_timings(metrics, total=total))
 
+            if b64_splicer is not None:
+                return b64_splicer.response(response.model_dump(), headers)
             return JSONResponse(content=response.model_dump(), headers=headers)
 
         except ValidationError as exc:
