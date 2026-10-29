@@ -28,7 +28,9 @@ from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_primsts as fp
 from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_sm120_lpt_pair as lpt
 
 H, FF = 3072, 9216
-MS = {"t2i-2048": 16896, "i2i-2048": 33280}
+# Served single-block Ms at 2048^2 (T_pad=80; pitfall 399). Earlier jobs (78/92-95) used the
+# close shapes 16896/33280 (T=512).
+MS = {"t2i-2048": 16464, "i2i-2048": 32848}
 CASES = 2
 CALLS = 20
 WARMUP = 3
@@ -253,7 +255,6 @@ def check():
     for label, M in MS.items():
         c = make_case(M, 77 + M)
         pristine = [c[k].clone() for k in IN_KEYS]
-        tiles = 2 * ((M + 127) // 128) * (H // 128)
         ref17 = {
             "down": fi_linear(c["a_down"], c["w_down"], c["sf_down"], c["sfw_down"], c["al_down"],
                               17),
@@ -269,6 +270,7 @@ def check():
         passed &= main_vs_17
         log(f"{label}: policy {lpt.raster_for(M)}, main order vs t17 bitwise {main_vs_17}")
         for arm, rv in arms.items():
+            tiles = _tiles(M, forced_128=rv is not None)
             for k, p in zip(IN_KEYS, pristine):
                 c[k].copy_(p)
             for _ in range(WARMUP):
@@ -330,21 +332,38 @@ def check():
                             "graph_replay_poisoned_x10": f"{g_each}/10",
                             "counter_values": sorted(counters), "tiles": tiles, "ok": ok}
             log(key, json.dumps(results[key]))
-        # Kill switch: TRTLLM_FLUX3_LPT_RASTER=0 -> main's order (0, 1) at every M.
-        os.environ["TRTLLM_FLUX3_LPT_RASTER"] = "0"
-        lpt.raster_enabled.cache_clear()
-        ks_order = tuple(lpt.raster_for(M))
-        c["o_down"].fill_(float("nan"))
-        c["o_attn"].fill_(float("nan"))
-        run_pair(c, None)
-        torch.cuda.synchronize()
-        ks_ok = (ks_order == (0, 1) and torch.equal(c["o_attn"], ref_main["attn"])
-                 and torch.equal(c["o_down"], ref_main["down"]))
-        os.environ.pop("TRTLLM_FLUX3_LPT_RASTER")
-        lpt.raster_enabled.cache_clear()
-        results[f"{label}_killswitch"] = {"raster_for": list(ks_order), "ok": ks_ok}
-        passed &= ks_ok
-        log(f"{label} killswitch: {results[f'{label}_killswitch']}")
+        # Kill switches: TRTLLM_FLUX3_LPT_RASTER=0 -> main's (63571fc0) route at every M (t256 at
+        # M >= 8192, this module at (0, 1) below); TRTLLM_FLUX3_SM120_LARGE_M_TILES=0 -> main's
+        # 128 module at (0, 1) at every M. Route asserted, outputs bitwise vs main's route.
+        from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_sm120_large_m as lm
+        ref_ks = _killswitch_ref(c)
+        for env, want_t256 in (("TRTLLM_FLUX3_LPT_RASTER", M >= lm.LARGE_M_MIN),
+                               ("TRTLLM_FLUX3_SM120_LARGE_M_TILES", False)):
+            os.environ[env] = "0"
+            lpt.raster_enabled.cache_clear()
+            lm._enabled_routes.cache_clear()
+            ks_order = tuple(lpt.raster_for(M))
+            route_t256 = _t256_route(M)
+            c["o_down"].fill_(float("nan"))
+            c["o_attn"].fill_(float("nan"))
+            run_pair(c, None)
+            torch.cuda.synchronize()
+            ks_ok = (ks_order == (0, 1) and not lpt.along_n(M) and route_t256 == want_t256
+                     and torch.equal(c["o_attn"], ref_main["attn"])
+                     and torch.equal(c["o_down"], ref_main["down"])
+                     and torch.equal(c["o_attn"], ref_ks[0]) and torch.equal(c["o_down"], ref_ks[1])
+                     and _counter(ws) == (2 * ((M + 255) // 256) * 24 if want_t256
+                                          else _tiles(M, forced_128=True)))
+            os.environ.pop(env)
+            lpt.raster_enabled.cache_clear()
+            lm._enabled_routes.cache_clear()
+            results[f"{label}_killswitch_{env}"] = {
+                "raster_for": list(ks_order), "route": "t256-AlongM" if route_t256 else "128",
+                "expected_route": "t256-AlongM" if want_t256 else "128", "ok": ks_ok}
+            passed &= ks_ok
+            log(f"{label} killswitch {env}: {results[f'{label}_killswitch_{env}']}")
+        results[f"{label}_default_route"] = ("t256-AlongM" if _t256_route(M) else
+                                             f"128-raster{list(lpt.raster_for(M))}")
         del c, pristine, ref17, ref_main
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -357,8 +376,34 @@ ALT_ROUNDS = 50
 SMALL_M = 4176
 
 
-def _tiles(M):
-    return 2 * ((M + 127) // 128) * (H // 128)
+def _t256_route(M):
+    """Does lpt.run's default route take the t256 (256x128) module at M (main 63571fc0 route)?"""
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_sm120_large_m as lm
+    along_n = getattr(lpt, "along_n", lambda rows: False)
+    return lm.use("pair", M) and not along_n(M)
+
+
+def _tiles(M, forced_128=False):
+    """Tile count the dynamic counter ends at: 128-row tiles on this module, 256-row on t256."""
+    tm = 128 if forced_128 or not _t256_route(M) else 256
+    return 2 * ((M + tm - 1) // tm) * (H // 128)
+
+
+def _killswitch_ref(c):
+    """Main's (63571fc0) route run directly: t256 module at M >= 8192, else 128 at (0, 1)."""
+    from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_sm120_large_m as lm
+    ws = torch.zeros(lpt._WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
+    args = (c["a_down"], c["w_down"], c["sf_down"], c["sfw_down"], c["al_down"], c["o_down"],
+            c["a_attn"], c["w_out"], c["sf_attn"], c["sfw_out"], c["al_attn"], c["o_attn"], ws,
+            lpt.sched_mode(), 0)
+    if c["M"] >= lm.LARGE_M_MIN:
+        lm.pair_module().lpt_pair(*args)
+    else:
+        lpt.module().lpt_pair(*args, 0, 1)
+    torch.cuda.synchronize()
+    out = (c["o_attn"].clone(), c["o_down"].clone())
+    del ws
+    return out
 
 
 def _counter(ws):
@@ -379,8 +424,11 @@ def _alt_set(name, ms, seed0):
         run_pair(c, (0, 1))
         torch.cuda.synchronize()
         c["ref_main"] = (c["o_attn"].clone(), c["o_down"].clone())
+        c["ref_ks"] = _killswitch_ref(c)
         c["main_vs_17"] = (torch.equal(c["ref_main"][0], c["ref17"][0])
-                           and torch.equal(c["ref_main"][1], c["ref17"][1]))
+                           and torch.equal(c["ref_main"][1], c["ref17"][1])
+                           and torch.equal(c["ref_ks"][0], c["ref17"][0])
+                           and torch.equal(c["ref_ks"][1], c["ref17"][1]))
         c["round0"] = None
         cs.append(c)
     s = torch.cuda.Stream()
@@ -426,9 +474,9 @@ def _replay_check(st, ws):
     for c in st["cases"]:
         if c["round0"] is None:
             c["round0"] = (c["o_attn"].clone(), c["o_down"].clone())
-        m = _eq(c, c["ref_main"])
+        m = _eq(c, c["ref_main"]) and _eq(c, c["ref_ks"])
         if not m:
-            s["max_abs_diff_vs_main"] = max(s["max_abs_diff_vs_main"], _maxdiff(c, c["ref_main"]))
+            s["max_abs_diff_vs_main"] = max(s["max_abs_diff_vs_main"], _maxdiff(c, c["ref_ks"]))
         bm &= m
         bt &= _eq(c, c["ref17"])
         br &= _eq(c, c["round0"])
@@ -445,7 +493,8 @@ def _eager_check(c, rv, ws, stats):
     _poison(c)
     run_pair(c, rv)
     torch.cuda.synchronize()
-    ok = (_eq(c, c["ref_main"]) and _eq(c, c["ref17"]) and _counter(ws) == _tiles(c["M"])
+    ok = (_eq(c, c["ref_main"]) and _eq(c, c["ref17"])
+          and _counter(ws) == _tiles(c["M"], forced_128=rv is not None)
           and all(torch.equal(p, c[k]) for k, p in zip(IN_KEYS, c["pristine"])))
     stats["calls"] += 1
     stats["ok"] += ok
@@ -491,7 +540,9 @@ def alt():
                "t2i": {"Ms": tms, "tiles_after_graph": _tiles(t2i["last_M"]), **t2i["stats"]},
                "i2i": {"Ms": ims, "tiles_after_graph": _tiles(i2i["last_M"]), **i2i["stats"]},
                "eager": eager,
-               "policy": {str(M): list(lpt.raster_for(M)) for M in sorted(set(tms + ims))}}
+               "policy": {str(M): ("t256-AlongM" if _t256_route(M) else
+                                   f"128-raster{list(lpt.raster_for(M))}")
+                          for M in sorted(set(tms + ims + [SMALL_M]))}}
         passed &= rounds_ok == ALT_ROUNDS
         out[pname] = res
         log(f"{pname}: {json.dumps(res)}")

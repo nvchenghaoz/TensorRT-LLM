@@ -25,6 +25,13 @@ output is bitwise equal to FlashInfer tactic 17 / TRT-LLM FP4GemmRunner tactic 0
 TRTLLM_FLUX3_SM120_PAIR_KERNEL=0 restores the two-stream pair (down on the current stream,
 attn_out on a side stream). TRTLLM_FLUX3_SM120_PAIR_SCHED=static selects the stock static
 round-robin order of the same kernel (diagnostics).
+
+Idea 32 (L2-aware tile order): at rows >= RASTER_MIN_ROWS (the ~32K bucket, i2i single blocks at
+M=32848) the pair runs on this 128x128 module with its tiles rasterized AlongN (raster_for), not
+on the t256 AlongM module: AlongM streams down's whole A operand (M x 9216 FP4, ~150 MB, over the
+128 MB L2) from DRAM once per N column. Below that, routes are main's (t256 at 8192 <= rows,
+this module at AlongM below). TRTLLM_FLUX3_LPT_RASTER=0 or TRTLLM_FLUX3_SM120_LARGE_M_TILES
+without 'pair' restores main's route and order at every M. Outputs are bitwise identical.
 """
 
 from __future__ import annotations
@@ -60,6 +67,36 @@ def sched_mode() -> int:
             f"TRTLLM_FLUX3_SM120_PAIR_SCHED must be one of {sorted(_SCHED_MODES)}, got {sched!r}"
         )
     return _SCHED_MODES[sched]
+
+
+@lru_cache(maxsize=1)
+def raster_enabled() -> bool:
+    """TRTLLM_FLUX3_LPT_RASTER=0 restores main's route and tile order at every M."""
+    return os.environ.get("TRTLLM_FLUX3_LPT_RASTER", "1").strip() != "0"
+
+
+# (raster, max_swizzle) of this module: raster 0 = AlongM (CUTLASS's grouped default, M fastest
+# within an N column; main's order), 1 = AlongN (N fastest within an M panel).
+_MAIN_ORDER = (0, 1)
+_ALONG_N = (1, 1)
+# Rows from which the pair takes this module at AlongN instead of the t256 AlongM module: the
+# ~32K bucket (M range, never M equality). Idea 32 gate 1 (experiments/ascent/idea32_raster,
+# CUDA-event medians, us/call): M=32848 128-AlongN 1667 vs t256-AlongM 2481 (A/A 0.4%);
+# 16464 895 vs 861 and 16384 895 vs 837 (t256 stays).
+RASTER_MIN_ROWS = 24576
+
+
+def along_n(rows: int) -> bool:
+    """True when a call with `rows` rows runs this module at AlongN (static per shape)."""
+    from . import flux3_sm120_large_m
+
+    return (
+        rows >= RASTER_MIN_ROWS and raster_enabled() and flux3_sm120_large_m.enabled("pair")
+    )
+
+
+def raster_for(rows: int) -> tuple[int, int]:
+    return _ALONG_N if along_n(rows) else _MAIN_ORDER
 
 
 @lru_cache(maxsize=1)
@@ -119,20 +156,39 @@ def run(
     attn_out: torch.Tensor,
     mode: int | None = None,
     grid_ctas: int = 0,
+    raster: tuple[int, int] | None = None,
 ) -> None:
     """down_out = BF16(down_alpha * down_activation @ down_weight^T), attn_out likewise, in one
     launch on the current stream (down's tiles first).
 
     At M >= flux3_sm120_large_m.LARGE_M_MIN the same kernel at TileShape 256x128x128 runs
-    (bitwise equal; TRTLLM_FLUX3_SM120_LARGE_M_TILES=0 keeps main's module at every M)."""
+    (bitwise equal; TRTLLM_FLUX3_SM120_LARGE_M_TILES=0 keeps main's module at every M), except at
+    rows >= RASTER_MIN_ROWS, where this module runs at AlongN (along_n). raster=(order,
+    max_swizzle) forces this module at that order (diagnostics)."""
     from . import flux3_sm120_large_m
 
-    mod = (
-        flux3_sm120_large_m.pair_module()
-        if flux3_sm120_large_m.use("pair", down_activation.shape[0])
-        else module()
-    )
-    mod.lpt_pair(
+    rows = down_activation.shape[0]
+    if raster is None and not along_n(rows) and flux3_sm120_large_m.use("pair", rows):
+        flux3_sm120_large_m.pair_module().lpt_pair(
+            down_activation,
+            down_weight,
+            down_activation_scale,
+            down_weight_scale,
+            down_alpha,
+            down_out,
+            attn_activation,
+            attn_weight,
+            attn_activation_scale,
+            attn_weight_scale,
+            attn_alpha,
+            attn_out,
+            workspace(down_activation.device),
+            sched_mode() if mode is None else int(mode),
+            int(grid_ctas),
+        )
+        return
+    order, swizzle = raster_for(rows) if raster is None else raster
+    module().lpt_pair(
         down_activation,
         down_weight,
         down_activation_scale,
@@ -148,4 +204,6 @@ def run(
         workspace(down_activation.device),
         sched_mode() if mode is None else int(mode),
         int(grid_ctas),
+        int(order),
+        int(swizzle),
     )
