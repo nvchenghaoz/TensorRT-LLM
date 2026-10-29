@@ -300,6 +300,50 @@ def _(xq, s_x, wq, s_w, bias=None, residual=None):
     )
 
 
+# --------------------------------------------------------------------------- GN+swish -> e4m3
+# |min_t swish(t)| = 0.2784645... (at t = -1.27846); rounded UP so the bound holds.
+SWISH_NEG_BOUND = 0.2784646
+
+
+def gn_swish_fp8(x: Tensor, norm: nn.GroupNorm) -> Tuple[Tensor, Tensor]:
+    """swish(GroupNorm(x)) quantized to e4m3 with a per-tensor scale: (q, s_x[1] fp32).
+
+    Pure torch ops (traced and fused by Inductor; no custom op, no host sync).
+    Per-channel var_mean (fp32 accumulation for low-precision x, as
+    group_norm_channel_stats) plus per-channel amin/amax of x; groups combined exactly
+    as group_norm_channel_stats does. With a_c = gamma_c*rstd_g, b_c = beta_c - mean_g*a_c
+    the GN output of channel c lies in [lo_c, hi_c] (the affine of min_c/max_c), so
+    amax = max(max_{n,c} swish(max(hi_c, 0)), |min swish|) bounds |swish(GN(x))|
+    (swish is increasing above -1.278 and >= -0.27846). s_x = amax / 448 and
+    q = sat_e4m3(swish(a_c*x + b_c) / s_x), all in fp32, IEEE division, clamp before
+    the (non-saturating) cast.
+    """
+    n, c = x.shape[:2]
+    g = norm.num_groups
+    acc = torch.float64 if x.dtype == torch.float32 else torch.float32
+    red = tuple(range(2, x.dim()))
+    var_c, mean_c = torch.var_mean(x.to(acc), dim=red, correction=0)
+    mn_c = torch.amin(x, dim=red).float()
+    mx_c = torch.amax(x, dim=red).float()
+    mean_c = mean_c.view(n, g, c // g)
+    var_c = var_c.view(n, g, c // g)
+    mean_g = mean_c.mean(-1, keepdim=True)
+    var_g = var_c.mean(-1, keepdim=True) + (mean_c - mean_g).square().mean(-1, keepdim=True)
+    rstd_g = torch.rsqrt(var_g + norm.eps)
+    mean = mean_g.expand(n, g, c // g).reshape(n, c).float()
+    rstd = rstd_g.expand(n, g, c // g).reshape(n, c).float()
+    a = rstd if norm.weight is None else norm.weight.float().view(1, c) * rstd
+    b = -mean * a if norm.bias is None else norm.bias.float().view(1, c) - mean * a
+    hi = torch.maximum(a * mn_c + b, a * mx_c + b).clamp_min(0.0)
+    top = (hi * torch.sigmoid(hi)).amax()
+    s_x = (torch.clamp_min(top, SWISH_NEG_BOUND) / QMAX).reshape(1)
+    bshape = (n, c) + (1,) * (x.dim() - 2)
+    y = x.float() * a.view(bshape) + b.view(bshape)
+    y = y * torch.sigmoid(y)
+    q = torch.div(y, s_x.view((1,) * x.dim())).clamp(-QMAX, QMAX).to(FP8)
+    return q, s_x
+
+
 # --------------------------------------------------------------------------- weight prep
 def quantize_conv3x3_weight(weight: Tensor) -> Tuple[Tensor, Tensor]:
     """[Cout,Cin,3,3] -> (e4m3 KRSC [Cout,3,3,Cin] contiguous, s_w [Cout] fp32).
