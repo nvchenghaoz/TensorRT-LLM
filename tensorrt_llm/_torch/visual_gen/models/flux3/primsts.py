@@ -1169,6 +1169,8 @@ def qkv_fp8_attention_forward(
         x.quantized_by if isinstance(x, NVFP4Activation) else None,
         backend.scale,
         bool(v_live),
+        # False (i2i reference-stream blocks): dynamic Q/K amax, as main's generic route there.
+        bool(getattr(attn, "_flux3_static_qk", True)),
     )
     if side_gate_up is not None:
         from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
