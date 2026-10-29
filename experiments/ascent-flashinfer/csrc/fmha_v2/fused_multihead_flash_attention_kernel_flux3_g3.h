@@ -442,6 +442,12 @@ inline void make_map(CUtensorMap* map, void const* ptr, int b, int s, int h, int
 
 inline bool supported(bert::Fused_multihead_attention_params_v2 const& params,
                       bert::Fused_multihead_attention_launch_params const& launch_params) {
+#if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
+  // G3's epilogue writes BF16 through Gmem_tile_o only. An NVFP4-out module hands its FP4 buffer
+  // (B*S*H*D/2 bytes) to the kernel as o_ptr, so a G3 store there would overrun it 4x: every
+  // call of such a module takes the 4-warp launcher, which carries the NVFP4 store.
+  return false;
+#endif
   if (launch_params.attention_mask_type != fmha::Attention_mask_type::PADDING) return false;
   if (params.has_alibi || params.softmax_stats_ptr != nullptr) return false;
   if (params.cu_q_seqlens != nullptr || params.cu_kv_seqlens != nullptr) return false;
