@@ -289,7 +289,40 @@ def run_bench():
     }))
 
 
+def run_ncu():
+    # Main's kernel (git 762d1fc6) and this tree's, 2 calls each per M class, for profile_kernels.
+    import subprocess
+    import types
+
+    path = "tensorrt_llm/_torch/visual_gen/models/flux3/flux3_adaln_quant.py"
+    src = subprocess.check_output(
+        ["git", "show", f"762d1fc684da3037a392f48af7539a52b7250758:{path}"], text=True
+    ).split("@torch.library.custom_op")[0]
+    src = src.replace("from .primsts import",
+                      "from tensorrt_llm._torch.visual_gen.models.flux3.primsts import")
+    mm = types.ModuleType("b132_main_faq")
+    mm.__file__ = "/tmp/b132_main_faq_ncu.py"
+    with open(mm.__file__, "w") as f:
+        f.write(src)
+    exec(compile(src, mm.__file__, "exec"), mm.__dict__)
+    cand = faq._adaln_nvfp4_kernel
+    cases = {n: (k, a) for n, k, a in make_cases()}
+    for arm, kern in (("main", mm._adaln_nvfp4_kernel), ("cand", cand)):
+        faq._adaln_nvfp4_kernel = kern
+        for cname in ("single_M4176", "mode_M4096_step0"):
+            kk, aa = cases[cname]
+            _, gg = gs_for(kk, aa)
+            for _ in range(2):
+                fused(kk, aa, gg, False, poison=False,
+                      outs=fused(kk, aa, gg, False))
+            torch.cuda.synchronize()
+            print("ncu", arm, cname, flush=True)
+    faq._adaln_nvfp4_kernel = cand
+
+
 if MODE == "check":
     run_check()
+elif MODE == "ncu":
+    run_ncu()
 else:
     run_bench()
