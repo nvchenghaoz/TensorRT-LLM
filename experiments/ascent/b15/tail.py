@@ -75,8 +75,14 @@ def main():
         inputs_ok = all(torch.equal(a, b) for a, b in zip(pristine, pr.inputs(c)))
         ok = n_eq == pr.WARMUP + pr.ITERS and inputs_ok
         passed &= ok
+        from tensorrt_llm._torch.visual_gen.models.flux3 import (
+            flux3_sm120_lpt_pair_residual as lptr,
+        )
+
         out["check"][f"M{m}_{form}"] = {"fused_vs_base_bitwise": f"{n_eq}/{pr.WARMUP + pr.ITERS}",
-                                        "inputs_unchanged": inputs_ok}
+                                        "inputs_unchanged": inputs_ok,
+                                        "route_gate_form_takes_fused": bool(lptr.gate_form(
+                                            c["gate"], c["index"], m, H))}
         s = torch.cuda.Stream()
 
         def seq(f):

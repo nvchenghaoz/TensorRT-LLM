@@ -106,11 +106,27 @@ def available(device: torch.device) -> bool:
     return lpt.enabled() and _sm120_linear_backend() == "cutlass"
 
 
+# Row range the fused op serves. Fused-128 at Heuristic raster (AlongM) loses to main's t256 pair
+# + Inductor gated residual at large M: i2i single blocks M=32848 ([1,3,D] table + u8 index)
+# 3.360 vs 3.025 ms per tail, outputs bitwise (branch 15 job 300; A/A 0.7 us). At M=16464 it wins
+# (1.009 vs 1.114 ms). So M >= _DECLINE_MIN_ROWS takes main's route (range check, never an M
+# equality). Before branch 15 no caller reached this op at M >= 24576 (the i2i singles carried a
+# per-token gate), so every route that existed is unchanged.
+_DECLINE_MIN_ROWS = 24576
+
+
+def serves(rows: int) -> bool:
+    """Whether the fused op takes a call of `rows` output rows (see _DECLINE_MIN_ROWS)."""
+    return 0 < rows < _DECLINE_MIN_ROWS
+
+
 def gate_form(
     gate: torch.Tensor, index: torch.Tensor | None, rows: int, width: int
 ) -> bool:
     """Whether (gate, index) is a row table this op takes: [1, R, D] bf16 with a [1, rows, 1]
-    bool/uint8 index, or [1, 1, D] without one."""
+    bool/uint8 index, or [1, 1, D] without one, at a row count it serves."""
+    if not serves(rows):
+        return False
     if gate.dim() != 3 or gate.shape[0] != 1 or gate.shape[-1] != width:
         return False
     if gate.dtype != torch.bfloat16:
