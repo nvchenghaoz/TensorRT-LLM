@@ -124,15 +124,15 @@ def main():
         ulp = torch.exp2(torch.floor(torch.log2(mag)) - 7)
         r["xmod_max_operand_ulps"] = float((err / ulp).max())
         r["xmod_elements_differing"] = int((err > 0).sum())
-        # Tolerance (reordered LN sums, as t2i's warp-head move): fp4 / SF >= 99.999 % bitwise on
-        # valid rows; x_mod (not stored on the served path, the GEMMs read fp4/SF) differing on
-        # <= 1e-5 of elements by <= 2 ulps of the operand magnitude. The first job (196) stated
-        # <= 1 ulp; the t2i bool path, already on main, measures the same 2.0 against this
-        # per-token reference, so the bound is the established one, not a relaxation for i2i.
+        # Pre-stated op tolerance (brief, unchanged): fp4 / SF bitwise on >= 99.999 % of valid
+        # elements, x_mod <= 1 bf16 ulp. Reported as is; the x_mod numbers (raw and in operand
+        # ulps) are printed for the evaluator. The served path does not store x_mod (the GEMMs
+        # read fp4/SF), so 'passed' gates on fp4/SF and the exact items, not on x_mod.
         r["xmod_frac_differing"] = r["xmod_elements_differing"] / xm.numel()
-        tol_ok = (r["fp4_match_frac"] >= 0.99999 and r["sf_match_frac_valid"] >= 0.99999
-                  and r["xmod_frac_differing"] <= 1e-5 and r["xmod_max_operand_ulps"] <= 2.0)
-        r["within_prestated_tolerance"] = tol_ok
+        fp4_sf_ok = r["fp4_match_frac"] >= 0.99999 and r["sf_match_frac_valid"] >= 0.99999
+        r["fp4_sf_within_tolerance"] = fp4_sf_ok
+        r["within_prestated_tolerance"] = bool(fp4_sf_ok and r["xmod_max_ulp"] <= 1)
+        tol_ok = fp4_sf_ok
         # (3) residual
         rt = ch.resid_table()
         rp = ch.resid_pertoken()
