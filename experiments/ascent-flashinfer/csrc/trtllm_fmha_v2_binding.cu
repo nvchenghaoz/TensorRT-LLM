@@ -433,6 +433,17 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   params.is_uniform_q = batch_size > 0;
 
 #if defined(FMHA_FLUX3_D128_LAUNCHER)
+#if defined(FMHA_FLUX3_LOAD_TRIM) && FMHA_FLUX3_LOAD_TRIM
+#ifndef FMHA_FLUX3_LDT_STRIDE
+#define FMHA_FLUX3_LDT_STRIDE 3072
+#endif
+  // load_trim compiles the K/V row stride in (gmem_tile_qkv_packed.h); the Python router only
+  // sends calls with that stride here, any other stride must use the untrimmed module.
+  TVM_FFI_ICHECK(params.k_stride_in_bytes == FMHA_FLUX3_LDT_STRIDE &&
+                 params.v_stride_in_bytes == FMHA_FLUX3_LDT_STRIDE)
+      << "FLUX.3 d128 load_trim module needs K/V row stride " << FMHA_FLUX3_LDT_STRIDE
+      << " bytes, got " << params.k_stride_in_bytes << "/" << params.v_stride_in_bytes;
+#endif
   if (head_dim == 128 && head_dim_v == 128 && data_type == DATA_TYPE_E4M3 &&
       output_dtype == DATA_TYPE_BF16) {
     FMHA_FLUX3_D128_LAUNCHER(params, launch_params, stream);
