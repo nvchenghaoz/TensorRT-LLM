@@ -243,7 +243,7 @@ def parent(ckpt, outdir, order):
         outdir = os.path.join(os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp"), "idea184_step0")
     os.makedirs(outdir, exist_ok=True)
     try:
-        for c in ("434118cf", "1185e8f9"):
+        for c in ("0b4693c4", "434118cf"):
             rc = subprocess.run(["git", "-C", WT, "merge-base", "--is-ancestor", c, "HEAD"]).returncode
             log(f"[ancestry] {c} is_ancestor rc={rc}")
         log("[head] " + subprocess.run(["git", "-C", WT, "rev-parse", "HEAD"], capture_output=True,

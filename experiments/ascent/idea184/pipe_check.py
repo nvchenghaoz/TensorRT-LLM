@@ -161,8 +161,8 @@ def parent():
     out = {}
     head = subprocess.run(["git", "-C", WT, "rev-parse", "HEAD"], capture_output=True,
                           text=True).stdout.strip()
-    rc = subprocess.run(["git", "-C", WT, "merge-base", "--is-ancestor", "434118cf", "HEAD"]).returncode
-    log(f"[head] {head} ancestry(434118cf) rc={rc}")
+    rc = subprocess.run(["git", "-C", WT, "merge-base", "--is-ancestor", "0b4693c4", "HEAD"]).returncode
+    log(f"[head] {head} ancestry(0b4693c4) rc={rc}")
     for env in ("1", "0"):
         cmd = [sys.executable, __file__, CKPT, "--child"]
         e = dict(os.environ, TRTLLM_FLUX3_ATTN_NVFP4_OUT=env)

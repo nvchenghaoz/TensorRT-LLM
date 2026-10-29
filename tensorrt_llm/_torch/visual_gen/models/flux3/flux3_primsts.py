@@ -1589,10 +1589,15 @@ def attn_nvfp4_out_enabled() -> bool:
     return os.environ.get("TRTLLM_FLUX3_ATTN_NVFP4_OUT", "1").strip() != "0"
 
 
-def attn_nvfp4_out_module():
+def attn_nvfp4_out_module(key: torch.Tensor | None = None, value: torch.Tensor | None = None):
+    """The routed fmha_v2 flux3 module plus lever nvfp4_out: the levers main's
+    run_fmha_v2_fp8_sm12x picks for these K/V (load_trim_levers), or ROUTED_LEVERS at preload."""
     from tensorrt_llm._torch.visual_gen.attention.backends import fmha_v2_flux3 as fx
 
-    return fx.get_flux3_d128_module((*fx.ROUTED_LEVERS, "nvfp4_out"))
+    levers = fx.ROUTED_LEVERS
+    if key is not None and value is not None:
+        levers = fx.load_trim_levers(levers, key, value)
+    return fx.get_flux3_d128_module((*levers, "nvfp4_out"))
 
 
 def _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight):
@@ -1608,7 +1613,7 @@ def _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight):
     sf = torch.empty((fx.nvfp4_scale_bytes(rows, width),), dtype=torch.uint8, device=qkv8.device)
     fx.fmha_v2_flux3_d128_nvfp4_out(
         q8, k8, v8, fp4, sf, nvfp4_owner(attn_weight).inverse_scale, heads, head_dim, seq_len,
-        scale_bmm1_d=scales[3:4], scale_bmm2_d=scales[2:3], module=attn_nvfp4_out_module(),
+        scale_bmm1_d=scales[3:4], scale_bmm2_d=scales[2:3], module=attn_nvfp4_out_module(k8, v8),
     )
     return fp4, sf
 

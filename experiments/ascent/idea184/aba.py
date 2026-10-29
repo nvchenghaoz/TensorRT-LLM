@@ -112,8 +112,8 @@ def parent(ckpt, order, warm, timed):
     os.makedirs(outdir, exist_ok=True)
     head = subprocess.run(["git", "-C", WT, "rev-parse", "HEAD"], capture_output=True,
                           text=True).stdout.strip()
-    rc = subprocess.run(["git", "-C", WT, "merge-base", "--is-ancestor", "434118cf", "HEAD"]).returncode
-    log(f"[head] {head} ancestry(434118cf) rc={rc}")
+    rc = subprocess.run(["git", "-C", WT, "merge-base", "--is-ancestor", "0b4693c4", "HEAD"]).returncode
+    log(f"[head] {head} ancestry(0b4693c4) rc={rc}")
     results = []
     for i, arm in enumerate(order):
         out = os.path.join(outdir, f"arm{i}_{arm}.json")
