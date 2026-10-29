@@ -12,7 +12,8 @@ untimed test request, i.e. check.py's run A. Per arm:
     Dynamo/Inductor compile, a recompile or a cuDNN FE FP8 plan build; plus per-request server
     post_denoise ms (a compile inside a request would add seconds).
 Between arms (first label = base): per-prompt PSNR/LPIPS candidate vs base.
-Last stdout line: {"passed": ...} = every arm valid, all 12 within gate v2, pass 2 == pass 1 within tol.
+Last stdout line: {"passed": ...} = every arm: at most max(1, ceil(10%)) = 2 of the 12 prompts outside
+gate v2 (the controller's allowance) and pass 2 vs pass 1 within tolerance for all 12.
 """
 
 import hashlib
@@ -56,6 +57,7 @@ PROMPTS = [
     "A robot chef cooking pancakes in a modern kitchen",
 ]
 LPIPS_MAX, PSNR_MIN = 0.265977, 17.658
+ALLOWED = max(1, math.ceil(0.1 * 12))  # the controller's diverging-prompt allowance
 _LP = {}
 
 
@@ -174,7 +176,10 @@ for spec in sys.argv[1:]:
            "audit": {"warmup_completed_line": w_end, "compile_or_build_lines_after_warmup": after[:10],
                      "n_after_warmup": len(after), "fp8_lines_before_warmup_end": before_fp8[:16]},
            "_imgs": {k: sorted(v)[0][1] for k, v in imgs.items()}}
-    arm["passed"] = arm["c1_within_gate"] == 12 and arm["repeat_within_tol"] and not ref_err
+    arm["diverging"] = [r["key"] for r in rows if not r["passed"]]
+    # check.py policy: at most max(1, ceil(10% of 12)) = 2 diverging prompts, passing majority.
+    arm["passed"] = (len(arm["diverging"]) <= ALLOWED and len(rows) == 12 and arm["repeat_within_tol"]
+                     and not ref_err)
     arms.append(arm)
     log(json.dumps({k: v for k, v in arm.items() if k not in ("_imgs", "c1_pass1", "repeat_pairs")}))
     for r in rows:
