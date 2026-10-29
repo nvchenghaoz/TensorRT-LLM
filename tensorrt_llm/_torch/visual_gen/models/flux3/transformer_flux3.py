@@ -272,6 +272,52 @@ def _use_fused_qkv(config: DiffusionModelConfig) -> bool:
     return quant_algo != QuantAlgo.NVFP4  # static NVFP4 may have mismatched per-shard scales
 
 
+def prepare_text_qkv_weight(attn: nn.Module, config: DiffusionModelConfig) -> bool:
+    """Set attn._flux3_bf16_qkv_weight to cat([to_q, to_k, to_v].weight) (and the bias) for a
+    separate-QKV attention whose three projections are plain BF16 Linears, else None.
+
+    attn_pre_out then runs one F.linear on the [3*D, K] weight and splits the views, which
+    is bitwise equal to the three F.linear calls (same cuBLAS math per output column).
+    Called from prepare_primsts_weights (after load and LoRA merge), so the copy is fresh.
+    Kill switch TRTLLM_FLUX3_P_TEXT_GEMM=0 keeps the three separate calls.
+    """
+    from tensorrt_llm._torch.modules.linear import UnquantizedLinearMethod
+
+    attn._flux3_bf16_qkv_weight = None
+    attn._flux3_bf16_qkv_bias = None
+    if os.environ.get("TRTLLM_FLUX3_P_TEXT_GEMM", "1") == "0":
+        return False
+    if getattr(attn, "qkv_mode", None) != QKVMode.SEPARATE_QKV:
+        return False
+    if config.extra_attrs.get("force_unfused_lora_topology"):
+        return False
+    if (config.mapping.tp_size if config.mapping else 1) != 1:
+        return False
+    layers = [getattr(attn, name, None) for name in ("to_q", "to_k", "to_v")]
+    for layer in layers:
+        if not isinstance(layer, Linear) or type(layer.quant_method) is not UnquantizedLinearMethod:
+            return False
+        if any(name.startswith("_flux3_primsts") for name in vars(layer)):
+            return False
+        if getattr(layer, "use_custom_cublas_mm", False) or getattr(
+            layer, "use_cute_dsl_bf16_gemm", False
+        ):
+            return False
+        if getattr(layer, "lora", None) is not None:
+            return False
+        w = layer.weight
+        if w.dtype != torch.bfloat16 or w.ndim != 2 or w.shape[1] != layers[0].weight.shape[1]:
+            return False
+    biases = [layer.bias for layer in layers]
+    if any(b is None for b in biases) and not all(b is None for b in biases):
+        return False
+    with torch.no_grad():
+        attn._flux3_bf16_qkv_weight = torch.cat([layer.weight for layer in layers], 0).contiguous()
+        if biases[0] is not None:
+            attn._flux3_bf16_qkv_bias = torch.cat(biases, 0).contiguous()
+    return True
+
+
 def _use_fused_proj_out(config: DiffusionModelConfig) -> bool:
     if config.extra_attrs.get("force_unfused_lora_topology"):
         return False
@@ -613,6 +659,18 @@ class Flux3Attention(Attention):
             if isinstance(projection_input, NVFP4Activation)
             else projection_input
         )
+        fused_qkv_weight = getattr(self, "_flux3_bf16_qkv_weight", None)
+        if (
+            separate is None
+            and fused_qkv_weight is not None
+            and isinstance(native_input, Tensor)
+            and native_input.dtype == torch.bfloat16
+            and native_input.numel() > 32 * native_input.shape[-1]
+        ):
+            # Exact: one F.linear on cat([wq, wk, wv]) + split views (prepare_text_qkv_weight).
+            separate = F.linear(
+                native_input, fused_qkv_weight, self._flux3_bf16_qkv_bias
+            ).split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
         q, k, v = separate if separate is not None else self.get_qkv(native_input)
         q = q.view(b, -1, self.local_num_attention_heads, self.head_dim)
         k = k.view(b, -1, self.local_num_attention_heads, self.head_dim)
@@ -2163,3 +2221,16 @@ class Flux3Model(BaseDiffusionModel):
         fused_heads = prepare_fp8r_adaln_quant(blocks)
         if fused_heads:
             logger.info(f"FLUX.3 FP8R fused LN+adaLN+E4M3 quantize head: {fused_heads}")
+        self.prepare_text_qkv_weights()
+
+    def prepare_text_qkv_weights(self) -> list:
+        """One BF16 GEMM on a cat([wq, wk, wv]) weight for the txt_mode_blocks' separate-QKV
+        path (exact; TRTLLM_FLUX3_P_TEXT_GEMM=0 keeps three)."""
+        fused = [
+            f"txt_mode_blocks.{i}"
+            for i, block in enumerate(self.txt_mode_blocks)
+            if prepare_text_qkv_weight(getattr(block, "_orig_mod", block).attn, self.model_config)
+        ]
+        if fused:
+            logger.info(f"FLUX.3 fused BF16 text QKV GEMM (exact): {fused}")
+        return fused
