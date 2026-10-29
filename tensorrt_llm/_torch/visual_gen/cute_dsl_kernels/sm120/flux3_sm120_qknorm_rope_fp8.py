@@ -80,6 +80,21 @@ _SM_COUNT = {}
 VEC = os.environ.get("TRTLLM_FLUX3_QKV_FP8_VEC", "1").strip() != "0"
 _VEC_CTAS_PER_SM = 4
 
+# Static Q/K scale (idea 268; precision class). TRTLLM_FLUX3_QKV_FP8_STATIC_QK=0 restores main's
+# per-tensor amax route byte for byte. VEC path with internal partials only (the non-VEC fold, the
+# three-launch path and external_partials keep main's dynamic Q/K amax).
+# Bound: the kernel's inv_rms = rsqrt(ss/128 + eps) gives |x_i| * inv_rms <= sqrt(128), so the
+# (even, odd) pair norm after the weight is <= sqrt(128) * max|w|; RoPE (fp32 cos/sin) keeps the
+# pair norm and the BF16 round adds <= 2^-8. B' = mul_rn(mul_rn(sqrt(128), max|w|), 1 + 2^-6)
+# bounds every |rot| of every token; scale = bf16(max(B'/448, min)) as main's rule with B' in
+# place of the amax, so |rot * factor| <= ~0.992 * 448 (satfinite stays a guard). B' depends
+# only on the norm weights (kernel args), so mode 1 runs on V only: Q/K warps skip their rows and
+# only parts[2, cta] is written; mode 2 derives the Q/K factor in-kernel and the V factor from
+# the V partials exactly as main. scales[8] contract unchanged; V bytes and V scale bitwise main.
+STATIC_QK = os.environ.get("TRTLLM_FLUX3_QKV_FP8_STATIC_QK", "1").strip() != "0"
+_SQRT_128 = 11.313708498984761  # fp32 rounds it to 0x41350517 (as cutlass.Float32 does)
+_STATIC_MARGIN = 1.0 + 2.0 ** -6
+
 
 def _fold_grid(device: torch.device, configured: int, per_sm: int = _FOLD_CTAS_PER_SM) -> int:
     if configured > 0:
@@ -791,6 +806,7 @@ def _qknorm_rope_fp8_vec_kernel(
     heads: cutlass.Constexpr,
     src_ld: cutlass.Constexpr,
     mode: cutlass.Constexpr,
+    static_qk: cutlass.Constexpr,
 ):
     """_qknorm_rope_fp8_fold_kernel with vectorized, pipelined data movement (same arithmetic).
 
@@ -836,13 +852,82 @@ def _qknorm_rope_fp8_vec_kernel(
     )
     ring_base = warp * span  # BF16 index of this warp's ring (q/k warps only)
     s_lane = cutlass.Int32(ring.iterator.toint()) + ring_base * 2 + lane * 16
-    if warp < 8:
-        # Row cta's head pairs go in flight before the partial re-reduce below.
-        for s0 in cutlass.range_constexpr(stages):
-            _cp_async16(s_lane + s0 * 512, g_lane + cutlass.Int64(cta) * (src_ld * 2) + s0 * 512)
-            _cp_async_commit()
+    skip_qk = static_qk and mode == 1  # static mode 1: Q/K warps do nothing
+    if cutlass.const_expr(not skip_qk):
+        if warp < 8:
+            # Row cta's head pairs go in flight before the partial re-reduce below.
+            for s0 in cutlass.range_constexpr(stages):
+                _cp_async16(
+                    s_lane + s0 * 512, g_lane + cutlass.Int64(cta) * (src_ld * 2) + s0 * 512
+                )
+                _cp_async_commit()
     factor = cutlass.Float32(0.0)
-    if cutlass.const_expr(mode == 2):
+    if cutlass.const_expr(mode == 2 and static_qk):
+        # V plane: its <= 3 partials per thread, folded and reduced exactly as below (p = 2).
+        loaded = []
+        for i in cutlass.range_constexpr(3):
+            pidx = tidx + i * 384
+            x = cutlass.Float32(_AMAX_INIT)
+            if pidx < n_part:
+                x = (parts + 2 * n_part + pidx).load()
+            loaded.append(x)
+        part_amax = cutlass.Float32(_AMAX_INIT)
+        for i in cutlass.range_constexpr(3):
+            part_amax = _max_f32(part_amax, loaded[i])
+        for delta in (16, 8, 4, 2, 1):
+            part_amax = _max_f32(
+                part_amax,
+                cute.arch.shuffle_sync_op(part_amax, delta, kind=nvvm.ShflKind.bfly),
+            )
+        if lane == 0:
+            red[24 + warp] = part_amax
+        if warp < 8:
+            # Q/K: B' from max|w| over the plane's 128 norm weights (4 per lane, as hoisted below).
+            norm_b = q_norm if plane == 0 else k_norm
+            w_amax = cutlass.Float32(0.0)
+            for pair_group in cutlass.range_constexpr(2):
+                even_col = 2 * (pair_group * 32 + lane)
+                w_amax = _max_abs(w_amax, (norm_b + even_col).load().to(cutlass.Float32))
+                w_amax = _max_abs(w_amax, (norm_b + even_col + 1).load().to(cutlass.Float32))
+            for delta in (16, 8, 4, 2, 1):
+                w_amax = _max_f32(
+                    w_amax, cute.arch.shuffle_sync_op(w_amax, delta, kind=nvvm.ShflKind.bfly)
+                )
+            if lane == 0:
+                if warp % 4 == 0:
+                    red[plane * 12] = _mul_rn(
+                        _mul_rn(cutlass.Float32(_SQRT_128), w_amax),
+                        cutlass.Float32(_STATIC_MARGIN),
+                    )
+        cute.arch.sync_threads()
+        plane_amax = cutlass.Float32(_AMAX_INIT)
+        if warp < 8:
+            plane_amax = red[plane * 12]
+        else:
+            for w in cutlass.range_constexpr(12):
+                plane_amax = _max_f32(plane_amax, red[24 + w])
+        _, factor = _scale_factor(plane_amax, min_scale)
+        if cta == 0:
+            out_scales = cute.make_tensor(scales, cute.make_layout(8))
+            for p in cutlass.range_constexpr(2):
+                if tidx == p:
+                    s_p, f_p = _scale_factor(red[p * 12], min_scale)
+                    out_scales[p] = s_p
+                    out_scales[4 + p] = f_p
+            if tidx == 2:
+                amax_v = cutlass.Float32(_AMAX_INIT)
+                for w in cutlass.range_constexpr(12):
+                    amax_v = _max_f32(amax_v, red[24 + w])
+                s_v, f_v = _scale_factor(amax_v, min_scale)
+                out_scales[2] = s_v
+                out_scales[6] = f_v
+            if tidx == 3:
+                s_q, _ = _scale_factor(red[0], min_scale)
+                s_k, _ = _scale_factor(red[12], min_scale)
+                out_scales[3] = _mul_rn(_mul_rn(s_q, s_k), sm_scale)
+            if tidx == 4:
+                out_scales[7] = cutlass.Float32(0.0)
+    if cutlass.const_expr(mode == 2 and not static_qk):
         # Plane by plane: load this plane's <= 3 partials, fold them in the same order, reduce the
         # warp, then the next plane (keeps only 3 loaded values live; max is order-free anyway).
         for p in cutlass.range_constexpr(3):
@@ -893,6 +978,7 @@ def _qknorm_rope_fp8_vec_kernel(
                 out_scales[7] = cutlass.Float32(0.0)
     amax = cutlass.Float32(_AMAX_INIT)
     if warp < 8:
+      if cutlass.const_expr(not skip_qk):  # noqa: E111 (static mode 1: Q/K warps idle)
         norm = q_norm if plane == 0 else k_norm
         weights = []
         for pair_group in cutlass.range_constexpr(2):
@@ -971,11 +1057,19 @@ def _qknorm_rope_fp8_vec_kernel(
             red[warp] = amax
         cute.arch.sync_threads()
         cta_amax = cutlass.Float32(_AMAX_INIT)
-        if tidx < 3:
-            for w in cutlass.range_constexpr(4):
-                cta_amax = _max_f32(cta_amax, red[tidx * 4 + w])
-            partial = cute.make_tensor(parts + tidx * n_part + cta, cute.make_layout(1))
-            partial[0] = cta_amax
+        if cutlass.const_expr(static_qk):
+            # Only the V partial (rows 0/1 of parts are neither written nor read when static).
+            if tidx == 2:
+                for w in cutlass.range_constexpr(4):
+                    cta_amax = _max_f32(cta_amax, red[8 + w])
+                partial = cute.make_tensor(parts + 2 * n_part + cta, cute.make_layout(1))
+                partial[0] = cta_amax
+        else:
+            if tidx < 3:
+                for w in cutlass.range_constexpr(4):
+                    cta_amax = _max_f32(cta_amax, red[tidx * 4 + w])
+                partial = cute.make_tensor(parts + tidx * n_part + cta, cute.make_layout(1))
+                partial[0] = cta_amax
 
 
 @cute.jit
@@ -998,11 +1092,12 @@ def _launch_vec(
     heads: cutlass.Constexpr,
     src_ld: cutlass.Constexpr,
     mode: cutlass.Constexpr,
+    static_qk: cutlass.Constexpr,
     stream,
 ):
     _qknorm_rope_fp8_vec_kernel(
         src, k_off, v_off, dst, parts, scales, q_norm, k_norm, cos_sin, positions, rows, n_part,
-        sm_scale, min_scale, heads, src_ld, mode,
+        sm_scale, min_scale, heads, src_ld, mode, static_qk,
     ).launch(
         grid=[grid, 1, 1], block=[12 * 32, 1, 1], stream=stream,
         min_blocks_per_mp=_VEC_CTAS_PER_SM,
@@ -1018,8 +1113,10 @@ def _vec_supported(q, k, v, heads, src_ld) -> bool:
     )
 
 
-def _fold_pass(mode, key_base, args, rows, n_part, grid, sm_scale, vec=False):
-    key = key_base + (("vec" if vec else "fold"), mode)
+def _fold_pass(mode, key_base, args, rows, n_part, grid, sm_scale, vec=False, static_qk=False):
+    static_qk = bool(vec and static_qk)
+    # Main's keys unchanged; the static-Q/K VEC kernels get their own entries.
+    key = key_base + (("vec" if vec else "fold"), mode) + (("static_qk",) if static_qk else ())
     stream = cutlass_torch.current_stream()
     compiled = _COMPILED.get(key)
     src, k_off, v_off, dst, parts, scales, qn, kn, cs, pos = args
@@ -1029,10 +1126,16 @@ def _fold_pass(mode, key_base, args, rows, n_part, grid, sm_scale, vec=False):
         cutlass.Float32(sm_scale), cutlass.Float32(_MIN_SCALING_FACTOR),
     )
     if compiled is None:
-        compiled = cute.compile(
-            _launch_vec if vec else _launch_fold, src, k_off, v_off, dst, parts, scales, qn, kn,
-            cs, pos, *rt, heads, src_ld, mode, stream,
-        )
+        if vec:
+            compiled = cute.compile(
+                _launch_vec, src, k_off, v_off, dst, parts, scales, qn, kn, cs, pos, *rt, heads,
+                src_ld, mode, static_qk, stream,
+            )
+        else:
+            compiled = cute.compile(
+                _launch_fold, src, k_off, v_off, dst, parts, scales, qn, kn, cs, pos, *rt, heads,
+                src_ld, mode, stream,
+            )
         _COMPILED[key] = compiled
     compiled(src, k_off, v_off, dst, parts, scales, qn, kn, cs, pos, *rt, stream)
 
@@ -1106,7 +1209,9 @@ def qknorm_rope_fp8(
     Returns (qkv8, scales): qkv8 float8_e4m3fn [3, M, W] (contiguous q, k, v planes) and FP32
     scales[8] = [q_descale, k_descale, v_descale, q_descale*k_descale*sm_scale, q_factor,
     k_factor, v_factor, 0]. Bitwise equal to qknorm_rope (BF16) followed by
-    fp8_sm12x.quantize_qkv_e4m3 on the same rows. q/k/v are only read.
+    fp8_sm12x.quantize_qkv_e4m3 on the same rows, except that with STATIC_QK (VEC, internal
+    partials) the q/k scales come from the RMSNorm bound B' (see STATIC_QK) instead of the
+    amax; v and its scale stay bitwise. q/k/v are only read.
     """
     rows, width = q.shape[0], q.shape[1]
     heads = width // 128
@@ -1146,10 +1251,12 @@ def qknorm_rope_fp8(
                 raise ValueError("partials must be contiguous FP32 [3, n_part], n_part <= 1024")
         part_ptr = make_ptr(cutlass.Float32, fold_parts.data_ptr(), assumed_align=16)
         ptrs = (src, *common, dst, part_ptr, scale_ptr, qn, kn, cs, pos)
+        # Static Q/K scale: VEC with this call's own mode 1 only (read per call).
+        static_qk = bool(STATIC_QK and vec and external_partials is None)
         if external_partials is None:
-            _fold_pass(1, key_base, ptrs, rows, n_part, n_part, sm_scale, vec)
+            _fold_pass(1, key_base, ptrs, rows, n_part, n_part, sm_scale, vec, static_qk)
         grid2 = max(1, min(rows, _fold_grid(device, _FOLD_GRID2, per_sm)))
-        _fold_pass(2, key_base, ptrs, rows, n_part, grid2, sm_scale, vec)
+        _fold_pass(2, key_base, ptrs, rows, n_part, grid2, sm_scale, vec, static_qk)
         return qkv8, scales
     partials = torch.empty(3 * rows * _PARTS_PER_ROW, dtype=torch.float32, device=device)
     part_ptr = make_ptr(cutlass.Float32, partials.data_ptr(), assumed_align=16)
