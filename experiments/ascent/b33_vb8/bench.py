@@ -4,6 +4,9 @@ The same script runs in both trees of run_gpu_pair. Arms built in one process (c
 base (main's served G3 levers), cand (base + v_b8t) and base2 (base + a no-op macro: own .so,
 the A/A copy). In the baseline tree the G3 header has no v_b8t code, so cand == base there.
 kernel_ms of a label = median replay of the tree's ROUTED arm (cand in the branch, base in main).
+noise_floor = max(p90-p10 of the per-round BASE2/BASE A/A ratios, median within-block p90-p10 of
+the routed arm): repeat noise with the run's slow power-cap clock drift removed (pooled_spread,
+over all replays of the drifting run, is reported too).
 
 Labels (served 2048^2, T=80, knowledge 384 / 686, plan 724):
   t2i-2048  graph of 1 BF16-out G3 call at 16384 + 4 nvfp4_out at 16384 + 28 nvfp4_out at 16464
@@ -141,6 +144,7 @@ def main():
         nrep = max(3, int(args.block_s / rep_s))
         log(f"[{lab}] replay ~{rep_s * 1e3:.1f} ms, {nrep} replays per block")
         per = {a: [] for a in arms}
+        block_spread = {a: [] for a in arms}
         rounds = []
         for r in range(args.rounds):
             # both cyclic orders (base->cand->base2 and base->base2->cand), each rotated, so every
@@ -167,6 +171,7 @@ def main():
                 k = min(len(ts) - 1, int(args.drop_s / rep_s))
                 ts = ts[k:]
                 per[a] += ts
+                block_spread[a].append((pctl(ts, 0.9) - pctl(ts, 0.1)) / med(ts))
                 w, mhz = sampler.window(a, tb + args.drop_s, te)
                 row[a] = {"ms": round(med(ts), 4), "W": w, "MHz": mhz}
             row["cand/base"] = round(row["cand"]["ms"] / row["base"]["ms"], 5)
@@ -184,8 +189,17 @@ def main():
         out["inproc"][lab] = summ
         xs = per[routed_arm]
         m = med(xs)
+        # noise_floor: repeat noise of one configuration with the slow power-cap clock drift of
+        # the run removed = max(p90-p10 of the 12 per-round BASE2/BASE A/A ratios, median
+        # within-block p90-p10 of the routed arm). pooled_spread (all replays of the routed arm
+        # across the drifting run) is reported alongside.
+        aa_spread = pctl(aa, 0.9) - pctl(aa, 0.1)
+        blk = med(block_spread[routed_arm])
         out["batch"][lab] = {"kernel_ms": round(m, 4),
-                             "noise_floor": round((pctl(xs, 0.9) - pctl(xs, 0.1)) / m, 4),
+                             "noise_floor": round(max(aa_spread, blk), 4),
+                             "aa_ratio_spread": round(aa_spread, 4),
+                             "within_block_spread": round(blk, 4),
+                             "pooled_spread": round((pctl(xs, 0.9) - pctl(xs, 0.1)) / m, 4),
                              "calls": n_bf16 + n_img + 28, "S_img": s_img, "S_full": s_full}
         log(f"[{lab}] summary {json.dumps({k: v for k, v in summ.items() if k != 'rounds'})}")
         for S in inps:
