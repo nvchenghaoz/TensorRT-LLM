@@ -123,11 +123,14 @@ def run(case):
     return s.elapsed_time(e), h
 
 
+WARM = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 hashes = {"t2i": set(), "i2i": set()}
-for case in ("t2i", "i2i"):
-    ms, h = run(case)
-    hashes[case].add(h)
-    log("warm", case, round(ms, 2))
+for w in range(WARM):  # untimed: lets clocks/thermals settle before timing (drift seen in 339/340)
+    for case in ("t2i", "i2i"):
+        ms, h = run(case)
+        hashes[case].add(h)
+        log("warm", w, case, round(ms, 2))
+INFO["loadavg_timing_start"] = open("/proc/loadavg").read().strip()
 spans = {"t2i": [], "i2i": []}
 for rd in range(ROUNDS):
     for case in ("t2i", "i2i"):
@@ -135,6 +138,9 @@ for rd in range(ROUNDS):
         spans[case].append(ms)
         hashes[case].add(h)
     log("ROUND", rd, {c: round(spans[c][-1], 2) for c in spans})
+
+
+INFO["loadavg_timing_end"] = open("/proc/loadavg").read().strip()
 
 
 def q(v, p):
