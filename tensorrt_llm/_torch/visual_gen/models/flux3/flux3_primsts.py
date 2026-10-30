@@ -128,6 +128,11 @@ def sm120_linear_preload(device: torch.device) -> None:
         from . import flux3_sm120_lpt_pair_residual
 
         flux3_sm120_lpt_pair_residual.preload(device)
+        # The one-launch tail with the gated residual for M >= 24576 (two accumulators per
+        # output tile; TRTLLM_FLUX3_SM120_TAIL_ONE_LAUNCH).
+        from . import flux3_sm120_tail_one_launch
+
+        flux3_sm120_tail_one_launch.preload(device)
         if flux3_sm120_lpt_pair.enabled() and attn_nvfp4_out_enabled():
             # The FMHA nvfp4_out variant module (attn_out's activation from the FMHA epilogue).
             attn_nvfp4_out_module()
@@ -1797,6 +1802,76 @@ def _nvfp4_out_pair_prequant_fake(
             (down_activation.shape[0], down_weight.shape[0]), dtype=torch.bfloat16
         ),
     )
+
+
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_nvfp4_tail_one_launch", mutates_args=(), device_types="cuda"
+)
+def nvfp4_tail_one_launch(
+    down_activation: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_activation_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    attn_data: torch.Tensor,
+    attn_scales: torch.Tensor,
+    attn_weight: torch.Tensor,
+    attn_weight_scale: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    select: torch.Tensor | None,
+    gate_mode: int,
+) -> torch.Tensor:
+    """residual + gate * (attn_out(attn_data) + down(down_activation)) in ONE SM120 launch
+    (flux3_sm120_tail_one_launch), bitwise equal to nvfp4_out_pair_prequant followed by the
+    compiled block's residual pointwise. The operands are nvfp4_out_pair_prequant's; residual is
+    the contiguous BF16 block input ([..., N]); gate is the BF16 modulation gate: gate_mode 0 one
+    [N] row, 1 a [K, N] table indexed per row by select (bool/uint8, True/1 = row 1), 2 per row
+    (same shape as residual)."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_nvfp4 import _scalar
+
+    from . import flux3_sm120_tail_one_launch as tol
+
+    down_owner = nvfp4_owner(down_weight)
+    attn_owner = nvfp4_owner(attn_weight)
+    device = attn_data.device
+    n = attn_weight.shape[0]
+    out = torch.empty(residual.shape, device=device, dtype=residual.dtype)
+    tol.run(
+        attn_data.detach(),
+        attn_weight.detach(),
+        attn_scales.detach(),
+        attn_weight_scale.detach(),
+        _scalar(device, attn_owner.input_global_scale * attn_owner.weight_global_scale),
+        down_activation.detach(),
+        down_weight.detach(),
+        down_activation_scale.detach(),
+        down_weight_scale.detach(),
+        _scalar(device, down_owner.input_global_scale * down_owner.weight_global_scale),
+        residual.detach(),
+        gate.detach().reshape(-1, n),
+        None if select is None else select.detach().reshape(-1),
+        out,
+        gate_mode=int(gate_mode),
+    )
+    return out
+
+
+@nvfp4_tail_one_launch.register_fake
+def _nvfp4_tail_one_launch_fake(
+    down_activation,
+    down_weight,
+    down_activation_scale,
+    down_weight_scale,
+    attn_data,
+    attn_scales,
+    attn_weight,
+    attn_weight_scale,
+    residual,
+    gate,
+    select,
+    gate_mode,
+):
+    return residual.new_empty(residual.shape)
 
 
 @fp8_attention_side_gate_up.register_fake

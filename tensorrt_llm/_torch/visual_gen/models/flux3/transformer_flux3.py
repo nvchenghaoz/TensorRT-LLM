@@ -70,6 +70,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     sm120_attn_nvfp4_out_weight,
     sm120_side_gate_up_args,
     sm120_tail_pair_forward,
+    sm120_tail_one_launch_forward,
     sm120_tail_pair_residual_forward,
     verify_nvfp4_coverage,
 )
@@ -1006,6 +1007,7 @@ class Flux3ModeBlock(nn.Module):
         # Set by prepare_sm120_tail_pair after weight preparation (static, read in forward).
         self._sm120_tail_pair = False
         self._sm120_side_gate_up = 0
+        self._sm120_tail_one_launch = False
 
     def forward(
         self,
@@ -1067,6 +1069,15 @@ class Flux3ModeBlock(nn.Module):
                 )
                 if fused is not None:
                     return fused
+            if getattr(self, "_sm120_tail_one_launch", False):
+                # Tails the route above declines, in this route's M bucket (M >= 24576): down +
+                # attn_out + x + mod_gate * (attn_y + mlp_y) in one launch, bitwise to the pair +
+                # residual below. TRTLLM_FLUX3_SM120_TAIL_ONE_LAUNCH=0 keeps main's path.
+                x_new = sm120_tail_one_launch_forward(
+                    self, attn, mlp_input, gate_up, x, mod_gate
+                )
+                if x_new is not None:
+                    return x_new
             pair = (
                 sm120_tail_pair_forward(self, attn, mlp_input, gate_up)
                 if self._sm120_tail_pair
@@ -1179,6 +1190,7 @@ class Flux3SingleStreamBlock(nn.Module):
         # Set by prepare_sm120_tail_pair after weight preparation (static, read in forward).
         self._sm120_tail_pair = False
         self._sm120_side_gate_up = 0
+        self._sm120_tail_one_launch = False
 
     def forward(
         self,
@@ -1255,6 +1267,15 @@ class Flux3SingleStreamBlock(nn.Module):
                 )
                 if fused is not None:
                     return fused
+            if getattr(self, "_sm120_tail_one_launch", False):
+                # Tails the route above declines (the i2i single blocks' per-token [1, S, D] gate)
+                # in this route's M bucket (M >= 24576): one launch, bitwise to the path below.
+                gate_src, gate_select = (mod[2], mod[3]) if len(mod) == 4 else (mod_gate, None)
+                x_new = sm120_tail_one_launch_forward(
+                    self, attn, mlp_input, gate_up, residual, gate_src, gate_select
+                )
+                if x_new is not None:
+                    return x_new
             pair = (
                 sm120_tail_pair_forward(self, attn, mlp_input, gate_up)
                 if self._sm120_tail_pair
@@ -2364,6 +2385,16 @@ class Flux3Model(BaseDiffusionModel):
             )
         if paired:
             logger.info(f"FLUX.3 SM120 down || attn_out two-stream tail pair: {paired}")
+        one_launch = [
+            name
+            for name, block in blocks
+            if getattr(getattr(block, "_orig_mod", block), "_sm120_tail_one_launch", False)
+        ]
+        if one_launch:
+            logger.info(
+                "FLUX.3 SM120 one-launch block tail (pair + gated residual, M bucket "
+                f"TRTLLM_FLUX3_SM120_TAIL_ONE_LAUNCH_MIN_M): {one_launch}"
+            )
         from tensorrt_llm._torch.visual_gen.models.flux3.flux3_adaln_fp8r import (
             prepare_fp8r_adaln_quant,
         )
