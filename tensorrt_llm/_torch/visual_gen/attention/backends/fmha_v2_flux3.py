@@ -380,6 +380,18 @@ void {kname}_g3(const __grid_constant__ bert::Fused_multihead_attention_params_v
       params, &tm_k, &tm_v);
 }}
 
+#if defined(FMHA_FLUX3_V_CF) && FMHA_FLUX3_V_CF
+// v_cf: the same kernel reading V from the swap23 stage layout (5D map, conflict-free V LDSM).
+extern "C"
+__global__ __launch_bounds__(384, 1)
+void {kname}_g3_vcf(const __grid_constant__ bert::Fused_multihead_attention_params_v2 params,
+                    const __grid_constant__ CUtensorMap tm_k,
+                    const __grid_constant__ CUtensorMap tm_v){{
+  fused_multihead_attention::device_flash_attention_nl_tiled_flux3_g3<Kernel_traits_nl_tiled,
+                                                                      true>(params, &tm_k, &tm_v);
+}}
+#endif
+
 void {launcher}_g3_nl_tiled(
     const bert::Fused_multihead_attention_params_v2 &params,
     const Launch_params &launch_params,
@@ -392,14 +404,31 @@ void {launcher}_g3_nl_tiled(
   CUtensorMap tm_k, tm_v;
   g3::make_map(&tm_k, params.k_ptr, (int)params.b, (int)params.s, (int)params.h_kv, 128,
                (int64_t)params.k_stride_in_bytes, 64, CU_TENSOR_MAP_SWIZZLE_64B);
-  g3::make_map(&tm_v, params.v_ptr, (int)params.b, (int)params.s, (int)params.h_kv, 128,
-               (int64_t)params.v_stride_in_bytes, 128, CU_TENSOR_MAP_SWIZZLE_128B);
+#if defined(FMHA_FLUX3_V_CF) && FMHA_FLUX3_V_CF
+  bool const v_cf = g3::v_swap23_ok(params);
+#else
+  bool const v_cf = false;
+#endif
+  if( v_cf ) {{
+#if defined(FMHA_FLUX3_V_CF) && FMHA_FLUX3_V_CF
+    g3::make_map_v_swap23(&tm_v, params.v_ptr, (int)params.b, (int)params.s, (int)params.h_kv,
+                          128, (int64_t)params.v_stride_in_bytes);
+#endif
+  }} else {{
+    g3::make_map(&tm_v, params.v_ptr, (int)params.b, (int)params.s, (int)params.h_kv, 128,
+                 (int64_t)params.v_stride_in_bytes, 128, CU_TENSOR_MAP_SWIZZLE_128B);
+  }}
   constexpr int smem_size = g3::Layout<Kernel_traits_nl_tiled>::SMEM_BYTES;
   static bool attr_set = false;
   if( !attr_set ) {{
     FMHA_CHECK_CUDA(cudaFuncSetAttribute({kname}_g3,
                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          smem_size));
+#if defined(FMHA_FLUX3_V_CF) && FMHA_FLUX3_V_CF
+    FMHA_CHECK_CUDA(cudaFuncSetAttribute({kname}_g3_vcf,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         smem_size));
+#endif
     attr_set = true;
   }}
   // Q-row prefix (run_q_rows / run_nvfp4_out_q_rows): 0 or >= params.s runs all rows. The kernel
@@ -411,6 +440,12 @@ void {launcher}_g3_nl_tiled(
   }}
   int q_tiles = (q_rows + 63) / 64;
   dim3 grid((q_tiles + g3::GROUPS - 1) / g3::GROUPS, params.h, params.b);
+#if defined(FMHA_FLUX3_V_CF) && FMHA_FLUX3_V_CF
+  if( v_cf ) {{
+    {kname}_g3_vcf<<<grid, g3::THREADS, smem_size, stream>>>(params, tm_k, tm_v);
+    return;
+  }}
+#endif
   {kname}_g3<<<grid, g3::THREADS, smem_size, stream>>>(params, tm_k, tm_v);
 }}
 """
@@ -436,3 +471,14 @@ _LEVER_FLAGS["v_b8t"] = ("vb8", "-DFMHA_FLUX3_V_B8T=1")
 
 if _os_st.environ.get("TRTLLM_FMHA_V2_FLUX3_VB8", "1") != "0" and "g3" in ROUTED_LEVERS:
     ROUTED_LEVERS = (*ROUTED_LEVERS, "v_b8t")
+
+# v_cf (FMHA_FLUX3_V_CF, flux3_g3.h + the g3 launcher; needs v_b8t; bitwise vs the same levers
+# without it): the V TMA uses a 5D map that writes each 16-key group with key bits 2 and 3
+# swapped, and the v_b8t lane offsets address swap23(key), so the V
+# ldmatrix.m16n16.x2.trans.b8 loads are bank-conflict free (4 wavefronts instead of 8). Calls
+# with s % 16 != 0 (or b > 1 and s % 64 != 0) run the unchanged G3 kernel with the 4D map.
+# TRTLLM_FMHA_V2_FLUX3_VCF=0 drops it from the routed set.
+_LEVER_FLAGS["v_cf"] = ("vcf", "-DFMHA_FLUX3_V_CF=1")
+
+if _os_st.environ.get("TRTLLM_FMHA_V2_FLUX3_VCF", "1") != "0" and "v_b8t" in ROUTED_LEVERS:
+    ROUTED_LEVERS = (*ROUTED_LEVERS, "v_cf")
