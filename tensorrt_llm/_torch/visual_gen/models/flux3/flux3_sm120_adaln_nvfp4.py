@@ -473,9 +473,13 @@ _DEFAULT_DEFINES = ("MINB=12",)
 _X_POLICY = int(os.environ.get("TRTLLM_FLUX3_ADALN_WARP_X_POLICY", "0").strip() or "0")
 if _X_POLICY not in (0, 1, 2):
     raise ValueError(f"TRTLLM_FLUX3_ADALN_WARP_X_POLICY must be 0, 1 or 2, got {_X_POLICY}")
-# Descending CTA row order (TRTLLM_FLUX3_ADALN_WARP_ROW_REV, default 0 = main's cubin): only the
-# bool / no-select builds take it, never the u8 SEL_INDEX build. Exact. Resolved at call time.
-_ROW_REV = int(os.environ.get("TRTLLM_FLUX3_ADALN_WARP_ROW_REV", "0").strip() or "0")
+# Descending CTA row order (TRTLLM_FLUX3_ADALN_WARP_ROW_REV; 0 = the previous cubin byte for
+# byte): only the bool / no-select builds take it, never the u8 SEL_INDEX build. Exact (same rows,
+# same per-row math). After the AlongN fused pair+residual writer the last-written x rows are
+# still in L2, so walking rows from the top reads them first: in-model at 2048^2 the 16464 bool
+# head runs 87.7 -> 65.3 us/call and the 16384 row head 88 -> 67 us/call; the next QKV GEMM loses
+# ~9 us/call, net t2i denoise -8 ms/request (branch 51, job 580). Resolved at call time.
+_ROW_REV = int(os.environ.get("TRTLLM_FLUX3_ADALN_WARP_ROW_REV", "1").strip() or "0")
 _MODULES = {}
 COMPILE_SECONDS = {}
 NUM_REGS = {}
