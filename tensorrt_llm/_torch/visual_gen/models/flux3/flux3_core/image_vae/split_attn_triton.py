@@ -160,7 +160,14 @@ def can_use(q: Tensor) -> bool:
         and c % CFG_A["BK"] == 0
         and c % CFG_B["BN"] == 0
         and t >= CFG_A["BN"]
+        and _nt_ok(t // CFG_A["BN"])
     )
+
+
+def _nt_ok(nt: int) -> bool:
+    """Kernel B reduces the [T, NT] tile maxes in unmasked chunks of MPC = min(64, NT) columns,
+    so NT must be a power of two <= 64 or a multiple of 64 (other T keep landing 25's path)."""
+    return nt >= 1 and ((nt <= 64 and nt & (nt - 1) == 0) or nt % 64 == 0)
 
 
 def qk_tilemax(q: Tensor, k: Tensor, cfg: dict = None) -> tuple[Tensor, Tensor]:
