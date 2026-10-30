@@ -868,6 +868,16 @@ FLUX3_BROADCAST_ADALN = True
 # The step-batched flow-map text stream (flow_map_text_step) hands forward its single_* rows
 # as broadcast [1, 1, D] rows too, so the single blocks keep the table + select path.
 FLUX3_TEXT_STEP_BROADCAST = True
+# More than two joint chunks whose single_* rows are all broadcast [1, 1, D] (i2i: image,
+# image_cond, text): [1, K, D] tables + a u8 [1, S, 1] chunk index instead of per-token
+# [1, S, D] modulation, so the fused adaLN+NVFP4 head serves those single blocks too.
+# TRTLLM_FLUX3_JOINT_TABLE=0 restores the per-token path.
+FLUX3_JOINT_TABLE = os.environ.get("TRTLLM_FLUX3_JOINT_TABLE", "1").strip().lower() not in (
+    "0",
+    "off",
+    "false",
+    "",
+)
 
 
 def _cond_primsts_enabled() -> bool:
@@ -886,7 +896,18 @@ def _flux3_select_mod(mod: tuple) -> Tuple[Tensor, Tensor, Tensor]:
     if len(mod) == 3:
         return mod
     shift, scale, gate, select = mod
-    return tuple(torch.where(select, value[:, 1:2], value[:, 0:1]) for value in (shift, scale, gate))
+    if select.dtype == torch.bool:
+        return tuple(
+            torch.where(select, value[:, 1:2], value[:, 0:1]) for value in (shift, scale, gate)
+        )
+    # u8 chunk index into [1, K, D] tables (K = 3 on i2i): nested exact value copies.
+    out = []
+    for value in (shift, scale, gate):
+        picked = value[:, 0:1]
+        for row in range(1, value.shape[1]):
+            picked = torch.where(select == row, value[:, row : row + 1], picked)
+        out.append(picked)
+    return tuple(out)
 
 
 class Flux3ModeBlock(nn.Module):
@@ -1752,7 +1773,22 @@ class Flux3Model(BaseDiffusionModel):
                 prepared[prefix + "cos_sin"] = table.float().contiguous()
         if len(chunks) == 2:
             prepared["_flux3_joint_select"] = self._joint_select(chunks, pe.device)
+        elif FLUX3_JOINT_TABLE and 2 < len(chunks) <= 255:
+            prepared["_flux3_joint_index"] = self._joint_index(chunks, pe.device)
         return prepared
+
+    @staticmethod
+    def _joint_index(chunks: list[tuple[str, int, int]], device: torch.device) -> Tensor:
+        """u8 [1, S, 1]: the chunk number of every joint row (built on device, no H2D copy)."""
+        starts, total = [], 0
+        for _, start, end in chunks:
+            starts.append(total)
+            total += end - start
+        ar = torch.arange(total, device=device)
+        index = torch.zeros(total, dtype=torch.uint8, device=device)
+        for boundary in starts[1:]:
+            index += (ar >= boundary).to(torch.uint8)
+        return index.view(1, total, 1)
 
     @staticmethod
     def _joint_select(chunks: list[tuple[str, int, int]], device: torch.device) -> Tensor:
@@ -2082,6 +2118,23 @@ class Flux3Model(BaseDiffusionModel):
                 torch.cat([streams[name][field] for name, _, _ in chunks], dim=1)
                 for field in mod_fields
             ) + (select,)
+        elif (
+            FLUX3_JOINT_TABLE
+            and 2 < len(chunks) <= 255
+            and all(
+                streams[name][field].shape[1] == 1
+                for name, _, _ in chunks
+                for field in mod_fields
+            )
+        ):
+            # [1, K, D] tables (one broadcast row per chunk) + a u8 chunk index per row.
+            index = prepared.get("_flux3_joint_index")
+            if index is None or index.shape[1] != combined.shape[1]:
+                index = self._joint_index(chunks, combined.device)
+            mod = tuple(
+                torch.cat([streams[name][field] for name, _, _ in chunks], dim=1)
+                for field in mod_fields
+            ) + (index,)
         else:
             mod = tuple(joint(field) for field in mod_fields)
         freqs = _block_freqs(prepared, "_flux3_joint_")

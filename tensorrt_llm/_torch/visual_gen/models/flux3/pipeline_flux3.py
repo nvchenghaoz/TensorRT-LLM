@@ -49,6 +49,7 @@ I2I_COND_L = -1
 #   _flux3_{text,image,joint}_cos_sin: _packed_positions -> rope_cos_sin_table (torch.cat)
 #     then .float().contiguous()
 #   _flux3_joint_select: _packed_positions -> _joint_select (torch.arange on device)
+#   _flux3_joint_index: _packed_positions -> _joint_index (torch.arange/zeros on device)
 # Valid only while prepare runs eagerly (not inside a captured graph).
 _FLUX3_GRAPH_REUSABLE_INPUTS = frozenset(
     (
@@ -65,6 +66,7 @@ _FLUX3_GRAPH_REUSABLE_INPUTS = frozenset(
         "_flux3_image_cos_sin",
         "_flux3_joint_cos_sin",
         "_flux3_joint_select",
+        "_flux3_joint_index",
     )
 )
 # Read at every replay; TRTLLM_FLUX3_GRAPH_REUSE_INPUTS=0 turns the copy skip off.
