@@ -210,9 +210,19 @@ def parent():
                      ("t2i_check00", "eager_t2i_check00"), ("i2i_edit00", "eager_i2i_edit00")):
             if (by[x]["lat"], by[x]["img"]) != (by[y]["lat"], by[y]["img"]):
                 fails.append(f"env{arm}: {y} != {x}")
-        for rec in r["recs"]:
-            if rec.get("new_graphs") or rec.get("new_captures"):
-                fails.append(f"env{arm} {rec['label']}: compile/capture in a steady request")
+    # Compiles / captures: a request in a new text bucket (t2i_T2, T=160) recompiles on main too.
+    # The branch must add none beyond main's on any request, and none at all in the warmed bucket.
+    compile_info = []
+    for a, b in zip(on["recs"], off["recs"]):
+        if "new_graphs" not in a:
+            continue
+        ca = (a["new_graphs"], a["new_captures"])
+        cb = (b["new_graphs"], b["new_captures"])
+        compile_info.append({"label": a["label"], "T": a["T"], "env1": ca, "env0": cb})
+        if ca[0] > cb[0] or ca[1] > cb[1]:
+            fails.append(f"{a['label']}: branch compiles/captures {ca} > main {cb}")
+        if a["T"] == on["recs"][0]["T"] and (ca[0] or ca[1]):
+            fails.append(f"{a['label']}: compile/capture in the warmed text bucket")
     c1, c0 = on["counts"], off["counts"]
     n1 = len(on["fused_blocks"])
     if n1 == 0 or off["fused_blocks"]:
@@ -232,6 +242,7 @@ def parent():
                        "alternating t2i/i2i request sequences at 2048x2048; final latent (fp32) + "
                        "uint8 image sha256; repeats and eager (CUDA graphs off) vs graph runs",
            "requests": cmp, "routes_env1": c1, "routes_env0": c0, "fused_blocks": on["fused_blocks"],
+           "compiles": compile_info,
            "recs_env1": on["recs"], "recs_env0": off["recs"]}
     print(json.dumps(res))
 
