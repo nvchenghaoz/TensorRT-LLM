@@ -75,6 +75,10 @@ typedef long long i64;
 #ifndef X_POLICY
 #define X_POLICY 0
 #endif
+// ROW_REV=1: CTAs walk rows in descending order (same row set, same per-row math; exact).
+#ifndef ROW_REV
+#define ROW_REV 0
+#endif
 // LN_ID=1: the LayerNorm affine is the identity (weight == 1.0 bf16, bias == +0.0 bf16,
 // verified on the host by register_identity_affine). fmul(n, 1.0f) == n for every n
 // (--ftz=false), so only the +0.0f add stays (it still maps -0 to +0): bitwise to LN_ID=0.
@@ -230,7 +234,11 @@ flux3_adaln_nvfp4_warp(const uint4 *__restrict__ x, const u8 *__restrict__ sel,
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
   const int lane = threadIdx.x & 31;
+#if ROW_REV
+  const int row = (int)(gridDim.x - 1 - blockIdx.x) * WARPS + (threadIdx.x >> 5);
+#else
   const int row = blockIdx.x * WARPS + (threadIdx.x >> 5);
+#endif
   if (row >= padded) return;
   const i64 rowpart = (i64)(row & 31) * 16 + (i64)((row & 127) >> 5) * 4 + (i64)(row >> 7) * (128 * SFC);
   if (row >= M) {
@@ -465,6 +473,9 @@ _DEFAULT_DEFINES = ("MINB=12",)
 _X_POLICY = int(os.environ.get("TRTLLM_FLUX3_ADALN_WARP_X_POLICY", "0").strip() or "0")
 if _X_POLICY not in (0, 1, 2):
     raise ValueError(f"TRTLLM_FLUX3_ADALN_WARP_X_POLICY must be 0, 1 or 2, got {_X_POLICY}")
+# Descending CTA row order (TRTLLM_FLUX3_ADALN_WARP_ROW_REV, default 0 = main's cubin): only the
+# bool / no-select builds take it, never the u8 SEL_INDEX build. Exact. Resolved at call time.
+_ROW_REV = int(os.environ.get("TRTLLM_FLUX3_ADALN_WARP_ROW_REV", "0").strip() or "0")
 _MODULES = {}
 COMPILE_SECONDS = {}
 NUM_REGS = {}
@@ -637,6 +648,8 @@ def launch(
         extra_defines = tuple(extra_defines) + ("LN_ID=1",)
     if has_select and select.dtype == torch.uint8:
         extra_defines = tuple(extra_defines) + ("SEL_INDEX=1",)
+    elif _ROW_REV:
+        extra_defines = tuple(extra_defines) + ("ROW_REV=1",)
     fn = _compile(x.device, warps, use_pdl, extra_defines)
     grid = (padded + warps - 1) // warps
     stream = torch.cuda.current_stream(x.device).cuda_stream
