@@ -60,24 +60,45 @@ def epi_vec() -> bool:
 
 
 @functools.cache
+def epi_v2() -> bool:
+    """TRTLLM_FLUX3_SM120_SWIGLU_EPI_V2: 1 (default) = lane-local epilogue (FLUX3_EPI_V2=1 on top of
+    EPI_VEC; modules _ev2 / _dyn_ev2, bitwise equal); 0 = the EPI_VEC modules (_ev / _dyn_ev) byte
+    for byte. Ignored when EPI_VEC is off."""
+    value = os.environ.get("TRTLLM_FLUX3_SM120_SWIGLU_EPI_V2", "1").strip()
+    if value not in ("0", "1"):
+        raise ValueError(f"TRTLLM_FLUX3_SM120_SWIGLU_EPI_V2 must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+@functools.cache
 def _build(suffix: str, flags: tuple[str, ...]):
     return gen_spec(suffix, flags).build_and_load()
 
 
-def get_module_static(vec: bool | None = None):
+def get_module_static(vec: bool | None = None, v2: bool | None = None):
     """StaticPersistentScheduler build (main's module, same name, when vec is off)."""
     if vec is None:
         vec = epi_vec()
-    return _build("_ev", ("-DFLUX3_EPI_VEC=1",)) if vec else _build("", ())
+    if not vec:
+        return _build("", ())
+    if v2 is None:
+        v2 = epi_v2()
+    if v2:
+        return _build("_ev2", ("-DFLUX3_EPI_VEC=1", "-DFLUX3_EPI_V2=1"))
+    return _build("_ev", ("-DFLUX3_EPI_VEC=1",))
 
 
-def get_module_dynamic(vec: bool | None = None):
+def get_module_dynamic(vec: bool | None = None, v2: bool | None = None):
     """CLC dynamic persistent scheduler build (cutlass::gemm::PersistentScheduler on Sm120)."""
     if vec is None:
         vec = epi_vec()
-    if vec:
-        return _build("_dyn_ev", ("-DFLUX3_TILESCHED=1", "-DFLUX3_EPI_VEC=1"))
-    return _build("_dyn", ("-DFLUX3_TILESCHED=1",))
+    if not vec:
+        return _build("_dyn", ("-DFLUX3_TILESCHED=1",))
+    if v2 is None:
+        v2 = epi_v2()
+    if v2:
+        return _build("_dyn_ev2", ("-DFLUX3_TILESCHED=1", "-DFLUX3_EPI_VEC=1", "-DFLUX3_EPI_V2=1"))
+    return _build("_dyn_ev", ("-DFLUX3_TILESCHED=1", "-DFLUX3_EPI_VEC=1"))
 
 
 def get_module():
