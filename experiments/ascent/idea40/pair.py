@@ -465,8 +465,13 @@ def main():
     # iteration) and then one t2i call per arm (same rotated order), so both
     # cases get ITERS paired samples per arm. A round = PER_ROUND iterations.
     ITERS = ROUNDS * PER_ROUND * 2  # default 400 -> 200 per i2i reference, 400 t2i
-    ORDERS = [("A", "B", "A2"), ("B", "A2", "A"), ("A2", "A", "B")]
+    ORDERS = [("A", "A2", "B"), ("A2", "B", "A"), ("B", "A", "A2")]
     AR = ("A", "A2", "B")
+    l_poll0 = load1()
+    t_poll = time.time()
+    while (load1() or 0) >= 4.0 and time.time() - t_poll < 180:  # poll <= 3 min, then run anyway
+        time.sleep(10)
+    log(f"load poll: load1 {l_poll0} -> {load1()} after {time.time() - t_poll:.0f} s")
     l_start = load1()
     log(f"timing: load1 {l_start}, iters {ITERS} (rounds of {PER_ROUND}), arms {AR}")
     for arm in AR:  # 10 warmups per arm per case
@@ -515,18 +520,36 @@ def main():
             idx = [i for i, k in enumerate(rnd_of[case]) if k == r]
             rr.append(statistics.median([b[i] for i in idx]) / statistics.median([a[i] for i in idx]))
         rq = statistics.quantiles(rr, n=10)
-        return {"paired_diff_ms_median": round(statistics.median(d), 3),
+        # per-rotation ratio = per iteration (one step of the A/A2/B rotation,
+        # same input for every arm); median with a bootstrap 95% CI (fixed seed).
+        pr = [y / x for x, y in zip(a, b)]
+        g = random.Random(1234)
+        boots = sorted(statistics.median(g.choices(pr, k=len(pr))) for _ in range(2000))
+        return {"ratio_per_rotation_median": round(statistics.median(pr), 4),
+                "ratio_per_rotation_ci95": [round(boots[49], 4), round(boots[1949], 4)],
+                "paired_diff_ms_median": round(statistics.median(d), 3),
                 "paired_diff_iqr": [round(dq[0], 3), round(dq[-1], 3)],
                 "ratio_median_of_rounds": round(statistics.median(rr), 4),
-                "ratio_p10_p90": [round(rq[0], 4), round(rq[-1], 4)], "rounds": len(rr),
+                "ratio_rounds_p10_p90": [round(rq[0], 4), round(rq[-1], 4)], "rounds": len(rr),
                 "pairs": len(d)}
 
-    summary = {"load1_start": l_start, "load1_end": l_end}
+    summary = {"load1_start": l_start, "load1_end": l_end, "load1_before_poll": l_poll0}
     for c in cases:
         summary[c] = {"per_arm": {a: st(T[c][a]) for a in AR},
-                      "B_vs_A": cmp(c, "B"), "A2_vs_A (A/A)": cmp(c, "A2")}
+                      "B_vs_A": cmp(c, "B"), "A2_vs_A": cmp(c, "A2")}
         log(f"timing {c}: {json.dumps(summary[c])}")
     log(f"load1 start {l_start} end {l_end}")
+
+    # Verdict rules fixed in advance (area lead 1283 / top lead 1277).
+    def ci(c, k):
+        return summary[c][k]["ratio_per_rotation_ci95"]
+    verdict = {}
+    void = any(not (ci(c, "A2_vs_A")[0] <= 1.0 <= ci(c, "A2_vs_A")[1]) for c in ("i2i", "t2i"))
+    verdict["void_A2_ci_excludes_1"] = void
+    verdict["t2i_pass"] = ci("t2i", "B_vs_A")[0] <= 1.0  # CI includes 1 or lies below it
+    verdict["i2i_pass"] = ci("i2i", "B_vs_A")[1] < 1.0 and ci("i2i", "B_vs_A")[1] < ci("i2i", "A2_vs_A")[0]
+    summary["verdict"] = verdict
+    log(f"verdict {verdict}")
 
     # ---------------- 4. untimed interleaved sequence after timing ----------------
     # Same shape as timing (rotated arm order, alternating reference, i2i then
@@ -553,7 +576,19 @@ def main():
                "output": {"class": "exact"}, "passed": ok, "checks": passed, "summary": summary,
                "tree_has_change": tree_has_change}
     else:
-        out = {"passed": ok, "checks": passed, "summary": summary,
+        batch = {}
+        for c, lab in (("i2i", "i2i-2048"), ("t2i", "t2i-2048")):
+            sb = summary[c]["per_arm"]["B"]
+            batch[lab] = {"step_ms": sb["step_ms"], "noise_floor": sb["noise_floor"],
+                          "base_step_ms": summary[c]["per_arm"]["A"]["step_ms"],
+                          "B_over_A": summary[c]["B_vs_A"]["ratio_per_rotation_median"],
+                          "B_over_A_ci95": summary[c]["B_vs_A"]["ratio_per_rotation_ci95"],
+                          "A2_over_A": summary[c]["A2_vs_A"]["ratio_per_rotation_median"],
+                          "A2_over_A_ci95": summary[c]["A2_vs_A"]["ratio_per_rotation_ci95"],
+                          "B_minus_A_ms_median": summary[c]["B_vs_A"]["paired_diff_ms_median"],
+                          "B_minus_A_ms_iqr": summary[c]["B_vs_A"]["paired_diff_iqr"]}
+        out = {"batch": batch, "output": {"class": "exact"}, "verdict": summary["verdict"],
+               "passed": ok, "checks": passed, "summary": summary,
                "compared": "arm A (main code swapped in) vs arm B (tree): msgspec corpus vs json.loads, "
                            "b64 corpus vs base64.b64decode(validate=True), handler bodies + VisualGenParams "
                            "dump + ref sha256 (A,B,A,t2i), malformed-request status+body (incl. 3000-deep "
