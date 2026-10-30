@@ -223,6 +223,7 @@ note(any("ROW_REV=1" in d for d in cap_defs), "warmup graphs captured ROW_REV=1 
 note(all(("ROW_REV=1" in d) != ("SEL_INDEX=1" in d) for d in cap_defs),
      f"every captured head build is exactly one of ROW_REV / SEL_INDEX: {cap_defs}")
 # from here, the test-only extra key separates the R0 arm's graphs (default keeps "default")
+runner.clear()
 runner.register_extra_key_fn("b51_arm", lambda *a, **k: ARM[0])
 
 
