@@ -61,7 +61,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
-from tensorrt_llm.media.encoding import image_to_bytes
+from tensorrt_llm.media.encoding import image_to_b64, image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
@@ -184,6 +184,32 @@ class _MsgspecRequest(Request):
             else:
                 self._json_body = json.loads(body)
         return self._json_body
+
+
+_json_fast_decoder = msgspec.json.Decoder()
+
+
+async def _request_json_fast(raw_request: Request):
+    """``await raw_request.json()``, decoding plain JSON bodies with msgspec.
+
+    msgspec decodes a multi-MB body (an inline base64 image) ~2.5x faster
+    than ``json.loads``. Anything msgspec rejects -- and every body that is
+    empty, msgpack, already parsed or not on ``_MsgspecRequest`` -- goes
+    through ``raw_request.json()`` unchanged, so error types and messages are
+    exactly ``json.loads``'s.
+    """
+    if (isinstance(raw_request, _MsgspecRequest)
+            and not hasattr(raw_request, "_json_body")
+            and raw_request.headers.get("x-trtllm-msgpack") != "1"):
+        body = await raw_request.body()
+        if body:
+            try:
+                raw_request._json_body = _json_fast_decoder.decode(body)
+            except (msgspec.DecodeError, UnicodeError, ValueError,
+                    RecursionError):
+                # Deeply nested bodies: json.loads raises its own message.
+                pass
+    return await raw_request.json()
 
 
 class _MsgspecRoute(APIRoute):
@@ -483,6 +509,178 @@ def _resolve_media_dir() -> Path:
         # EROFS, which is not one.
         stamp = datetime.now().strftime("%y%m%d-%H%M%S")
         return Path(tempfile.mkdtemp(prefix=f"trtllm_generated-{stamp}-"))
+
+
+class _B64JsonSplicer:
+    """Render a JSON response whose base64 payloads are spliced in as bytes.
+
+    ``JSONResponse(model_dump())`` copies and scans every multi-megabyte
+    base64 string in ``json.dumps`` and again in ``.encode()``. Instead, each
+    payload is represented in the model by a unique placeholder string, the
+    (small) model is rendered with Starlette's exact ``JSONResponse.render``
+    arguments, and the raw ``base64.b64encode`` bytes replace each quoted
+    placeholder. Base64 output is pure ASCII from ``[A-Za-z0-9+/=]``, which
+    ``json.dumps`` never escapes, so the body is byte-identical to
+    ``JSONResponse(content=model_dump()).body``.
+    """
+
+    def __init__(self) -> None:
+        self._prefix = f"trtllm-b64-{uuid.uuid4().hex}-"
+        self._payloads: List[bytes] = []
+
+    def placeholder(self, b64: bytes) -> str:
+        token = f"{self._prefix}{len(self._payloads)}"
+        self._payloads.append(b64)
+        return token
+
+    @staticmethod
+    def _dumps(content: Any) -> bytes:
+        # Same arguments as starlette.responses.JSONResponse.render.
+        return json.dumps(content,
+                          ensure_ascii=False,
+                          allow_nan=False,
+                          indent=None,
+                          separators=(",", ":")).encode("utf-8")
+
+    def render_parts(self, content: Any) -> Optional[List[bytes]]:
+        """The spliced body as its parts (not joined), or None if ambiguous."""
+        body = self._dumps(content)
+        parts = []
+        pos = 0
+        for i, payload in enumerate(self._payloads):
+            marker = f'"{self._prefix}{i}"'.encode("ascii")
+            idx = body.find(marker, pos)
+            if idx < 0 or body.count(marker) != 1:
+                return None
+            # Keep the opening quote, drop the placeholder text, keep the
+            # closing quote with the next part.
+            parts.append(body[pos:idx + 1])
+            parts.append(payload)
+            pos = idx + len(marker) - 1
+        parts.append(body[pos:])
+        return parts
+
+    def restore(self, content: Any) -> Any:
+        """Replace placeholders in a model_dump() with the decoded payloads."""
+        for item in content.get("data", []):
+            token = item.get("b64_json")
+            if isinstance(token, str) and token.startswith(self._prefix):
+                item["b64_json"] = self._payloads[int(
+                    token[len(self._prefix):])].decode("ascii")
+        return content
+
+    def response(self, content: Any, headers) -> Response:
+        parts = self.render_parts(content)
+        if parts is None:
+            return JSONResponse(content=self.restore(content), headers=headers)
+        return _SplicedJSONResponse(parts, headers)
+
+
+class _PartsLength:
+    """Sized stand-in for a body: Starlette's ``init_headers`` only takes len."""
+
+    __slots__ = ("_n", )
+
+    def __init__(self, n: int) -> None:
+        self._n = n
+
+    def __len__(self) -> int:
+        return self._n
+
+
+class _SplicedJSONResponse(Response):
+    """A JSON response that sends ``parts`` as consecutive ``http.response.body`` messages.
+
+    Equivalent to ``Response(content=b"".join(parts), media_type="application/json")``.
+    The headers (order and values, Content-Length = total) are Starlette's
+    own for the joined body; only the multi-megabyte join copy is skipped.
+    ``body`` still returns the joined bytes (built on first access) for
+    callers that read it outside the ASGI send path.
+    """
+
+    media_type = "application/json"
+
+    def __init__(self, parts: List[bytes], headers=None) -> None:
+        self._parts = parts
+        self._joined: Optional[bytes] = None
+        self._sizing = True
+        try:
+            super().__init__(content=None,
+                             media_type="application/json",
+                             headers=headers)
+        finally:
+            self._sizing = False
+
+    @property
+    def body(self):
+        if self._sizing:  # Response.__init__ -> init_headers: Content-Length
+            return _PartsLength(sum(len(p) for p in self._parts))
+        if self._joined is None:
+            self._joined = b"".join(self._parts)
+        return self._joined
+
+    @body.setter
+    def body(self, value) -> None:
+        # Response.__init__ stores render(None) == b""; the parts are the body.
+        pass
+
+    async def __call__(self, scope, receive, send) -> None:
+        prefix = "websocket." if scope.get("type") == "websocket" else ""
+        await send({
+            "type": prefix + "http.response.start",
+            "status": self.status_code,
+            "headers": self.raw_headers,
+        })
+        parts = [p for p in self._parts if p] or [b""]
+        last = len(parts) - 1
+        for i, part in enumerate(parts):
+            await send({
+                "type": prefix + "http.response.body",
+                "body": part,
+                "more_body": i < last,
+            })
+        if self.background is not None:
+            await self.background()
+
+
+_LOGGED_REF_FIELDS = ("image_reference", "video_reference", "audio_reference")
+
+
+def _ref_for_log(ref: Any) -> Any:
+    """Return ``ref`` with an inline payload replaced by its size."""
+    fmt = getattr(ref, "format", None)
+    content = getattr(ref, "content", None)
+    if fmt in ("bytes", "base64") and isinstance(content, (bytes, str)):
+        unit = "bytes" if fmt == "bytes" else "chars"
+        return ref.model_copy(update={"content": f"<{len(content)} {unit}>"})
+    return ref
+
+
+def _params_for_log(params: Any) -> Any:
+    """Return ``params`` for a log line, without inline reference payloads.
+
+    ``repr`` of a multi-megabyte ``bytes``/base64 reference builds a string
+    several times its size (and the log line copies it again), on every
+    request, even when INFO is filtered. A shallow copy with each inline
+    payload replaced by its length keeps the line informative and small.
+    ``params`` itself is not modified.
+    """
+    update = {}
+    for name in _LOGGED_REF_FIELDS:
+        refs = getattr(params, name, None)
+        if refs is None:
+            continue
+        if isinstance(refs, list):
+            new_refs = [_ref_for_log(ref) for ref in refs]
+            if any(a is not b for a, b in zip(new_refs, refs)):
+                update[name] = new_refs
+        else:
+            new_ref = _ref_for_log(refs)
+            if new_ref is not refs:
+                update[name] = new_ref
+    if not update:
+        return params
+    return params.model_copy(update=update)
 
 
 def _normalize_image_output(image) -> list:
@@ -3644,6 +3842,7 @@ class OpenAIServer(_VideoRoutesMixin):
         (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
         request_received = raw_request.state.server_arrival_time
+        b64_splicer = None
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
@@ -3659,7 +3858,7 @@ class OpenAIServer(_VideoRoutesMixin):
             try:
                 params = parse_visual_gen_params(request, self.generator)
                 logger.info(
-                    f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
+                    f"Generating image: {image_id} with params: {_params_for_log(params)} and prompt: {request.prompt}"
                 )
                 image_gen_start = time.perf_counter()
                 # Offload the blocking resolve/enqueue off the event loop but
@@ -3727,11 +3926,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 pil_format = request.format.upper()
                 ext = f".{request.format}"
                 if request.response_format == "b64_json":
+                    b64_splicer = _B64JsonSplicer()
                     data = [
                         ImageObject(
-                            b64_json=base64.b64encode(
-                                image_to_bytes(
-                                    image, format=pil_format)).decode("utf-8"),
+                            b64_json=b64_splicer.placeholder(
+                                image_to_b64(image, format=pil_format)),
                             revised_prompt=request.prompt,
                         ) for image in output_images
                     ]
@@ -3762,6 +3961,8 @@ class OpenAIServer(_VideoRoutesMixin):
             headers = build_visual_gen_timing_headers(
                 build_visual_gen_server_timings(metrics, total=total))
 
+            if b64_splicer is not None:
+                return b64_splicer.response(response.model_dump(), headers)
             return JSONResponse(content=response.model_dump(), headers=headers)
 
         except Exception as e:
@@ -3855,7 +4056,7 @@ class OpenAIServer(_VideoRoutesMixin):
         normalized_content_type = content_type.lower()
 
         if "application/json" in normalized_content_type:
-            body = await raw_request.json()
+            body = await _request_json_fast(raw_request)
             if not isinstance(body, dict):
                 raise ValueError(
                     "JSON image edit request body must be an object")
@@ -3907,6 +4108,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 "Image editing is not supported by the loaded visual generation model."
             )
 
+        b64_splicer = None
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
@@ -3917,11 +4119,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     return path_error
                 params = parse_visual_gen_params(request, self.generator)
                 logger.info(
-                    f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
+                    f"Editing image: {image_id} with params: {_params_for_log(params)} and prompt: {request.prompt}"
                 )
                 image_edit_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt,
-                                                 params=params)
+                # Offload the blocking resolve/enqueue off the event loop but
+                # await it (bad params -> 400 here); then await generation.
+                handle = await asyncio.to_thread(self.generator.generate_async,
+                                                 request.prompt, params)
+                output = await handle.aresult()
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:
@@ -3947,11 +4152,11 @@ class OpenAIServer(_VideoRoutesMixin):
             pil_format = request.output_format.upper()
             ext = f".{request.output_format}"
             if request.response_format == "b64_json":
+                b64_splicer = _B64JsonSplicer()
                 data = [
                     ImageObject(
-                        b64_json=base64.b64encode(
-                            image_to_bytes(image,
-                                           format=pil_format)).decode("utf-8"),
+                        b64_json=b64_splicer.placeholder(
+                            image_to_b64(image, format=pil_format)),
                         revised_prompt=request.prompt,
                     ) for image in output_images
                 ]
@@ -3982,6 +4187,8 @@ class OpenAIServer(_VideoRoutesMixin):
             headers = build_visual_gen_timing_headers(
                 build_visual_gen_server_timings(metrics, total=total))
 
+            if b64_splicer is not None:
+                return b64_splicer.response(response.model_dump(), headers)
             return JSONResponse(content=response.model_dump(), headers=headers)
 
         except ValidationError as exc:

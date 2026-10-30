@@ -18,6 +18,7 @@ import torch.multiprocessing as mp
 import zmq
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.visual_gen import ref_shm
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
@@ -33,6 +34,12 @@ if TYPE_CHECKING:
 # Timeouts (seconds) for the client-side coordinator.
 POLL_TIMEOUT = 0.01
 AWAIT_TIMEOUT = 0.05
+# Upper bound on how long the coordinator loop sleeps when nothing wakes it.
+# Request dispatch and response delivery wake the loop immediately (enqueue
+# wakes it through call_soon_threadsafe, responses through an add_reader
+# registration on the ZMQ socket's FD); this timeout only paces worker
+# liveness checks and send retries.
+SERVE_IDLE_TIMEOUT = 0.02
 THREAD_TIMEOUT = 5.0
 WORKER_TIMEOUT = 2.0
 WORKER_SPAWN_SHUTDOWN_TIMEOUT = 5.0
@@ -374,22 +381,23 @@ class DiffusionRequest:
         Only the coordinator -> rank0 hop travels as handles: rank0 restores the
         bytes before broadcasting, because a shared-tensor handle is consumed
         exactly once and minting one for N ranks would free the block N-1 times.
+
+        Each payload goes into its own POSIX shm file (``ref_shm.put``, one
+        ``os.write``); when that fails, it takes the torch shared-tensor path
+        instead.
         """
         if self.params is None:
             return
         self.ref_handles = handles = []
         for slot in ("image_reference", "video_reference", "audio_reference"):
             for index, ref in enumerate(getattr(self.params, slot, None) or []):
-                # A read-only view: the one copy happens inside from_tensor(),
-                # which is what moves the payload into shared memory.
-                buffer = torch.frombuffer(ref.content, dtype=torch.uint8)
-                handles.append(
-                    {
-                        "slot": slot,
-                        "index": index,
-                        "handle": SharedTensorContainer.from_tensor(buffer).dump_to_dict(),
-                    }
-                )
+                handle = ref_shm.put(ref.content)
+                if handle is None:
+                    # A read-only view: the one copy happens inside from_tensor(),
+                    # which is what moves the payload into shared memory.
+                    buffer = torch.frombuffer(ref.content, dtype=torch.uint8)
+                    handle = SharedTensorContainer.from_tensor(buffer).dump_to_dict()
+                handles.append({"slot": slot, "index": index, "handle": handle})
                 ref.content = b""
         if not handles:
             self.ref_handles = None
@@ -403,8 +411,17 @@ class DiffusionRequest:
         failures = []
         for entry in self.ref_handles or []:
             try:
+                handle = entry["handle"]
+                if ref_shm.is_handle(handle):
+                    # take() unlinks the file even when the lookup below fails.
+                    try:
+                        ref = getattr(self.params, entry["slot"])[entry["index"]]
+                    finally:
+                        content = ref_shm.take(handle)
+                    ref.content = content
+                    continue
                 ref = getattr(self.params, entry["slot"])[entry["index"]]
-                container = SharedTensorContainer.from_dict(entry["handle"])
+                container = SharedTensorContainer.from_dict(handle)
                 ref.content = container.get_local_view().numpy().tobytes()
             except Exception as exc:
                 failures.append(f"{entry['slot']}[{entry['index']}]: {exc}")
@@ -1061,7 +1078,20 @@ class DiffusionRemoteClient:
         # before the next poll.
         if req_ids:
             self._iter_stats.record_enqueue(self.pending_requests.qsize())
+            self._wake_serve_loop()
         return req_ids
+
+    def _wake_serve_loop(self) -> None:
+        """Wake the coordinator loop from any thread (no-op if it is gone)."""
+        loop = getattr(self, "_event_loop", None)
+        wake = getattr(self, "_serve_wake", None)
+        if loop is None or wake is None:
+            return
+        try:
+            loop.call_soon_threadsafe(wake.set)
+        except RuntimeError:
+            # The event loop is already closed; nothing left to wake.
+            pass
 
     async def await_responses(
         self, request_ids: Union[int, List[int]], timeout: Optional[float] = None
@@ -1188,18 +1218,23 @@ class DiffusionRemoteClient:
         except RuntimeError as e:
             logger.warning(f"DiffusionClient: Failed to release request {request.request_id}: {e}")
 
-    def _process_requests(self):
-        """Process pending requests."""
+    def _process_requests(self) -> bool:
+        """Send at most one pending request without blocking.
+
+        Returns True when a request was handed to the workers, so the caller
+        can keep draining the queue; False when the queue is empty, the send
+        must be retried later, or shutdown was requested.
+        """
         req = None
         try:
             if self._request_to_send is None:
-                req = self.pending_requests.get(timeout=POLL_TIMEOUT)
+                req = self.pending_requests.get_nowait()
                 if req is None:
                     try:
                         self._send_shutdown()
                     finally:
                         self.shutdown_event.set()
-                    return
+                    return False
                 self._request_to_send = req
 
             req = self._request_to_send
@@ -1209,6 +1244,7 @@ class DiffusionRemoteClient:
             # Once the request has been handed to the workers it becomes the
             # in-flight ("active") request from the client's perspective.
             self._iter_stats.record_request_started(req.request_id, self.pending_requests.qsize())
+            return True
         except queue.Empty:
             pass
         except zmq.Again:
@@ -1222,11 +1258,18 @@ class DiffusionRemoteClient:
             self._request_to_send = None
             logger.error(f"DiffusionClient: Error sending request: {e}")
             logger.error(traceback.format_exc())
+        return False
 
     def _process_responses(self):
-        """Poll and process responses."""
-        try:
-            if self.responses_ipc.poll(timeout=POLL_TIMEOUT):
+        """Receive and process every response that is already available.
+
+        Never blocks: the coordinator loop is woken by the response socket's
+        FD (see ``_serve_forever``), so this only drains what has arrived.
+        """
+        while True:
+            try:
+                if not self.responses_ipc.poll(timeout=0):
+                    return
                 response = self.responses_ipc.get()
                 if isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
@@ -1239,8 +1282,9 @@ class DiffusionRemoteClient:
                     asyncio.run_coroutine_threadsafe(
                         self._store_response(response), self._event_loop
                     )
-        except Exception as e:
-            logger.error(f"DiffusionClient: Error processing response: {e}")
+            except Exception as e:
+                logger.error(f"DiffusionClient: Error processing response: {e}")
+                return
 
     async def _store_response(self, response: DiffusionResponse):
         """Store response in the completed_responses dict (async helper).
@@ -1318,6 +1362,9 @@ class DiffusionRemoteClient:
         # Create async primitives in this thread's event loop
         self.response_event = asyncio.Event()
         self.lock = asyncio.Lock()
+        # Set (from any thread, via _wake_serve_loop or the response socket's
+        # FD reader) whenever the coordinator loop has work to do.
+        self._serve_wake = asyncio.Event()
 
         # Signal that the event loop is ready
         self.event_loop_ready.set()
@@ -1334,14 +1381,33 @@ class DiffusionRemoteClient:
         if not self._init_ipc():
             return
 
-        while not self.shutdown_event.is_set():
-            worker_failure = self._check_worker_liveness()
-            if worker_failure is not None:
-                self._abort_worker_group(worker_failure)
-            if self._worker_failure is None:
-                self._process_requests()
-                self._process_responses()
-            await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
+        wake = getattr(self, "_serve_wake", None)
+        if wake is None:
+            wake = self._serve_wake = asyncio.Event()
+        response_fd = self._add_response_reader(wake)
+        try:
+            while not self.shutdown_event.is_set():
+                # Clear before processing so a wake-up that arrives while we
+                # work is kept for the next wait instead of being lost.
+                wake.clear()
+                worker_failure = self._check_worker_liveness()
+                if worker_failure is not None:
+                    self._abort_worker_group(worker_failure)
+                if self._worker_failure is None:
+                    while self._process_requests():
+                        pass
+                    self._process_responses()
+                if self.shutdown_event.is_set():
+                    break
+                # Sleep until a request is enqueued, a response arrives on the
+                # socket, or the idle timeout paces the liveness check. This
+                # also yields to _store_response/await_responses coroutines.
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=SERVE_IDLE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._remove_response_reader(response_fd)
 
         self._cleanup_ipc()
 
@@ -1351,6 +1417,39 @@ class DiffusionRemoteClient:
         # within one polling interval and remains bounded.
         while self._worker_failure is not None and not self._shutdown_started:
             await asyncio.sleep(POLL_TIMEOUT)
+
+    def _add_response_reader(self, wake: asyncio.Event) -> Optional[int]:
+        """Wake the coordinator loop when the response socket has activity.
+
+        ZMQ exposes a signalling FD that becomes readable whenever the socket
+        has pending internal commands (e.g. an incoming message). The socket
+        itself is still only touched from this loop's thread; the reader
+        callback only sets ``wake``. ``_process_responses`` drains every
+        available message after each wake-up, which re-arms the FD. If the FD
+        cannot be registered, the loop falls back to SERVE_IDLE_TIMEOUT
+        polling.
+        """
+        try:
+            responses_ipc = self.responses_ipc
+            responses_ipc.setup_lazily()
+            fd = responses_ipc.socket.getsockopt(zmq.FD)
+            asyncio.get_running_loop().add_reader(fd, wake.set)
+            return fd
+        except Exception as e:
+            logger.warning(
+                f"DiffusionClient: response socket wake-up unavailable ({e}); "
+                f"polling every {SERVE_IDLE_TIMEOUT * 1000:.0f} ms"
+            )
+            return None
+
+    @staticmethod
+    def _remove_response_reader(fd: Optional[int]) -> None:
+        if fd is None:
+            return
+        try:
+            asyncio.get_running_loop().remove_reader(fd)
+        except Exception:
+            pass
 
     def _check_worker_liveness(self) -> Optional[str]:
         if (
@@ -1477,6 +1576,7 @@ class DiffusionRemoteClient:
                     )
 
             self.pending_requests.put(None)
+            self._wake_serve_loop()
 
             self.background_thread.join(timeout=THREAD_TIMEOUT)
             if self.background_thread.is_alive():

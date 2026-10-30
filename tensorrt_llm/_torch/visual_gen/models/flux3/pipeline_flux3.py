@@ -8,7 +8,7 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import ExifTags, Image, ImageOps
 from safetensors.torch import load_file
 from torch import Tensor
 
@@ -34,6 +34,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.logger import logger
+from tensorrt_llm.media import png_decode
 
 I2I_COND_T = 0
 I2I_COND_L = -1
@@ -178,9 +179,37 @@ def pack_i2i_image_condition(
 
 
 def _load_image_pixels(source: str | bytes, *, device: torch.device) -> Tensor:
-    """Prepare a reference image as FP32 [1, 3, H, W] in [-1, 1]."""
+    """Prepare a reference image as FP32 [1, 3, H, W] in [-1, 1].
+
+    Pixels are the same as ImageOps.exif_transpose(...).convert("RGB") + center crop, but
+    the steps that would only copy (no EXIF orientation, an RGB image, a full-image crop)
+    are skipped. The uint8 HWC pixels go to the device through pinned memory (the caching
+    host allocator keeps the block until the copy completes) and are cast there: the same
+    fp32 values as a CPU cast + pageable 4x-larger H2D, without blocking the host behind
+    queued GPU work.
+
+    8-bit RGB non-interlaced PNG bytes on CUDA are decoded by png_decode (host inflate +
+    GPU unfilter, bitwise PIL's pixels); anything else returns None there and takes the
+    PIL path below.
+    """
+    device = torch.device(device)
+    if isinstance(source, bytes) and device.type == "cuda":
+        hwc = png_decode.decode_png_rgb8_to_device(source, device)
+        if hwc is not None:
+            # png_decode only accepts 16 <= w, h <= 4096: no resize, no empty crop.
+            full_h, full_w = hwc.shape[:2]
+            width, height = full_w // 16 * 16, full_h // 16 * 16
+            left, top = (full_w - width) // 2, (full_h - height) // 2
+            hwc = hwc[top : top + height, left : left + width].contiguous()
+            return hwc.permute(2, 0, 1).unsqueeze(0).to(torch.float32) / 127.5 - 1
     with Image.open(BytesIO(source) if isinstance(source, bytes) else source) as original:
-        image = ImageOps.exif_transpose(original).convert("RGB")
+        original.load()
+        image = original
+        # exif_transpose reads the orientation this way and returns a plain copy for 1.
+        if original.getexif().get(ExifTags.Base.Orientation, 1) != 1:
+            image = ImageOps.exif_transpose(original)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
         scale = min(1.0, 4096 / math.sqrt(image.width * image.height))
         if scale < 1:
             image = image.resize(
@@ -190,15 +219,17 @@ def _load_image_pixels(source: str | bytes, *, device: torch.device) -> Tensor:
         if min(width, height) == 0:
             raise ValueError("FLUX.3 reference images must be at least 16 pixels on each axis")
         left, top = (image.width - width) // 2, (image.height - height) // 2
-        pixels = np.array(image.crop((left, top, left + width, top + height)))
-    return (
-        torch.from_numpy(pixels)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .to(device=device, dtype=torch.float32)
-        / 127.5
-        - 1
-    )
+        box = (left, top, left + width, top + height)
+        if box != (0, 0, image.width, image.height):
+            image = image.crop(box)
+        pixels = np.asarray(image)
+    hwc = torch.empty(pixels.shape, dtype=torch.uint8, pin_memory=device.type == "cuda")
+    np.copyto(hwc.numpy(), pixels)
+    if device.type == "cuda":
+        hwc = hwc.to(device, non_blocking=True)
+    else:
+        hwc = hwc.to(device)
+    return hwc.permute(2, 0, 1).unsqueeze(0).to(torch.float32) / 127.5 - 1
 
 
 def _as_image_grid(tokens: Tensor, orig_ids: Tensor) -> Tensor:

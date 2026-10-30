@@ -7,8 +7,10 @@ import contextlib
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from pydantic import ValidationError
 
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm.visual_gen.args import CompilationConfig, VisualGenArgs
 
@@ -381,3 +383,60 @@ class TestRequestValidation:
 
         with pytest.raises(ValueError, match="must be multiples of"):
             pipe.validate_resolution(481, 832, 33)
+
+
+class TestCUDAGraphReusableInputs:
+    """Replay skips the static-input copy only for allow-listed kwargs whose
+    source tensor object is the one copied last time; an empty allowlist copies
+    everything (the default)."""
+
+    @staticmethod
+    def _runner(reusable=()):
+        runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        if reusable:
+            runner.register_reusable_inputs(reusable)
+        key = ("k",)
+        # A captured graph stand-in: replay() only copies inputs and calls .replay().
+        runner.graphs[key] = MagicMock()
+        runner.graph_outputs[key] = "out"
+        runner.static_inputs[key] = ([], {"rope": torch.zeros(4), "x": torch.zeros(4)})
+        return runner, key
+
+    def test_allow_listed_input_is_copied_once_per_source_object(self):
+        runner, key = self._runner(reusable=["rope"])
+        static = runner.static_inputs[key][1]
+        rope, x = torch.ones(4), torch.ones(4)
+        assert runner.replay(key, (), {"rope": rope, "x": x}) == "out"
+        assert torch.equal(static["rope"], rope) and torch.equal(static["x"], x)
+
+        # Same objects: the allow-listed copy is skipped, the other one is not.
+        rope.fill_(2)
+        x.fill_(2)
+        runner.replay(key, (), {"rope": rope, "x": x})
+        assert torch.equal(static["rope"], torch.ones(4))
+        assert torch.equal(static["x"], x)
+
+        # A new source object is copied.
+        runner.replay(key, (), {"rope": torch.full((4,), 3.0), "x": x})
+        assert torch.equal(static["rope"], torch.full((4,), 3.0))
+        assert runner.graphs[key].replay.call_count == 3
+
+        # clear() forgets the sources, so nothing stale can match afterwards.
+        assert runner._last_src
+        runner.clear()
+        assert runner._last_src == {}
+
+    def test_empty_allowlist_copies_every_replay(self):
+        runner, key = self._runner()
+        static = runner.static_inputs[key][1]
+        rope = torch.ones(4)
+        runner.replay(key, (), {"rope": rope, "x": rope})
+        rope.fill_(5)
+        runner.replay(key, (), {"rope": rope, "x": rope})
+        assert torch.equal(static["rope"], rope)
+        assert runner._last_src == {}
+
+    def test_registration_after_capture_is_rejected(self):
+        runner, _ = self._runner()
+        with pytest.raises(RuntimeError, match="before graph capture"):
+            runner.register_reusable_inputs(["rope"])

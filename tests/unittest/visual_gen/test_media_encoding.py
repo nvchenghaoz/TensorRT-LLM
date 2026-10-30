@@ -2,19 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Direct unit coverage for :mod:`tensorrt_llm.media.encoding`.
 
-Exercises real PNG round-trips, ``video_to_bytes``, and the path-based
-``resolve_video_format`` contract.
+Exercises real PNG round-trips (including the GPU PNG writer against Pillow),
+``video_to_bytes``, and the path-based ``resolve_video_format`` contract.
 """
 
+import base64
+import struct
+import zlib
 from io import BytesIO
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 
+from tensorrt_llm.media import encoding
 from tensorrt_llm.media.encoding import (
+    image_to_b64,
     image_to_bytes,
     resolve_video_format,
     save_image,
@@ -99,6 +105,100 @@ def test_save_image_accepts_batch_size_1(tmp_path):
     assert Path(saved).exists()
     img = Image.open(saved)
     img.verify()
+
+
+# ---------------------------------------------------------------------------
+# GPU PNG writer: pixels identical to Pillow's PNG, bytes may differ
+# ---------------------------------------------------------------------------
+
+
+def _png_cases():
+    g = torch.Generator().manual_seed(0)
+    yy, xx = torch.meshgrid(torch.arange(64), torch.arange(48), indexing="ij")
+    gradient = torch.stack(((yy * 4) % 256, (xx * 5) % 256, ((yy + xx) * 3) % 256), -1)
+    return [
+        torch.randint(0, 256, (37, 53, 3), generator=g, dtype=torch.uint8),
+        gradient.to(torch.uint8),
+        torch.randint(0, 256, (17, 19, 4), generator=g, dtype=torch.uint8),
+        torch.randint(0, 256, (23, 29, 1), generator=g, dtype=torch.uint8),
+        torch.full((8, 8, 3), 200, dtype=torch.uint8),
+        # Several deflate blocks (1024 rows each) and several IDAT chunks.
+        torch.randint(0, 256, (2100, 40, 3), generator=g, dtype=torch.uint8),
+    ]
+
+
+def _pil_png(image: torch.Tensor) -> bytes:
+    array = image.numpy()
+    buffer = BytesIO()
+    Image.fromarray(array[..., 0] if array.shape[-1] == 1 else array).save(
+        buffer, format="PNG", compress_level=1
+    )
+    return buffer.getvalue()
+
+
+def _png_pixels(data: bytes) -> torch.Tensor:
+    with Image.open(BytesIO(data)) as img:
+        array = np.array(img)
+    return torch.from_numpy(array if array.ndim == 3 else array[..., None])
+
+
+def _idat_stream(data: bytes) -> bytes:
+    pos, idat = 8, []
+    while pos < len(data):
+        (length,) = struct.unpack(">I", data[pos : pos + 4])
+        if data[pos + 4 : pos + 8] == b"IDAT":
+            idat.append(data[pos + 8 : pos + 8 + length])
+        pos += 12 + length
+    return b"".join(idat)
+
+
+def test_png_filter_choice_matches_pillow():
+    """The per-row filters are Pillow's heuristic, so the filtered scanlines are
+    exactly what Pillow deflates."""
+    for image in _png_cases()[:5]:
+        expected = zlib.decompress(_idat_stream(_pil_png(image)))
+        assert encoding._png_filter_scanlines(image).numpy().tobytes() == expected
+
+
+def test_cpu_tensors_keep_the_pillow_bytes():
+    image = _png_cases()[0]
+    assert image_to_bytes(image) == _pil_png(image)
+    assert image_to_b64(image) == base64.b64encode(_pil_png(image))
+
+
+def test_huffman_lengths_respect_the_length_limit():
+    """Fibonacci counts force a tree deeper than 15; the limited code must stay
+    complete (Kraft sum 1) and keep every used symbol."""
+    fib = [1, 1]
+    while len(fib) < 40:
+        fib.append(fib[-1] + fib[-2])
+    counts = fib + [0] * (257 - len(fib))
+    lengths = encoding._huffman_lengths(counts, 15)
+    assert max(lengths) <= 15
+    assert all((c > 0) == (n > 0) for c, n in zip(counts, lengths))
+    assert sum(1 << (15 - n) for n in lengths if n) == 1 << 15
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_png_pixels_match_pillow(tmp_path):
+    for image in _png_cases():
+        data = image_to_bytes(image.cuda())
+        assert torch.equal(_png_pixels(data), image)
+        assert image_to_b64(image.cuda()) == base64.b64encode(data)
+        saved = save_image(image.cuda().unsqueeze(0), tmp_path / "out.png")
+        assert Path(saved).read_bytes() == data
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_png_falls_back_to_pillow_when_gpu_deflate_fails():
+    image = _png_cases()[0]
+
+    def fail(scan):
+        raise RuntimeError("Huffman length limit failed")
+
+    with mock.patch.object(encoding, "_png_gpu_deflate", side_effect=fail):
+        assert image_to_bytes(image.cuda()) == _pil_png(image)
+        assert image_to_b64(image.cuda()) == base64.b64encode(_pil_png(image))
 
 
 # ---------------------------------------------------------------------------

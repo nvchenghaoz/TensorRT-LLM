@@ -621,6 +621,37 @@ def test_reference_image_preprocessing(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_CUDA, reason="CUDA required")
+@pytest.mark.parametrize("mode", ["RGB", "RGBA", "RGB+exif"])
+def test_reference_png_bytes_on_cuda_match_the_pil_path(mode):
+    """PNG bytes on CUDA take the GPU decode when in scope (RGB) and the PIL path
+    otherwise; both decode to the CPU PIL path's bytes. The [-1, 1] rescale then runs
+    on the GPU, where float32 rounding may differ from the CPU's by one ulp at |x| <= 1
+    (2**-23)."""
+    from io import BytesIO
+
+    import numpy as np
+    from PIL import Image
+
+    from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import _load_image_pixels
+
+    pixels = np.random.default_rng(3).integers(0, 256, (83, 101, 4), dtype=np.uint8)
+    source = Image.fromarray(pixels[..., :3] if mode != "RGBA" else pixels)
+    buffer = BytesIO()
+    if mode == "RGB+exif":
+        exif = source.getexif()
+        exif[274] = 8
+        source.save(buffer, format="PNG", exif=exif)
+    else:
+        source.save(buffer, format="PNG")
+    data = buffer.getvalue()
+    expected = _load_image_pixels(data, device=torch.device("cpu"))
+    actual = _load_image_pixels(data, device=torch.device("cuda"))
+    # 83x101 crops to 80x96; EXIF orientation 8 rotates it first (96x80).
+    assert expected.shape == ((1, 3, 96, 80) if mode == "RGB+exif" else (1, 3, 80, 96))
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=2**-23)
+
+
+@pytest.mark.skipif(not HAS_CUDA, reason="CUDA required")
 @pytest.mark.parametrize("with_reference", [False, True])
 @pytest.mark.parametrize("compile_blocks", [False, True])
 @torch.inference_mode()

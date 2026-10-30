@@ -23,7 +23,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
     find_free_port,
     run_diffusion_worker,
 )
-from tensorrt_llm._torch.visual_gen.output import PipelineOutput
+from tensorrt_llm._torch.visual_gen.output import PipelineOutput, _IpcMappingCache
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.visual_gen import VisualGenArgs, VisualGenParams
 
@@ -33,13 +33,14 @@ def _producer(q, device):
     try:
         video = torch.arange(2 * 3 * 4 * 5 * 3, dtype=torch.uint8).reshape(2, 3, 4, 5, 3).to(device)
         audio = torch.randn(2, 2, 100).to(device)
-        output = PipelineOutput(video=video, audio=audio, frame_rate=24.0)
+        image = torch.randint(0, 256, (6, 7, 3), dtype=torch.uint8).to(device)
+        output = PipelineOutput(video=video, audio=audio, image=image, frame_rate=24.0)
         output.to_handle()
-        q.put(("ok", output, video.cpu(), audio.cpu()))
+        q.put(("ok", output, video.cpu(), audio.cpu(), image.cpu()))
         # Stay alive until the consumer has rebuilt the views (IPC refcount).
         q.get()
     except Exception as e:  # noqa: BLE001 - surface producer errors to the test
-        q.put(("error", repr(e), None, None))
+        q.put(("error", repr(e), None, None, None))
 
 
 class TestExecutorSharedTensorIPC(unittest.TestCase):
@@ -49,7 +50,7 @@ class TestExecutorSharedTensorIPC(unittest.TestCase):
         try:
             producer = mp.Process(target=_producer, args=(q, device))
             producer.start()
-            status, output, ref_video, ref_audio = q.get(timeout=120)
+            status, output, ref_video, ref_audio, ref_image = q.get(timeout=120)
             self.assertEqual(status, "ok", msg=str(output))
             # Media fields cross the IPC as handle dicts, not tensors.
             self.assertIsInstance(output.video, dict)
@@ -62,6 +63,7 @@ class TestExecutorSharedTensorIPC(unittest.TestCase):
 
             self.assertTrue(torch.equal(resp.output.video.cpu(), ref_video))
             self.assertTrue(torch.equal(resp.output.audio.cpu(), ref_audio))
+            self.assertTrue(torch.equal(resp.output.image.cpu(), ref_image))
             self.assertEqual(resp.output.frame_rate, 24.0)
             producer.join()
         finally:
@@ -73,8 +75,31 @@ class TestExecutorSharedTensorIPC(unittest.TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     def test_roundtrip_cuda(self):
+        """The image field keeps its producer segment mapped (one anchor) and
+        still rebuilds exactly."""
         torch.cuda.set_device(0)
-        self._run_roundtrip("cuda")
+        _IpcMappingCache.clear()
+        try:
+            self._run_roundtrip("cuda")
+            self.assertTrue(_IpcMappingCache.active)
+            self.assertEqual(len(_IpcMappingCache._anchors), 1)
+        finally:
+            _IpcMappingCache.clear()
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_roundtrip_cuda_mapping_cache_failure_falls_back(self):
+        """If the mapping cache cannot map a segment it turns itself off and the
+        rebuild takes torch's per-request open, with the same result."""
+        torch.cuda.set_device(0)
+        try:
+            with mock.patch.object(
+                _IpcMappingCache, "ensure", side_effect=RuntimeError("no mapping")
+            ):
+                self._run_roundtrip("cuda")
+            self.assertFalse(_IpcMappingCache.active)
+        finally:
+            _IpcMappingCache.active = True
+            _IpcMappingCache.clear()
 
     def test_restore_noop_without_handles(self):
         """A response carrying plain tensors (handle-passing off) is untouched."""

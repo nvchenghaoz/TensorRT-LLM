@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import pytest
+import torch
 from fastapi import UploadFile
 from PIL import Image
 
@@ -688,6 +689,51 @@ class TestInlineMediaDecoding:
             parse_visual_gen_params(request, self._generator())
 
 
+class TestBase64MediaDecode:
+    """Large canonical base64 decodes on the GPU; the result must be exactly the
+    strict CPU decoder's, and anything non-canonical must take the CPU path."""
+
+    @staticmethod
+    def _payload(pad: int) -> str:
+        # 3 * k + (3 - pad) % 3 bytes give `pad` trailing '='.
+        n = 3 * (visual_gen_utils._B64_GPU_MIN_CHARS // 4 + 7) + (3 - pad) % 3
+        return base64.b64encode(os.urandom(n)).decode()
+
+    @pytest.mark.parametrize("pad", [0, 1, 2])
+    def test_decode_matches_strict_cpu_decode(self, pad):
+        payload = self._payload(pad)
+        assert payload.count("=") == pad
+        expected = base64.b64decode(payload, validate=True)
+        assert visual_gen_utils._decode_base64_media(payload) == expected
+        assert visual_gen_utils._decode_base64_media("data:image/png;base64," + payload) == expected
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.parametrize("pad", [0, 1, 2])
+    def test_gpu_decode_is_the_strict_decode(self, pad):
+        torch.cuda.init()  # the GPU path runs only once this process holds a CUDA context
+        payload = self._payload(pad)
+        decoded = visual_gen_utils._b64decode_canonical_gpu(payload)
+        assert decoded == base64.b64decode(payload, validate=True)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_gpu_decode_rejects_non_canonical_input(self):
+        torch.cuda.init()
+        payload = self._payload(1)
+        # Non-zero pad bits: the strict decoder accepts this, the canonical path must not.
+        last = payload[-2]
+        alphabet = visual_gen_utils._B64_ALPHABET.decode()
+        flipped = alphabet[alphabet.index(last) ^ 1]
+        non_canonical = [
+            payload[:-2] + flipped + "=",
+            payload[:100] + "=" + payload[101:],  # '=' inside the body
+            payload[:100] + "!" + payload[101:],  # outside the alphabet
+            payload[:-1],  # length not a multiple of 4
+        ]
+        for value in non_canonical:
+            assert visual_gen_utils._b64decode_canonical_gpu(value) is None
+        assert visual_gen_utils._b64decode_canonical_gpu(payload[:64]) is None  # below threshold
+
+
 class TestPrepareReferenceSlots:
     """The engine choke point: every declared form resolves to raw bytes."""
 
@@ -812,6 +858,50 @@ class TestReferenceHandleTransport:
 
         assert received.params.image_reference[0].content == payload
 
+    @pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="POSIX shm (/dev/shm) required")
+    def test_posix_shm_file_is_consumed_exactly_once(self):
+        """Each payload rides its own /dev/shm file; consuming the handle unlinks
+        it, and a second consume of the same handle fails instead of reading
+        someone else's data."""
+        from tensorrt_llm._torch.visual_gen import ref_shm
+
+        payloads = (os.urandom(3 * 1024 * 1024 + 5), os.urandom(17))
+        req = self._request(*payloads)
+        req.refs_to_shm()
+        handles = [e["handle"] for e in req.ref_handles]
+        assert all(ref_shm.is_handle(h) for h in handles)
+        paths = [Path(h[ref_shm.HANDLE_KEY]) for h in handles]
+        assert all(p.exists() for p in paths)
+
+        req.refs_from_shm()
+        assert tuple(r.content for r in req.params.image_reference) == payloads
+        assert not any(p.exists() for p in paths)
+        with pytest.raises(FileNotFoundError):
+            ref_shm.take(handles[0])
+
+    def test_torch_shared_tensor_path_when_shm_is_unavailable(self, monkeypatch):
+        from tensorrt_llm._torch.visual_gen import ref_shm
+
+        monkeypatch.setattr(ref_shm, "put", lambda content: None)
+        payload = os.urandom(64 * 1024)
+        req = self._request(payload)
+        req.refs_to_shm()
+        assert not ref_shm.is_handle(req.ref_handles[0]["handle"])
+
+        received = pickle.loads(pickle.dumps(req))
+        received.refs_from_shm()
+        assert received.params.image_reference[0].content == payload
+
+    def test_take_refuses_paths_outside_its_namespace(self, tmp_path):
+        from tensorrt_llm._torch.visual_gen import ref_shm
+
+        target = tmp_path / "secret"
+        target.write_bytes(b"x")
+        for path in (str(target), "/dev/shm/other_file", "/dev/shm/../etc/passwd"):
+            with pytest.raises(ValueError):
+                ref_shm.take({ref_shm.HANDLE_KEY: path, "size": 1})
+        assert target.exists()
+
 
 class TestReferenceBroadcastSplit:
     """Reference payloads leave the object before the rank0 -> N-rank hop.
@@ -909,10 +999,17 @@ class TestReferenceBroadcastSplit:
         Named per handle rather than scanned out of /dev/shm, which is global
         to the machine and picks up unrelated processes.
         """
-        return [
-            Path("/dev/shm") / base64.b64decode(e["handle"]["storage_handle"]).decode().lstrip("/")
-            for e in req.ref_handles or []
-        ]
+        from tensorrt_llm._torch.visual_gen import ref_shm
+
+        blocks = []
+        for e in req.ref_handles or []:
+            handle = e["handle"]
+            if ref_shm.is_handle(handle):
+                blocks.append(Path(handle[ref_shm.HANDLE_KEY]))
+            else:
+                name = base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
+                blocks.append(Path("/dev/shm") / name)
+        return blocks
 
     def test_consuming_a_handle_releases_its_block(self):
         """rank0 frees a block by consuming its handle; nothing else does, so an

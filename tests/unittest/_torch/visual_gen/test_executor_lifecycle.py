@@ -32,7 +32,7 @@ import zmq
 from utils.spawn_process import SpawnProcessContext, spawn_process
 
 from tensorrt_llm._torch.visual_gen import executor as executor_module
-from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
+from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient, DiffusionResponse
 from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
 pytestmark = pytest.mark.cpu_only
@@ -900,6 +900,49 @@ def test_worker_death_during_request_send_is_contained() -> None:
     assert client.shutdown_event.is_set()
     client.response_event.set.assert_called_once_with()
     client._iter_stats.record_request_started.assert_not_called()
+
+
+def test_coordinator_drains_queued_requests_and_responses_without_waiting() -> None:
+    """One coordinator wake-up sends every queued request and stores every
+    response already on the socket; an empty queue never blocks."""
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    client.shutdown_event = threading.Event()
+    client.pending_requests = executor_module.queue.Queue()
+    requests = [MagicMock(request_id=i) for i in range(3)]
+    for request in requests:
+        client.pending_requests.put(request)
+    client._request_to_send = None
+    client.requests_ipc = MagicMock()
+    client._iter_stats = MagicMock()
+
+    sent = 0
+    while client._process_requests():
+        sent += 1
+    assert sent == 3
+    assert [c.args[0] for c in client.requests_ipc.put_nowait.call_args_list] == requests
+    start = time.monotonic()
+    assert client._process_requests() is False
+    assert time.monotonic() - start < executor_module.POLL_TIMEOUT
+
+    responses = [DiffusionResponse(request_id=i, output=None) for i in range(2)]
+    client.responses_ipc = MagicMock()
+    client.responses_ipc.poll.side_effect = [True, True, False]
+    client.responses_ipc.get.side_effect = responses
+    client._event_loop = None
+    client._store_response = lambda response: response
+    stored = []
+    with patch.object(
+        executor_module.asyncio,
+        "run_coroutine_threadsafe",
+        side_effect=lambda response, loop: stored.append(response),
+    ):
+        client._process_responses()
+    assert stored == responses
+    assert [c.kwargs["timeout"] for c in client.responses_ipc.poll.call_args_list] == [0, 0, 0]
+
+    # Waking a coordinator whose loop is gone is a no-op, not an error.
+    client._serve_wake = asyncio.Event()
+    client._wake_serve_loop()
 
 
 def test_worker_liveness_check_does_not_abort_worker_group() -> None:

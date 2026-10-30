@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Direct tests for :mod:`tensorrt_llm.media.decoding`, plus the rank
-convergence protocol that guards it
-(``tensorrt_llm._torch.visual_gen.utils.synchronize_media_prepare_status``).
+"""Direct tests for :mod:`tensorrt_llm.media.decoding` and
+:mod:`tensorrt_llm.media.png_decode`, plus the rank convergence protocol that
+guards them (``tensorrt_llm._torch.visual_gen.utils.synchronize_media_prepare_status``).
 
 The decode tests run on the checked-in H.264 fixtures (see
 ``test_data/README.md`` for provenance). Each fixture frame encodes its own
@@ -15,9 +15,12 @@ on a supported platform fails them (it is a declared dependency).
 """
 
 import math
+import struct
 import subprocess
 import sys
 import time
+import zlib
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +29,7 @@ import torch
 from PIL import Image
 
 from tensorrt_llm._torch.visual_gen.utils import synchronize_media_prepare_status
+from tensorrt_llm.media import png_decode
 from tensorrt_llm.media.decoding import (
     _lanczos_taps,
     decode_video_reference_window,
@@ -379,3 +383,107 @@ class TestDecodeVideoReferenceWindow:
         torch.cuda.synchronize()
         per_frame = (time.perf_counter() - start) / 10
         assert per_frame < 0.25, f"resize took {per_frame * 1e3:.1f} ms/frame"
+
+
+# ---------------------------------------------------------------------------
+# PNG decode (host inflate + GPU unfilter): bitwise Pillow pixels or None
+# ---------------------------------------------------------------------------
+
+
+def _png_chunk(tag: bytes, body: bytes) -> bytes:
+    return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
+
+
+def _encode_rgb8_png(pixels: np.ndarray, extra_chunks=(), idat_parts: int = 1) -> bytes:
+    """RGB8 PNG whose rows cycle through all five filter types (spec section 9)."""
+    h, w, _ = pixels.shape
+    x = pixels.reshape(h, w * 3).astype(np.int32)
+    rows = []
+    for r in range(h):
+        a = np.concatenate([np.zeros(3, np.int32), x[r, :-3]])
+        b = x[r - 1] if r else np.zeros_like(x[r])
+        c = np.concatenate([np.zeros(3, np.int32), b[:-3]])
+        p = a + b - c
+        pa, pb, pc = np.abs(p - a), np.abs(p - b), np.abs(p - c)
+        paeth = np.where((pa <= pb) & (pa <= pc), a, np.where(pb <= pc, b, c))
+        ft = r % 5
+        pred = [np.zeros_like(a), a, b, (a + b) >> 1, paeth][ft]
+        rows.append(bytes([ft]) + ((x[r] - pred) & 255).astype(np.uint8).tobytes())
+    z = zlib.compress(b"".join(rows), 6)
+    cuts = [len(z) * i // idat_parts for i in range(idat_parts + 1)]
+    out = b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    for chunk in extra_chunks:
+        out += chunk
+    for i in range(idat_parts):
+        out += _png_chunk(b"IDAT", z[cuts[i] : cuts[i + 1]])
+    return out + _png_chunk(b"IEND", b"")
+
+
+def _pil_rgb(data: bytes) -> np.ndarray:
+    with Image.open(BytesIO(data)) as img:
+        return np.array(img)
+
+
+class TestPngDecode:
+    _RNG = np.random.default_rng(7)
+    _PIXELS = _RNG.integers(0, 256, (37, 53, 3), dtype=np.uint8)
+
+    def test_scope_parse(self):
+        """In-scope files parse; anything PIL may decode differently (other colour
+        types, interlace, text/EXIF chunks, bad CRCs, tiny sizes) is left to PIL."""
+        good = _encode_rgb8_png(self._PIXELS, [_png_chunk(b"gAMA", struct.pack(">I", 45455))], 3)
+        width, height, idat = png_decode.parse_png_rgb8(good)
+        assert (width, height, len(idat)) == (53, 37, 3)
+
+        buffer = BytesIO()
+        Image.fromarray(self._PIXELS).convert("RGBA").save(buffer, format="PNG")
+        corrupt = bytearray(good)
+        corrupt[29] ^= 1  # IHDR CRC
+        out_of_scope = [
+            buffer.getvalue(),
+            _encode_rgb8_png(self._PIXELS, [_png_chunk(b"tEXt", b"k\0v")]),
+            _encode_rgb8_png(self._PIXELS, [_png_chunk(b"gAMA", b"\0")]),
+            _encode_rgb8_png(self._PIXELS[:8, :8]),
+            bytes(corrupt),
+            good[:-12],  # no IEND
+        ]
+        for data in out_of_scope:
+            assert png_decode.parse_png_rgb8(data) is None
+
+    def test_inflate_is_exact_size(self):
+        raw = bytes(range(256)) * 9
+        z = zlib.compress(raw)
+        out = torch.empty(len(raw), dtype=torch.uint8)
+        for use_libdeflate in (False, True):
+            assert png_decode.inflate_scanlines_into(z, out, _use_libdeflate=use_libdeflate)
+            assert out.numpy().tobytes() == raw
+            short = torch.empty(len(raw) - 1, dtype=torch.uint8)
+            assert not png_decode.inflate_scanlines_into(z, short, _use_libdeflate=use_libdeflate)
+            assert not png_decode.inflate_scanlines_into(
+                z + b"\0", out, _use_libdeflate=use_libdeflate
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.parametrize("shape", [(37, 53), (16, 16), (300, 17), (2100, 24)])
+    def test_device_pixels_are_pillow_pixels(self, shape):
+        pixels = self._RNG.integers(0, 256, (*shape, 3), dtype=np.uint8)
+        for data in (_encode_rgb8_png(pixels, idat_parts=2), self._pillow_png(pixels)):
+            decoded = png_decode.decode_png_rgb8_to_device(data, "cuda")
+            assert decoded is not None
+            np.testing.assert_array_equal(decoded.cpu().numpy(), _pil_rgb(data))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_out_of_scope_and_bad_filters_return_none(self):
+        data = bytearray(_encode_rgb8_png(self._PIXELS))
+        assert png_decode.decode_png_rgb8_to_device(bytes(data), "cpu") is None
+        rows = bytearray(zlib.decompress(bytes(png_decode.parse_png_rgb8(data)[2][0])))
+        rows[0] = 5  # filter byte out of range
+        z = zlib.compress(bytes(rows))
+        bad = bytes(data[:33]) + _png_chunk(b"IDAT", z) + _png_chunk(b"IEND", b"")
+        assert png_decode.decode_png_rgb8_to_device(bad, "cuda") is None
+
+    @staticmethod
+    def _pillow_png(pixels: np.ndarray) -> bytes:
+        buffer = BytesIO()
+        Image.fromarray(pixels).save(buffer, format="PNG", compress_level=6)
+        return buffer.getvalue()

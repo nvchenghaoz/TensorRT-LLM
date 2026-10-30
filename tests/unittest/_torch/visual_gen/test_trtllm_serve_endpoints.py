@@ -1065,7 +1065,7 @@ class TestImageGeneration:
         the first."""
         # Use deterministic distinct images (all-zeros vs all-255) so
         # we can verify per-image output mapping, not just call counts.
-        from tensorrt_llm.media.encoding import image_to_bytes
+        from tensorrt_llm.media.encoding import image_to_b64, image_to_bytes
 
         img0 = torch.zeros((64, 64, 3), dtype=torch.uint8)
         img1 = torch.full((64, 64, 3), 255, dtype=torch.uint8)
@@ -1080,8 +1080,8 @@ class TestImageGeneration:
             client = _create_server(gen)
             with (
                 patch(
-                    "tensorrt_llm.serve.openai_server.image_to_bytes",
-                    wraps=image_to_bytes,
+                    "tensorrt_llm.serve.openai_server.image_to_b64",
+                    wraps=image_to_b64,
                 ) as mock_cvt,
                 patch("tensorrt_llm.media.encoding.save_image") as mock_save,
             ):
@@ -3387,3 +3387,76 @@ class TestTensorOnlyFormatRule:
         specs = self._specs(action_mode=True)
         with pytest.raises(ValueError, match="action_mode"):
             _resolve_tensor_only_format("mp4", {"action_mode": "policy"}, specs)
+
+
+# =========================================================================
+# Response fast paths (spliced b64_json body, log trimming)
+# =========================================================================
+
+
+class TestImageResponseFastPaths:
+    @staticmethod
+    def _content(splicer, payloads):
+        from tensorrt_llm.serve.openai_protocol import ImageGenerationResponse, ImageObject
+
+        data = [
+            ImageObject(b64_json=splicer.placeholder(p), revised_prompt='caf\u00e9 \u732b "q"')
+            for p in payloads
+        ]
+        return ImageGenerationResponse(created=1, data=data).model_dump()
+
+    def test_spliced_body_is_byte_identical_to_json_response(self):
+        """The b64 payloads are spliced into the rendered JSON as raw bytes;
+        the body (and Content-Length) must be exactly JSONResponse's."""
+        from fastapi.responses import JSONResponse
+
+        from tensorrt_llm.serve.openai_server import _B64JsonSplicer
+
+        payloads = [base64.b64encode(os.urandom(n)) for n in (0, 1, 2, 3, 70001)]
+        splicer = _B64JsonSplicer()
+        content = self._content(splicer, payloads)
+        headers = {"server-timing": "total;dur=1"}
+        response = splicer.response(content, headers)
+        reference = JSONResponse(
+            content=splicer.restore(json.loads(json.dumps(content))), headers=headers
+        )
+        assert response.body == reference.body
+        assert response.raw_headers == reference.raw_headers
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.run(response({"type": "http"}, None, send))
+        assert sent[0]["type"] == "http.response.start"
+        assert b"".join(m["body"] for m in sent[1:]) == reference.body
+        assert [m["more_body"] for m in sent[1:]][-1] is False
+
+    def test_ambiguous_placeholder_falls_back_to_json_response(self):
+        """If the prompt itself contains a placeholder token, splicing would be
+        ambiguous; the response must then be the plain JSONResponse."""
+        from fastapi.responses import JSONResponse
+
+        from tensorrt_llm.serve.openai_server import _B64JsonSplicer
+
+        splicer = _B64JsonSplicer()
+        content = self._content(splicer, [b"QUJD"])
+        content["data"][0]["revised_prompt"] = content["data"][0]["b64_json"]
+        assert splicer.render_parts(content) is None
+        response = splicer.response(content, None)
+        assert type(response) is JSONResponse
+        assert json.loads(response.body)["data"][0]["b64_json"] == "QUJD"
+
+    def test_log_params_replace_inline_reference_payloads(self):
+        from tensorrt_llm.serve.openai_server import _params_for_log
+        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
+
+        payload = os.urandom(4096)
+        params = VisualGenParams(image_reference=[MediaRef(content=payload, format="bytes")])
+        logged = _params_for_log(params)
+        assert logged is not params
+        assert logged.image_reference[0].content == "<4096 bytes>"
+        assert params.image_reference[0].content == payload
+        plain = VisualGenParams()
+        assert _params_for_log(plain) is plain

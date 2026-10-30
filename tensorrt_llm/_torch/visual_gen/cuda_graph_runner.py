@@ -3,7 +3,19 @@ import contextvars
 import functools
 import gc
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Hashable, List, Optional, Protocol, Tuple, TypeAlias
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Hashable,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    TypeAlias,
+)
 
 import torch
 
@@ -120,6 +132,29 @@ class CUDAGraphRunner:
         self._graph_output_refs: Dict[KeyType, Any] = {}
         self.static_inputs: Dict[KeyType, Tuple[List[Any], Dict[str, Any]]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
+        # Copy skip for step-invariant tensor kwargs (see register_reusable_inputs).
+        # _last_src holds STRONG references to the source tensor last copied into
+        # each (graph key, kwarg) static buffer, so a freed object's id can never
+        # fake a match. An empty allowlist copies every kwarg on every replay.
+        self._reusable_inputs: FrozenSet[str] = frozenset()
+        self._last_src: Dict[Tuple[KeyType, str], torch.Tensor] = {}
+
+    def register_reusable_inputs(self, names: Iterable[str]) -> None:
+        """Let replay skip ``copy_`` for the tensor kwargs named in ``names``.
+
+        For such a kwarg, replay copies only when the source tensor OBJECT differs
+        from the one last copied into that graph's static buffer. The caller must
+        guarantee that every source tensor passed under such a name is never
+        written in place after it is first passed (a fresh allocation per
+        request, or a cache that depends only on shape and is never rewritten),
+        and that the captured graph never writes that static input.
+        """
+        if self.graphs:
+            raise RuntimeError(
+                "CUDA graph reusable inputs must be registered before graph capture."
+            )
+        self._reusable_inputs = frozenset(names)
+        self._last_src.clear()
 
     def register_extra_key_fn(self, name: str, fn: ExtraKeyFn) -> None:
         """Register a graph-key extension computed from forward args/kwargs.
@@ -172,6 +207,7 @@ class CUDAGraphRunner:
         self, key: KeyType, fn: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any]
     ) -> None:
         logger.info(f"Capturing graph for key: {key}")
+        self._last_src.clear()
 
         # One time clone of inputs
         static_args = [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
@@ -217,9 +253,18 @@ class CUDAGraphRunner:
             else:
                 static_args[i] = arg
 
+        reusable = self._reusable_inputs
+        last_src = self._last_src
         for k, v in kwargs.items():
             if isinstance(v, torch.Tensor):
-                static_kwargs[k].copy_(v)
+                if k in reusable:
+                    slot = (key, k)
+                    if last_src.get(slot) is v:
+                        continue
+                    static_kwargs[k].copy_(v)
+                    last_src[slot] = v
+                else:
+                    static_kwargs[k].copy_(v)
             else:
                 static_kwargs[k] = v
 
@@ -254,6 +299,7 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        self._last_src.clear()
         if not self.graphs:
             return
         for graph in self.graphs.values():
