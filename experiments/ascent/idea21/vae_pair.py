@@ -292,5 +292,97 @@ def run_check():
     print(json.dumps(res))
 
 
+def _ord16(t):
+    i = t.contiguous().view(torch.int16).to(torch.int32)
+    return torch.where(i < 0, -(i & 0x7FFF), i)
+
+
+def eager_decode(vae, z):
+    """vae.decode without the compiled call (nn.Module.compile only wraps __call__)."""
+    from einops import rearrange
+
+    z = vae.inv_normalize(z)
+    z = rearrange(z, "... (c pi pj) i j -> ... c (i pi) (j pj)", pi=vae.ps[0], pj=vae.ps[1])
+    return vae.decoder.forward(z)
+
+
+def psnr_u8(a, b):
+    mse = (to_u8(a).double() - to_u8(b).double()).pow(2).mean().item()
+    return float("inf") if mse == 0 else 10 * math.log10(255.0 ** 2 / mse)
+
+
+@torch.inference_mode()
+def run_diag():
+    """Is the B-vs-A decode difference an FP8-decoder amplification of the op's 1-ulp changes?
+
+    Arms on one process and one latent: A (compiled, main softmax), B (compiled, op),
+    E (eager served decoder, main softmax), EB (eager, op), R (fp32 eager reference decoder,
+    no FP8, main softmax). Reports every arm vs R and the pairwise diffs, plus (eager) the
+    mid-block attention block's input/output differences E vs EB.
+    """
+    from tensorrt_llm._torch.visual_gen.models.flux3.flux3_core.image_vae import row_softmax_triton as rs
+    from tensorrt_llm._torch.visual_gen.models.flux3.flux3_core.image_vae.image_vae import (
+        Flux3ImageAttnBlock,
+    )
+
+    log(git_head())
+    vae, dt = build()
+    z = latent(0, dt)
+    out = {}
+    for arm, en in (("A", False), ("B", True)):
+        rs.ENABLED = en
+        vae.decode(z)
+        out[arm] = vae.decode(z).clone()
+    attn = [m for m in vae.decoder.modules() if isinstance(m, Flux3ImageAttnBlock)]
+    cap = {}
+
+    def hook(mod, inp, outp):
+        cap.setdefault("cur", {})["in"] = inp[0].clone()
+        cap["cur"]["out"] = outp.clone()
+
+    hs = [m.register_forward_hook(hook) for m in attn]
+    for arm, en in (("E", False), ("EB", True)):
+        rs.ENABLED = en
+        out[arm] = eager_decode(vae, z).clone()
+        cap[arm] = cap.pop("cur")
+    for h in hs:
+        h.remove()
+    att = {"n_attn_blocks": len(attn),
+           "input_bitwise": bool(torch.equal(cap["E"]["in"], cap["EB"]["in"]))}
+    o1, o2 = cap["E"]["out"], cap["EB"]["out"]
+    u = (_ord16(o1.to(torch.bfloat16)) - _ord16(o2.to(torch.bfloat16))).abs()
+    att.update({"out_dtype": str(o1.dtype), "out_share_differ": (u > 0).float().mean().item(),
+                "out_max_ulp_bf16": int(u.max().item()), "out_max_abs": (o1.float() - o2.float()).abs().max().item(),
+                "out_numel": o1.numel()})
+    del cap
+    torch.cuda.empty_cache()
+    log("attn block E vs EB", json.dumps(att))
+    # fp32 eager reference decoder (no FP8 convs, fp32 trunk), main's softmax
+    from safetensors.torch import load_file
+
+    from tensorrt_llm._torch.visual_gen.models.flux3.checkpoint import Flux3Checkpoint
+    from tensorrt_llm._torch.visual_gen.models.flux3.flux3_core.image_vae.image_vae import (
+        Flux3ImageVAE,
+        Flux3ImageVAEConfig,
+    )
+
+    pkg = Flux3Checkpoint(ROOT, "nvfp4")
+    ref = Flux3ImageVAE(Flux3ImageVAEConfig())
+    ref.load_state_dict(load_file(str(pkg.asset(pkg.config["vae"]["path"]))))
+    ref = ref.to(device="cuda", dtype=torch.float32).eval()
+    rs.ENABLED = False
+    out["R"] = ref.decode(z.float()).clone()
+    del ref
+    torch.cuda.empty_cache()
+    res = {"attn_E_vs_EB": att, "vs_R": {}, "pairs": {}}
+    for a in ("A", "B", "E", "EB"):
+        res["vs_R"][a] = {**u8cmp(out[a], out["R"]), "psnr_u8_db": psnr_u8(out[a], out["R"])}
+    for a, b in (("B", "A"), ("E", "A"), ("EB", "E"), ("EB", "A")):
+        res["pairs"][f"{a}_vs_{b}"] = {**u8cmp(out[a], out[b]), "psnr_u8_db": psnr_u8(out[a], out[b])}
+    res["passed"] = True
+    log("diag", json.dumps(res))
+    print(json.dumps(res))
+
+
 if __name__ == "__main__":
-    {"time": run_time, "check": run_check}[MODE]()
+    {"time": run_time, "check": run_check, "diag": run_diag}[MODE]()
