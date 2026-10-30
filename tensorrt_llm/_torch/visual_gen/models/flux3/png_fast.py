@@ -23,7 +23,10 @@ unfilter (None/Sub/Up/Avg/Paeth, PNG spec section 9). Here:
 decode_png_rgb8_to_device returns None (the caller uses PIL) for anything outside the
 fast path's scope: no PNG signature, not bit depth 8 / colour type 2 / interlace 0,
 sizes outside 16..4096, any chunk outside an allowlist of chunks that cannot change the
-pixels PIL returns (no eXIf / text chunks, which PIL reads EXIF orientation from), bad
+pixels PIL returns (no eXIf / text chunks, which PIL reads EXIF orientation from), an
+allowlisted ancillary chunk whose body is not the spec's exact layout (sRGB 1, gAMA 4,
+cHRM 32, pHYs 9, tIME 7 bytes; iCCP = 1-79 byte name, NUL, method 0, one complete zlib
+stream of at most 1 MiB), so PIL raises or decodes those itself, bad
 CRCs on non-IDAT chunks (PIL checks those; it does not check IDAT CRCs), non-consecutive
 IDATs, a missing IEND, a zlib stream that is not exactly the scanline size, or a filter
 byte > 4.
@@ -152,6 +155,41 @@ def inflate_scanlines_into(z: bytes, out: Tensor, *, use_libdeflate: bool = True
 
 
 # ----------------------------------------------------------------------------- parse
+def _ancillary_body_ok(cid: bytes, body) -> bool:
+    """True only for ancillary bodies PIL's PngStream reads without raising.
+
+    PIL raises on a short sRGB/gAMA/pHYs (ValueError / struct.error / IndexError), a
+    cHRM whose length is not a multiple of 4 (struct.error), an iCCP without its
+    separator and method byte (IndexError), a non-zero method (SyntaxError) or a profile
+    over MAX_TEXT_CHUNK (1 MiB, ValueError). Only the spec's exact layouts are taken here
+    (stricter than PIL); anything else returns False and PIL decides, so the outcome is
+    PIL's exception or PIL's pixels.
+    """
+    n = len(body)
+    if cid == b"sRGB":
+        return n == 1
+    if cid == b"gAMA":
+        return n == 4
+    if cid == b"cHRM":
+        return n == 32
+    if cid == b"pHYs":
+        return n == 9
+    if cid == b"tIME":
+        return n == 7
+    if cid == b"iCCP":
+        raw = bytes(body)
+        i = raw.find(b"\0")
+        if not (1 <= i <= 79) or i + 2 > n or raw[i + 1] != 0:
+            return False
+        d = zlib.decompressobj()
+        try:
+            d.decompress(raw[i + 2 :], 1 << 20)
+        except zlib.error:
+            return False
+        return d.eof and not d.unconsumed_tail and not d.unused_data
+    return False
+
+
 def parse_png_rgb8(data) -> tuple[int, int, list] | None:
     """(width, height, IDAT payload memoryviews) when the fast path applies, else None."""
     mv = memoryview(data)
@@ -192,6 +230,8 @@ def parse_png_rgb8(data) -> tuple[int, int, list] | None:
             elif cid == b"IEND":
                 seen_iend = True
                 break
+            elif not _ancillary_body_ok(cid, body):
+                return None
         pos = end
     if not seen_iend or not idat:
         return None
