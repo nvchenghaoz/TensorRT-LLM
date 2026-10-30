@@ -108,20 +108,36 @@ inline __device__ void tma_load_4d(uint32_t dst, CUtensorMap const* map, uint32_
       : "memory");
 }
 
+inline __device__ void tma_load_5d(uint32_t dst, CUtensorMap const* map, uint32_t bar, int c0,
+                                   int c1, int c2, int c3, int c4) {
+  asm volatile(
+      "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes "
+      "[%0], [%1, {%2, %3, %4, %5, %6}], [%7];\n" ::"r"(dst),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(c4), "r"(bar)
+      : "memory");
+}
+
 inline __device__ void named_bar_sync(int id, int threads) {
   asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(threads) : "memory");
 }
 
 // Issue the TMA loads of KV step j (64 keys) into ring stage j % STAGES.
+// V_SWAP23 (lever v_cf): tm_v is the 5D swap23 map (make_map_v_swap23), whose box writes key k
+// of the step to smem row swap23(k); v_g0 = bidb * (s / 16) is the batch's first 16-key group.
+template <bool V_SWAP23 = false>
 inline __device__ void issue_stage(int j, uint32_t ring, uint32_t full0, CUtensorMap const* tm_k,
-                                   CUtensorMap const* tm_v, int bidh, int bidb) {
+                                   CUtensorMap const* tm_v, int bidh, int bidb, int v_g0 = 0) {
   int const slot = j % STAGES;
   uint32_t const bar = full0 + slot * 8;
   uint32_t const dst = ring + slot * STAGE_BYTES;
   mbar_expect_tx(bar, STAGE_BYTES);
   tma_load_4d(dst, tm_k, bar, 0, bidh, j * 64, bidb);
   tma_load_4d(dst + K_CHUNK_BYTES, tm_k, bar, 64, bidh, j * 64, bidb);
-  tma_load_4d(dst + K_BYTES, tm_v, bar, 0, bidh, j * 64, bidb);
+  if (V_SWAP23) {
+    tma_load_5d(dst + K_BYTES, tm_v, bar, bidh * 128, 0, 0, 0, v_g0 + j * 4);
+  } else {
+    tma_load_4d(dst + K_BYTES, tm_v, bar, 0, bidh, j * 64, bidb);
+  }
 }
 
 #if defined(FMHA_FLUX3_V_B8T) && FMHA_FLUX3_V_B8T
@@ -137,9 +153,16 @@ inline __device__ void issue_stage(int j, uint32_t ring, uint32_t full0, CUtenso
 //
 // Head dim: r0 / r1 hold d = base + g / base + 8 + g (main: base + 2g / base + 2g + 1), so
 // acc_o's n-col -> d map differs; v_b8t_unpermute() restores main's layout once per tile.
+//
+// v_cf (V_SWAP23): with the swap23 V map the stage holds key k at smem row swap23(k) (key bits 2
+// and 3 exchanged inside each 16-key group), so lanes 0-7 (keys {0,1,8,9,2,3,10,11}) address rows
+// {0,1,4,5,2,3,6,7}: 8 distinct 16-B chunks under SWIZZLE_128B, one wavefront per 8 rows instead
+// of two. Every lane still reads the same V bytes (key, d) as without it: bitwise equal.
+template <bool V_SWAP23 = false>
 inline __device__ uint32_t v_b8t_lane_offset(int lane) {
   int const key = 16 * (lane >> 4) + 2 * ((lane >> 2) & 3) + (lane & 1) + 8 * ((lane >> 1) & 1);
-  return (uint32_t)(key * 128 + ((key & 7) << 4));
+  int const row = V_SWAP23 ? ((key & ~12) | ((key & 4) << 1) | ((key & 8) >> 1)) : key;
+  return (uint32_t)(row * 128 + ((row & 7) << 4));
 }
 
 template <typename Fragment>
@@ -211,11 +234,14 @@ inline __device__ void v_b8t_unpermute(Acc (&acc)[M][N], int lane) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Kernel_traits, typename Params>
+template <typename Kernel_traits, bool V_SWAP23 = false, typename Params>
 inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& params,
                                                                 CUtensorMap const* tm_k,
                                                                 CUtensorMap const* tm_v) {
   using namespace flux3_g3;
+#if !(defined(FMHA_FLUX3_V_B8T) && FMHA_FLUX3_V_B8T)
+  static_assert(!V_SWAP23, "the swap23 V layout (v_cf) is only read by the v_b8t V loads");
+#endif
   using Traits_p = typename Kernel_traits::Traits_p;
   using Traits_o = typename Kernel_traits::Traits_o;
   using Cta_tile_p = typename Kernel_traits::Cta_tile_p;
@@ -280,6 +306,7 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
   uint32_t const ring = smem_u32(smem_);
   uint32_t const full0 = smem_u32(smem_ + L::BAR_OFFSET);
   uint32_t const empty0 = full0 + STAGES * 8;
+  int const v_g0 = V_SWAP23 ? bidb * (int)(params.s / 16) : 0;
 
   // Barrier init + TMA prologue (one thread).
   int issued = 0;
@@ -302,7 +329,7 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
   if (tid == 0) {
     int const n0 = nsteps < STAGES ? nsteps : STAGES;
     for (; issued < n0; ++issued) {
-      issue_stage(issued, ring, full0, tm_k, tm_v, bidh, bidb);
+      issue_stage<V_SWAP23>(issued, ring, full0, tm_k, tm_v, bidh, bidb, v_g0);
     }
   }
 
@@ -322,7 +349,7 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
 #if defined(FMHA_FLUX3_V_B8T) && FMHA_FLUX3_V_B8T
   static_assert((int)Mma_tile_o::VALID_MMAS_N == 8 && (int)Mma_tile_o::MMAS_K == 2, "");
   uint32_t const v_ring = smem_u32(smem_ + K_BYTES);
-  uint32_t const v_lane_off = v_b8t_lane_offset(lane);
+  uint32_t const v_lane_off = v_b8t_lane_offset<V_SWAP23>(lane);
 #endif
 
 #if defined(FMHA_FLUX3_MASK_SKIP) && FMHA_FLUX3_MASK_SKIP
@@ -385,7 +412,7 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
           } else if (!mbar_test_wait(ebar, eph)) {
             break;
           }
-          issue_stage(j, ring, full0, tm_k, tm_v, bidh, bidb);
+          issue_stage<V_SWAP23>(j, ring, full0, tm_k, tm_v, bidh, bidb, v_g0);
           ++issued;
         }
       }
@@ -588,6 +615,36 @@ inline void make_map(CUtensorMap* map, void const* ptr, int b, int s, int h, int
                            CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   if (r != CUDA_SUCCESS) {
     throw std::runtime_error("flux3 g3: cuTensorMapEncodeTiled failed");
+  }
+}
+
+// v_cf: the V map whose box lands key k of a 64-key step at smem row swap23(k). The box is
+// {128 B of head h, 4 keys (lo), 2 (key bit 3), 2 (key bit 2), 4 groups of 16 keys}: smem row
+// = lo + 4 * b3 + 8 * b2 + 16 * g holds key lo + 8 * b3 + 4 * b2 + 16 * g. Heads fold into dim 0
+// (head stride == d bytes) and batches into the 16-key-group dim (batch stride == s rows), so the
+// map needs s % 16 == 0 (and, for b > 1, s % 64 == 0, so that no step crosses a batch: keys past
+// s then read as zero-filled out-of-bounds rows exactly as the 4D map gives them).
+inline bool v_swap23_ok(bert::Fused_multihead_attention_params_v2 const& params) {
+  if (params.s % 16 != 0) return false;
+  if (params.b > 1 && params.s % 64 != 0) return false;
+  if ((int64_t)params.b * (params.s / 16) < 4) return false;
+  return true;
+}
+
+inline void make_map_v_swap23(CUtensorMap* map, void const* ptr, int b, int s, int h, int d,
+                              int64_t row_stride_bytes) {
+  cuuint64_t const row = (cuuint64_t)row_stride_bytes;
+  cuuint64_t dims[5] = {(cuuint64_t)h * (cuuint64_t)d, 4, 2, 2,
+                        (cuuint64_t)b * (cuuint64_t)(s / 16)};
+  cuuint64_t strides[4] = {row, 8 * row, 4 * row, 16 * row};
+  cuuint32_t box[5] = {128, 4, 2, 2, 4};
+  cuuint32_t elem_strides[5] = {1, 1, 1, 1, 1};
+  CUresult r = encode_fn()(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, const_cast<void*>(ptr), dims,
+                           strides, box, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                           CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                           CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (r != CUDA_SUCCESS) {
+    throw std::runtime_error("flux3 g3: cuTensorMapEncodeTiled (v swap23) failed");
   }
 }
 
