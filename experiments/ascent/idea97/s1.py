@@ -12,6 +12,7 @@ DECLARED TOLERANCE (stated before timing, from the brief):
 """
 
 import json
+import os
 import random
 import sys
 import time
@@ -68,6 +69,9 @@ def main():
     q = (torch.randn(C, T, device="cuda", generator=g) * 1.5).to(torch.bfloat16)
     k = (torch.randn(C, T, device="cuda", generator=g) * 1.5).to(torch.bfloat16)
     v = torch.randn(C, T, device="cuda", generator=g).to(torch.bfloat16)
+    # served channels_last decoder: q/k are [C, T] views with strides (1, C)
+    q = q.t().contiguous().t()
+    k = k.t().contiguous().t()
     vf = v.float()
     s_v = (vf.abs().amax(dim=-1, keepdim=True) / 448.0).clamp(min=1e-30)
     vq = (vf / s_v).clamp(-448.0, 448.0).to(FP8).contiguous()
@@ -168,13 +172,34 @@ def main():
         "scale_a": rel <= 1e-5,
         "o_vs_fp64": e_c <= 2 * e_m,
     }
-    # repeat determinism (NaN-poisoned outputs each call)
-    first = o_c.clone()
+    # the served (non-DEBUG) kernel vs the DEBUG compile, then repeat determinism of the served one
+    o0, sa0, _ = sa.pv_prologue(s, mp, vq, svf, SCALE, cfg)
+    gates["debug_compile_matches_served"] = bool(torch.equal(o0, o_c) and torch.equal(sa0, sa_c))
+    res["served_vs_debug"] = {"o_bitwise_share": (o0 == o_c).float().mean().item(),
+                              "sa_bitwise": bool(torch.equal(sa0, sa_c))}
+    first, first_sa = o0.clone(), sa0.clone()
+    s_keep = s[rows].clone()
     rep = True
-    for _ in range(5):
+    for _ in range(int(os.environ.get("REPS", "20"))):
         o2, sa2, _ = sa.pv_prologue(s, mp, vq, svf, SCALE, cfg)
-        rep &= bool(torch.equal(o2, first) and torch.equal(sa2, sa_c))
+        rep &= bool(torch.equal(o2, first) and torch.equal(sa2, first_sa))
     gates["repeat_bitwise"] = rep
+    gates["inputs_unchanged"] = bool(torch.equal(s[rows], s_keep))
+    # S (served channels_last q/k) vs bmm, within the K bound vs fp64, m bitwise vs own S
+    m_tiles = mp.amax(dim=1)
+    gates["m_bitwise_vs_own_S"] = bool(torch.equal(m_tiles.view(torch.int32), s.amax(dim=1).view(torch.int32)))
+    qd, kd = q.double(), k.double()
+    s64 = qd[:, rows].t() @ kd
+    bound = 512 * 2.0**-24 * (qd[:, rows].abs().t() @ kd.abs())
+    e_c = (s[rows].double() - s64).abs()
+    res["S_vs_fp64"] = {"max_abs": e_c.max().item(), "max_ratio_to_bound": (e_c / bound).max().item()}
+    gates["S_within_K_bound"] = bool((e_c <= bound).all().item())
+    s_b = torch.bmm(q.t().unsqueeze(0), k.unsqueeze(0), out_dtype=torch.float32)[0]
+    neq = 0
+    for i in range(0, T, 4096):
+        neq += int((s[i:i + 4096] != s_b[i:i + 4096]).sum().item())
+    res["S_vs_bmm_differing"] = neq
+    del s_b
     res["gates"] = gates
     res["passed"] = bool(all(gates.values()))
     log(json.dumps(res))
