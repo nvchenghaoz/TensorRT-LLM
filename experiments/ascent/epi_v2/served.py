@@ -228,10 +228,15 @@ def pair():
                                                  for _ in range(bench.CALLS)])
             t[arm] = []
         rng = random.Random(M)
-        for g in graphs.values():
-            g.replay()
-        torch.cuda.synchronize()
-        for _ in range(bench.ROUNDS * 2):
+        # Soak (untimed) so the timed rounds run at settled clocks: job 663/664's 16K p10 rows
+        # were ~6% under the median from the first rounds.
+        import time as _time
+        t_end = _time.time() + float(os.environ.get("EPI_V2_SOAK_S", "15"))
+        while _time.time() < t_end:
+            for g in graphs.values():
+                g.replay()
+            torch.cuda.synchronize()
+        for _ in range(int(os.environ.get("EPI_V2_PAIR_ROUNDS", "60"))):
             order = list(graphs)
             rng.shuffle(order)
             for arm in order:
