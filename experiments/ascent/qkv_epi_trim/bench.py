@@ -65,6 +65,12 @@ def time_graphs(fns, R, ITERS, seed=54):
     for g in graphs.values():
         g.replay()
     torch.cuda.synchronize()
+    # Warm the clocks before timing (the first M measured otherwise shows a wide spread).
+    t_end = time.time() + float(os.environ.get("B_WARM_S", "3"))
+    while time.time() < t_end:
+        for g in graphs.values():
+            g.replay()
+        torch.cuda.synchronize()
     rng = random.Random(seed)
     times = {n: [] for n in graphs}
     order = list(graphs)
