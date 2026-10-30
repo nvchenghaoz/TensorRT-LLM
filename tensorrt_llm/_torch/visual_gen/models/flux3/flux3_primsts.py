@@ -1916,7 +1916,7 @@ def _sm120_qkv_planar_gemms(
     return out
 
 
-def _qkv_epi_fp8_route(activation, weight, q_norm, k_norm, cos_sin) -> bool:
+def _qkv_epi_fp8_route(activation, weight, q_norm, k_norm, cos_sin, static_qk=True) -> bool:
     """Idea 14's fused route applies exactly where main's chain is the batched QKV3 GEMM +
     qknorm_rope_fp8 VEC/FOLD with the static Q/K scale (TRTLLM_FLUX3_QKV_EPI_FP8=0: never)."""
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120 import (
@@ -1926,6 +1926,8 @@ def _qkv_epi_fp8_route(activation, weight, q_norm, k_norm, cos_sin) -> bool:
     from . import flux3_qkv_epi_fp8
     from . import flux3_sm120_strided_gemm as strided
 
+    if not static_qk:  # dynamic Q/K amax: only main's two-pass chain computes it
+        return False
     if not (flux3_qkv_epi_fp8.enabled() and strided.batched()):
         return False
     if not (qr8.FOLD and qr8.VEC and qr8.STATIC_QK):
@@ -1973,7 +1975,7 @@ def nvfp4_qkv_rope_fp8_impl(
 
     rows = activation.shape[0]
     width = weight.shape[0] // 3
-    if _qkv_epi_fp8_route(activation, weight, q_norm, k_norm, cos_sin):
+    if _qkv_epi_fp8_route(activation, weight, q_norm, k_norm, cos_sin, static_qk):
         # Idea 14: Q/K E4M3 straight from the QKV GEMM epilogue + a V-only quantize; bitwise
         # main's qkv8/scales and gemm v plane (q/k planes of gemm undefined, as main's L2 discard).
         # `positions` is the identity _token_positions table here (the epilogue indexes cos_sin
