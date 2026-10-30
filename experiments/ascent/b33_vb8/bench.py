@@ -5,9 +5,10 @@ base (main's served G3 levers), cand (base + v_b8t) and base2 (base + a no-op ma
 the A/A copy). In the baseline tree the G3 header has no v_b8t code, so cand == base there.
 kernel_ms of a label = median replay of the tree's ROUTED arm (cand in the branch, base in main).
 
-Labels (served 2048^2, T=80, knowledge 384 / 686):
+Labels (served 2048^2, T=80, knowledge 384 / 686, plan 724):
   t2i-2048  graph of 1 BF16-out G3 call at 16384 + 4 nvfp4_out at 16384 + 28 nvfp4_out at 16464
-  i2i-2048  graph of 6 BF16-out G3 calls at 16384 + 4 nvfp4_out at 16384 + 28 nvfp4_out at 32848
+  i2i-2048  graph of 1 BF16-out G3 call at 16384 + 9 nvfp4_out at 16384 + 28 nvfp4_out at 32848
+  i2i-2048-preL19 (optional) 6 BF16-out + 4 nvfp4_out at 16384 + 28 nvfp4_out at 32848
 Each round times one block of replays per arm (rotating arm order) and samples SM MHz and board
 W every 10 ms in a thread. Reported per round: CAND/BASE and BASE2/BASE (A/A) median ratios.
 Inputs: fixed seeds, pristine copies restored before timing and compared after.
@@ -30,7 +31,11 @@ import common as c  # noqa: E402
 
 b = c.b
 log = c.log
-CHAINS = {"t2i-2048": (1, 16384, 16464), "i2i-2048": (6, 16384, 32848)}
+# label -> (BF16-out calls at S_img, nvfp4_out calls at S_img, S_img, S_full); + 28 nfo at S_full.
+# i2i-2048 is the served set on main 8cc26728 (landing 19, COND_ATTN_NFO=1: plan 724);
+# i2i-2048-preL19 is the older set (evidence only).
+CHAINS = {"t2i-2048": (1, 4, 16384, 16464), "i2i-2048": (1, 9, 16384, 32848),
+          "i2i-2048-preL19": (6, 4, 16384, 32848)}
 
 
 class Sampler:
@@ -96,7 +101,7 @@ def main():
     out = {"batch": {}, "inproc": {}, "routed": list(routed), "routed_arm": routed_arm,
            "levers": {k: list(v) for k, v in levs.items()}}
     for lab in [x for x in args.labels.split(",") if x]:
-        n_bf16, s_img, s_full = CHAINS[lab]
+        n_bf16, n_img, s_img, s_full = CHAINS[lab]
         inps = {S: b.make_qkv(S, 900 + S, False) for S in (s_img, s_full)}
         graphs, keep = {}, []
         for a in arms:
@@ -107,7 +112,7 @@ def main():
             def body(a=a, nouts=nouts, obf=obf):
                 for _ in range(n_bf16):
                     b.call_bf16(lib, mods[a]["bf16"], inps[s_img], obf)
-                for _ in range(4):
+                for _ in range(n_img):
                     b.call_nfo(lib, mods[a]["nfo"], inps[s_img], nouts[s_img], gscale)
                 for _ in range(28):
                     b.call_nfo(lib, mods[a]["nfo"], inps[s_full], nouts[s_full], gscale)
@@ -177,7 +182,7 @@ def main():
         m = med(xs)
         out["batch"][lab] = {"kernel_ms": round(m, 4),
                              "noise_floor": round((pctl(xs, 0.9) - pctl(xs, 0.1)) / m, 4),
-                             "calls": n_bf16 + 32, "S_img": s_img, "S_full": s_full}
+                             "calls": n_bf16 + n_img + 28, "S_img": s_img, "S_full": s_full}
         log(f"[{lab}] summary {json.dumps({k: v for k, v in summ.items() if k != 'rounds'})}")
         for S in inps:
             if not torch.equal(inps[S]["guard"].payload, inps[S]["pristine"]):

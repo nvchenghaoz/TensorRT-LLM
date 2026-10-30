@@ -46,7 +46,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--repeats", type=int, default=100)
     p.add_argument("--sizes", default="16384,16464,32848,16900,4176")
-    p.add_argument("--chains", default="1:16384:16464,6:16384:32848")
+    # n_bf16:n_nfo_img:S_img:S_full (+ 28 nfo at S_full); the last is i2i after landing 19
+    p.add_argument("--chains", default="1:4:16384:16464,6:4:16384:32848,1:9:16384:32848")
     p.add_argument("--skip_sass", action="store_true")
     args = p.parse_args()
     lib = c.lib_mod()
@@ -146,11 +147,11 @@ def main():
             del inp, brefs
             torch.cuda.empty_cache()
 
-        for n_bf16, s_img, s_full in chains:
+        for n_bf16, n_img, s_img, s_full in chains:
             inps = {S: b.make_qkv(S, 500 + S + int(peaky), peaky) for S in (s_img, s_full)}
             crefs = {}
             for a in ("base", "cand"):
-                seq = [("b", s_img)] * n_bf16 + [("n", s_img)] * 4 + [("n", s_full)] * 28
+                seq = [("b", s_img)] * n_bf16 + [("n", s_img)] * n_img + [("n", s_full)] * 28
                 fns, tens, checks = [], [], []
                 for kind, S in seq:
                     if kind == "b":
@@ -166,16 +167,17 @@ def main():
                                    b.call_nfo(lib, m, i, oo, gscale))
                         tens += [out.fp4, out.sf]
                         checks.append(out.check)
-                ref, row = b.run_seq(fns, tens, checks, 2, failures, f"{tag}_chain{s_full}_{a}")
-                rows[f"{tag}_chain{s_full}_{a}"] = row
-                log(f"[{tag} chain {n_bf16}:{s_img}:{s_full} {a}] {json.dumps(row)}")
+                cn = f"{n_bf16}_{n_img}_{s_img}_{s_full}"
+                ref, row = b.run_seq(fns, tens, checks, 2, failures, f"{tag}_chain{cn}_{a}")
+                rows[f"{tag}_chain{cn}_{a}"] = row
+                log(f"[{tag} chain {cn} {a}] {json.dumps(row)}")
                 crefs[a] = [t.cpu() for t in ref]
                 del fns, tens, checks, ref
                 torch.cuda.empty_cache()
             eq = all(torch.equal(x, y) for x, y in zip(crefs["base"], crefs["cand"]))
-            bitwise[f"{tag}_chain_{n_bf16}_{s_img}_{s_full}"] = eq
+            bitwise[f"{tag}_chain_{cn}"] = eq
             if not eq:
-                failures.append(f"bitwise_{tag}_chain_{s_full}")
+                failures.append(f"bitwise_{tag}_chain_{cn}")
             for S in inps:
                 if not torch.equal(inps[S]["guard"].payload, inps[S]["pristine"]):
                     failures.append(f"{tag}_chain_inputs_changed_S{S}")
