@@ -81,7 +81,10 @@ def dit_config():
 
 
 def build():
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.config import (
+        DiffusionModelConfig,
+        create_attention_metadata_state,
+    )
     from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import Flux3Model
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
@@ -102,13 +105,17 @@ def build():
             backend="FLASHINFER",
             quant_attention_config=QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8"),
         )
+        kw["attention_metadata_state"] = create_attention_metadata_state()
         mc = DiffusionModelConfig(**kw)
+        with torch.device("cuda"):
+            model = Flux3Model(mc)
     except Exception as exc:  # noqa: BLE001
         backend = f"default ({type(exc).__name__}: {exc})"
         kw.pop("attention", None)
+        kw.pop("attention_metadata_state", None)
         mc = DiffusionModelConfig(**kw)
-    with torch.device("cuda"):
-        model = Flux3Model(mc)
+        with torch.device("cuda"):
+            model = Flux3Model(mc)
     model = model.cuda().eval()
     g = torch.Generator(device="cuda").manual_seed(1234)
     with torch.no_grad():
