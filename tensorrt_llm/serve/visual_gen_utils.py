@@ -287,6 +287,62 @@ def _b64(key: str, value: str) -> bytes:
         ) from exc
 
 
+_B64_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+# Below this many encoded characters the CPU decode is already cheap.
+_B64_GPU_MIN_CHARS = 1 << 20
+_b64_gpu_luts: Dict[Any, Any] = {}
+
+
+def _b64decode_canonical_gpu(payload: str) -> Optional[bytes]:
+    """Decode a large, canonical base64 string on the GPU, or return None.
+
+    Only canonical input takes this path: ASCII, length a multiple of 4, every
+    character in the standard alphabet except up to two trailing ``=``, and
+    zero pad bits. For such input ``base64.b64decode(payload, validate=True)``
+    has exactly one answer, which this computes; everything else (including
+    every input the strict decoder rejects) returns None so the caller runs
+    the strict CPU decode unchanged.
+    """
+    n = len(payload)
+    if n < _B64_GPU_MIN_CHARS or n % 4 or not payload.isascii():
+        return None
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        raw = payload.encode("ascii")
+        pad = 2 if raw.endswith(b"==") else (1 if raw.endswith(b"=") else 0)
+        dev = torch.device("cuda", torch.cuda.current_device())
+        lut = _b64_gpu_luts.get(dev)
+        if lut is None:
+            table = torch.full((256,), -1, dtype=torch.int32)
+            table[torch.frombuffer(bytearray(_B64_ALPHABET), dtype=torch.uint8).long()] = torch.arange(
+                64, dtype=torch.int32
+            )
+            lut = _b64_gpu_luts[dev] = table.to(dev)
+        chars = torch.frombuffer(raw, dtype=torch.uint8).to(dev)
+        vals = lut[chars.long()]
+        if pad:
+            vals[n - pad :] = 0
+        q = vals.view(-1, 4)
+        # Any non-alphabet character (an '=' anywhere but the tail included).
+        bad = (vals < 0).any()
+        last = q[-1]
+        if pad == 1:
+            bad = bad | ((last[2] & 0x3) != 0)
+        elif pad == 2:
+            bad = bad | ((last[1] & 0xF) != 0)
+        w = (q[:, 0] << 18) | (q[:, 1] << 12) | (q[:, 2] << 6) | q[:, 3]
+        out = torch.stack(((w >> 16) & 0xFF, (w >> 8) & 0xFF, w & 0xFF), dim=1).to(torch.uint8)
+        out = out.view(-1)[: (n // 4) * 3 - pad]
+        if bool(bad.item()):
+            return None
+        return out.cpu().numpy().tobytes()
+    except Exception:
+        return None
+
+
 def _decode_base64_media(value: str) -> Optional[bytes]:
     payload = value
     if value.startswith("data:"):
@@ -298,6 +354,9 @@ def _decode_base64_media(value: str) -> Optional[bytes]:
             "Image edit input exceeds the per-image byte limit "
             f"before decoding ({len(payload)} encoded bytes)."
         )
+    decoded = _b64decode_canonical_gpu(payload)
+    if decoded is not None:
+        return decoded
     try:
         return base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError):
