@@ -32,7 +32,9 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_core.image_vae import spl
 C = 512
 T0 = time.time()
 ACCEPT = [(256, 256), (128, 128), (64, 64), (256, 192)]
-REJECT = [(96, 96), (144, 144), (160, 160), (192, 192), (125, 125)]
+# 125x125 (T=15625) also fails on main (landing 25's e4m3 _scaled_mm needs T % 16 == 0): checked as
+# "same error in both arms"; 100x100 (T=10000, T % 256 != 0) is the runnable non-multiple-of-256 case.
+REJECT = [(96, 96), (144, 144), (160, 160), (192, 192), (100, 100), (125, 125)]
 ITERS = int(os.environ.get("ITERS", "50"))
 
 
@@ -138,6 +140,21 @@ def main():
         use = sa.can_use(q2)
         r = {"T": t, "NT": t / 256, "can_use": use, "old_can_use": old_can_use(q2)}
         gates[f"{key}_can_use_as_expected"] = use == expect
+        errs = []
+        for arm in (True, False):
+            try:
+                call(arm, qkv)
+                errs.append(None)
+            except RuntimeError as ex:  # main's own _scaled_mm needs T % 16 == 0
+                errs.append(str(ex)[:200])
+        if errs[0] is not None or errs[1] is not None:
+            r["errors_on_off"] = errs
+            gates[f"{key}_same_error_as_landing25"] = (not expect) and errs[0] == errs[1]
+            out[key] = r
+            log(key, json.dumps(r))
+            del qkv, keep
+            torch.cuda.empty_cache()
+            continue
         y_on = call(True, qkv)
         y_off = call(False, qkv)
         r["census_on"] = census(True, qkv)
