@@ -82,6 +82,11 @@ struct Flux3Nvfp4OutPtrs {
 static thread_local Flux3Nvfp4OutPtrs g_flux3_nvfp4_out;
 #endif
 
+#if defined(FMHA_FLUX3_D128_LAUNCHER)
+// FLUX.3 G3 Q-row prefix for the current run_q_rows / run_nvfp4_out_q_rows call (0: all rows).
+static thread_local int64_t g_flux3_q_rows = 0;
+#endif
+
 static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
                               const Launch_params launch_params,
                               // types
@@ -464,6 +469,7 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
 #endif
   if (head_dim == 128 && head_dim_v == 128 && data_type == DATA_TYPE_E4M3 &&
       output_dtype == DATA_TYPE_BF16) {
+    launch_params.flux3_q_rows = static_cast<int>(g_flux3_q_rows);
     FMHA_FLUX3_D128_LAUNCHER(params, launch_params, stream);
   } else {
     throw std::runtime_error("FLUX.3 d128 FMHAv2 variant supports only E4M3 d128 -> BF16.");
@@ -504,6 +510,35 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);
 
+#if defined(FMHA_FLUX3_D128_LAUNCHER)
+/**
+ * FLUX.3: run() with a Q-row prefix for the G3 launcher. Only Q tiles [0, ceil(q_rows / 64))
+ * (rounded up to whole 3-group CTAs) are computed; every K/V row still enters attention.
+ * q_rows == 0 is run() unchanged. The 4-warp fallback ignores the prefix (all rows).
+ */
+void TRTLLMFMHAv2RunFlux3QRows(TensorView q, TensorView k, TensorView v, TensorView o,
+                               Optional<TensorView> maybe_lse, Optional<TensorView> scale_bmm1_d,
+                               Optional<TensorView> scale_bmm2_d, int64_t num_heads,
+                               int64_t head_dim, int64_t seq_len, const float scale_softmax,
+                               const float scale_bmm1, const float scale_bmm2, bool causal,
+                               bool is_e4m3, bool is_bf16_output, int64_t q_rows) {
+  TVM_FFI_ICHECK(q_rows >= 0 && q_rows <= seq_len)
+      << "q_rows must lie in [0, seq_len], got " << q_rows << " for seq_len " << seq_len;
+  g_flux3_q_rows = q_rows;
+  try {
+    TRTLLMFMHAv2Run(q, k, v, o, maybe_lse, scale_bmm1_d, scale_bmm2_d, num_heads, head_dim,
+                    seq_len, scale_softmax, scale_bmm1, scale_bmm2, causal, is_e4m3,
+                    is_bf16_output);
+  } catch (...) {
+    g_flux3_q_rows = 0;
+    throw;
+  }
+  g_flux3_q_rows = 0;
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_q_rows, flashinfer::TRTLLMFMHAv2RunFlux3QRows);
+#endif  // FMHA_FLUX3_D128_LAUNCHER
+
 #if defined(FMHA_FLUX3_NVFP4_OUT) && FMHA_FLUX3_NVFP4_OUT
 /**
  * FLUX.3 d128 E4M3 attention with the NVFP4 output epilogue: instead of BF16 O [B, S, H, D] the
@@ -542,6 +577,27 @@ void TRTLLMFMHAv2RunFlux3Nvfp4Out(TensorView q, TensorView k, TensorView v, Tens
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_nvfp4_out, flashinfer::TRTLLMFMHAv2RunFlux3Nvfp4Out);
+
+/** FLUX.3: run_nvfp4_out() with the G3 Q-row prefix of run_q_rows (0: all rows). */
+void TRTLLMFMHAv2RunFlux3Nvfp4OutQRows(TensorView q, TensorView k, TensorView v, TensorView fp4,
+                                       TensorView sf, TensorView gscale,
+                                       Optional<TensorView> scale_bmm1_d,
+                                       Optional<TensorView> scale_bmm2_d, int64_t num_heads,
+                                       int64_t head_dim, int64_t seq_len, int64_t q_rows) {
+  TVM_FFI_ICHECK(q_rows >= 0 && q_rows <= seq_len)
+      << "q_rows must lie in [0, seq_len], got " << q_rows << " for seq_len " << seq_len;
+  g_flux3_q_rows = q_rows;
+  try {
+    TRTLLMFMHAv2RunFlux3Nvfp4Out(q, k, v, fp4, sf, gscale, scale_bmm1_d, scale_bmm2_d, num_heads,
+                                 head_dim, seq_len);
+  } catch (...) {
+    g_flux3_q_rows = 0;
+    throw;
+  }
+  g_flux3_q_rows = 0;
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_nvfp4_out_q_rows, flashinfer::TRTLLMFMHAv2RunFlux3Nvfp4OutQRows);
 #endif  // FMHA_FLUX3_NVFP4_OUT
 
 }  // namespace flashinfer

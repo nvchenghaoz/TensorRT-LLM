@@ -351,6 +351,11 @@ struct Fused_multihead_attention_launch_params {
   int device_l2_cache_size = 0;
   // skip softmax attention
   bool enable_skip_softmax = false;
+#if defined(FMHA_FLUX3_D128_LAUNCHER)
+  // FLUX.3 d128 G3 launcher only: Q-row prefix. 0 or >= params.s runs all rows; otherwise the
+  // grid covers q_tiles = ceil(flux3_q_rows / 64) Q tiles (K/V still span all params.s rows).
+  int flux3_q_rows = 0;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

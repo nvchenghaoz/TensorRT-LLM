@@ -264,6 +264,95 @@ def fmha_v2_flux3_d128_nvfp4_out(
     return fp4, sf
 
 
+# Q-row prefix (Launch_params.flux3_q_rows, G3 launcher only): run_q_rows / run_nvfp4_out_q_rows
+# compute Q tiles [0, ceil(q_rows / 64)) rounded up to whole 3-group CTAs, over all seq_len K/V
+# rows. q_rows == 0 or >= seq_len runs all rows. Rows [0, q_rows) are bitwise the full launch's
+# (each Q tile is computed independently); rows past q_prefix_rows_written(q_rows) are not
+# written. The 4-warp fallback (calls G3 does not support) ignores q_rows and runs all rows.
+G3_GROUP_ROWS = 192
+
+
+def q_prefix_rows_written(q_rows: int) -> int:
+    """Rows a q_rows prefix launch writes: ceil(ceil(q_rows / 64) / 3) * 192 (16512 for 16384)."""
+    return ((q_rows + 63) // 64 + 2) // 3 * G3_GROUP_ROWS
+
+
+def fmha_v2_flux3_d128_q_rows(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    q_rows: int,
+    *,
+    scale_bmm1_d: Optional[torch.Tensor],
+    scale_bmm2_d: Optional[torch.Tensor],
+    module,
+) -> torch.Tensor:
+    """fmha_v2_flux3_d128 (non-causal, no LSE) computing only the Q-row prefix q_rows."""
+    if head_dim != 128 or query.dtype != torch.float8_e4m3fn or out.dtype != torch.bfloat16:
+        raise ValueError("fmha_v2_flux3_d128_q_rows supports E4M3 head_dim 128 -> BF16 only.")
+    module.run_q_rows(
+        query,
+        key,
+        value,
+        out,
+        None,
+        scale_bmm1_d,
+        scale_bmm2_d,
+        num_heads,
+        head_dim,
+        seq_len,
+        1.0,
+        1.0,
+        1.0,
+        False,
+        True,
+        True,
+        int(q_rows),
+    )
+    return out
+
+
+def fmha_v2_flux3_d128_nvfp4_out_q_rows(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    fp4: torch.Tensor,
+    sf: torch.Tensor,
+    global_scale: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    q_rows: int,
+    *,
+    scale_bmm1_d: Optional[torch.Tensor],
+    scale_bmm2_d: Optional[torch.Tensor],
+    module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fmha_v2_flux3_d128_nvfp4_out computing only the Q-row prefix q_rows (fp4 rows and SF row
+    blocks of rows [0, q_rows) bitwise the full launch's)."""
+    if head_dim != 128 or query.dtype != torch.float8_e4m3fn:
+        raise ValueError("fmha_v2_flux3_d128_nvfp4_out_q_rows supports E4M3 head_dim 128 only.")
+    module.run_nvfp4_out_q_rows(
+        query,
+        key,
+        value,
+        fp4,
+        sf,
+        global_scale,
+        scale_bmm1_d,
+        scale_bmm2_d,
+        num_heads,
+        head_dim,
+        seq_len,
+        int(q_rows),
+    )
+    return fp4, sf
+
+
 # softmax_trim (FMHA_FLUX3_SOFTMAX_TRIM, softmax.h; bitwise vs base2): P packs to FP8 without the
 # multiply by scale_softmax (requires scale_softmax == 1, as fmha_v2_flux3_d128 passes) and the
 # row max reduces as a depth-4 fmaxf tree. TRTLLM_FMHA_V2_FLUX3_ST=0 drops it from the routed set.
@@ -313,7 +402,14 @@ void {launcher}_g3_nl_tiled(
                                          smem_size));
     attr_set = true;
   }}
-  int q_tiles = ((int)params.s + 63) / 64;
+  // Q-row prefix (run_q_rows / run_nvfp4_out_q_rows): 0 or >= params.s runs all rows. The kernel
+  // derives its tile range from blockIdx.x and params.s only, so a smaller grid.x computes the
+  // leading q_tiles * 64 rows (rounded up to whole CTAs) over every K/V row.
+  int q_rows = (int)params.s;
+  if( launch_params.flux3_q_rows > 0 && launch_params.flux3_q_rows < q_rows ) {{
+    q_rows = launch_params.flux3_q_rows;
+  }}
+  int q_tiles = (q_rows + 63) / 64;
   dim3 grid((q_tiles + g3::GROUPS - 1) / g3::GROUPS, params.h, params.b);
   {kname}_g3<<<grid, g3::THREADS, smem_size, stream>>>(params, tm_k, tm_v);
 }}
