@@ -103,6 +103,9 @@ def _softmax_rows_e4m3_kernel(
     REVERSE: tl.constexpr,
     STORE_CS: tl.constexpr,
 ):
+    # Inductor passes Python floats as fp64 and a direct launch as fp32: the multiplier is the
+    # fp32 rounding of scale either way (as in main's Inductor kernel).
+    scale = scale.to(tl.float32)
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
     offs = tl.arange(0, BLOCK)
@@ -139,6 +142,7 @@ def _softmax_rows_bf16_kernel(
     REVERSE: tl.constexpr,
     STORE_CS: tl.constexpr,
 ):
+    scale = scale.to(tl.float32)  # see _softmax_rows_e4m3_kernel
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
     offs = tl.arange(0, BLOCK)

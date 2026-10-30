@@ -153,6 +153,13 @@ def run_check():
         "main_max_rel": ((sa_b[rows, 0].double() - sa64).abs() / sa64).max().item()}
     gates["dec_pq"] = c["max_ulp"] <= 1 and (1.0 - c["share_differ"]) >= 0.9999
     gates["dec_scale_a"] = rel <= 1e-5
+    # the op under torch.compile (Inductor launches it with an fp64 scale arg) == direct launch
+    cc = torch.compile(cand_dec, dynamic=False, options={"layout_optimization": False,
+                                                          "emulate_precision_casts": True})
+    pq_k, sa_k = cc(s)
+    gates["dec_compiled_eq_direct"] = bool(torch.equal(pq_k.view(torch.uint8), pq_c.view(torch.uint8))
+                                           and torch.equal(sa_k, sa_c))
+    del pq_k, sa_k
     # repeat sequence (same count as timing: 3 warm + ITERS) vs iteration 0
     iters = int(os.environ.get("ITERS", "20"))
     rep = True
@@ -177,6 +184,10 @@ def run_check():
     c = cmp_chunked(p_c, p_b, _ord16)
     res["enc_p_vs_main"] = c
     gates["enc_p"] = c["max_ulp"] <= 1
+    cc = torch.compile(cand_enc, dynamic=False, options={"layout_optimization": False})
+    p_k = cc(s)
+    gates["enc_compiled_eq_direct"] = bool(torch.equal(p_k, p_c))
+    del p_k
     # P vs fp64 softmax on sampled rows: both arms
     x = s.reshape(-1, T)[rows].double()
     p64 = torch.softmax(x * SCALE, -1)
