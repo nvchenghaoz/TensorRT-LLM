@@ -719,6 +719,8 @@ namespace torch_ext {
 
 namespace {
 
+int64_t g_last_raster = 0;  // diagnostics only (lpt_pair_residual_last_raster)
+
 void check_gemm_operand(TensorView a, TensorView b, TensorView sfa, TensorView sfb,
                         TensorView alpha) {
   TVM_FFI_ICHECK_EQ(a.dtype(), dl_uint8) << "a must be packed FP4 (uint8)";
@@ -759,7 +761,7 @@ void lpt_pair_residual(TensorView a0, TensorView b0, TensorView sfa0, TensorView
                        TensorView alpha0, TensorView mlp_y, TensorView a1, TensorView b1,
                        TensorView sfa1, TensorView sfb1, TensorView alpha1, TensorView x,
                        TensorView gate, TensorView gate_index, int64_t has_index, TensorView out,
-                       TensorView workspace) {
+                       TensorView workspace, int64_t raster) {
   using namespace flux3_lptr;
   check_gemm_operand(a0, b0, sfa0, sfb0, alpha0);
   check_gemm_operand(a1, b1, sfa1, sfb1, alpha1);
@@ -842,6 +844,14 @@ void lpt_pair_residual(TensorView a0, TensorView b0, TensorView sfa0, TensorView
       {},
       hw_info};
   arguments.scheduler.tile_counter = args_layout.counter;
+  // raster: 0 leaves the scheduler's default (main's launch), 1 AlongM, 2 AlongN. Only the
+  // tile -> linear index map changes: flags are indexed by (M_idx, N_idx) and every group-0 tile
+  // precedes every group-1 tile in linear order under either raster, so outputs are bitwise equal
+  // and the flag wait stays deadlock-free.
+  if (raster == 1 || raster == 2) {
+    using Enum_t = decltype(arguments.scheduler.raster_order);
+    arguments.scheduler.raster_order = raster == 1 ? Enum_t::AlongM : Enum_t::AlongN;
+  }
   arguments.scheduler.prefetch_x = x.data_ptr();
   arguments.scheduler.prefetch_y = mlp_y.data_ptr();
   arguments.scheduler.prefetch_ld = N;
@@ -875,6 +885,9 @@ void lpt_pair_residual(TensorView a0, TensorView b0, TensorView sfa0, TensorView
   TVM_FFI_ICHECK(status == cutlass::Status::kSuccess)
       << "flux3_lpt_pair_residual: initialize_workspace failed";
   typename GemmKernel::Params params = GemmKernel::to_underlying_arguments(arguments, gemm_ws);
+  g_last_raster = params.scheduler.raster_order_ == decltype(params.scheduler.raster_order_)::AlongN
+                      ? 2
+                      : 1;
   dim3 const grid = GemmKernel::get_grid_shape(params);
   dim3 const block = GemmKernel::get_block_shape();
   int const smem = GemmKernel::SharedStorageSize;
@@ -900,6 +913,9 @@ void lpt_pair_residual(TensorView a0, TensorView b0, TensorView sfa0, TensorView
       << "flux3_lpt_pair_residual: GEMM launch failed: " << cudaGetErrorString(err);
 }
 
+// Diagnostics: the raster the last launch resolved to (1 AlongM, 2 AlongN; 0 before any launch).
+int64_t lpt_pair_residual_last_raster() { return g_last_raster; }
+
 // Build facts for the microbenchmark log: stages * 1000000 + kernel shared storage bytes.
 int64_t lpt_pair_residual_info() {
   using namespace flux3_lptr;
@@ -911,3 +927,5 @@ int64_t lpt_pair_residual_info() {
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(lpt_pair_residual, torch_ext::lpt_pair_residual);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(lpt_pair_residual_info, torch_ext::lpt_pair_residual_info);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(lpt_pair_residual_last_raster,
+                              torch_ext::lpt_pair_residual_last_raster);
