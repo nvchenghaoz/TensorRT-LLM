@@ -172,11 +172,12 @@ _FP8R_QKV_PLANAR = False
 # flux3_sm120_qknorm_rope_fp8 on its packed q|k|v column views (bitwise qknorm_rope + K1/K2) and
 # the same fmha_v2 call runs through visual_gen_fp8_attention_sm120_prequant. v stays the GEMM's
 # BF16 column view (for PAG). Q/K use the dynamic amax (static_qk=False), as main's K1/K2 do.
-# Default OFF ('0' = main's path): it calls _fp8r_qkv_gemm (torch._scaled_mm), so it must be
-# wired to landing 81's FP8R GEMM entry (flux3_fp8r_gemm, TRTLLM_FLUX3_FP8R_GEMM) before it can
-# default on. TRTLLM_FLUX3_FP8R_QKV_FP8_DIRECT=1 enables it; module-level (Dynamo guards on it),
-# read at trace time.
-FP8R_QKV_FP8_DIRECT = os.environ.get("TRTLLM_FLUX3_FP8R_QKV_FP8_DIRECT", "0").strip() == "1"
+# Default ON (idea 35): flux3_fp8r_gemm.install() rebinds fp8r_qkv_rope_fp8 to its _cg twin
+# (trtllm::flux3_sm120_fp8r_qkv_rope_fp8_cg, the overlay FP8R GEMM, bitwise equal to
+# torch._scaled_mm), so image.0 runs the same GEMM arm as main's qknorm_rope_cg route.
+# TRTLLM_FLUX3_FP8R_QKV_FP8_DIRECT=0 keeps main's path (GEMM -> in-place qknorm_rope -> K1/K2);
+# module-level (Dynamo guards on it), read at trace time.
+FP8R_QKV_FP8_DIRECT = os.environ.get("TRTLLM_FLUX3_FP8R_QKV_FP8_DIRECT", "1").strip() != "0"
 
 
 @torch.library.custom_op(
