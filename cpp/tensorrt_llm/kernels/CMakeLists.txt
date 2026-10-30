@@ -35,6 +35,7 @@ add_subdirectory(kimiK3AttnRes)
 add_subdirectory(mhcKernels)
 add_subdirectory(compressorKernels)
 add_subdirectory(fusedSampling)
+add_subdirectory(flux3)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
@@ -77,6 +78,11 @@ list(FILTER SRC_CU EXCLUDE REGEX "fusedSampling/.*")
 # Marlin is built as its own architecture-scoped OBJECT library below.
 list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
+# The FLUX.3 target kernels build their own sm_120 OBJECT library
+# (flux3/gemm/CMakeLists.txt); its FMHA launcher is built with the generated
+# context FMHA kernels (contextFusedMultiHeadAttention/CMakeLists.txt).
+list(FILTER SRC_CPP EXCLUDE REGEX "/kernels/flux3/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "/kernels/flux3/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
@@ -114,7 +120,8 @@ endif()
 add_library(
   kernels_src STATIC
   ${SRC_CPP} ${SRC_CU} ${MOE_KERNELS_SRC}
-  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>)
+  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>
+  $<TARGET_OBJECTS:flux3_kernels_src>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(

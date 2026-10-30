@@ -216,7 +216,10 @@ class AttentionConfig(StrictBaseModel):
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "fp8", (0, 0, 1)),
         }
+        # ("fp8", "fp8") is per-tensor E4M3 Q/K/V, served only by the modeling_v2 FLUX.3
+        # SM120 target; VisualGenArgs rejects it when modeling_v2 is "off".
         FLASHINFER_RECIPES = {
+            ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "nvfp4", (0, 0, 0)),
@@ -864,6 +867,17 @@ class VisualGenArgs(StrictBaseModel):
         ),
     )
 
+    modeling_v2: Literal["off", "auto", "require"] = Field(
+        "off",
+        status="prototype",
+        description=(
+            "Whether to build the pipeline from a modeling_v2 target (experimental) instead "
+            "of the built-in pipeline. 'off' never does. 'auto' uses a target when one claims "
+            "this deployment and falls back to the built-in pipeline otherwise. 'require' "
+            "raises instead of falling back."
+        ),
+    )
+
     enable_layerwise_nvtx_marker: bool = Field(
         False,
         status="prototype",
@@ -883,6 +897,28 @@ class VisualGenArgs(StrictBaseModel):
         if isinstance(data, dict) and data.get("quant_config", "_sentinel") is None:
             data = {**data, "quant_config": QuantConfig()}
         return data
+
+    @model_validator(mode="after")
+    def _validate_modeling_v2_attention(self) -> "VisualGenArgs":
+        """Reject FLASHINFER per-tensor FP8 Q/K/V unless a modeling_v2 target may serve it.
+
+        The built-in FLASHINFER backend does not implement the recipe; only the modeling_v2
+        FLUX.3 SM120 target does.
+        """
+        attention = self.attention_config
+        quant = attention.quant_attention_config
+        if (
+            self.modeling_v2 == "off"
+            and attention.backend == "FLASHINFER"
+            and quant is not None
+            and (quant.qk_dtype, quant.v_dtype) == ("fp8", "fp8")
+        ):
+            raise ValueError(
+                "quant_attention_config qk_dtype='fp8', v_dtype='fp8' with backend='FLASHINFER' "
+                "is served only by a modeling_v2 target; set modeling_v2='auto' or 'require', "
+                "or choose another FLASHINFER recipe."
+            )
+        return self
 
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:

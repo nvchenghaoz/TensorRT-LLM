@@ -30,6 +30,13 @@ target ran, not that a particular knob setting was measured.
 Routing modules are imported lazily: resolving a GptOss config never imports
 the DeepSeek tree, and a target's modeling code is imported only on the
 ``route`` branch that returns it.
+
+VisualGen pipelines route the same way through a second table,
+``MODELING_V2_VISUAL_GEN_ROUTERS``, keyed by the pipeline class name AutoPipeline
+detects (a VisualGen package carries no ``architectures[0]``).
+``modeling_v2_resolve_visual_gen`` reads ``VisualGenArgs.modeling_v2`` off the
+``DiffusionPipelineConfig``; ``AutoPipeline.from_config`` builds the class it
+returns instead of the registry's, and the target is never registered.
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
@@ -54,6 +62,14 @@ MODELING_V2_ROUTERS = {
     # Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
     # config loader's composite branch writes the same name back.
     "Qwen4ExpForConditionalGeneration": "models.qwen4_exp.routing",
+}
+
+# VisualGen: the pipeline class name AutoPipeline detects -> routing module, relative to
+# this package. A VisualGen package has no ``architectures[0]``; the detected Diffusers
+# ``_class_name`` (or the name the detector assigns, ``Flux3Pipeline`` for a FLUX.3 package)
+# plays its part.
+MODELING_V2_VISUAL_GEN_ROUTERS = {
+    "Flux3Pipeline": "models.flux3.routing",
 }
 
 
@@ -91,8 +107,8 @@ class ModelingV2Mode(str, enum.Enum):
     REQUIRE = "require"
 
     @classmethod
-    def of(cls, llm_args: "TorchLlmArgs") -> "ModelingV2Mode":
-        return cls(llm_args.modeling_v2)
+    def of(cls, args: "TorchLlmArgs | DiffusionPipelineConfig") -> "ModelingV2Mode":
+        return cls(args.modeling_v2)
 
 
 class NoTarget(Exception):
@@ -107,6 +123,14 @@ class NoTarget(Exception):
 def routing_module(arch: str):
     """Import and return the routing module for ``arch``, or None."""
     name = MODELING_V2_ROUTERS.get(arch)
+    if name is None:
+        return None
+    return import_module(f"{_PACKAGE}.{name}")
+
+
+def visual_gen_routing_module(class_name: str):
+    """Import and return the routing module for the VisualGen pipeline ``class_name``, or None."""
+    name = MODELING_V2_VISUAL_GEN_ROUTERS.get(class_name)
     if name is None:
         return None
     return import_module(f"{_PACKAGE}.{name}")
@@ -154,5 +178,37 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
         logger.info(
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
+        )
+        return None
+
+
+def modeling_v2_resolve_visual_gen(
+    config: "DiffusionPipelineConfig", class_name: str
+) -> Optional[type]:
+    """Decide which modeling_v2 pipeline, if any, this VisualGen deployment builds.
+
+    ``class_name`` is the pipeline class AutoPipeline detected from the checkpoint. Returns
+    the target pipeline class, or None for the registry's pipeline: when
+    ``config.modeling_v2`` is ``off`` (nothing is imported), when no routing module claims
+    ``class_name``, or when the routing module's ``route`` raises ``NoTarget``. In
+    ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+    """
+    mode = ModelingV2Mode.of(config)
+    if mode is ModelingV2Mode.OFF:
+        return None
+
+    try:
+        routing = visual_gen_routing_module(class_name)
+        if routing is None:
+            known = ", ".join(sorted(MODELING_V2_VISUAL_GEN_ROUTERS)) or "(none)"
+            raise NoTarget(f"no routing module for this pipeline; routed pipelines: {known}")
+        return routing.route(config, _device_compute_capability())
+    except NoTarget as why:
+        if mode is ModelingV2Mode.REQUIRE:
+            raise ValueError(
+                f"modeling_v2='require', but no target fits {class_name!r}: {why}"
+            ) from None
+        logger.info(
+            f"modeling_v2: no target fits {class_name!r} ({why}); using the built-in pipeline"
         )
         return None

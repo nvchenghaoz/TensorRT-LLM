@@ -231,6 +231,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
     runtime_lora: Optional[RuntimeLoRAConfig] = None
+    # VisualGenArgs.modeling_v2, read by AutoPipeline.from_config.
+    modeling_v2: str = "off"
 
     # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
     enable_layerwise_nvtx_marker: bool = False
@@ -614,6 +616,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         cache_cfg = args.cache_config if args else None
         runtime_lora_cfg = args.runtime_lora_config if args else None
         enable_layerwise_nvtx_marker = bool(args.enable_layerwise_nvtx_marker) if args else False
+        modeling_v2 = args.modeling_v2 if args else "off"
 
         from .pipeline_registry import PipelineComponent
 
@@ -834,6 +837,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             cache=cache_cfg,
             device=device,
             runtime_lora=runtime_lora_cfg,
+            modeling_v2=modeling_v2,
             enable_layerwise_nvtx_marker=enable_layerwise_nvtx_marker,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,

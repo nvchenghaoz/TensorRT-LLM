@@ -174,9 +174,18 @@ class AutoPipeline:
         AutoPipeline._validate_vae_quantization(config, class_name, entry)
         pipeline_class = entry.pipeline_cls
 
-        # Let the pipeline class upgrade itself to a specialised variant
-        # (e.g. LTX2Pipeline → LTX2TwoStagesPipeline) based on config.
-        pipeline_class = pipeline_class.resolve_variant(config)
+        # VisualGenArgs.modeling_v2: a modeling_v2 target claims this deployment, or None
+        # (always None for "off", which imports nothing beyond the resolver). A target is
+        # built as returned; it is not registered and has no variants.
+        from .._experimental.modeling_v2._router_index import modeling_v2_resolve_visual_gen
+
+        target = modeling_v2_resolve_visual_gen(config, class_name)
+        if target is not None:
+            pipeline_class = target
+        else:
+            # Let the pipeline class upgrade itself to a specialised variant
+            # (e.g. LTX2Pipeline → LTX2TwoStagesPipeline) based on config.
+            pipeline_class = pipeline_class.resolve_variant(config)
 
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
 

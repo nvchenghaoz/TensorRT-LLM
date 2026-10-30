@@ -88,6 +88,7 @@ class Arch(str, enum.Enum):
     """
 
     SM_103 = "sm_103"
+    SM_120 = "sm_120"
 
 
 @dataclass(frozen=True)

@@ -88,13 +88,18 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
   file(GLOB arch_files "${TRTLLM_FMHA_GEN_DIR}/fmha_v2_cu/*_sm${arch}.cu")
   # Compile the hand-written skip_softmax warp-specialized FMHA into the sm_120
   # family target. It uses sm_120-only TMA + sync-MMA, so it must never be
-  # compiled for other architectures.
+  # compiled for other architectures. The FLUX.3 target's FP8 attention launcher
+  # (kernels/flux3/fmha) is built with them, with --use_fast_math: its softmax is
+  # the fast-math build's arithmetic (ex2.approx.ftz, approximate reciprocal).
   if(${arch} EQUAL 120)
     list(
       APPEND
       arch_files
       "${CMAKE_CURRENT_SOURCE_DIR}/skip_softmax_sm120/fused_multihead_flash_attention_ws_sm120.cu"
-    )
+      "${CMAKE_CURRENT_SOURCE_DIR}/../flux3/fmha/flux3FmhaSm120.cu")
+    set_source_files_properties(
+      "${CMAKE_CURRENT_SOURCE_DIR}/../flux3/fmha/flux3FmhaSm120.cu"
+      PROPERTIES COMPILE_OPTIONS "--use_fast_math")
   endif()
   if(arch_files)
     set(TARGET_NAME _context_attention_kernels_${arch})

@@ -26,7 +26,9 @@ import pytest
 import tensorrt_llm._torch._experimental.modeling_v2 as _modeling_v2
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     MODELING_V2_ROUTERS,
+    MODELING_V2_VISUAL_GEN_ROUTERS,
     routing_module,
+    visual_gen_routing_module,
 )
 
 # The package, not this file: these paths address the tree under test, and this
@@ -35,6 +37,10 @@ pytestmark = pytest.mark.cpu_only
 
 _ROOT = Path(_modeling_v2.__file__).resolve().parent
 _ARCHS = sorted(MODELING_V2_ROUTERS)
+# Every routing table: LLM architectures and VisualGen pipeline class names. The structural
+# gates below read both; the LLM step-target gates read _ARCHS alone.
+_ALL_ROUTERS = {**MODELING_V2_ROUTERS, **MODELING_V2_VISUAL_GEN_ROUTERS}
+_ALL_KEYS = sorted(_ALL_ROUTERS)
 
 
 def _module_path(dotted: str) -> Path:
@@ -50,31 +56,33 @@ _TARGET_IMPORT = re.compile(r"^\s*from \.(\w+)\.modeling import (\w+)$", re.MULT
 
 def _routed_targets(arch: str):
     """(target directory, class name) for every target ``route`` can return."""
-    source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
-    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    source = _module_path(_ALL_ROUTERS[arch]).read_text()
+    family_dir = _module_path(_ALL_ROUTERS[arch]).parent
     return [(family_dir / target, name) for target, name in _TARGET_IMPORT.findall(source)]
 
 
 def test_every_routed_architecture_has_an_importable_routing_module():
     for arch in _ARCHS:
         assert routing_module(arch) is not None, arch
+    for pipeline in sorted(MODELING_V2_VISUAL_GEN_ROUTERS):
+        assert visual_gen_routing_module(pipeline) is not None, pipeline
 
 
 def test_no_routing_module_is_orphaned():
     """A routing.py the index does not name would never be consulted."""
-    indexed = {_module_path(m) for m in MODELING_V2_ROUTERS.values()}
+    indexed = {_module_path(m) for m in _ALL_ROUTERS.values()}
     on_disk = set((_ROOT / "models").glob("*/routing.py"))
     assert on_disk == indexed, (
-        f"routing modules on disk but not in MODELING_V2_ROUTERS: "
+        f"routing modules on disk but in no routing table: "
         f"{sorted(p.relative_to(_ROOT) for p in on_disk - indexed)}"
     )
 
 
-@pytest.mark.parametrize("arch", _ARCHS)
+@pytest.mark.parametrize("arch", _ALL_KEYS)
 def test_no_target_directory_is_orphaned(arch):
     """A target directory ``route`` never imports from is dead code: nothing
     else can reach it."""
-    family_dir = _module_path(MODELING_V2_ROUTERS[arch]).parent
+    family_dir = _module_path(_ALL_ROUTERS[arch]).parent
     on_disk = {p.parent for p in family_dir.glob("*/modeling.py")}
     routed = {target_dir for target_dir, _ in _routed_targets(arch)}
     assert on_disk == routed, (
@@ -84,7 +92,7 @@ def test_no_target_directory_is_orphaned(arch):
     )
 
 
-@pytest.mark.parametrize("arch", _ARCHS)
+@pytest.mark.parametrize("arch", _ALL_KEYS)
 def test_target_identity_matches_its_path(arch):
     """Identity is the directory name: <checkpoint>__<gpu arch>__<parallel>,
     and the class name encodes the same triple."""
@@ -117,7 +125,7 @@ def test_every_target_ships_both_products():
     ``tests/integration/defs/accuracy/references/``, read by the gates CI runs
     rather than by a reader.
     """
-    for arch in _ARCHS:
+    for arch in _ALL_KEYS:
         for target_dir, name in _routed_targets(arch):
             for product in ("modeling.py", "weights.py"):
                 assert (target_dir / product).is_file(), f"{name}: missing {product}"
@@ -130,7 +138,7 @@ def test_targets_do_not_share_files():
     other's. A shared helper between two targets is the first step back to
     the abstraction this package exists to avoid.
     """
-    for arch in _ARCHS:
+    for arch in _ALL_KEYS:
         for target_dir, name in _routed_targets(arch):
             for source_file in target_dir.glob("*.py"):
                 text = source_file.read_text()

@@ -161,6 +161,10 @@ add_th_common_family(
   mhcOp.cpp
   compressorOp.cpp)
 
+# FLUX.3 target bindings keep their existing family targets; source lists live
+# with the model.
+add_subdirectory(flux3)
+
 add_library(
   th_common SHARED
   $<TARGET_OBJECTS:th_common_attention>

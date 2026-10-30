@@ -57,6 +57,26 @@ only a mode, and routing picks the target from the configuration.
 The checkpoint is read exactly as published, with no target-owned
 `config.json`.
 
+### VisualGen
+
+VisualGen pipelines take the same three modes through `VisualGenArgs`:
+
+```yaml
+# trtllm-serve <model> --visual_gen_args serve.yaml   (or a bare key in engine.json)
+modeling_v2: require
+```
+
+A VisualGen package has no `architectures[0]`, so the second table in
+`_router_index.py`, `MODELING_V2_VISUAL_GEN_ROUTERS`, is keyed by the pipeline class
+name `AutoPipeline` detects (`Flux3Pipeline` -> `models.flux3.routing`).
+`AutoPipeline.from_config` calls `modeling_v2_resolve_visual_gen(config, class_name)`
+after the registry lookup; a returned target is built instead of the registry's class
+(and instead of `resolve_variant`). A target is a `BasePipeline` subclass that is never
+registered: off mode never sees it. Its `route(config, compute_capability)` reads the
+`DiffusionPipelineConfig`: the package's DiT shape and precision layout, the variant, the
+GPU, the parallel sizes, and the engine choices whose kernels the target owns (its
+attention recipe, for one), declining the features it does not implement.
+
 ## How a config finds its target
 
 ```
@@ -104,7 +124,8 @@ checkpoint of the same shape is ungated.
 ## Layout
 
 ```
-_router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
+_router_index.py    architectures[0] -> routing module, and VisualGen pipeline class -> routing
+                    module. Small, stable, test-guarded.
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
   <checkpoint>__<gpu arch>__<parallel>/
