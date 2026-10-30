@@ -929,3 +929,377 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(lpt_pair_residual, torch_ext::lpt_pair_residual);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(lpt_pair_residual_info, torch_ext::lpt_pair_residual_info);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(lpt_pair_residual_last_raster,
                               torch_ext::lpt_pair_residual_last_raster);
+
+// ------------------------------------------------------------------------------------------------
+// Idea 55 (add-only): the t256 instance, built only with -DFLUX3_LPTR_T256 (module
+// flux3_fp4_lpt_pair_residual_t256_sm120; main's module above compiles without it, so the 128
+// instance is unchanged). The SAME kernel template as above -- Flux3LptResidualScheduler (atomic
+// counter, down tiles before attn_out tiles), PairResidualAdapter<PairResidualEpilogue> (deferred
+// per-warp epoch flags, flag-wait residual epilogue), the args kernel, workspace layout and epoch
+// -- with TileShape 256x128x128 (Cooperative: two consumer warpgroups, 128 rows each, 1x1x1
+// cluster) and the mainloop's auto stage count (3), as flux3_fp4_lpt_pair_t256_sm120.cu. Each
+// output element runs the same k64 MMA chain over K as the 128 instance and the same
+// BF16(alpha * acc) + residual epilogue math, so outputs are bitwise equal.
+// Scheduler L2 prefetch: the shared scheduler prefetches 128 rows x 256 B per claimed attn_out
+// tile at row M_idx * 128 + j. With 256-row tiles the launcher passes a doubled row stride, so the
+// same 128 prefetches land on rows M_idx * 256 + 2j, and the t256 scheduler (a subclass, selected
+// for this tile shape only) adds the odd rows. FLUX3_LPTR_T256_PF: 3 (default) every row of x and
+// mlp_y; 4 every row of x, even rows of mlp_y; 1 even rows of x and mlp_y; 2 every row of x
+// (even rows via x, odd via x + N); 0 none.
+// A hint only.
+#ifdef FLUX3_LPTR_T256
+#include <type_traits>
+
+namespace cutlass::gemm::kernel::detail {
+
+// The t256 instance's scheduler: Flux3LptResidualScheduler unchanged (claims, raster, first-tile
+// claim and its 128 prefetches per claimed attn_out tile, which the doubled row stride puts on
+// the tile's even rows), plus the same prefetches on the odd rows (odd_x / odd_y = x / mlp_y one
+// row on), so every row of the 256-row tile's x and mlp_y is pulled into L2. A hint only.
+template <class GroupProblemShape, int SchedulerPipelineStageCount>
+class Flux3LptResidualSchedulerT256
+    : public Flux3LptResidualScheduler<GroupProblemShape, SchedulerPipelineStageCount> {
+  using Base = Flux3LptResidualScheduler<GroupProblemShape, SchedulerPipelineStageCount>;
+
+ public:
+  static constexpr bool kFlux3T256 = true;
+  using WorkTileInfo = typename Base::WorkTileInfo;
+  using SchedulerResponse = typename Base::SchedulerResponse;
+  using BaseArguments = typename Base::Arguments;
+  using BaseParams = typename Base::Params;
+
+  struct Arguments : BaseArguments {
+    void const* odd_x = nullptr;  // x + 1 row, or nullptr (no odd-row prefetch)
+    void const* odd_y = nullptr;  // mlp_y + 1 row
+    int odd_rows = 0;             // half-row index bound of the odd rows (M / 2)
+  };
+
+  struct Params : BaseParams {
+    void const* odd_x = nullptr;
+    void const* odd_y = nullptr;
+    int odd_rows = 0;
+  };
+
+  template <class TileShape, class ClusterShape>
+  static Params to_underlying_arguments(GroupProblemShape problem_shapes, TileShape tile_shape,
+                                        ClusterShape cluster_shape,
+                                        KernelHardwareInfo const& hw_info,
+                                        Arguments const& arguments, void* workspace = nullptr,
+                                        const uint32_t epilogue_subtile = 1,
+                                        uint32_t ktile_start_alignment_count = 1u) {
+    Params params;
+    static_cast<BaseParams&>(params) = Base::to_underlying_arguments(
+        problem_shapes, tile_shape, cluster_shape, hw_info,
+        static_cast<BaseArguments const&>(arguments), workspace, epilogue_subtile,
+        ktile_start_alignment_count);
+    params.odd_x = arguments.odd_x;
+    params.odd_y = arguments.odd_y;
+    params.odd_rows = arguments.odd_rows;
+    return params;
+  }
+
+  Flux3LptResidualSchedulerT256() = default;
+
+  CUTLASS_DEVICE explicit Flux3LptResidualSchedulerT256(Params const& params,
+                                                        SchedulerResponse* response_ptr)
+      : Base(static_cast<BaseParams const&>(params), response_ptr),
+        odd_x_(static_cast<char const*>(params.odd_x)),
+        odd_y_(static_cast<char const*>(params.odd_y)),
+        odd_ld_bytes_(params.prefetch_ld * 2),
+        odd_rows_(params.odd_rows) {}
+
+  template <typename TileSchedulerPipeline, typename TileSchedulerPipelineState,
+            typename CallbackBeforeCommit = WorkTileInfo (*)(WorkTileInfo)>
+  CUTLASS_DEVICE auto advance_to_next_work(
+      TileSchedulerPipeline& scheduler_pipeline,
+      TileSchedulerPipelineState scheduler_pipe_producer_state, uint32_t advance_count = 1,
+      CallbackBeforeCommit callback_before_commit = [](WorkTileInfo info) { return info; }) {
+    auto result = Base::advance_to_next_work(scheduler_pipeline, scheduler_pipe_producer_state,
+                                             advance_count, callback_before_commit);
+#if defined(__CUDA_ARCH__)
+    auto const& work_tile = cute::get<0>(result);
+    if (work_tile.is_valid() && work_tile.L_idx == 1 && odd_x_ != nullptr) {
+      int const lane = threadIdx.x % 32;
+      int64_t const col_bytes = int64_t(work_tile.N_idx) * 128 * 2;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < 4; ++i) {
+        int const r = work_tile.M_idx * 128 + lane + 32 * i;  // row 2r + 1 of the tensor
+        if (r < odd_rows_) {
+          int64_t const off = int64_t(r) * odd_ld_bytes_ + col_bytes;
+          asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" ::"l"(odd_x_ + off)
+                       : "memory");
+          if (odd_y_ != nullptr) {
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" ::"l"(odd_y_ + off)
+                         : "memory");
+          }
+        }
+      }
+    }
+#endif
+    return result;
+  }
+
+ private:
+  char const* odd_x_ = nullptr;
+  char const* odd_y_ = nullptr;
+  int64_t odd_ld_bytes_ = 0;
+  int odd_rows_ = 0;
+};
+
+// More specialized than the selector above: only the 256x128x128 tile takes it.
+template <class ClusterShape, uint32_t SchedulerPipelineStageCount>
+struct TileSchedulerSelector<GroupScheduler, arch::Sm120, cute::Shape<cute::_256, cute::_128,
+                                                                      cute::_128>,
+                             ClusterShape, SchedulerPipelineStageCount, flux3_lptr::ProblemShape> {
+  using Scheduler = Flux3LptResidualSchedulerT256<flux3_lptr::ProblemShape,
+                                                  static_cast<int>(SchedulerPipelineStageCount)>;
+};
+
+}  // namespace cutlass::gemm::kernel::detail
+
+namespace flux3_lptr {
+namespace t256 {
+
+using TileShape = Shape<_256, _128, _128>;
+
+#ifdef FLUX3_LPTR_T256_STAGES
+using StageCountType = cutlass::gemm::collective::StageCount<FLUX3_LPTR_T256_STAGES>;
+#else
+using StageCountType = cutlass::gemm::collective::StageCountAutoCarveout<0>;
+#endif
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, ElementMainloop, LayoutA*,
+    AlignmentAB, ElementMainloop, LayoutB*, AlignmentAB, float, TileShape, ClusterShape,
+    StageCountType, cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+using GemmKernel =
+    cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+                                         void>;
+
+// The args kernel and ArgsLayout above fill these arrays: the t256 kernel must read the same types.
+static_assert(std::is_same_v<typename GemmKernel::InternalStrideA, flux3_lptr::StrideA>);
+static_assert(std::is_same_v<typename GemmKernel::InternalStrideB, flux3_lptr::StrideB>);
+static_assert(std::is_same_v<typename GemmKernel::CollectiveMainloop::InternalLayoutSFA,
+                             flux3_lptr::LayoutSFA>);
+static_assert(std::is_same_v<typename GemmKernel::CollectiveMainloop::InternalLayoutSFB,
+                             flux3_lptr::LayoutSFB>);
+static_assert(std::is_same_v<typename GemmKernel::ElementA, flux3_lptr::GemmElementA>);
+static_assert(std::is_same_v<typename GemmKernel::ElementB, flux3_lptr::GemmElementB>);
+static_assert(GemmKernel::CollectiveMainloop::TiledMma::SFVecSize == 16, "NVFP4 SF vector 16");
+static_assert(size(typename GemmKernel::TiledMma{}) == 32 * kMmaWarps, "8 MMA warps expected");
+static_assert(GemmKernel::TileScheduler::kFlux3T256, "t256 scheduler not selected");
+
+}  // namespace t256
+}  // namespace flux3_lptr
+
+namespace torch_ext {
+
+// Same contract as lpt_pair_residual (same arguments, same workspace, epoch and flags).
+void lpt_pair_residual_t256(TensorView a0, TensorView b0, TensorView sfa0, TensorView sfb0,
+                            TensorView alpha0, TensorView mlp_y, TensorView a1, TensorView b1,
+                            TensorView sfa1, TensorView sfb1, TensorView alpha1, TensorView x,
+                            TensorView gate, TensorView gate_index, int64_t has_index,
+                            TensorView out, TensorView workspace, int64_t raster) {
+  using namespace flux3_lptr;
+  using GK = t256::GemmKernel;
+  constexpr int kTileM = 256;
+  check_gemm_operand(a0, b0, sfa0, sfb0, alpha0);
+  check_gemm_operand(a1, b1, sfa1, sfb1, alpha1);
+  CHECK_DEVICE(a0, a1);
+  CHECK_DEVICE(a0, workspace);
+  CHECK_DEVICE(a0, x);
+  CHECK_DEVICE(a0, out);
+  CHECK_DEVICE(a0, mlp_y);
+  CHECK_DEVICE(a0, gate);
+  int64_t const M = a0.size(0);
+  int64_t const N = b0.size(0);
+  TVM_FFI_ICHECK_EQ(a1.size(0), M) << "both groups must have the same M";
+  TVM_FFI_ICHECK_EQ(b1.size(0), N) << "both groups must have the same N";
+  check_bf16_2d(mlp_y, M, N, "mlp_y");
+  check_bf16_2d(x, M, N, "x");
+  check_bf16_2d(out, M, N, "out");
+  check_bf16_2d(gate, -1, N, "gate");
+  TVM_FFI_ICHECK(gate.size(0) >= 1) << "gate needs at least one row";
+  TVM_FFI_ICHECK(out.data_ptr() != x.data_ptr()) << "out must not alias x";
+  if (has_index != 0) {
+    CHECK_DEVICE(a0, gate_index);
+    TVM_FFI_ICHECK_EQ(gate_index.dtype(), dl_uint8) << "gate_index must be uint8";
+    TVM_FFI_ICHECK(gate_index.numel() >= M) << "gate_index needs one entry per row";
+  }
+
+  PairInputs in{};
+  TensorView const* as[2] = {&a0, &a1};
+  TensorView const* bs[2] = {&b0, &b1};
+  TensorView const* sfas[2] = {&sfa0, &sfa1};
+  TensorView const* sfbs[2] = {&sfb0, &sfb1};
+  for (int i = 0; i < kGroups; ++i) {
+    in.a[i] = as[i]->data_ptr();
+    in.b[i] = bs[i]->data_ptr();
+    in.sfa[i] = sfas[i]->data_ptr();
+    in.sfb[i] = sfbs[i]->data_ptr();
+    in.m[i] = static_cast<int>(as[i]->size(0));
+    in.n[i] = static_cast<int>(bs[i]->size(0));
+    in.k[i] = static_cast<int>(as[i]->size(1) * 2);
+  }
+
+  size_t const ws_bytes = static_cast<size_t>(workspace.numel()) * get_element_size(workspace);
+  TVM_FFI_ICHECK(ws_bytes > kFlagsOffset) << "workspace too small";
+  auto* ws = static_cast<uint8_t*>(workspace.data_ptr());
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(ws) % 256 == 0) << "workspace must be 256B aligned";
+  ArgsLayout args_layout = make_args_layout(ws);
+  int64_t const tiles_m = (M + kTileM - 1) / kTileM;
+  int64_t const tiles_n = N / 128;
+  size_t const flag_bytes = static_cast<size_t>(tiles_m * tiles_n * kMmaWarps) * sizeof(uint32_t);
+  TVM_FFI_ICHECK(kFlagsOffset + flag_bytes <= ws_bytes)
+      << "flux3_lpt_pair_residual_t256: workspace too small for " << tiles_m * tiles_n
+      << " tiles";
+
+  cudaStream_t stream = get_stream(a0.device());
+  int const device_id = a0.device().device_id;
+
+  {
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(1);
+    config.blockDim = dim3(32);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaError_t err = cudaLaunchKernelEx(&config, flux3_lptr_args_kernel, in, args_layout);
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "flux3_lpt_pair_residual_t256: args kernel launch failed: " << cudaGetErrorString(err);
+  }
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = device_id;
+  hw_info.sm_count = device_sm_count(device_id);
+
+  typename GK::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {kGroups, args_layout.problem_sizes, /*problem_sizes_host=*/nullptr},
+      {args_layout.a_ptr, args_layout.stride_a, args_layout.b_ptr, args_layout.stride_b,
+       args_layout.sfa_ptr, args_layout.layout_sfa, args_layout.sfb_ptr, args_layout.layout_sfb},
+      {},
+      hw_info};
+  arguments.scheduler.tile_counter = args_layout.counter;
+  if (raster == 1 || raster == 2) {
+    using Enum_t = decltype(arguments.scheduler.raster_order);
+    arguments.scheduler.raster_order = raster == 1 ? Enum_t::AlongM : Enum_t::AlongN;
+  }
+  int pf = 3;
+  {
+    char const* p = std::getenv("FLUX3_LPTR_T256_PF");
+    if (p != nullptr) {
+      pf = std::atoi(p);
+    }
+  }
+  // Doubled row stride: prefetch j of tile M_idx lands on row 2 * (M_idx * 128 + j).
+  arguments.scheduler.prefetch_ld = 2 * N;
+  arguments.scheduler.odd_x = nullptr;
+  if (pf == 3 || pf == 4) {  // even rows of x and mlp_y (base scheduler) + odd rows (t256 part):
+                             // 3 odd rows of x and mlp_y, 4 odd rows of x only
+    arguments.scheduler.prefetch_x = x.data_ptr();
+    arguments.scheduler.prefetch_y = mlp_y.data_ptr();
+    arguments.scheduler.prefetch_rows = static_cast<int>((M + 1) / 2);
+    arguments.scheduler.odd_x = static_cast<__nv_bfloat16 const*>(x.data_ptr()) + N;
+    arguments.scheduler.odd_y =
+        pf == 3 ? static_cast<void const*>(static_cast<__nv_bfloat16 const*>(mlp_y.data_ptr()) + N)
+                : nullptr;
+    arguments.scheduler.odd_rows = static_cast<int>(M / 2);
+  } else if (pf == 2) {
+    arguments.scheduler.prefetch_x = x.data_ptr();
+    arguments.scheduler.prefetch_y = static_cast<__nv_bfloat16 const*>(x.data_ptr()) + N;
+    arguments.scheduler.prefetch_rows = static_cast<int>(M / 2);  // odd rows stay in bounds
+  } else {
+    arguments.scheduler.prefetch_x = pf == 1 ? x.data_ptr() : nullptr;
+    arguments.scheduler.prefetch_y = mlp_y.data_ptr();
+    arguments.scheduler.prefetch_rows = static_cast<int>((M + 1) / 2);
+  }
+  auto& epi = arguments.epilogue;
+  epi.mlp_y = static_cast<__nv_bfloat16*>(mlp_y.data_ptr());
+  epi.out = static_cast<__nv_bfloat16*>(out.data_ptr());
+  epi.x = static_cast<__nv_bfloat16 const*>(x.data_ptr());
+  epi.gate = static_cast<__nv_bfloat16 const*>(gate.data_ptr());
+  epi.gate_index = has_index != 0 ? static_cast<uint8_t const*>(gate_index.data_ptr()) : nullptr;
+  epi.alpha0 = static_cast<float const*>(alpha0.data_ptr());
+  epi.alpha1 = static_cast<float const*>(alpha1.data_ptr());
+  epi.flags = reinterpret_cast<uint32_t*>(ws + kFlagsOffset);
+  epi.epoch = args_layout.epoch;
+  epi.ld = static_cast<int>(N);
+  epi.tiles_n = static_cast<int>(tiles_n);
+  {
+    char const* d = std::getenv("FLUX3_LPTR_DIAG");
+    epi.diag = d != nullptr ? std::atoi(d) : 0;
+    if (epi.diag & 8) {
+      arguments.scheduler.prefetch_x = nullptr;  // 8: no L2 prefetch
+      arguments.scheduler.odd_x = nullptr;
+    }
+  }
+
+  TVM_FFI_ICHECK(GK::can_implement(arguments)) << "flux3_lpt_pair_residual_t256: cannot implement";
+  size_t const need = GK::get_workspace_size(arguments);
+  TVM_FFI_ICHECK(kArgsRegionBytes + need <= kFlagsOffset)
+      << "flux3_lpt_pair_residual_t256: GEMM workspace overlaps the flags (" << need << " B)";
+  void* gemm_ws = ws + kArgsRegionBytes;
+  auto status = GK::initialize_workspace(arguments, gemm_ws, stream, nullptr);
+  TVM_FFI_ICHECK(status == cutlass::Status::kSuccess)
+      << "flux3_lpt_pair_residual_t256: initialize_workspace failed";
+  typename GK::Params params = GK::to_underlying_arguments(arguments, gemm_ws);
+  g_last_raster = params.scheduler.raster_order_ == decltype(params.scheduler.raster_order_)::AlongN
+                      ? 2
+                      : 1;
+  dim3 const grid = GK::get_grid_shape(params);
+  dim3 const block = GK::get_block_shape();
+  int const smem = GK::SharedStorageSize;
+  static bool attr_set = false;
+  if (!attr_set) {
+    cudaError_t err = cudaFuncSetAttribute(cutlass::device_kernel<GK>,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    TVM_FFI_ICHECK(err == cudaSuccess) << "cudaFuncSetAttribute: " << cudaGetErrorString(err);
+    attr_set = true;
+  }
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = smem;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  cudaError_t err = cudaLaunchKernelEx(&config, cutlass::device_kernel<GK>, params);
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "flux3_lpt_pair_residual_t256: GEMM launch failed: " << cudaGetErrorString(err);
+}
+
+// Build facts: stages * 1000000 + kernel shared storage bytes (t256 instance).
+int64_t lpt_pair_residual_t256_info() {
+  using namespace flux3_lptr;
+  return static_cast<int64_t>(t256::CollectiveMainloop::DispatchPolicy::Stages) * 1000000 +
+         static_cast<int64_t>(t256::GemmKernel::SharedStorageSize);
+}
+
+// Kernel attributes: which 0 = the 128 instance, 1 = t256. Returns
+// numRegs * 1000000 + localSizeBytes (local memory per thread, i.e. spills).
+int64_t lpt_pair_residual_func_attrs(int64_t which) {
+  using namespace flux3_lptr;
+  cudaFuncAttributes attr{};
+  cudaError_t err = which == 1
+                        ? cudaFuncGetAttributes(&attr, cutlass::device_kernel<t256::GemmKernel>)
+                        : cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>);
+  TVM_FFI_ICHECK(err == cudaSuccess) << "cudaFuncGetAttributes: " << cudaGetErrorString(err);
+  return static_cast<int64_t>(attr.numRegs) * 1000000 + static_cast<int64_t>(attr.localSizeBytes);
+}
+
+}  // namespace torch_ext
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(lpt_pair_residual_t256, torch_ext::lpt_pair_residual_t256);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(lpt_pair_residual_t256_info, torch_ext::lpt_pair_residual_t256_info);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(lpt_pair_residual_func_attrs,
+                              torch_ext::lpt_pair_residual_func_attrs);
+#endif  // FLUX3_LPTR_T256
