@@ -13,6 +13,7 @@ from torch import Tensor
 from . import decoder_tail_triton as _tail
 from . import fp8_conv as _fp8c
 from . import row_softmax_triton as _rsm
+from . import split_attn_triton as _sat
 from . import subpixel_conv as _spc
 from .decoder_tail_triton import (
     add_norm_swish_conv_out_3x3,
@@ -185,6 +186,16 @@ class Flux3ImageAttnBlock(nn.Module):
         q = q.reshape(b, c, h * w).to(torch.bfloat16)
         k = k.reshape(b, c, h * w).to(torch.bfloat16)
         v = v.reshape(b, c, h * w).to(torch.bfloat16)
+        if fp8_pv and b == 1 and _sat.can_use(q):
+            # Same math as below in two kernels (split_attn_triton): QK^T writes S plus
+            # per-tile row maxes; the e4m3 P.V builds pq and l from S in its prologue, so pq
+            # never reaches DRAM (reordered: l and P.V accumulation order only).
+            fp8 = torch.float8_e4m3fn
+            vf = v[0].float()  # [c, T]
+            s_v = (vf.abs().amax(dim=-1, keepdim=True) / 448.0).clamp(min=1e-30)  # [c, 1]
+            vq = (vf / s_v).clamp(-448.0, 448.0).to(fp8).contiguous()  # [c, T] row-major
+            o_t = _sat.split_attn_e4m3(q[0], k[0], vq, s_v.reshape(c), c**-0.5)  # [T, c]
+            return o_t.t().reshape(b, c, h, w).to(dt)
         s = torch.bmm(q.transpose(1, 2), k, out_dtype=torch.float32)
         if fp8_pv and b == 1:
             fp8 = torch.float8_e4m3fn
