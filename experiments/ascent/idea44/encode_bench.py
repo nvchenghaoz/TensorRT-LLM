@@ -56,7 +56,7 @@ REFS = {  # experiments/ascent-benchmark/inputs.json
 }
 CASES = {"t2i-2048": ["check00", "check01", "check02", "check10"],
          "i2i-2048": ["acc07", "acc14", "held03", "check08"]}
-N_PAIRS = int(os.environ.get("N_PAIRS", "160"))
+N_PAIRS = int(os.environ.get("N_PAIRS", "200"))  # timed rotations per case (one call per arm each)
 N_DIAG = int(os.environ.get("N_DIAG", "60"))  # A/A pairs per case (noise reference)
 N_STAGE = int(os.environ.get("N_STAGE", "40"))
 PROMPT = "A red fox on a snowy hill, \"sharp\" text SIGN — café"
@@ -184,10 +184,13 @@ class Arms:
         self.tree_b64 = enc._b64_gpu
         self.tree_resp = osrv._B64JsonSplicer.response
         self.main_b64, self.main_render, self.main_resp = make_main_fns(enc, osrv)
+        # A2: an independent second copy of main (the A/A control arm).
+        self.main2_b64, _, self.main2_resp = make_main_fns(enc, osrv)
+        assert self.main2_b64 is not self.main_b64 and self.main2_resp is not self.main_resp
 
     def set(self, arm):
-        b64 = {"A": self.main_b64, "B": self.tree_b64, "C": self.tree_b64, "D": self.main_b64}[arm]
-        resp = {"A": self.main_resp, "B": self.tree_resp, "C": self.main_resp, "D": self.tree_resp}[arm]
+        b64 = {"A": self.main_b64, "A2": self.main2_b64, "B": self.tree_b64}[arm]
+        resp = {"A": self.main_resp, "A2": self.main2_resp, "B": self.tree_resp}[arm]
         self.enc._b64_gpu = b64
         self.osrv._B64JsonSplicer.response = resp
         assert self.enc._b64_gpu is b64 and self.osrv._B64JsonSplicer.response is resp
@@ -828,52 +831,61 @@ async def client(port, osrv, enc, arms, pix, result):
         async def stats():
             async with session.get(base + "/stats") as r:
                 return json.loads(await r.read())
+        # Verdict rules (fixed before the run, plan 615): VOID if the A2/A bootstrap 95% CI
+        # excludes 1.0; a case passes if its B/A CI lies below 1.0 (or includes 1.0 for a
+        # no-regression row).
+        import random
+        rng = random.Random(44)
+
+        def boot_ci(xs, n=2000):
+            meds = sorted(statistics.median(rng.choices(xs, k=len(xs))) for _ in range(n))
+            return [round(meds[int(0.025 * n)], 4), round(meds[int(0.975 * n) - 1], 4)]
+
+        ARMS3 = ("A", "A2", "B")
+        rots = [ARMS3[i:] + ARMS3[:i] for i in range(3)]
         for c, ks in CASES.items():
-            plan = [(("A", "B"), N_PAIRS)] + ([(("A", "A"), N_DIAG)] if N_DIAG > 0 else [])
-            for arm_set, npairs in plan:
-                for it in range(10):
-                    for a in arm_set:
-                        await get(f"/enc/{a}/{ks[it % 4]}")
-                await stats()
-                ts = [[], []]  # by position in arm_set (A/A safe)
-                diffs = []
-                seq = []
-                bad = 0
-                for it in range(npairs):
-                    k = ks[it % 4]
-                    order = (0, 1) if it % 2 == 0 else (1, 0)
-                    got = [0.0, 0.0]
-                    for p in order:
-                        a = arm_set[p]
-                        body, ms = await get(f"/enc/{a}/{k}")
-                        got[p] = ms
-                        if hashlib.sha256(body).hexdigest() != ref_sha[k]:
-                            bad += 1
-                        seq.append((a, k))
-                    ts[0].append(got[0])
-                    ts[1].append(got[1])
-                    diffs.append(got[1] - got[0])
-                st = await stats()
-                srv = {}
-                for a in set(arm_set):
-                    rows = [s for s in st if s["arm"] == a]
-                    srv[a] = {f: round(statistics.median([r[f] for r in rows]), 3)
-                              for f in ("enc_ms", "build_ms", "send_ms")}
-                q = statistics.quantiles(diffs, n=4)
-                key = "".join(arm_set)
-                timing.setdefault(c, {})
-                if key == "AB":
-                    timing[c]["A"] = stat(ts[0])
-                    timing[c]["B"] = stat(ts[1])
-                timing[c][f"pair_{key}"] = {"median_diff_ms": round(statistics.median(diffs), 3),
-                                            "iqr_ms": [round(q[0], 3), round(q[2], 3)],
-                                            "first_ms": stat(ts[0]),
-                                            "second_ms": stat(ts[1]),
-                                            "server_side": srv, "bad_bodies": bad}
-                seqs[(c, key)] = seq
-                ok &= bad == 0
-                log(f"{c} {key}: {timing[c][f'pair_{key}']}")
-        # ---------------- 4. untimed replay of the timed AB sequence ----------------------
+            for it in range(10):
+                for a in rots[it % 3]:
+                    await get(f"/enc/{a}/{ks[it % 4]}")
+            await stats()
+            ts = {a: [] for a in ARMS3}
+            seq = []
+            bad = 0
+            for it in range(N_PAIRS):
+                k = ks[it % 4]
+                for a in rots[it % 3]:
+                    body, ms = await get(f"/enc/{a}/{k}")
+                    ts[a].append(ms)
+                    if hashlib.sha256(body).hexdigest() != ref_sha[k]:
+                        bad += 1
+                    seq.append((a, k))
+            st = await stats()
+            srv = {}
+            for a in ARMS3:
+                rows = [s for s in st if s["arm"] == a]
+                srv[a] = {f: round(statistics.median([r[f] for r in rows]), 3)
+                          for f in ("enc_ms", "build_ms", "send_ms")}
+            r_ba = [b / a for a, b in zip(ts["A"], ts["B"])]
+            r_aa = [b / a for a, b in zip(ts["A"], ts["A2"])]
+            d_ba = [b - a for a, b in zip(ts["A"], ts["B"])]
+            ci_ba, ci_aa = boot_ci(r_ba), boot_ci(r_aa)
+            void = not (ci_aa[0] <= 1.0 <= ci_aa[1])
+            verdict = "VOID" if void else ("faster" if ci_ba[1] < 1.0 else
+                                          ("no_regression" if ci_ba[0] <= 1.0 <= ci_ba[1] else "slower"))
+            timing[c] = {a: stat(ts[a]) for a in ARMS3}
+            timing[c]["B"].update({"ratio_B_over_A": round(statistics.median(r_ba), 4),
+                                   "ratio_B_over_A_ci95": ci_ba,
+                                   "ratio_A2_over_A": round(statistics.median(r_aa), 4),
+                                   "ratio_A2_over_A_ci95": ci_aa, "verdict": verdict})
+            timing[c]["paired"] = {"median_diff_B_minus_A_ms": round(statistics.median(d_ba), 3),
+                                   "B_over_A": round(statistics.median(r_ba), 4), "B_over_A_ci95": ci_ba,
+                                   "A2_over_A": round(statistics.median(r_aa), 4), "A2_over_A_ci95": ci_aa,
+                                   "verdict": verdict, "server_side": srv, "bad_bodies": bad,
+                                   "loadavg": loadavg()}
+            seqs[(c, "AB")] = seq
+            ok &= bad == 0  # correctness only; the timing verdict is reported separately
+            log(f"{c}: {timing[c]['paired']}")
+        # ---------------- 4. untimed replay of the timed A/A2/B sequence -------------------
         replay_bad = 0
         for c in CASES:
             for a, k in seqs[(c, "AB")]:
