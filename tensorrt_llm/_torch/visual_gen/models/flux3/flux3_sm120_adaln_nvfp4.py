@@ -455,11 +455,14 @@ flux3_adaln_nvfp4_warp(const uint4 *__restrict__ x, const u8 *__restrict__ sel,
 # register allocation, never the instruction math, so every config is bitwise to every other.
 _DEFAULT_WARPS = 1
 _DEFAULT_DEFINES = ("MINB=12",)
-# L2 policy of the 12 x loads (TRTLLM_FLUX3_ADALN_WARP_X_POLICY): 0 = plain loads (the previous
-# build, same module key and cubin), 1 = evict_last fraction 1.0, 2 = evict_last fraction 0.5
-# (default). Exact: a cache hint changes no value. Fraction 0.5 keeps x L2-resident for the
-# block-end gated residual while giving the GEMMs back less L2 than fraction 1.0 (fact 1713).
-_X_POLICY = int(os.environ.get("TRTLLM_FLUX3_ADALN_WARP_X_POLICY", "2").strip() or "0")
+# L2 policy of the 12 x loads (TRTLLM_FLUX3_ADALN_WARP_X_POLICY): 0 = plain loads (default;
+# same module key and cubin as before the hint existed), 1 = evict_last fraction 1.0, 2 =
+# evict_last fraction 0.5. Exact: a cache hint changes no value. Since the gated residual moved
+# into the fused pair+residual epilogue (x is read after the down tiles' mlp_y scratch), the
+# evict_last lines only take L2 from the pair and the QKV epilogue: in-model at 2048^2 X_POLICY=0
+# is ~26 ms/request faster than 2 for t2i (pair -12.7 ms, v_quant epilogue -8.9 ms) and not
+# slower for i2i (branch 20, job 304).
+_X_POLICY = int(os.environ.get("TRTLLM_FLUX3_ADALN_WARP_X_POLICY", "0").strip() or "0")
 if _X_POLICY not in (0, 1, 2):
     raise ValueError(f"TRTLLM_FLUX3_ADALN_WARP_X_POLICY must be 0, 1 or 2, got {_X_POLICY}")
 _MODULES = {}
