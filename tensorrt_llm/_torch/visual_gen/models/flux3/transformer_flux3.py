@@ -74,6 +74,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     sm120_tail_pair_residual_forward,
     verify_nvfp4_coverage,
 )
+from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_qkv_epi_fp8
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import fp8_attention_side_gate_up
 from tensorrt_llm._torch.visual_gen.models.flux3.primsts import (
     linear_forward as _primsts_linear_forward,
@@ -165,10 +166,16 @@ FLUX3_ROPE_TABLE = True
 
 
 def _block_freqs(prepared: dict, prefix: str) -> Tuple[Tensor, ...]:
-    """(cos, sin), plus the prebuilt cos_sin table when _packed_positions made one."""
+    """(cos, sin), plus the prebuilt cos_sin table when _packed_positions made one, plus its
+    compact RoPE table (rope_tab, rope_idx; idea 84) when that was built and verified."""
     cos, sin = prepared[prefix + "cos"], prepared[prefix + "sin"]
     table = prepared.get(prefix + "cos_sin")
-    return (cos, sin) if table is None else (cos, sin, table)
+    if table is None:
+        return (cos, sin)
+    rope_tab, rope_idx = prepared.get(prefix + "rope_tab"), prepared.get(prefix + "rope_idx")
+    if rope_tab is None or rope_idx is None:
+        return (cos, sin, table)
+    return (cos, sin, table, rope_tab, rope_idx)
 
 
 def apply_flux3_pag(
@@ -1891,6 +1898,11 @@ class Flux3Model(BaseDiffusionModel):
             for prefix in [f"_flux3_{name}_" for name in positions] + ["_flux3_joint_"]:
                 table = rope_cos_sin_table(prepared[prefix + "cos"], prepared[prefix + "sin"])
                 prepared[prefix + "cos_sin"] = table.float().contiguous()
+                # Idea 84: the fused QKV epilogue's compact RoPE table (None: not built or
+                # its bitwise check failed; the epilogue then reads cos_sin).
+                compact = flux3_qkv_epi_fp8.build_rope_compact(prepared[prefix + "cos_sin"])
+                if compact is not None:
+                    prepared[prefix + "rope_tab"], prepared[prefix + "rope_idx"] = compact
         if len(chunks) == 2:
             prepared["_flux3_joint_select"] = self._joint_select(chunks, pe.device)
         elif FLUX3_JOINT_TABLE and 2 < len(chunks) <= 255:

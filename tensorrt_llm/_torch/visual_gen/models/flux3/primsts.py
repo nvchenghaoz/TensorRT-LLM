@@ -1411,6 +1411,8 @@ def qkv_fp8_attention_forward(
 
     data, scales = adapter.activation(x)
     cos_sin = freqs[2] if len(freqs) > 2 else rope_cos_sin_table(cos, sin)
+    # Idea 84: freqs[3:5] = the compact RoPE table of freqs[2] (_block_freqs), when built.
+    rope_tab, rope_idx = (freqs[3], freqs[4]) if len(freqs) > 4 else (None, None)
     qkv8, fp8_scales, gemm = nvfp4_qkv_rope_fp8_prepared(
         data,
         adapter.weight,
@@ -1426,6 +1428,8 @@ def qkv_fp8_attention_forward(
         bool(v_live),
         # False (i2i reference-stream blocks): dynamic Q/K amax, as main's generic route there.
         bool(getattr(attn, "_flux3_static_qk", True)),
+        rope_tab,
+        rope_idx,
     )
     if side_gate_up is not None:
         from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (

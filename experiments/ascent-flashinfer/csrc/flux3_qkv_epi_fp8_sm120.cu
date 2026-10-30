@@ -194,7 +194,30 @@ __device__ __forceinline__ void static_scale(__nv_bfloat16 const* norm, float mi
 // ---------------------------------------------------------------------------------------------
 // Epilogue (operator-style, wrapped by Sm90TmaWarpSpecializedAdapter)
 // ---------------------------------------------------------------------------------------------
-template <class StrideC_, class StrideD_, class EpilogueSchedule_>
+struct QkvFp8EpiArgs {
+  uint8_t* qk8 = nullptr;                    // E4M3 planes 0 (q), 1 (k): [2][rows][width]
+  __nv_bfloat16* v = nullptr;                // BF16 v plane [rows][width]
+  float* v_parts = nullptr;                  // [m_tiles * n_tiles] per-tile max|v|
+  float const* alpha = nullptr;              // [3] plane alphas
+  __nv_bfloat16 const* q_norm = nullptr;     // [128]
+  __nv_bfloat16 const* k_norm = nullptr;     // [128]
+  float const* cos_sin = nullptr;            // [rows][128] (cos 0..63, sin 64..127)
+  int rows = 0;
+  int width = 0;
+  int n_tiles = 0;                           // width / 128
+  float min_scale = 0.0f;
+};
+// Idea 84 (TRTLLM_FLUX3_QKV_EPI_ROPE_COMPACT): the compact per-axis RoPE table. Axis a (pairs
+// 16a .. 16a+15) of row r is entry rope_idx[r][a] of rope_tab, 32 FP32 in the epilogue's lane
+// order: slot s = q + 4 wn (= the lane's pair p0) holds {cos(16a+s), cos(16a+s+8), sin(16a+s),
+// sin(16a+s+8)} at [4s, 4s+4). flux3_qkv_epi_fp8.build_rope_compact builds it from cos_sin and
+// checks every index bit for bit on device (rope_tab[rope_idx[r][a]] == row r's axis-a slice).
+struct QkvFp8EpiArgsCompact : QkvFp8EpiArgs {
+  float const* rope_tab = nullptr;           // [entries][32]
+  int const* rope_idx = nullptr;             // [rows][4] entry per axis
+};
+
+template <class StrideC_, class StrideD_, class EpilogueSchedule_, bool kCompact = false>
 class QkvFp8Epilogue {
  public:
   using EpilogueSchedule = EpilogueSchedule_;
@@ -221,19 +244,7 @@ class QkvFp8Epilogue {
   };
   using TensorStorage = SharedStorage;
 
-  struct Arguments {
-    uint8_t* qk8 = nullptr;                    // E4M3 planes 0 (q), 1 (k): [2][rows][width]
-    __nv_bfloat16* v = nullptr;                // BF16 v plane [rows][width]
-    float* v_parts = nullptr;                  // [m_tiles * n_tiles] per-tile max|v|
-    float const* alpha = nullptr;              // [3] plane alphas
-    __nv_bfloat16 const* q_norm = nullptr;     // [128]
-    __nv_bfloat16 const* k_norm = nullptr;     // [128]
-    float const* cos_sin = nullptr;            // [rows][128] (cos 0..63, sin 64..127)
-    int rows = 0;
-    int width = 0;
-    int n_tiles = 0;                           // width / 128
-    float min_scale = 0.0f;
-  };
+  using Arguments = cute::conditional_t<kCompact, QkvFp8EpiArgsCompact, QkvFp8EpiArgs>;
   using Params = Arguments;
 
   template <class ProblemShape>
@@ -279,6 +290,7 @@ class QkvFp8Epilogue {
     static_assert(size<0>(FrgLayout{}) == 4, "m16n8 C fragment expected");
     static_assert(size<1>(FrgLayout{}) == 4, "2x2 warps: MMA_M = 4");
     static_assert(size<2>(FrgLayout{}) == 8, "2x2 warps: MMA_N = 8");
+    static_assert(!kCompact || FLUX3_EPI_WIDE, "the compact RoPE table needs the wide epilogue");
 
     int const m_tile = static_cast<int>(get<0>(blk_coord_mnkl));
     int const n_tile = static_cast<int>(get<1>(blk_coord_mnkl));
@@ -329,7 +341,13 @@ class QkvFp8Epilogue {
           CUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < 2; ++j) {
             uint4 o = quad_t32(wv[4 * j], wv[4 * j + 1], wv[4 * j + 2], wv[4 * j + 3], lane & 3);
-            if (live) *reinterpret_cast<uint4*>(dst + 64 * j) = o;
+#ifdef FLUX3_EPI_DIAG_NOVST
+            // Diagnostic only: V values computed, (almost) never stored.
+            if (live && (o.x ^ o.y ^ o.z ^ o.w) == 0x12345679u)
+#else
+            if (live)
+#endif
+              *reinterpret_cast<uint4*>(dst + 64 * j) = o;
           }
 #else
           if (live) {
@@ -366,7 +384,13 @@ class QkvFp8Epilogue {
     // ---------------- Q/K: RMSNorm + RoPE -> E4M3 ----------------
     __nv_bfloat16 const* norm = plane == 0 ? params.q_norm : params.k_norm;
     float scale_unused, factor;
+#ifdef FLUX3_EPI_DIAG_NOSF
+    // Diagnostic only: a plane-dependent constant instead of the per-tile static factor.
+    factor = plane == 0 ? 0.0625f : 0.125f;
+    (void)scale_unused;
+#else
     static_scale(norm, params.min_scale, scale_unused, factor);
+#endif
     float const eps = __uint_as_float(kEpsBits);
     float const inv128 = __uint_as_float(kInv128Bits);
 
@@ -429,12 +453,25 @@ class QkvFp8Epilogue {
       }
     }
 #endif
+    float inv[8];
+#ifdef FLUX3_EPI_DIAG_NOX
+    // Diagnostic only: no cross-warp exchange (each warp finishes its own half-row sums).
+    CUTLASS_PRAGMA_UNROLL
+    for (int r = 0; r < 8; ++r) {
+      float w0 = add_rn(u[r][0], u[r][0]);
+      float w1 = add_rn(u[r][1], u[r][1]);
+      w0 = add_rn(__shfl_xor_sync(0xffffffffu, w0, 2), w0);
+      w1 = add_rn(__shfl_xor_sync(0xffffffffu, w1, 2), w1);
+      w0 = add_rn(__shfl_xor_sync(0xffffffffu, w0, 1), w0);
+      w1 = add_rn(__shfl_xor_sync(0xffffffffu, w1, 1), w1);
+      inv[r] = rsqrt_approx(fma_rn(add_rn(w1, w0), inv128, eps));
+    }
+#else
     if (wn == 1) {
       CUTLASS_PRAGMA_UNROLL
       for (int r = 0; r < 8; ++r) ss_mem.part[wm][r][lane] = make_float2(u[r][0], u[r][1]);
     }
     bar_sync(bar_id);
-    float inv[8];
     if (wn == 0) {
       CUTLASS_PRAGMA_UNROLL
       for (int r = 0; r < 8; ++r) {
@@ -455,6 +492,7 @@ class QkvFp8Epilogue {
       CUTLASS_PRAGMA_UNROLL
       for (int r = 0; r < 8; ++r) inv[r] = ss_mem.inv[wm][r][group];
     }
+#endif  // FLUX3_EPI_DIAG_NOX
 
     // Pass 2: RoPE pairs (col0 + 16 ni, +1) -> E4M3 pair, pair index p = col0 / 2 + 8 ni.
     uint32_t wpair[8];
@@ -470,11 +508,40 @@ class QkvFp8Epilogue {
       int const row = row_base + get<0>(tCcD(2 * (r & 1), r >> 1, 0));
       float const iv = inv[r];
       float const* cs_row = params.cos_sin + static_cast<int64_t>(row < rows ? row : 0) * 128 + p0;
+      // kCompact: entry e[a] = {cos(ni = 2a), cos(2a + 1), sin(2a), sin(2a + 1)} of this lane.
+      float4 ce[4];
+      if constexpr (kCompact) {
+        int4 const ix = __ldg(reinterpret_cast<int4 const*>(params.rope_idx) + (row < rows ? row : 0));
+        float4 const* tab = reinterpret_cast<float4 const*>(params.rope_tab) + p0;
+        ce[0] = __ldg(tab + static_cast<int64_t>(ix.x) * 8);
+        ce[1] = __ldg(tab + static_cast<int64_t>(ix.y) * 8);
+        ce[2] = __ldg(tab + static_cast<int64_t>(ix.z) * 8);
+        ce[3] = __ldg(tab + static_cast<int64_t>(ix.w) * 8);
+      }
       uint32_t hb[8];
       CUTLASS_PRAGMA_UNROLL
       for (int ni = 0; ni < 8; ++ni) {
+        if constexpr (kCompact) {
+          float const cv = (ni & 1) ? ce[ni >> 1].y : ce[ni >> 1].x;
+          float const sv = (ni & 1) ? ce[ni >> 1].w : ce[ni >> 1].z;
+          float const xe = __uint_as_float(pk[r][ni] << 16);
+          float const xo = __uint_as_float(pk[r][ni] & 0xFFFF0000u);
+          float const even = mul_rn(mul_rn(iv, xe), bits_to_f32(wpair[ni] & 0xFFFFu));
+          float const odd = mul_rn(mul_rn(iv, xo), bits_to_f32(wpair[ni] >> 16));
+          float const rot_e = fma_rn(even, cv, neg_f32(mul_rn(odd, sv)));
+          float const rot_o = fma_rn(odd, cv, mul_rn(even, sv));
+          hb[ni] = e4m3x2(bf16_round(rot_e), bf16_round(rot_o), factor);
+          continue;
+        }
+#ifdef FLUX3_EPI_DIAG_NOCS
+        // Diagnostic only: row-dependent register values instead of the cos_sin loads.
+        float const cv = __int_as_float(0x3F000000 | ((row * 64 + p0 + 8 * ni) & 0x7FFFF));
+        float const sv = __int_as_float(0x3E800000 | ((row * 64 + p0 + 8 * ni) & 0x7FFFF));
+        (void)cs_row;
+#else
         float const cv = __ldg(cs_row + 8 * ni);
         float const sv = __ldg(cs_row + 64 + 8 * ni);
+#endif
         float const xe = __uint_as_float(pk[r][ni] << 16);
         float const xo = __uint_as_float(pk[r][ni] & 0xFFFF0000u);
         float const even = mul_rn(mul_rn(iv, xe), bits_to_f32(wpair[ni] & 0xFFFFu));
@@ -490,7 +557,13 @@ class QkvFp8Epilogue {
       for (int j = 0; j < 2; ++j) {
         uint2 o = quad_t16(hb[4 * j] | (hb[4 * j + 1] << 16), hb[4 * j + 2] | (hb[4 * j + 3] << 16),
                            lane & 3);
-        if (row < rows) *reinterpret_cast<uint2*>(dst + 64 * j) = o;
+#ifdef FLUX3_EPI_DIAG_NOQKST
+        // Diagnostic only: E4M3 Q/K computed, (almost) never stored.
+        if (row < rows && (o.x ^ o.y) == 0x12345679u)
+#else
+        if (row < rows)
+#endif
+          *reinterpret_cast<uint2*>(dst + 64 * j) = o;
       }
     }
 #else
@@ -579,6 +652,20 @@ using GemmKernel =
                                          CollectiveEpilogue, cutlass::gemm::PersistentScheduler>;
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
+// Idea 84: the same kernel with the compact RoPE table (same mainloop, same smem carve-out).
+using EpilogueOpCompact =
+    QkvFp8Epilogue<StrideCD, StrideCD, cutlass::epilogue::NoSmemWarpSpecialized, true>;
+static_assert(sizeof(typename EpilogueOpCompact::SharedStorage) ==
+                  sizeof(typename EpilogueOp::SharedStorage),
+              "compact epilogue must keep the mainloop's stage count");
+using CollectiveEpilogueCompact =
+    cutlass::epilogue::collective::detail::Sm90TmaWarpSpecializedAdapter<EpilogueOpCompact>;
+using GemmKernelCompact =
+    cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,
+                                         CollectiveEpilogueCompact,
+                                         cutlass::gemm::PersistentScheduler>;
+using GemmCompact = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelCompact>;
+
 int cached_sm_count(int device) {
   static int counts[64] = {0};
   if (device < 0 || device >= 64) device = 0;
@@ -588,11 +675,11 @@ int cached_sm_count(int device) {
   return counts[device];
 }
 
-typename Gemm::Arguments make_args(void const* a, void const* b, void const* sfa, void const* sfb,
-                                   int m, int n, int k, int device,
-                                   typename EpilogueOp::Arguments const& epi) {
+template <class GemmT = Gemm, class EpiArgsT = typename EpilogueOp::Arguments>
+typename GemmT::Arguments make_args(void const* a, void const* b, void const* sfa, void const* sfb,
+                                    int m, int n, int k, int device, EpiArgsT const& epi) {
   using Sm1xxBlkScaledConfig = typename CollectiveMainloop::Sm1xxBlkScaledConfig;
-  typename Gemm::Arguments args;
+  typename GemmT::Arguments args;
   args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
   args.problem_shape = cute::make_shape(m, n, k, 3);
   args.mainloop.ptr_A = static_cast<cutlass::float_e2m1_t const*>(a);
@@ -702,9 +789,11 @@ using namespace flux3_qkv_epi;
 // a [M, K/2] u8, b [3N, K/2] u8 (q, k, v planes), sfa/sfb swizzled E4M3 scales (sfb: 3 planes),
 // alpha f32[3], q_norm/k_norm bf16[128], cos_sin f32[M, 128], qkv8 [3, M, N] 1-byte (planes 0, 1
 // written), v bf16 [M, N] (v plane), v_parts f32[ceil(M/128) * N/128].
-void qkv3_epi_fp8(TensorView a, TensorView b, TensorView sfa, TensorView sfb, TensorView alpha,
-                  TensorView q_norm, TensorView k_norm, TensorView cos_sin, TensorView qkv8,
-                  TensorView v, TensorView v_parts, TensorView workspace, double min_scale) {
+template <class GemmT, bool kCompact>
+void qkv3_epi_fp8_impl(TensorView a, TensorView b, TensorView sfa, TensorView sfb, TensorView alpha,
+                       TensorView q_norm, TensorView k_norm, TensorView cos_sin, TensorView qkv8,
+                       TensorView v, TensorView v_parts, TensorView workspace, double min_scale,
+                       TensorView const* rope_tab, TensorView const* rope_idx) {
   TVM_FFI_ICHECK_EQ(a.dtype(), dl_uint8) << "a must be uint8 (packed e2m1)";
   TVM_FFI_ICHECK_EQ(b.dtype(), dl_uint8) << "b must be uint8 (packed e2m1)";
   TVM_FFI_ICHECK_EQ(alpha.dtype(), dl_float32);
@@ -732,7 +821,20 @@ void qkv3_epi_fp8(TensorView a, TensorView b, TensorView sfa, TensorView sfb, Te
     TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(p) % 16 == 0) << "16-B alignment required";
   }
 
-  typename EpilogueOp::Arguments epi;
+  using EpiArgs = cute::conditional_t<kCompact, QkvFp8EpiArgsCompact, QkvFp8EpiArgs>;
+  EpiArgs epi;
+  if constexpr (kCompact) {
+    TVM_FFI_ICHECK_EQ(rope_tab->dtype(), dl_float32) << "rope_tab must be float32";
+    TVM_FFI_ICHECK_EQ(rope_idx->dtype(), dl_int32) << "rope_idx must be int32";
+    TVM_FFI_ICHECK(rope_tab->ndim() == 2 && rope_tab->size(1) == 32) << "rope_tab [entries, 32]";
+    TVM_FFI_ICHECK(rope_idx->ndim() == 2 && rope_idx->size(1) == 4) << "rope_idx [rows, 4]";
+    TVM_FFI_ICHECK(rope_idx->size(0) >= m) << "rope_idx rows < M";
+    for (auto* p : {rope_tab->data_ptr(), rope_idx->data_ptr()}) {
+      TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(p) % 16 == 0) << "16-B alignment required";
+    }
+    epi.rope_tab = static_cast<float const*>(rope_tab->data_ptr());
+    epi.rope_idx = static_cast<int const*>(rope_idx->data_ptr());
+  }
   epi.qk8 = static_cast<uint8_t*>(qkv8.data_ptr());
   epi.v = static_cast<__nv_bfloat16*>(v.data_ptr());
   epi.v_parts = static_cast<float*>(v_parts.data_ptr());
@@ -746,9 +848,9 @@ void qkv3_epi_fp8(TensorView a, TensorView b, TensorView sfa, TensorView sfb, Te
   epi.min_scale = static_cast<float>(min_scale);
 
   int const device = a.device().device_id;
-  Gemm gemm;
-  auto args =
-      make_args(a.data_ptr(), b.data_ptr(), sfa.data_ptr(), sfb.data_ptr(), m, n, k, device, epi);
+  GemmT gemm;
+  auto args = make_args<GemmT>(a.data_ptr(), b.data_ptr(), sfa.data_ptr(), sfb.data_ptr(), m, n, k,
+                               device, epi);
   size_t need = gemm.get_workspace_size(args);
   size_t have = static_cast<size_t>(workspace.numel()) * get_element_size(workspace);
   TVM_FFI_ICHECK(need <= have) << "workspace too small: need " << need << " have " << have;
@@ -763,6 +865,25 @@ void qkv3_epi_fp8(TensorView a, TensorView b, TensorView sfa, TensorView sfb, Te
   st = gemm.run(stream, nullptr, /*launch_with_pdl=*/true);
   TVM_FFI_ICHECK(st == cutlass::Status::kSuccess)
       << "run failed: " << cutlass::cutlassGetStatusString(st);
+}
+
+void qkv3_epi_fp8(TensorView a, TensorView b, TensorView sfa, TensorView sfb, TensorView alpha,
+                  TensorView q_norm, TensorView k_norm, TensorView cos_sin, TensorView qkv8,
+                  TensorView v, TensorView v_parts, TensorView workspace, double min_scale) {
+  qkv3_epi_fp8_impl<Gemm, false>(a, b, sfa, sfb, alpha, q_norm, k_norm, cos_sin, qkv8, v, v_parts,
+                                 workspace, min_scale, nullptr, nullptr);
+}
+
+// Idea 84: as qkv3_epi_fp8, with Q/K RoPE read from the compact per-axis table: rope_tab f32
+// [entries, 32] (QkvFp8EpiArgsCompact's lane order), rope_idx i32 [>= M, 4]. cos_sin is only
+// shape-checked (build_rope_compact guarantees tab[idx] == cos_sin bit for bit).
+void qkv3_epi_fp8_compact(TensorView a, TensorView b, TensorView sfa, TensorView sfb,
+                          TensorView alpha, TensorView q_norm, TensorView k_norm,
+                          TensorView cos_sin, TensorView qkv8, TensorView v, TensorView v_parts,
+                          TensorView workspace, double min_scale, TensorView rope_tab,
+                          TensorView rope_idx) {
+  qkv3_epi_fp8_impl<GemmCompact, true>(a, b, sfa, sfb, alpha, q_norm, k_norm, cos_sin, qkv8, v,
+                                       v_parts, workspace, min_scale, &rope_tab, &rope_idx);
 }
 
 // v bf16 [M, N] -> v8 (qkv8 plane 2) E4M3, scales f32[8]. discard: drop each consumed v line from
@@ -804,6 +925,7 @@ int64_t qkv3_epi_stages() {
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(qkv3_epi_fp8, qkv3_epi_fp8);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(qkv3_epi_fp8_compact, qkv3_epi_fp8_compact);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(v_quant, v_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(qkv3_epi_workspace_size, qkv3_epi_workspace_size);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(qkv3_epi_smem, qkv3_epi_smem);

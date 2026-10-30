@@ -67,6 +67,14 @@ _FLUX3_GRAPH_REUSABLE_INPUTS = frozenset(
         "_flux3_joint_cos_sin",
         "_flux3_joint_select",
         "_flux3_joint_index",
+        # Idea 84: _packed_positions -> flux3_qkv_epi_fp8.build_rope_compact (gather / where
+        # outputs, fresh per request, never written in place).
+        "_flux3_text_rope_tab",
+        "_flux3_text_rope_idx",
+        "_flux3_image_rope_tab",
+        "_flux3_image_rope_idx",
+        "_flux3_joint_rope_tab",
+        "_flux3_joint_rope_idx",
     )
 )
 # Read at every replay; TRTLLM_FLUX3_GRAPH_REUSE_INPUTS=0 turns the copy skip off.
