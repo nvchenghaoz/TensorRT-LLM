@@ -226,7 +226,17 @@ def _prepare_nvfp4(layer: Linear, swiglu: bool) -> PreparedNVFP4:
             interleaved_64=layer.use_cute_dsl_blockscaling_mm,
         )
         scale = torch.ops.trtllm.block_scale_interleave(scale)
-    return PreparedNVFP4(weight, scale, 1.0 / inverse_scale, weight_global_scale, swiglu=swiglu)
+    v2w = False
+    if swiglu and is_sm120(weight.device):
+        # Idea 89: rows reordered for the lane-local CUTLASS SwiGLU epilogue (FLUX3_EPI_V2=2);
+        # every consumer resolves the flag through the owner (TRTLLM_FLUX3_SM120_SWIGLU_EPI_V2=0
+        # keeps main's layout and modules).
+        from .flux3_swiglu_fp4_cutlass import maybe_permute_for_v2w
+
+        weight, scale, v2w = maybe_permute_for_v2w(weight, scale)
+    prepared = PreparedNVFP4(weight, scale, 1.0 / inverse_scale, weight_global_scale, swiglu=swiglu)
+    prepared._flux3_v2w = v2w
+    return prepared
 
 
 def _qkv_epilogue_eligible(attn: nn.Module) -> bool:

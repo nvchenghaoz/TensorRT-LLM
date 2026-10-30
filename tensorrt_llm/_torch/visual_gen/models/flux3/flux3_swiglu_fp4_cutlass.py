@@ -61,9 +61,11 @@ def epi_vec() -> bool:
 
 @functools.cache
 def epi_v2() -> bool:
-    """TRTLLM_FLUX3_SM120_SWIGLU_EPI_V2: 1 (default) = lane-local epilogue (FLUX3_EPI_V2=1 on top of
-    EPI_VEC; modules _ev2 / _dyn_ev2, bitwise equal); 0 = the EPI_VEC modules (_ev / _dyn_ev) byte
-    for byte. Ignored when EPI_VEC is off."""
+    """TRTLLM_FLUX3_SM120_SWIGLU_EPI_V2 (read at weight preparation): 1 (default) = lane-local
+    epilogue: prepare permutes the packed gate_up weight rows (permute_weight_v2w) and those weights
+    run the FLUX3_EPI_V2=2 modules (_ev2w / _dyn_ev2w; same MMA permutation as EPI_VEC, bitwise
+    equal outputs); 0 = unpermuted weights on the EPI_VEC modules (_ev / _dyn_ev) byte for byte.
+    Needs EPI_VEC; ignored when EPI_VEC is off."""
     value = os.environ.get("TRTLLM_FLUX3_SM120_SWIGLU_EPI_V2", "1").strip()
     if value not in ("0", "1"):
         raise ValueError(f"TRTLLM_FLUX3_SM120_SWIGLU_EPI_V2 must be 0 or 1, got {value!r}")
@@ -76,7 +78,8 @@ def _build(suffix: str, flags: tuple[str, ...]):
 
 
 def get_module_static(vec: bool | None = None, v2: bool | None = None):
-    """StaticPersistentScheduler build (main's module, same name, when vec is off)."""
+    """StaticPersistentScheduler build (main's module, same name, when vec is off). v2: the module
+    for v2w-permuted weights."""
     if vec is None:
         vec = epi_vec()
     if not vec:
@@ -84,12 +87,13 @@ def get_module_static(vec: bool | None = None, v2: bool | None = None):
     if v2 is None:
         v2 = epi_v2()
     if v2:
-        return _build("_ev2", ("-DFLUX3_EPI_VEC=1", "-DFLUX3_EPI_V2=1"))
+        return _build("_ev2w", ("-DFLUX3_EPI_VEC=1", "-DFLUX3_EPI_V2=2"))
     return _build("_ev", ("-DFLUX3_EPI_VEC=1",))
 
 
 def get_module_dynamic(vec: bool | None = None, v2: bool | None = None):
-    """CLC dynamic persistent scheduler build (cutlass::gemm::PersistentScheduler on Sm120)."""
+    """CLC dynamic persistent scheduler build (cutlass::gemm::PersistentScheduler on Sm120). v2: the
+    module for v2w-permuted weights."""
     if vec is None:
         vec = epi_vec()
     if not vec:
@@ -97,13 +101,95 @@ def get_module_dynamic(vec: bool | None = None, v2: bool | None = None):
     if v2 is None:
         v2 = epi_v2()
     if v2:
-        return _build("_dyn_ev2", ("-DFLUX3_TILESCHED=1", "-DFLUX3_EPI_VEC=1", "-DFLUX3_EPI_V2=1"))
+        return _build("_dyn_ev2w", ("-DFLUX3_TILESCHED=1", "-DFLUX3_EPI_VEC=1", "-DFLUX3_EPI_V2=2"))
     return _build("_dyn_ev", ("-DFLUX3_TILESCHED=1", "-DFLUX3_EPI_VEC=1"))
 
 
-def get_module():
-    """The module selected by TRTLLM_FLUX3_SM120_SWIGLU_SCHED; only that one is built."""
-    return get_module_dynamic() if tile_sched() == "dynamic" else get_module_static()
+def get_module(v2: bool | None = None):
+    """The module selected by TRTLLM_FLUX3_SM120_SWIGLU_SCHED; only that one is built. v2=None:
+    the module prepared weights use under the current env (v2w when EPI_VEC and EPI_V2 are on)."""
+    if v2 is None:
+        v2 = v2w_prepare_enabled()
+    return get_module_dynamic(None, v2) if tile_sched() == "dynamic" else get_module_static(None, v2)
+
+
+def v2w_prepare_enabled() -> bool:
+    """Whether weight preparation permutes packed gate_up weights for the v2w modules."""
+    return enabled() and epi_vec() and epi_v2()
+
+
+def weight_is_v2w(weight: torch.Tensor) -> bool:
+    """True when weight is a prepared gate_up weight that permute_weight_v2w reordered (flag on its
+    registered NVFP4 owner, so offload moves are followed)."""
+    from tensorrt_llm._torch.visual_gen.models.flux3.nvfp4_metadata import find_nvfp4_owner
+
+    owner = find_nvfp4_owner(weight)
+    return bool(getattr(owner, "_flux3_v2w", False)) if owner is not None else False
+
+
+def maybe_permute_for_v2w(weight: torch.Tensor, weight_scale: torch.Tensor):
+    """(weight, scale, permuted) for a packed gate_up weight at preparation: v2w-permuted when
+    v2w_prepare_enabled() and the shape is one the CUTLASS module serves."""
+    columns, half_k = weight.shape
+    if not (v2w_prepare_enabled() and columns % 128 == 0 and (half_k * 2) % 128 == 0
+            and (columns // 2 // 16) % 4 == 0):
+        return weight, weight_scale, False
+    w, s = permute_weight_v2w(weight, weight_scale)
+    return w, s, True
+
+
+def v2w_row_permutation(columns: int, device) -> torch.Tensor:
+    """Source row of every packed gate_up weight row for FLUX3_EPI_V2=2 (served MMA permutation):
+    within each 64-row group, row 2*s + e (pair slot s = q + 4r + 16nb, e = value/gate) takes
+    the interleaved row 2*o + e of output o = 8q + 4nb + r."""
+    assert columns % 64 == 0
+    p = torch.arange(64, device=device)
+    e, s = p & 1, p >> 1
+    q, r, nb = s & 3, (s >> 2) & 3, s >> 4
+    local = 2 * (8 * q + 4 * nb + r) + e
+    rows = torch.arange(columns, device=device)
+    return (rows // 64) * 64 + local[rows % 64]
+
+
+def _sf_index(rows: int, kb: int, device) -> torch.Tensor:
+    """[rows, kb] -> byte offset in the 128x4-swizzled scale layout (rows % 128 == 0, kb % 4 == 0)."""
+    n = torch.arange(rows, device=device).unsqueeze(1)
+    k = torch.arange(kb, device=device).unsqueeze(0)
+    return (k & 3) + (k >> 2) * 512 + (n & 31) * 16 + ((n & 127) >> 5) * 4 + (n >> 7) * 128 * kb
+
+
+def permute_weight_v2w(weight: torch.Tensor, weight_scale: torch.Tensor):
+    """(weight, 128x4-swizzled scale) with rows permuted by v2w_row_permutation. Exact (bytes)."""
+    w = _u8(weight)
+    columns, half_k = w.shape
+    kb = half_k * 2 // 16
+    assert columns % 128 == 0 and kb % 4 == 0
+    perm = v2w_row_permutation(columns, w.device)
+    sf = _u8(weight_scale).reshape(-1)
+    assert sf.numel() == columns * kb
+    idx = _sf_index(columns, kb, w.device)
+    sf_rows = sf[idx][perm]
+    out_sf = torch.empty_like(sf)
+    out_sf[idx] = sf_rows
+    return w[perm].contiguous().view(weight.dtype), out_sf.view(weight_scale.dtype).reshape(
+        weight_scale.shape)
+
+
+def unpermute_weight_v2w(weight: torch.Tensor, weight_scale: torch.Tensor):
+    """Inverse of permute_weight_v2w (for non-v2w consumers of a permuted weight). Exact (bytes)."""
+    w = _u8(weight)
+    columns, half_k = w.shape
+    kb = half_k * 2 // 16
+    perm = v2w_row_permutation(columns, w.device)
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(columns, device=w.device)
+    sf = _u8(weight_scale).reshape(-1)
+    idx = _sf_index(columns, kb, w.device)
+    sf_rows = sf[idx][inv]
+    out_sf = torch.empty_like(sf)
+    out_sf[idx] = sf_rows
+    return w[inv].contiguous().view(weight.dtype), out_sf.view(weight_scale.dtype).reshape(
+        weight_scale.shape)
 
 
 def _scale_size(rows: int, columns: int) -> int:
@@ -161,7 +247,9 @@ def swiglu_packed(
     else:
         assert output.shape == (padded_rows, columns // 4) and output.dtype == torch.uint8
         assert output_scale.numel() == _scale_size(padded_rows, columns // 2)
-    (module or get_module()).flux3_swiglu_fp4_gemm(
+    if module is None:
+        module = get_module(weight_is_v2w(weight))
+    module.flux3_swiglu_fp4_gemm(
         _u8(activation.contiguous()),
         _u8(weight),
         _u8(activation_scale),

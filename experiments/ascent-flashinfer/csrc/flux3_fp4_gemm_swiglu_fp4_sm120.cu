@@ -170,7 +170,12 @@ __device__ __forceinline__ bool div_safe(float a, float b) {
 #ifndef FLUX3_EPI_V2
 #define FLUX3_EPI_V2 0
 #endif
-#if FLUX3_EPI_V2 == 1 && FLUX3_EPI_VEC != 1
+// 2: the same lane-local epilogue on EPI_VEC's MMA permutation (unchanged mainloop); the caller
+// passes gate_up weight rows (and their scale rows) permuted within every 64-row group so that
+// accumulator pair slot q + 4r + 16nb holds output 8q + 4nb + r (see flux3_swiglu_fp4_cutlass.py
+// permute_weight_v2w). Mode 1's stride-16 lane columns put the 8 B rows of each ldmatrix on one
+// smem swizzle phase (measured +3.5% on the mainloop).
+#if FLUX3_EPI_V2 != 0 && FLUX3_EPI_VEC != 1
 #error "FLUX3_EPI_V2 needs FLUX3_EPI_VEC=1"
 #endif
 // STEP 0 diagnostics (WRONG numerics, timing only). FLUX3_DIAG_NOEPI: no epilogue work (the
@@ -307,7 +312,7 @@ class SwigluFp4Epilogue {
     }
     return;
 #endif
-#if FLUX3_EPI_V2 == 1
+#if FLUX3_EPI_V2 != 0
     static_assert(MMA_N == 8, "EPI_V2: each lane owns 8 consecutive pairs of a 32-output span");
     // Lane q: accumulator pair ni (0..7) of row half hh is output 8q + ni of its warp's 32 outputs
     // (col = 16q + 64w + 2ni: value even, gate odd); outputs 0..15 = scale block 0 (q = 0, 1),
@@ -349,8 +354,9 @@ class SwigluFp4Epilogue {
       v.x = odd ? recv : word[0];
       v.y = odd ? word[1] : recv;
       int const row = row_base + get<0>(tCcD(2 * odd, mi, 0));
-      int const col = col_base + get<1>(tCcD(0, mi, 0));
-      int const block_col = col >> 5;
+      // Warp's 64-column span (both permutations keep it contiguous) + lane's block (q >> 1).
+      int const span = get<1>(tCcD(0, mi, 0)) & ~63;
+      int const block_col = ((col_base + span) >> 5) + (q >> 1);
       if (row < params.rows_padded && FLUX3_STORE_OK(params)) {
         *reinterpret_cast<uint2*>(params.out + static_cast<int64_t>(row) * params.out_row_bytes +
                                   block_col * 8) = v;

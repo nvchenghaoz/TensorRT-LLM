@@ -194,9 +194,10 @@ def capture(fn):
 
 def time_arms(c, mods, rounds, seed):
     """{arm: [us/call per round]}: one CALLS-call graph per arm, seeded random order per round."""
-    graphs = {}
+    graphs, keep = {}, []
     for arm, mod in mods.items():
         bufs = swc.allocate_outputs(c["M"], N, c["a"].device)
+        keep.append(bufs)  # graph replays write these: keep them alive
         graphs[arm] = capture(lambda mod=mod, bufs=bufs: [call(c, mod, bufs, poison=False)
                                                           for _ in range(CALLS)])
     rng = random.Random(seed)
@@ -390,6 +391,93 @@ def check():
                       "results": results}))
 
 
+W_VARIANTS = {
+    "served": ("_dyn_ev", BASE),
+    "noepi": ("_dyn_ev_d_noepi", BASE + ("-DFLUX3_DIAG_NOEPI",)),
+    "v2": ("_dyn_ev2", V2),
+    "v2_noepi": ("_dyn_ev2_d_noepi", V2 + ("-DFLUX3_DIAG_NOEPI",)),
+    "v2w": ("_dyn_ev2w", BASE + ("-DFLUX3_EPI_V2=2",)),
+    "v2w_noshfl": ("_dyn_ev2w_d_noshfl", BASE + ("-DFLUX3_EPI_V2=2", "-DFLUX3_DIAG_NOSHFL")),
+    "v2w_nostore": ("_dyn_ev2w_d_nostore", BASE + ("-DFLUX3_EPI_V2=2", "-DFLUX3_DIAG_NOSTORE")),
+}
+PERMUTED = ("v2w", "v2w_noshfl", "v2w_nostore")
+
+
+def wperm():
+    """served MMA permutation + lane-local epilogue on row-permuted weights (FLUX3_EPI_V2=2)."""
+    gl = git_log()
+    VARIANTS.update(W_VARIANTS)
+    names = list(W_VARIANTS)
+    mods, specs = build(names)
+    res_rows = {n: resources(specs[n]) for n in names}
+    for n in names:
+        log(f"resources {n}: {json.dumps(res_rows[n])}")
+    checks, table, passed = {}, {}, True
+    for M in (4176,) + SERVED_MS:
+        c = make_case(M, seed=M + 3)
+        pb, psf = swc.permute_weight_v2w(c["b"], c["sfb"])
+        cw = dict(c, b=pb, sfb=psf)
+        bufs = swc.allocate_outputs(M, N, c["a"].device)
+        ref = [t.clone() for t in call(c, mods["served"], bufs)]
+        torch.cuda.synchronize()
+        n_ok = 0
+        for i in range(5):
+            out = call(cw, mods["v2w"], bufs)
+            torch.cuda.synchronize()
+            ok = all(torch.equal(x, y) for x, y in zip(out, ref))
+            if not ok and i == 0:
+                o = out[0].view(-1) != ref[0].view(-1)
+                s = out[1].view(-1) != ref[1].view(-1)
+                log(f"M={M} v2w mismatch: out {int(o.sum())} sf {int(s.sum())}")
+            n_ok += ok
+        checks[str(M)] = f"{n_ok}/5"
+        passed &= n_ok == 5
+        log(f"M={M}: v2w (permuted weights) bitwise vs served: {n_ok}/5")
+        if M == 4176:
+            continue
+        arms = {}
+        for n in names:
+            arms[n] = mods[n]
+        arms["served_aa"] = mods["served"]
+        # time_arms uses one case for every arm: run permuted arms on cw, others on c.
+        t = {}
+        graphs, keep = {}, []
+        for arm, mod in arms.items():
+            cc = cw if arm in PERMUTED else c
+            b2 = swc.allocate_outputs(M, N, c["a"].device)
+            keep.append(b2)  # graph replays write these: keep them alive
+            log(f"M={M} capture {arm}")
+            graphs[arm] = capture(lambda mod=mod, b2=b2, cc=cc: [call(cc, mod, b2, poison=False)
+                                                                 for _ in range(CALLS)])
+            t[arm] = []
+        rng = random.Random(M)
+        for arm, g in graphs.items():
+            log(f"M={M} warm replay {arm}")
+            g.replay()
+            torch.cuda.synchronize()
+        for _ in range(ROUNDS):
+            order = list(arms)
+            rng.shuffle(order)
+            for arm in order:
+                e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                e0.record()
+                graphs[arm].replay()
+                e1.record()
+                e1.synchronize()
+                t[arm].append(e0.elapsed_time(e1) * 1000.0 / CALLS)
+        del graphs
+        st = {arm: stats(v) for arm, v in t.items()}
+        base = st["served"]["median_us"]
+        for arm in st:
+            st[arm]["vs_served"] = round(st[arm]["median_us"] / base - 1.0, 4)
+        table[str(M)] = st
+        log(f"M={M} clocks {clocks()}: " + json.dumps(st))
+        del c, cw
+        torch.cuda.empty_cache()
+    print(json.dumps({"passed": bool(passed), "git": gl, "v2w_bitwise_vs_served": checks,
+                      "table_us_per_call": table, "resources": res_rows}))
+
+
 def pair():
     gl = git_log()
     mod = swc.get_module()
@@ -413,4 +501,7 @@ def pair():
 
 
 if __name__ == "__main__":
-    {"step0": step0, "check": check, "pair": pair}[sys.argv[1]]()
+    # check/pair here were the mode-1 (hierarchical PermTileN) evidence of jobs 597 / 610-611
+    # (commit d9f2b3c0, where EPI_V2=1 selected _dyn_ev2); the served v2w route's check and pair
+    # are in served.py.
+    {"step0": step0, "wperm": wperm, "check_mode1": check, "pair_mode1": pair}[sys.argv[1]]()

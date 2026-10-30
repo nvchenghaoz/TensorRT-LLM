@@ -1043,7 +1043,12 @@ def nvfp4_linear_swiglu(
 ) -> torch.Tensor:
     if is_sm120(activation.device):
         from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120 import flux3_sm120_nvfp4
+        from tensorrt_llm._torch.visual_gen.models.flux3 import flux3_swiglu_fp4_cutlass
 
+        if flux3_swiglu_fp4_cutlass.weight_is_v2w(weight):
+            weight, weight_scale = flux3_swiglu_fp4_cutlass.unpermute_weight_v2w(
+                weight, weight_scale
+            )
         return flux3_sm120_nvfp4.run(
             "swiglu",
             activation,
@@ -1107,6 +1112,10 @@ def nvfp4_swiglu_packed(
                     activation.device, input_global_scale * weight_global_scale
                 ),
                 output_inverse_scale,
+            )
+        if flux3_swiglu_fp4_cutlass.weight_is_v2w(weight):
+            weight, weight_scale = flux3_swiglu_fp4_cutlass.unpermute_weight_v2w(
+                weight, weight_scale
             )
         return flux3_sm120_nvfp4.run(
             "packed",
