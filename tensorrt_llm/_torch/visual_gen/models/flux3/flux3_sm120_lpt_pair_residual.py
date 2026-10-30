@@ -32,8 +32,8 @@ without one): the single blocks' [1, 2, D] table + select and the mode blocks' [
 TRTLLM_FLUX3_SM120_PAIR_RESIDUAL=0 restores main's pair + Inductor residual.
 
 Raster (idea 59): the grouped scheduler's default walks AlongM. raster_for() picks the launch's
-raster statically by M range (M < 8192: the default, i.e. main's launch; 8192 <= M < 24576 and
-M >= 24576: their own constant). Only the tile -> CTA map changes, so outputs are bitwise equal.
+raster statically by M range (M < 8192 and M >= 24576: the default, i.e. main's launch;
+8192 <= M < 24576: AlongN). Only the tile -> CTA map changes, so outputs are bitwise equal.
 TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_RASTER=0 restores main's launch at every M.
 """
 
@@ -70,8 +70,10 @@ def raster_enabled() -> bool:
 # Range buckets, never M equality (the served M is image tokens + the padded text bucket).
 _RASTER_MID_MIN = 8192  # 8192 <= M < 24576: t2i single 16464, mode / image_cond 16384
 _RASTER_LARGE_MIN = 24576  # M >= 24576: i2i single 32848
-_RASTER_MID = 2
-_RASTER_LARGE = 2
+_RASTER_MID = 2  # AlongN: 16464 1033.6 -> 1003.2 us, 16384 1012.6 -> 985.0 us (jobs 332/344)
+# M >= 24576 keeps main's launch: the module is not reached there on this base, and the route
+# decision belongs to idea 62 (job 344 prior at 32848 u8 K=3: AlongM 3356 us, AlongN 1853 us).
+_RASTER_LARGE = 0
 
 
 def raster_for(rows: int) -> int:
