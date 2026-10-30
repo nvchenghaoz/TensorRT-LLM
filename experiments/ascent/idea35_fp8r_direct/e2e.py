@@ -89,6 +89,8 @@ def sha(t):
     t = t.detach().contiguous()
     if t.dtype == torch.float8_e4m3fn:
         t = t.view(torch.uint8)
+    elif t.dtype == torch.bfloat16:
+        t = t.view(torch.int16)
     return hashlib.sha256(t.cpu().numpy().tobytes()).hexdigest()[:16]
 
 
