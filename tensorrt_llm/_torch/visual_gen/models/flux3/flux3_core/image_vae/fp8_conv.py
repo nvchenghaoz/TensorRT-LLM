@@ -50,6 +50,15 @@ PLAN_K24: Dict[Tuple[int, int, int], int] = {
     (256, 256, 512): 13,  # S4
     (256, 128, 1024): 13,  # S5
     (128, 128, 1024): 13,  # S6
+    # 2048x2048-output decode (branch 22 / idea 20, step-0 job 355, real operands, SM120).
+    # Each pin's output is BITWISE identical to the previous eng7[0] fallback's on real and
+    # random operands (same accumulation order; only the tiling differs). Interleaved
+    # per-call medians, fallback -> pin (calls per decode):
+    (512, 512, 512): 14,  # sb 1.725->1.702 ms (x3), sbr k24=22 2.267->1.809 ms (x3)
+    (512, 256, 1024): 14,  # sb k24=13 3.532->3.486 ms (x1)
+    (256, 256, 1024): 14,  # sb k24=22 2.301->1.844 (x2), sbr 2.414->1.969 (x2), fp32-b 2.415->1.967 (x1)
+    (256, 128, 2048): 13,  # sb k24=22 4.701->3.746 ms (x1)
+    (128, 128, 2048): 13,  # k24=23: sb 2.378->2.071 (x2), sbr 2.758->2.322, fp32-b 2.707->2.312, s 2.387->2.076
 }
 
 _lock = threading.Lock()
