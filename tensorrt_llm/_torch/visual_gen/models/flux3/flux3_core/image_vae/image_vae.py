@@ -12,6 +12,7 @@ from torch import Tensor
 
 from . import decoder_tail_triton as _tail
 from . import fp8_conv as _fp8c
+from . import row_softmax_triton as _rsm
 from . import subpixel_conv as _spc
 from .decoder_tail_triton import (
     add_norm_swish_conv_out_3x3,
@@ -187,10 +188,15 @@ class Flux3ImageAttnBlock(nn.Module):
         s = torch.bmm(q.transpose(1, 2), k, out_dtype=torch.float32)
         if fp8_pv and b == 1:
             fp8 = torch.float8_e4m3fn
-            z = s[0] * (c**-0.5)
-            e = torch.exp(z - z.amax(dim=-1, keepdim=True))
-            scale_a = 1.0 / (448.0 * e.sum(dim=-1, keepdim=True))  # [T, 1] fp32
-            pq = (e * 448.0).to(fp8)
+            if _rsm.can_use(s[0], e4m3=True):
+                # Same math as below in one persistent kernel that reads S from DRAM once
+                # (row_softmax_triton; only the fp32 row-sum order differs).
+                pq, scale_a = _rsm.row_softmax_e4m3(s[0], c**-0.5)
+            else:
+                z = s[0] * (c**-0.5)
+                e = torch.exp(z - z.amax(dim=-1, keepdim=True))
+                scale_a = 1.0 / (448.0 * e.sum(dim=-1, keepdim=True))  # [T, 1] fp32
+                pq = (e * 448.0).to(fp8)
             vf = v[0].float()  # [c, T]
             s_v = (vf.abs().amax(dim=-1, keepdim=True) / 448.0).clamp(min=1e-30)  # [c, 1]
             vq = (vf / s_v).clamp(-448.0, 448.0).to(fp8).contiguous()  # [c, T] row-major
@@ -198,7 +204,10 @@ class Flux3ImageAttnBlock(nn.Module):
                 pq, vq.t(), scale_a, s_v.reshape(1, c), out_dtype=torch.bfloat16
             )  # [T, c]
             return o_t.t().reshape(b, c, h, w).to(dt)
-        p = torch.softmax(s * (c**-0.5), dim=-1).to(torch.bfloat16)
+        if _rsm.can_use(s, e4m3=False):
+            p = _rsm.row_softmax_bf16(s, c**-0.5)
+        else:
+            p = torch.softmax(s * (c**-0.5), dim=-1).to(torch.bfloat16)
         o = torch.bmm(v, p.transpose(1, 2))
         return o.reshape(b, c, h, w).to(dt)
 
