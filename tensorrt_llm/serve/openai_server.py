@@ -518,6 +518,11 @@ class _B64JsonSplicer:
 
     def render(self, content: Any) -> Optional[bytes]:
         """Return the spliced body, or None if a placeholder is ambiguous."""
+        parts = self.render_parts(content)
+        return None if parts is None else b"".join(parts)
+
+    def render_parts(self, content: Any) -> Optional[List[bytes]]:
+        """The spliced body as its parts (not joined), or None if ambiguous."""
         body = self._dumps(content)
         parts = []
         pos = 0
@@ -532,7 +537,7 @@ class _B64JsonSplicer:
             parts.append(payload)
             pos = idx + len(marker) - 1
         parts.append(body[pos:])
-        return b"".join(parts)
+        return parts
 
     def restore(self, content: Any) -> Any:
         """Replace placeholders in a model_dump() with the decoded payloads."""
@@ -544,12 +549,77 @@ class _B64JsonSplicer:
         return content
 
     def response(self, content: Any, headers) -> Response:
-        body = self.render(content)
-        if body is None:
+        parts = self.render_parts(content)
+        if parts is None:
             return JSONResponse(content=self.restore(content), headers=headers)
-        return Response(content=body,
-                        media_type="application/json",
-                        headers=headers)
+        return _SplicedJSONResponse(parts, headers)
+
+
+class _PartsLength:
+    """Sized stand-in for a body: Starlette's ``init_headers`` only takes len."""
+
+    __slots__ = ("_n", )
+
+    def __init__(self, n: int) -> None:
+        self._n = n
+
+    def __len__(self) -> int:
+        return self._n
+
+
+class _SplicedJSONResponse(Response):
+    """``Response(content=b"".join(parts), media_type="application/json")``
+    that sends ``parts`` as consecutive ``http.response.body`` messages.
+
+    The headers (order and values, Content-Length = total) are Starlette's
+    own for the joined body; only the multi-megabyte join copy is skipped.
+    ``body`` still returns the joined bytes (built on first access) for
+    callers that read it outside the ASGI send path.
+    """
+
+    media_type = "application/json"
+
+    def __init__(self, parts: List[bytes], headers=None) -> None:
+        self._parts = parts
+        self._joined: Optional[bytes] = None
+        self._sizing = True
+        try:
+            super().__init__(content=None,
+                             media_type="application/json",
+                             headers=headers)
+        finally:
+            self._sizing = False
+
+    @property
+    def body(self):
+        if self._sizing:  # Response.__init__ -> init_headers: Content-Length
+            return _PartsLength(sum(len(p) for p in self._parts))
+        if self._joined is None:
+            self._joined = b"".join(self._parts)
+        return self._joined
+
+    @body.setter
+    def body(self, value) -> None:
+        # Response.__init__ stores render(None) == b""; the parts are the body.
+        pass
+
+    async def __call__(self, scope, receive, send) -> None:
+        prefix = "websocket." if scope.get("type") == "websocket" else ""
+        await send({
+            "type": prefix + "http.response.start",
+            "status": self.status_code,
+            "headers": self.raw_headers,
+        })
+        parts = [p for p in self._parts if p] or [b""]
+        last = len(parts) - 1
+        for i, part in enumerate(parts):
+            await send({
+                "type": prefix + "http.response.body",
+                "body": part,
+                "more_body": i < last,
+            })
+        if self.background is not None:
+            await self.background()
 
 
 _LOGGED_REF_FIELDS = ("image_reference", "video_reference", "audio_reference")
