@@ -18,6 +18,7 @@ import torch.multiprocessing as mp
 import zmq
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.visual_gen import ref_shm
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
@@ -380,22 +381,23 @@ class DiffusionRequest:
         Only the coordinator -> rank0 hop travels as handles: rank0 restores the
         bytes before broadcasting, because a shared-tensor handle is consumed
         exactly once and minting one for N ranks would free the block N-1 times.
+
+        Each payload goes into its own POSIX shm file (``ref_shm.put``, one
+        ``os.write``); when that is switched off (TRTLLM_VISUALGEN_REF_POSIX_SHM=0)
+        or fails, it takes the torch shared-tensor path instead.
         """
         if self.params is None:
             return
         self.ref_handles = handles = []
         for slot in ("image_reference", "video_reference", "audio_reference"):
             for index, ref in enumerate(getattr(self.params, slot, None) or []):
-                # A read-only view: the one copy happens inside from_tensor(),
-                # which is what moves the payload into shared memory.
-                buffer = torch.frombuffer(ref.content, dtype=torch.uint8)
-                handles.append(
-                    {
-                        "slot": slot,
-                        "index": index,
-                        "handle": SharedTensorContainer.from_tensor(buffer).dump_to_dict(),
-                    }
-                )
+                handle = ref_shm.put(ref.content)
+                if handle is None:
+                    # A read-only view: the one copy happens inside from_tensor(),
+                    # which is what moves the payload into shared memory.
+                    buffer = torch.frombuffer(ref.content, dtype=torch.uint8)
+                    handle = SharedTensorContainer.from_tensor(buffer).dump_to_dict()
+                handles.append({"slot": slot, "index": index, "handle": handle})
                 ref.content = b""
         if not handles:
             self.ref_handles = None
@@ -409,8 +411,17 @@ class DiffusionRequest:
         failures = []
         for entry in self.ref_handles or []:
             try:
+                handle = entry["handle"]
+                if ref_shm.is_handle(handle):
+                    # take() unlinks the file even when the lookup below fails.
+                    try:
+                        ref = getattr(self.params, entry["slot"])[entry["index"]]
+                    finally:
+                        content = ref_shm.take(handle)
+                    ref.content = content
+                    continue
                 ref = getattr(self.params, entry["slot"])[entry["index"]]
-                container = SharedTensorContainer.from_dict(entry["handle"])
+                container = SharedTensorContainer.from_dict(handle)
                 ref.content = container.get_local_view().numpy().tobytes()
             except Exception as exc:
                 failures.append(f"{entry['slot']}[{entry['index']}]: {exc}")

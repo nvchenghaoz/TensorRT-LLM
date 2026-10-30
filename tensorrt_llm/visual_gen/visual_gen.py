@@ -452,7 +452,16 @@ class VisualGen:
         # through the request pickle, which copies every reference byte to
         # cross one process boundary.
         request.refs_to_shm()
-        self.executor.enqueue_requests([request])
+        try:
+            self.executor.enqueue_requests([request])
+        except BaseException:
+            # Never sent: take the handles back so no shared-memory file outlives
+            # the request (same as the coordinator's _discard_unsent_request).
+            try:
+                request.refs_from_shm()
+            except RuntimeError:
+                pass
+            raise
         return VisualGenResult(req_id, self.executor, batch_size=batch_size)
 
     def __enter__(self):
