@@ -9,7 +9,8 @@ Labels (served 2048^2, T=80, knowledge 384 / 686, plan 724):
   t2i-2048  graph of 1 BF16-out G3 call at 16384 + 4 nvfp4_out at 16384 + 28 nvfp4_out at 16464
   i2i-2048  graph of 1 BF16-out G3 call at 16384 + 9 nvfp4_out at 16384 + 28 nvfp4_out at 32848
   i2i-2048-preL19 (optional) 6 BF16-out + 4 nvfp4_out at 16384 + 28 nvfp4_out at 32848
-Each round times one block of replays per arm (rotating arm order) and samples SM MHz and board
+Each round times one block of replays per arm (both cyclic arm orders, rotated, so predecessors
+are balanced over 12 rounds: pitfall 731) and samples SM MHz and board
 W every 10 ms in a thread. Reported per round: CAND/BASE and BASE2/BASE (A/A) median ratios.
 Inputs: fixed seeds, pristine copies restored before timing and compared after.
 """
@@ -142,7 +143,10 @@ def main():
         per = {a: [] for a in arms}
         rounds = []
         for r in range(args.rounds):
-            order = [arms[(i + r) % 3] for i in range(3)]
+            # both cyclic orders (base->cand->base2 and base->base2->cand), each rotated, so every
+            # arm has every predecessor equally often over 12 rounds (pitfall 731)
+            cyc = arms if (r // 3) % 2 == 0 else (arms[0], arms[2], arms[1])
+            order = [cyc[(i + r) % 3] for i in range(3)]
             row = {"order": order}
             for a in order:
                 sampler.tag = a
