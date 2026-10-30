@@ -404,8 +404,13 @@ def main():
         "empty_list": edit_body("check00", image=[]),
         "deep_nesting_3000": b"[" * 3000 + b"]" * 3000,
         "deep_nesting_obj_3000": b'{"a":' * 3000 + b"1" + b"}" * 3000,
+        # Python 3.12's C-level recursion guard (json scanner, msgspec) does not
+        # follow sys.setrecursionlimit; 3000 levels decode fine in both. These
+        # exceed the C guard, so json.loads and msgspec raise RecursionError.
+        "deep_nesting_100000": b"[" * 100000 + b"]" * 100000,
+        "deep_nesting_obj_100000": b'{"a":' * 100000 + b"1" + b"}" * 100000,
     }
-    DEEP = ("deep_nesting_3000", "deep_nesting_obj_3000")
+    DEEP = ("deep_nesting_3000", "deep_nesting_obj_3000", "deep_nesting_100000", "deep_nesting_obj_100000")
     err = {"A": {}, "B": {}}
     for arm in ("A", "B"):
         use(arm)
@@ -445,7 +450,9 @@ def main():
             tr = exc_of(lambda: asyncio.run(tree["json"](mk(body, "/v1/images/edits"))))
             mn = exc_of(lambda: asyncio.run(main_request_json(mk(body, "/v1/images/edits"))))
             log(f"deep {tag}: msgspec={ms} json.loads={jl} tree={tr} main={mn}")
-            deep_ok &= tr == jl == mn and tr[0] == "RecursionError"
+            deep_ok &= tr == jl == mn
+            if "100000" in tag:  # must exercise the fallback
+                deep_ok &= tr[0] == "RecursionError" and ms[0] != "ok"
     finally:
         sys.setrecursionlimit(50000)
     passed["deep_nesting_fallback"] = deep_ok
