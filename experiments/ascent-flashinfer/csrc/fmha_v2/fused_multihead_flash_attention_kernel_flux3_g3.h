@@ -124,6 +124,89 @@ inline __device__ void issue_stage(int j, uint32_t ring, uint32_t full0, CUtenso
   tma_load_4d(dst + K_BYTES, tm_v, bar, 0, bidh, j * 64, bidb);
 }
 
+#if defined(FMHA_FLUX3_V_B8T) && FMHA_FLUX3_V_B8T
+// v_b8t (idea 39): V B-fragments with one ldmatrix.m16n16.x2.trans.b8 per (ki, 16-d chunk)
+// instead of LDSM.MT88.4 (b16 transpose) + 4 PRMT (swizzle_rows).
+//
+// The V stage is [64 keys][128 d] e4m3, 128-B rows, SWIZZLE_128B (16-B chunk c of row r at
+// chunk c ^ (r & 7)). Lanes 0-15 / 16-31 give the row addresses of matrix 0 / 1 (keys 0-15 /
+// 16-31 of the k32 step). Lane i addresses key perm(i), perm(4q + j) = 2q + (j & 1) + 8 (j >> 1)
+// (+16 for matrix 1): thread (g = lane/4, q = lane%4) then gets, in k-slots 4q..4q+3, the keys
+// {2q, 2q+1, 2q+8, 2q+9} -- the k-order of P's A-fragment, exactly as main's repack gives.
+// So every QMMA multiplies the same P bytes by the same V bytes per k-slot as main.
+//
+// Head dim: r0 / r1 hold d = base + g / base + 8 + g (main: base + 2g / base + 2g + 1), so
+// acc_o's n-col -> d map differs; v_b8t_unpermute() restores main's layout once per tile.
+inline __device__ uint32_t v_b8t_lane_offset(int lane) {
+  int const key = 16 * (lane >> 4) + 2 * ((lane >> 2) & 3) + (lane & 1) + 8 * ((lane >> 1) & 1);
+  return (uint32_t)(key * 128 + ((key & 7) << 4));
+}
+
+template <typename Fragment>
+inline __device__ void ldsm_v_b8t(Fragment& b, uint32_t addr) {
+  uint32_t r0, r1, r2, r3;
+  asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(addr));
+  // MMA 0 (b.reg 0/1): d = base + g, keys 0-15 / 16-31; MMA 1 (b.reg 2/3): d = base + 8 + g.
+  b.reg(0) = r0;
+  b.reg(1) = r2;
+  b.reg(2) = r1;
+  b.reg(3) = r3;
+}
+
+// One helper call per (ki, d-chunk ni): v_stage = the stage's V base (1024-B aligned).
+template <typename Fragment>
+inline __device__ void load_v_b8t_chunk(Fragment& b, uint32_t v_stage, uint32_t lane_off, int ki,
+                                        int ni) {
+  ldsm_v_b8t(b, v_stage + (uint32_t)(ki * 32 * 128) + (lane_off ^ (uint32_t)(ni << 4)));
+}
+
+template <typename Fragment, int N>
+inline __device__ void load_v_b8t(Fragment (&b)[N], uint32_t v_stage, uint32_t lane_off, int ki) {
+#pragma unroll
+  for (int ni = 0; ni < N; ++ni) {
+    load_v_b8t_chunk(b[ni], v_stage, lane_off, ki, ni);
+  }
+}
+
+// Quad-local move of acc_o from the v_b8t d-map to main's. Per 16-d chunk and row half h, thread
+// q holds pairs L = d {2q, 2q+1} (regs 2h, 2h+1) and H = d {8+2q, 9+2q} (regs 4+2h, 5+2h); main
+// has thread q hold d 4q (reg 2h), 4q+1 (reg 4+2h), 4q+2 (reg 2h+1), 4q+3 (reg 5+2h), i.e. pair
+// indices p = 2q, 2q+1 where the b8t thread p % 4 holds pair p. Two shuffle rounds of a pair:
+//   round A: send (q odd ? L : H), read lane 2(q&1) + (q < 2)
+//   round B: send (q odd ? H : L), read lane 2(q&1) + (q >> 1)
+//   pair 2q = (q < 2 ? B : A), pair 2q+1 = (q < 2 ? A : B).
+template <typename Acc, int M, int N>
+inline __device__ void v_b8t_unpermute(Acc (&acc)[M][N], int lane) {
+  int const q = lane & 3;
+  bool const odd = (q & 1) != 0;
+  bool const low = q < 2;
+  int const quad = lane & ~3;
+  int const src_a = quad + 2 * (q & 1) + (low ? 1 : 0);
+  int const src_b = quad + 2 * (q & 1) + (q >> 1);
+#pragma unroll
+  for (int mi = 0; mi < M; ++mi) {
+#pragma unroll
+    for (int ni = 0; ni < N; ++ni) {
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        uint32_t const lx = acc[mi][ni].reg(2 * h), ly = acc[mi][ni].reg(2 * h + 1);
+        uint32_t const hx = acc[mi][ni].reg(4 + 2 * h), hy = acc[mi][ni].reg(5 + 2 * h);
+        uint32_t const ax = __shfl_sync(0xffffffffu, odd ? lx : hx, src_a);
+        uint32_t const ay = __shfl_sync(0xffffffffu, odd ? ly : hy, src_a);
+        uint32_t const bx = __shfl_sync(0xffffffffu, odd ? hx : lx, src_b);
+        uint32_t const by = __shfl_sync(0xffffffffu, odd ? hy : ly, src_b);
+        acc[mi][ni].reg(2 * h) = low ? bx : ax;      // d 4q
+        acc[mi][ni].reg(4 + 2 * h) = low ? by : ay;  // d 4q+1
+        acc[mi][ni].reg(2 * h + 1) = low ? ax : bx;  // d 4q+2
+        acc[mi][ni].reg(5 + 2 * h) = low ? ay : by;  // d 4q+3
+      }
+    }
+  }
+}
+#endif  // FMHA_FLUX3_V_B8T
+
 }  // namespace flux3_g3
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -236,6 +319,11 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
   Smem_tile_q smem_q(smem_q_ptr, tidx);
   Smem_tile_k smem_k(smem_, tidx);
   Smem_tile_v smem_v(smem_ + K_BYTES, tidx);
+#if defined(FMHA_FLUX3_V_B8T) && FMHA_FLUX3_V_B8T
+  static_assert((int)Mma_tile_o::VALID_MMAS_N == 8 && (int)Mma_tile_o::MMAS_K == 2, "");
+  uint32_t const v_ring = smem_u32(smem_ + K_BYTES);
+  uint32_t const v_lane_off = v_b8t_lane_offset(lane);
+#endif
 
 #if defined(FMHA_FLUX3_MASK_SKIP) && FMHA_FLUX3_MASK_SKIP
   int const kv_mask_loop_start = int(binfo.actual_seqlen / Cta_tile_p::N) * Cta_tile_p::N;
@@ -394,12 +482,21 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
       softmax.pack(frag_p);
 
       // BMM2 on the stage's V tile.
+#if defined(FMHA_FLUX3_V_B8T) && FMHA_FLUX3_V_B8T
+      uint32_t const v_stage = v_ring + slot * STAGE_BYTES;
+#pragma unroll
+      for (int ki = 0; ki < BMM2_TAIL_MMAS_K_BOUND; ++ki) {
+        load_v_b8t(frag_v[ki], v_stage, v_lane_off, ki);
+        fmha::gemm(acc_o, frag_p[ki], frag_v[ki]);
+      }
+#else
       smem_v.smem_read_buffer_ = slot * STAGE_BYTES;
 #pragma unroll
       for (int ki = 0; ki < BMM2_TAIL_MMAS_K_BOUND; ++ki) {
         smem_v.load(frag_v[ki], ki);
         fmha::gemm(acc_o, frag_p[ki], frag_v[ki]);
       }
+#endif
 
       // Release the stage: every warp of every active group arrives once.
       __syncwarp();
@@ -410,6 +507,10 @@ inline __device__ void device_flash_attention_nl_tiled_flux3_g3(Params const& pa
 
     acc_o_normalizer.update_sum(global_max, global_sum);
     acc_o_normalizer.final_update(acc_o, global_sum);
+#if defined(FMHA_FLUX3_V_B8T) && FMHA_FLUX3_V_B8T
+    // Back to main's acc_o d-map before the unchanged BF16 / NVFP4 epilogues.
+    v_b8t_unpermute(acc_o, lane);
+#endif
   }
 
   // Every group is done with the ring and the Q tiles; all issued TMA loads were consumed.

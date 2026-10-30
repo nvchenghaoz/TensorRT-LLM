@@ -330,3 +330,13 @@ _LEVER_FLAGS["q_regs"] = ("qr", "-DFMHA_FLUX3_Q_REGS=1")
 
 if _os_st.environ.get("TRTLLM_FMHA_V2_FLUX3_QR", "1") != "0":
     ROUTED_LEVERS = (*ROUTED_LEVERS, "q_regs")
+
+# v_b8t (FMHA_FLUX3_V_B8T, flux3_g3.h only; bitwise vs the same levers without it): the G3 BMM2
+# loads each V B-fragment with one ldmatrix.m16n16.x2.trans.b8 from per-lane key-permuted rows
+# instead of LDSM.MT88.4 + 4 PRMT, and moves acc_o back to main's d-map once per tile (quad
+# shuffle) before the unchanged BF16 / NVFP4 epilogues. The 4-warp kernel is unchanged.
+# TRTLLM_FMHA_V2_FLUX3_VB8=0 drops it from the routed set.
+_LEVER_FLAGS["v_b8t"] = ("vb8", "-DFMHA_FLUX3_V_B8T=1")
+
+if _os_st.environ.get("TRTLLM_FMHA_V2_FLUX3_VB8", "1") != "0" and "g3" in ROUTED_LEVERS:
+    ROUTED_LEVERS = (*ROUTED_LEVERS, "v_b8t")
