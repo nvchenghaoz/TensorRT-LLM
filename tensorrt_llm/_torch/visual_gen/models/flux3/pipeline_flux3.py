@@ -9,7 +9,7 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import ExifTags, Image, ImageOps
 from safetensors.torch import load_file
 from torch import Tensor
 
@@ -247,10 +247,13 @@ def pack_i2i_image_condition(
     x_cond_parts = []
     x_cond_id_parts = []
     for i_ref, latent in enumerate(latents):
+        # torch.full on the device (a fill kernel), not torch.tensor(..., device=cuda): the
+        # latter is a pageable H2D copy that blocks the host until the queued VAE encode is
+        # done, leaving the GPU idle through all of the denoise prep. Same int64 values.
         x_ref, x_ref_ids = prc_img(
             latent,
-            t_coord=torch.tensor([I2I_COND_T], device=latent.device, dtype=torch.long),
-            l_coord=torch.tensor([l_start - i_ref], device=latent.device, dtype=torch.long),
+            t_coord=torch.full((1,), I2I_COND_T, device=latent.device, dtype=torch.long),
+            l_coord=torch.full((1,), l_start - i_ref, device=latent.device, dtype=torch.long),
         )
         x_cond_parts.append(x_ref)
         x_cond_id_parts.append(x_ref_ids)
@@ -267,9 +270,24 @@ def pack_i2i_image_condition(
 
 
 def _load_image_pixels(source: str | bytes, *, device: torch.device) -> Tensor:
-    """Prepare a reference image as FP32 [1, 3, H, W] in [-1, 1]."""
+    """Prepare a reference image as FP32 [1, 3, H, W] in [-1, 1].
+
+    Pixels are the same as ImageOps.exif_transpose(...).convert("RGB") + center crop, but
+    the steps that would only copy (no EXIF orientation, an RGB image, a full-image crop)
+    are skipped. The uint8 HWC pixels go to the device through pinned memory (the caching
+    host allocator keeps the block until the copy completes) and are cast there: the same
+    fp32 values and strides as a CPU cast + pageable 4x-larger H2D, without blocking the
+    host behind the queued text encoder.
+    """
+    device = torch.device(device)
     with Image.open(BytesIO(source) if isinstance(source, bytes) else source) as original:
-        image = ImageOps.exif_transpose(original).convert("RGB")
+        original.load()
+        image = original
+        # exif_transpose reads the orientation this way and returns a plain copy for 1.
+        if original.getexif().get(ExifTags.Base.Orientation, 1) != 1:
+            image = ImageOps.exif_transpose(original)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
         scale = min(1.0, 4096 / math.sqrt(image.width * image.height))
         if scale < 1:
             image = image.resize(
@@ -279,15 +297,17 @@ def _load_image_pixels(source: str | bytes, *, device: torch.device) -> Tensor:
         if min(width, height) == 0:
             raise ValueError("FLUX.3 reference images must be at least 16 pixels on each axis")
         left, top = (image.width - width) // 2, (image.height - height) // 2
-        pixels = np.array(image.crop((left, top, left + width, top + height)))
-    return (
-        torch.from_numpy(pixels)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .to(device=device, dtype=torch.float32)
-        / 127.5
-        - 1
-    )
+        box = (left, top, left + width, top + height)
+        if box != (0, 0, image.width, image.height):
+            image = image.crop(box)
+        pixels = np.asarray(image)
+    hwc = torch.empty(pixels.shape, dtype=torch.uint8, pin_memory=device.type == "cuda")
+    np.copyto(hwc.numpy(), pixels)
+    if device.type == "cuda":
+        hwc = hwc.to(device, non_blocking=True)
+    else:
+        hwc = hwc.to(device)
+    return hwc.permute(2, 0, 1).unsqueeze(0).to(torch.float32) / 127.5 - 1
 
 
 _VAE_DECODE_DTYPES = {
@@ -842,11 +862,14 @@ class Flux3Pipeline(BasePipeline):
         pag_strength=1.0,
         timer: CudaPhaseTimer | None = None,
     ):
-        x_image, x_image_ids, x_image_orig_ids = self._sample_image_latents(height, width, seed)
-        device = x_image.device
         image_vae_dtype = next(self.vae.parameters()).dtype
         images = [image_cond] if isinstance(image_cond, Tensor) else image_cond
+        # Queue the reference encode(s) first: the CPU randn + pinned copy of the noise then
+        # runs on the host while the GPU encodes. The noise comes from a fresh seeded CPU
+        # generator, so its values do not depend on this order.
         image_latents = [self.vae.encode(image.to(image_vae_dtype))[0] for image in images]
+        x_image, x_image_ids, x_image_orig_ids = self._sample_image_latents(height, width, seed)
+        device = x_image.device
         x_image_cond, x_image_cond_ids, _ = pack_i2i_image_condition(
             image_latents,
             device=device,
