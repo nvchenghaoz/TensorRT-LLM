@@ -894,10 +894,12 @@ def _sm120_attn_nvfp4_out_eligible(block: nn.Module) -> bool:
 @functools.lru_cache(maxsize=None)
 def _cond_attn_nfo_enabled() -> bool:
     """TRTLLM_FLUX3_COND_ATTN_NFO for the prepared image_cond blocks (M = 16384 at 2048^2).
-    0 (default): BF16-out FMHA + side gate_up, attn_out quantized inside the LPT pair (branch 11
-    STEP 0: 8.51 ms/block vs 9.05 ms with the 4-warp nvfp4_out kernel, bitwise equal outputs).
-    1: follow the global FMHA NVFP4-out switch (attn_nvfp4_out_enabled) like image 1-4."""
-    return os.environ.get("TRTLLM_FLUX3_COND_ATTN_NFO", "0").strip() not in ("", "0")
+    1 (default): follow the global FMHA NVFP4-out switch (attn_nvfp4_out_enabled) like image 1-4
+    (G3 NVFP4-out epilogue; no separate nvfp4_quantize_prepared before the LPT pair+residual).
+    0: BF16-out FMHA + side gate_up, attn_out quantized before the LPT pair (branch 11's default,
+    measured against the old 4-warp nvfp4_out kernel before G3 had the NVFP4-out epilogue).
+    Outputs are bitwise equal either way."""
+    return os.environ.get("TRTLLM_FLUX3_COND_ATTN_NFO", "1").strip() not in ("", "0")
 
 
 def sm120_attn_nvfp4_out_weight(block: nn.Module) -> torch.Tensor | None:
