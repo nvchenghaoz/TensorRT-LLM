@@ -151,15 +151,24 @@ def _pv_prologue_kernel(
 
 
 def can_use(q: Tensor) -> bool:
-    """q: [b, c, T] bf16 CUDA; b == 1, T a multiple of every tile."""
+    """q: [b, c, T] bf16 CUDA; b == 1, c == 512, T a multiple of every tile, NT = T / 256 valid.
+
+    Audit of the unmasked loads/stores: kernel A tiles T by 128 (M) and 256 (N) and c by 32;
+    kernel B tiles T by 64 (M and K), c by 512 (N, == c), and reduces the tile maxes in MPC
+    chunks (_nt_ok). Strides are passed through (any q/k/vq layout); S offsets are int64 and
+    the other offsets (T * NT, T * c) stay below 2^31. Python ints only (static at trace time).
+    """
     if not (ENABLED and q.is_cuda and q.dim() == 3 and q.shape[0] == 1):
+        return False
+    if q.dtype != torch.bfloat16:
         return False
     c, t = q.shape[1], q.shape[2]
     return (
-        t % max(CFG_A["BM"], CFG_A["BN"], CFG_B["BM"], CFG_B["BK"]) == 0
+        c == CFG_B["BN"]
+        and t % max(CFG_A["BM"], CFG_A["BN"], CFG_B["BM"], CFG_B["BK"]) == 0
         and c % CFG_A["BK"] == 0
-        and c % CFG_B["BN"] == 0
         and t >= CFG_A["BN"]
+        and t * c < 2**31
         and _nt_ok(t // CFG_A["BN"])
     )
 
