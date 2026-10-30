@@ -1295,6 +1295,105 @@ class Flux3SingleStreamBlock(nn.Module):
         return residual + mod_gate * output
 
 
+# Last single block, dead-output elimination (exact): after single_blocks[-1] the model output
+# reads only the final-layer rows of the joint stream, the prefix [0, n) (image first; the
+# image_cond and text rows are read by nothing). Flux3Model.forward then passes keep_rows=n and
+# this block returns only rows [0, n): the adaLN head, the QKV GEMM and the FMHA still run on all
+# S rows (every K/V row enters attention), while the side gate_up, the down || attn_out pair and
+# the gated residual run on the first n rows (M=n). Bitwise the first n rows of the full block.
+# Own forward code object, so its Dynamo cache stays separate from the other single blocks'.
+# TRTLLM_FLUX3_LAST_BLOCK_ROWS=0 keeps main's block (class not swapped, no keep_rows).
+FLUX3_LAST_BLOCK_ROWS = os.environ.get("TRTLLM_FLUX3_LAST_BLOCK_ROWS", "1").strip() != "0"
+# The cut row count must be a multiple of this (FMHA NVFP4-out row blocks and GEMM M tiles).
+_LAST_BLOCK_ROWS_MULTIPLE = 256
+
+
+class _Flux3LastRowsSingleStreamBlock(Flux3SingleStreamBlock):
+    """single_blocks[-1] with the keep_rows cut (see FLUX3_LAST_BLOCK_ROWS)."""
+
+    def forward(
+        self,
+        combined: Tensor,
+        freqs: Tuple[Tensor, Tensor],
+        mod: Tuple[Tensor, Tensor, Tensor],
+        pag_strength: float = 0.0,
+        sample_bounds: Bounds | None = None,
+        pag_samples: tuple[int, ...] = (0,),
+        timestep: Tensor | None = None,
+        keep_rows: int = 0,
+    ) -> Tensor:
+        kwargs = dict(
+            pag_strength=pag_strength,
+            sample_bounds=sample_bounds,
+            pag_samples=pag_samples,
+            timestep=timestep,
+        )
+        if keep_rows <= 0:
+            return super().forward(combined, freqs, mod, **kwargs)
+        b, s = combined.shape[:2]
+        n = keep_rows
+        if not (
+            b == 1
+            and 0 < n < s
+            and pag_strength <= 0.0
+            and not self._fuse_proj_out
+            and self._sm120_tail_pair
+            and self._sm120_side_gate_up
+            and self._allreduce is None
+        ):
+            return super().forward(combined, freqs, mod, **kwargs)[:, :n]
+        attn_weight = sm120_attn_nvfp4_out_weight(self)
+        mod_shift, mod_scale, mod_gate = _flux3_select_mod(mod)
+        residual = combined
+        eps = self.pre_norm.variance_epsilon
+        fused = adaln_nvfp4_input(self, combined, mod, eps, freqs=freqs)
+        if fused is not None:
+            combined, quantized = fused
+        else:
+            combined = self._pertoken_adaln.apply(combined, mod_shift, mod_scale, self.pre_norm, eps)
+            quantized = _flux3_shared_fp8_input(self.attn, self.ff.gate_up_proj, combined)
+        direct = None
+        if attn_weight is not None and isinstance(quantized, NVFP4Activation):
+            side_args = sm120_side_gate_up_args(
+                self, quantized._replace(original=combined.reshape(-1, combined.shape[-1]))
+            )
+            full_sequence = sample_bounds is None or (
+                _ATTEND_SINGLE_SEGMENT_FAST_PATH
+                and len(sample_bounds) == 1
+                and sample_bounds[0][0] == 0
+                and sample_bounds[0][1] == s
+            )
+            if side_args is not None:
+                direct = _primsts_qkv_fp8_attention(
+                    self.attn, quantized, freqs, full_sequence, side_args, attn_weight,
+                    False, keep_rows=n,
+                )
+        if direct is None:
+            # Not the covered route: main's block on all rows (re-runs the head), then the prefix.
+            return super().forward(residual, freqs, mod, **kwargs)[:, :n]
+        attn, _, gate_up = direct
+        # Main's tail on the first n rows: the fused pair + gated residual when it takes the gate
+        # form (t2i's [1, 2, D] table + select index), else the pair + the Inductor residual.
+        gate_table, gate_index = (
+            (mod[2], mod[3][:, :n]) if len(mod) == 4 else (mod_gate[:, :n], None)
+        )
+        fused = sm120_tail_pair_residual_forward(
+            self, attn, None, gate_up, residual[:, :n], gate_table, gate_index
+        )
+        if fused is not None:
+            return fused
+        pair = sm120_tail_pair_forward(self, attn, None, gate_up)
+        attn_y, mlp_y = pair
+        output = attn_y.reshape(1, n, -1) + mlp_y.reshape(1, n, -1)
+        return residual[:, :n] + mod_gate[:, :n] * output
+
+
+def _set_last_rows_block_class(block: nn.Module, enabled: bool) -> None:
+    """Swap an (uncompiled) last single block between its base class and the keep_rows class."""
+    if type(block) in (Flux3SingleStreamBlock, _Flux3LastRowsSingleStreamBlock):
+        block.__class__ = _Flux3LastRowsSingleStreamBlock if enabled else Flux3SingleStreamBlock
+
+
 class _Flux3FP8RModeBlock(Flux3ModeBlock):
     """A BF16 checkpoint-excluded mode block switched to the SM120 FP8R path.
 
@@ -2160,7 +2259,10 @@ class Flux3Model(BaseDiffusionModel):
             mod = tuple(joint(field) for field in mod_fields)
         freqs = _block_freqs(prepared, "_flux3_joint_")
         combined = self._single_adaln_runtime.prepare(combined, *mod[:2])
+        last = len(self.single_blocks) - 1
+        keep_rows = self._last_block_keep_rows(combined, chunks, sample_bounds, pag_single_layers)
         for index, block in enumerate(self.single_blocks):
+            extra = {"keep_rows": keep_rows} if keep_rows and index == last else {}
             combined = block(
                 combined,
                 freqs,
@@ -2171,7 +2273,45 @@ class Flux3Model(BaseDiffusionModel):
                 sample_bounds=sample_bounds,
                 pag_samples=pag_samples,
                 timestep=timestep,
+                **extra,
             )
+        if keep_rows:
+            # The last block returned only rows [0, keep_rows): every final-layer read must lie in
+            # them, and nothing else reads the joint stream after the last block.
+            if combined.shape[1] != keep_rows:
+                raise RuntimeError(
+                    f"last single block returned {combined.shape[1]} rows, expected {keep_rows}"
+                )
+            offset = 0
+            for mode, start, end in chunks:
+                if mode in self.final_layer and offset + end - start > keep_rows:
+                    raise RuntimeError(
+                        f"final layer {mode!r} reads rows [{offset}, {offset + end - start}) "
+                        f"beyond the last block's kept rows [0, {keep_rows})"
+                    )
+                offset += end - start
+            key = (offset, keep_rows)
+            logged = self.__dict__.setdefault("_flux3_last_rows_logged", set())
+            if key not in logged:
+                logged.add(key)
+                from tensorrt_llm._torch.visual_gen.models.flux3 import (
+                    flux3_sm120_lpt_pair_residual as lptr,
+                )
+
+                target = self.single_blocks[last]
+                target = getattr(target, "_orig_mod", target)
+                gate, index = (mod[2], mod[3][:, :keep_rows]) if len(mod) == 4 else (mod[2], None)
+                fused = bool(
+                    getattr(target, "_sm120_pair_residual", False)
+                    and lptr.gate_form(gate[:, :keep_rows] if index is None else gate, index,
+                                       keep_rows, combined.shape[-1])
+                )
+                logger.info(
+                    f"FLUX.3 single_blocks.{last}: kept rows [0, {keep_rows}) of S={offset} "
+                    f"(chunks {[(mode, end - start) for mode, start, end in chunks]}; final layer "
+                    f"reads {sorted(self.final_layer)} only, checked); tail at M={keep_rows}: "
+                    f"{'fused pair + gated residual' if fused else 'pair + Inductor residual'}"
+                )
         outputs = {}
         for name in self.final_layer:
             parts, offset = [], 0
@@ -2197,6 +2337,43 @@ class Flux3Model(BaseDiffusionModel):
                 output.reshape(batch, -1, output.shape[-1]) if batch is not None else output
             )
         return outputs
+
+    def _last_block_keep_rows(
+        self,
+        combined: Tensor,
+        chunks: list[tuple[str, int, int]],
+        sample_bounds: Bounds,
+        pag_single_layers: list[int] | None,
+    ) -> int:
+        """n when the last single block may return only rows [0, n), else 0 (main's block).
+
+        Static from the layout: one sample at B=1, no sharder, PAG off on the last block, and the
+        final layers read exactly one joint chunk, the prefix [0, n) (n a multiple of
+        _LAST_BLOCK_ROWS_MULTIPLE, n < S); nothing after the last block reads any other row.
+        """
+        if not FLUX3_LAST_BLOCK_ROWS or not len(self.single_blocks):
+            return 0
+        last = len(self.single_blocks) - 1
+        block = self.single_blocks[last]
+        if type(getattr(block, "_orig_mod", block)) is not _Flux3LastRowsSingleStreamBlock:
+            return 0
+        if combined.dim() != 3 or combined.shape[0] != 1 or self.sharder.is_active:
+            return 0
+        if pag_single_layers and last in pag_single_layers:
+            return 0
+        if sample_bounds is None or len(sample_bounds) != 1:
+            return 0
+        reads, offset = [], 0
+        for mode, start, end in chunks:
+            if mode in self.final_layer:
+                reads.append((offset, offset + end - start))
+            offset += end - start
+        if len(reads) != 1 or reads[0][0] != 0 or offset != combined.shape[1]:
+            return 0
+        n = reads[0][1]
+        if n <= 0 or n >= offset or n % _LAST_BLOCK_ROWS_MULTIPLE:
+            return 0
+        return n
 
     def _final_layer_vec(self, vec: Tensor, inputs: dict, lengths: tuple[int, ...]) -> Tensor:
         """The vec the final layer's adaLN needs: one row when the stream is a single
@@ -2282,6 +2459,10 @@ class Flux3Model(BaseDiffusionModel):
 
     def prepare_primsts_weights(self) -> None:
         """Refresh image/joint PrimsTS layouts after loading or merging LoRA weights."""
+        if len(self.single_blocks):
+            # Re-preparation starts from the base class (the keep_rows class is set at the end).
+            last = self.single_blocks[-1]
+            _set_last_rows_block_class(getattr(last, "_orig_mod", last), False)
         quant = self.model_config.quant_config
         if quant is not None and quant.quant_algo == QuantAlgo.NVFP4:
             # PRECISION: load-time NVFP4 W4A4 for the selected BF16 checkpoint-excluded blocks
@@ -2402,6 +2583,20 @@ class Flux3Model(BaseDiffusionModel):
         fused_heads = prepare_fp8r_adaln_quant(blocks)
         if fused_heads:
             logger.info(f"FLUX.3 FP8R fused LN+adaLN+E4M3 quantize head: {fused_heads}")
+        if len(self.single_blocks):
+            last = getattr(self.single_blocks[-1], "_orig_mod", self.single_blocks[-1])
+            rows = bool(
+                FLUX3_LAST_BLOCK_ROWS
+                and type(last) is Flux3SingleStreamBlock
+                and last._sm120_tail_pair
+                and last._sm120_side_gate_up
+                and getattr(last, "_sm120_attn_nvfp4_out", False)
+            )
+            _set_last_rows_block_class(last, rows)
+            logger.info(
+                f"FLUX.3 last single block (single_blocks.{len(self.single_blocks) - 1}) computes "
+                f"only the final-layer rows (exact, TRTLLM_FLUX3_LAST_BLOCK_ROWS): {rows}"
+            )
         self.prepare_text_qkv_weights()
 
     def prepare_text_qkv_weights(self) -> list:

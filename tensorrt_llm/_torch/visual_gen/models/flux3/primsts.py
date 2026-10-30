@@ -1336,8 +1336,16 @@ def qkv_fp8_attention_forward(
     side_gate_up: tuple | None = None,
     attn_nvfp4_out: torch.Tensor | None = None,
     v_live: bool = True,
+    keep_rows: int = 0,
 ) -> tuple | None:
     """(attention output [B, S, H*D] BF16, planar BF16 QKV GEMM output [M, 3W]) or None.
+
+    keep_rows > 0 (last single block, _Flux3LastRowsSingleStreamBlock; a multiple of 128 < S):
+    only the side-gate_up NVFP4-out call at B = 1 is covered. QKV and the FMHA run on all S rows as
+    in main; the side gate_up runs on the first keep_rows rows of the shared NVFP4 activation, and
+    the result is (NVFP4AttnOut of the first keep_rows rows (views), gemm, (packed, scales) of
+    keep_rows rows), every value bitwise the first rows of main's. None (before launching anything)
+    for any other call.
 
     Only the GEMM output's v plane is defined on return (its q/k lines may be dropped from L2,
     flux3_sm120_qknorm_rope_fp8.L2DISCARD); v_live=False (the caller never reads v: PAG off)
@@ -1355,6 +1363,8 @@ def qkv_fp8_attention_forward(
     them); `original` goes to _prepared_activation only, as in nvfp4_qkv_prepared.
     """
     if not FLUX3_QKV_FP8_DIRECT or not full_sequence:
+        return None
+    if keep_rows and (side_gate_up is None or attn_nvfp4_out is None or keep_rows % 128):
         return None
     adapter = getattr(attn, "_flux3_primsts_nvfp4_qkv", None)
     if not isinstance(adapter, PreparedNVFP4) or adapter.qkv_scale is None:
@@ -1374,6 +1384,8 @@ def qkv_fp8_attention_forward(
     if sin.shape != cos.shape:
         return None
     if seq_len < backend._fp8_min_seq_len or seq_len <= 0:
+        return None
+    if keep_rows and (batch != 1 or keep_rows >= seq_len):
         return None
     q_dim, k_dim = attn.norm_q.weight.numel(), attn.norm_k.weight.numel()
     from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
@@ -1417,6 +1429,24 @@ def qkv_fp8_attention_forward(
         up_data, up_weight, up_scales, up_weight_scale, inverse_scale, up_original, source, mode = (
             side_gate_up
         )
+        if keep_rows:
+            from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
+                fp8_prequant_attention_nvfp4_out_side_gate_up,
+            )
+
+            # gate_up on the first keep_rows rows of the shared NVFP4 activation: its data rows,
+            # the leading keep_rows / 128 row blocks of the flat 128x4 scales, and the BF16 rows.
+            n = keep_rows
+            up_cols = (up_data.shape[-1] * 2 // 16 + 3) // 4 * 4
+            fp4, sf, packed, packed_scales = fp8_prequant_attention_nvfp4_out_side_gate_up(
+                qkv8, fp8_scales, batch, heads, up_data[:n], up_weight,
+                up_scales.reshape(-1)[: n * up_cols], up_weight_scale, inverse_scale,
+                up_original.reshape(-1, up_original.shape[-1])[:n], source, mode,
+                attn_nvfp4_out,
+            )
+            # The attention output's first n rows: fp4 rows and the leading n / 128 row blocks.
+            out_cols = (fp4.shape[-1] * 2 // 16 + 3) // 4 * 4
+            return NVFP4AttnOut(fp4[:, :n], sf[: n * out_cols]), gemm, (packed, packed_scales)
         if attn_nvfp4_out is not None and batch == 1:
             # attn_out's NVFP4 activation straight from the FMHA epilogue (sm120_attn_nvfp4_out).
             from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
