@@ -479,44 +479,111 @@ def check():
     passed &= kill_ok
     log(f"kill switch: {results['kill_switch']}")
 
-    # Repeat sequence (untimed) over the shared counter/epoch/flag workspace: t2i graph and i2i
-    # graph alternating t2i -> i2i -> t2i ..., 6 rounds, an eager M=4176 call (128 instance) after
-    # every graph, graph outputs NaN-poisoned before every replay and compared bitwise.
+    # Repeat sequence (untimed) over the shared counter/epoch/flag workspace (top-lead ruling
+    # 01:45): the served graphs (on the synced tree the i2i graph runs t256 at 16384 and fused-128
+    # r2 at 32848, landing 23) in t2i -> i2i -> i2i -> t2i ... order, one warmup round + ROUNDS
+    # rounds, an eager M=4176 call (128 instance) after every graph. Before every round the
+    # pristine inputs are copied back in place; before every replay the graph outputs are
+    # NaN-poisoned. Every output is compared bitwise with round 0, with the kill-switch graphs
+    # (captured with TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_T256=0, replayed once before round 0) and
+    # with pair + Inductor. After every replay / eager call: epoch advanced by exactly the number
+    # of launches, and the tile counter >= the last launch's tile count (every tile claimed).
+    rounds = int(os.environ.get("IDEA55_ROUNDS", "50"))
     t2i_seq = ([pool["M16464_select"]] * 27 + [pool["M16384_row"]] * 4 + [pool["M16384_sel"]])
     i2i_seq = ([pool["M16384_row"]] * 4 + [pool["M16384_row_nfo0"]] * 5 + [pool["M16384_u8s"]]
                + [pool["M32848_u8x3"]] * 2)
     s = torch.cuda.Stream()
     g_t2i, o_t2i = capture([lambda c=c: run_fused(c) for c in t2i_seq], s)
     g_i2i, o_i2i = capture([lambda c=c: run_fused(c) for c in i2i_seq], s)
+    os.environ["TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_T256"] = "0"
+    lptr.t256_enabled.cache_clear()
+    g_t2i_k, o_t2i_k = capture([lambda c=c: run_fused(c) for c in t2i_seq], s)
+    g_i2i_k, o_i2i_k = capture([lambda c=c: run_fused(c) for c in i2i_seq], s)
+    del os.environ["TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_T256"]
+    lptr.t256_enabled.cache_clear()
     small = pool["M4176_select"]
     pristine_all = {k: [t.clone() for t in inputs(c)] for k, c in pool.items()}
-    mism = 0
+
+    def counter():
+        return int(ws[:4].view(torch.int32)[0].item())
+
+    def tiles(M):
+        bm = 256 if route_of(lptr, M) == "t256" else 128
+        return 2 * ((M + bm - 1) // bm) * (H // 128)
+
+    # Kill-switch outputs (128 instance at every M).
+    kill = {}
+    for name, g, outs in (("t2i", g_t2i_k, o_t2i_k), ("i2i", g_i2i_k, o_i2i_k)):
+        for o in outs:
+            o.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        kill[name] = [o.clone() for o in outs]
+    kill_vs_ref = sum(not torch.equal(k.reshape(c["x"].shape), c["ref"])
+                      for name, cs in (("t2i", t2i_seq), ("i2i", i2i_seq))
+                      for k, c in zip(kill[name], cs))
+    mism = {"vs_round0": 0, "vs_kill_switch": 0, "vs_pair_inductor": 0}
+    state_bad = 0
     total = 0
     seq_log = []
-    for rnd in range(6):
+    round0 = {}
+    counters = {}
+    for rnd in range(-1, rounds):  # -1 = warmup round (compared too, not the round-0 reference)
+        for k, c in pool.items():
+            for p, t in zip(pristine_all[k], inputs(c)):
+                t.copy_(p)
+        torch.cuda.synchronize()
         order = [("t2i", g_t2i, o_t2i, t2i_seq), ("i2i", g_i2i, o_i2i, i2i_seq)]
         if rnd % 2:
             order.reverse()
+        bad_rnd = 0
         for name, g, outs, cs in order:
             for o in outs:
                 o.fill_(float("nan"))
+            e0 = epoch()
             g.replay()
             torch.cuda.synchronize()
-            bad = sum(not torch.equal(o.reshape(c["x"].shape), c["ref"]) for o, c in zip(outs, cs))
-            mism += bad
+            d_ep, cnt = epoch() - e0, counter()
+            ok_state = d_ep == len(cs) and cnt >= tiles(cs[-1]["M"])
+            counters.setdefault(name, set()).add(cnt)
+            if rnd == 0:
+                round0[name] = [o.clone() for o in outs]
+            for i, (o, c) in enumerate(zip(outs, cs)):
+                o = o.reshape(c["x"].shape)
+                b_ref = not torch.equal(o, c["ref"])
+                b_kill = not torch.equal(o, kill[name][i].reshape(c["x"].shape))
+                b_r0 = rnd > 0 and not torch.equal(o, round0[name][i].reshape(c["x"].shape))
+                mism["vs_pair_inductor"] += b_ref
+                mism["vs_kill_switch"] += b_kill
+                mism["vs_round0"] += b_r0
+                bad_rnd += b_ref or b_kill or b_r0
             total += len(outs)
+            e0 = epoch()
             o = run_fused(small).reshape(small["x"].shape)
             torch.cuda.synchronize()
-            bad_s = int(not torch.equal(o, small["ref"]))
-            mism += bad_s
+            d_ep_s, cnt_s = epoch() - e0, counter()
+            ok_state &= d_ep_s == 1 and cnt_s >= tiles(small["M"])
+            counters.setdefault("eager4176", set()).add(cnt_s)
+            b_s = not torch.equal(o, small["ref"])
+            mism["vs_pair_inductor"] += b_s
+            bad_rnd += b_s
             total += 1
             del o
-            seq_log.append(f"{name}:{bad + bad_s}")
+            state_bad += not ok_state
+            seq_log.append(f"{name}:{bad_rnd}{'' if ok_state else '!state'}")
+        if rnd % 10 == 0:
+            log(f"  repeat round {rnd}: mismatches {mism} state_bad {state_bad}")
     inputs_ok = all(all(torch.equal(p, t) for p, t in zip(pristine_all[k], inputs(c)))
                     for k, c in pool.items())
-    rep_ok = mism == 0 and inputs_ok
-    results["repeat_sequence"] = {"mismatches": mism, "compared": total, "inputs_unchanged":
-                                  inputs_ok, "order": seq_log}
+    rep_ok = (sum(mism.values()) == 0 and kill_vs_ref == 0 and state_bad == 0 and inputs_ok)
+    results["repeat_sequence"] = {
+        "rounds_after_warmup": rounds, "mismatches": mism, "kill_switch_vs_pair_inductor":
+        kill_vs_ref, "compared": total, "state_checks_failed": state_bad,
+        "tile_counter_values": {k: sorted(v) for k, v in counters.items()},
+        "tile_counts_last_launch": {"t2i": tiles(t2i_seq[-1]["M"]),
+                                    "i2i": tiles(i2i_seq[-1]["M"]),
+                                    "eager4176": tiles(small["M"])},
+        "inputs_unchanged": inputs_ok, "order": " ".join(seq_log)}
     passed &= rep_ok
     log(f"repeat sequence: {results['repeat_sequence']}")
     print(json.dumps({"passed": bool(passed), "compared_against": "pair (flux3_sm120_nvfp4_out_"
