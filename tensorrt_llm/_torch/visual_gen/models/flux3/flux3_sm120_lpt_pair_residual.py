@@ -30,6 +30,11 @@ The gate is a [1, R, D] row table plus an optional per-row index ([1, S, 1] bool
 without one): the single blocks' [1, 2, D] table + select and the mode blocks' [1, 1, D] row.
 
 TRTLLM_FLUX3_SM120_PAIR_RESIDUAL=0 restores main's pair + Inductor residual.
+
+Raster (idea 59): the grouped scheduler's default walks AlongM. raster_for() picks the launch's
+raster statically by M range (M < 8192 and M >= 24576: the default, i.e. main's launch;
+8192 <= M < 24576: AlongN). Only the tile -> CTA map changes, so outputs are bitwise equal.
+TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_RASTER=0 restores main's launch at every M.
 """
 
 from __future__ import annotations
@@ -52,6 +57,30 @@ _WORKSPACES: dict[int, torch.Tensor] = {}
 def enabled() -> bool:
     """TRTLLM_FLUX3_SM120_PAIR_RESIDUAL=0 keeps main's pair + Inductor gated residual."""
     return os.environ.get("TRTLLM_FLUX3_SM120_PAIR_RESIDUAL", "1").strip() != "0"
+
+
+@lru_cache(maxsize=1)
+def raster_enabled() -> bool:
+    """TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_RASTER=0 keeps main's launch (scheduler default raster,
+    AlongM for this grouped launch) at every M."""
+    return os.environ.get("TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_RASTER", "1").strip() != "0"
+
+
+# Raster by M range (CUTLASS RasterOrderOptions: 0 scheduler default = main, 1 AlongM, 2 AlongN).
+# Range buckets, never M equality (the served M is image tokens + the padded text bucket).
+_RASTER_MID_MIN = 8192  # 8192 <= M < 24576: t2i single 16464, mode / image_cond 16384
+_RASTER_LARGE_MIN = 24576  # M >= 24576: i2i single 32848
+_RASTER_MID = 2  # AlongN: 16464 1033.6 -> 1003.2 us, 16384 1012.6 -> 985.0 us (jobs 332/344)
+# M >= 24576 keeps main's launch: the module is not reached there on this base, and the route
+# decision belongs to idea 62 (job 344 prior at 32848 u8 K=3: AlongM 3356 us, AlongN 1853 us).
+_RASTER_LARGE = 0
+
+
+def raster_for(rows: int) -> int:
+    """The raster argument of the launch at M=rows (static by M range; M < 8192 is main's)."""
+    if not raster_enabled() or rows < _RASTER_MID_MIN:
+        return 0
+    return _RASTER_LARGE if rows >= _RASTER_LARGE_MIN else _RASTER_MID
 
 
 @lru_cache(maxsize=1)
@@ -213,6 +242,7 @@ def nvfp4_out_pair_residual(
         has_index,
         out,
         workspace(device),
+        raster_for(rows),
     )
     return out
 
@@ -249,8 +279,10 @@ def run_raw(
     gate: torch.Tensor,
     gate_index: torch.Tensor | None,
     mlp_y: torch.Tensor | None = None,
+    raster: int | None = None,
 ) -> torch.Tensor:
-    """The kernel with explicit device alphas (microbenchmarks/tests). Returns out [M, N]."""
+    """The kernel with explicit device alphas (microbenchmarks/tests). Returns out [M, N].
+    raster None routes by M (raster_for); 0/1/2 forces default/AlongM/AlongN."""
     rows, width = attn_data.shape[0], down_weight.shape[0]
     table = _aligned(gate.reshape(-1, width).contiguous())
     index = table if gate_index is None else gate_index.reshape(-1).contiguous().view(torch.uint8)
@@ -263,5 +295,6 @@ def run_raw(
         _aligned(x.reshape(rows, width).contiguous()), table, index,
         0 if gate_index is None else 1, out,
         workspace(x.device),
+        raster_for(rows) if raster is None else int(raster),
     )
     return out
