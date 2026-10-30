@@ -83,6 +83,27 @@ def raster_for(rows: int) -> int:
     return _RASTER_LARGE if rows >= _RASTER_LARGE_MIN else _RASTER_MID
 
 
+# Instance by M range (idea 55): 8192 <= M < 24576 (t2i single 16464, mode / image_cond 16384)
+# takes the t256 instance (256x128x128 tiles, same kernel template, bitwise equal outputs); M < 8192
+# and M >= 24576 keep the 128 instance (main's launch). Range buckets, never M equality; the upper
+# bound is explicit (serves() is not relied on to keep M >= 24576 off t256).
+_T256_MIN = 8192
+_T256_MAX = 24576
+
+
+@lru_cache(maxsize=1)
+def t256_enabled() -> bool:
+    """TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_T256=0 keeps the 128 instance at every M."""
+    return os.environ.get("TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_T256", "1").strip() != "0"
+
+
+def _launcher(rows: int):
+    """The kernel entry for a launch of M=rows (same arguments for both instances)."""
+    if t256_enabled() and _T256_MIN <= rows < _T256_MAX:
+        return t256_module().lpt_pair_residual_t256
+    return module().lpt_pair_residual
+
+
 @lru_cache(maxsize=1)
 def module():
     from flashinfer.jit import env as jit_env
@@ -94,6 +115,24 @@ def module():
         [jit_env.FLASHINFER_CSRC_DIR / "flux3_fp4_lpt_pair_residual_sm120.cu"],
         extra_cuda_cflags=nvcc_flags
         + ["-DENABLE_BF16", "-DENABLE_FP4", "-DCUTLASS_ENABLE_GDC_FOR_SM100=1"],
+        extra_cflags=["-DFAST_BUILD"],
+    )
+    return spec.build_and_load()
+
+
+@lru_cache(maxsize=1)
+def t256_module():
+    """The same .cu built with -DFLUX3_LPTR_T256: adds lpt_pair_residual_t256 (256x128x128)."""
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.core import current_compilation_context, gen_jit_spec
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(supported_major_versions=[12])
+    spec = gen_jit_spec(
+        "flux3_fp4_lpt_pair_residual_t256_sm120",
+        [jit_env.FLASHINFER_CSRC_DIR / "flux3_fp4_lpt_pair_residual_sm120.cu"],
+        extra_cuda_cflags=nvcc_flags
+        + ["-DENABLE_BF16", "-DENABLE_FP4", "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+           "-DFLUX3_LPTR_T256"],
         extra_cflags=["-DFAST_BUILD"],
     )
     return spec.build_and_load()
@@ -122,6 +161,8 @@ def preload(device: torch.device) -> None:
     if not enabled():
         return
     module()
+    if t256_enabled():
+        t256_module()
     workspace(device)
 
 
@@ -239,7 +280,7 @@ def nvfp4_out_pair_residual(
         has_index = 1
     mlp_y = torch.empty((rows, width), device=device, dtype=torch.bfloat16)
     out = torch.empty((rows, width), device=device, dtype=torch.bfloat16)
-    module().lpt_pair_residual(
+    _launcher(rows)(
         down_activation.detach(),
         down_weight,
         down_activation_scale.detach(),
@@ -304,7 +345,7 @@ def run_raw(
     if mlp_y is None:
         mlp_y = torch.empty((rows, width), device=x.device, dtype=torch.bfloat16)
     out = torch.empty((rows, width), device=x.device, dtype=torch.bfloat16)
-    module().lpt_pair_residual(
+    _launcher(rows)(
         down_activation, down_weight, down_activation_scale, down_weight_scale, down_alpha, mlp_y,
         attn_data, attn_weight, attn_scales, attn_weight_scale, attn_alpha,
         _aligned(x.reshape(rows, width).contiguous()), table, index,
