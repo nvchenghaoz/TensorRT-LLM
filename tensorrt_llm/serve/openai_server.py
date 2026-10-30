@@ -205,7 +205,9 @@ async def _request_json_fast(raw_request: Request):
         if body:
             try:
                 raw_request._json_body = _json_fast_decoder.decode(body)
-            except (msgspec.DecodeError, UnicodeError, ValueError):
+            except (msgspec.DecodeError, UnicodeError, ValueError,
+                    RecursionError):
+                # Deeply nested bodies: json.loads raises its own message.
                 pass
     return await raw_request.json()
 

@@ -13,10 +13,16 @@ Checks (untimed):
   3. handler parity on both references: response body (created normalized),
      VisualGenParams.model_dump (content replaced by sha256) + reference sha256,
      A,B,A,t2i sequence per arm; malformed request corpus status + body A == B.
-  4. after timing: untimed alternating A/B sequence matched against arm-A bodies.
-Timing: 10 warmups per arm, ROUNDS rounds alternating A,B, 10 handler calls per
-round (alternating references); per-arm median/p10/p90/rel-std, median of
-per-round B/A ratios, paired-diff median+IQR, load1 start/end.
+  3b. deep nesting (3000 levels) at the default recursion limit: tree raises
+     exactly json.loads's RecursionError (also in the error-parity corpus).
+  4. after timing: untimed interleaved A/A2/B sequence matched against arm-A
+     iteration-0 bodies.
+Timing: three arms in one process (A = main verbatim, A2 = second copy of main
+= in-process A/A control, B = tree); 10 warmups per arm per case, then
+2*ROUNDS*PER_ROUND iterations, each calling every arm on the same input in
+rotating order ABA2/BA2A/A2AB, i2i (reference alternating) then t2i. Per case
+(i2i pooled, per reference, t2i): per-arm median/p10/p90/rel-std, paired B-A and
+A2-A median+IQR, median of per-round (PER_ROUND iterations) ratios; load1.
 
 ARM env var: "both" (default) prints the full report; "A"/"B" prints the
 evidence_format JSON for that arm only (still timing both interleaved).
@@ -89,6 +95,7 @@ def strict_eq(a, b):
 
 def main():
     import sys
+    DEFAULT_RECURSION_LIMIT = sys.getrecursionlimit()  # the server's (nothing in tensorrt_llm sets it)
     sys.setrecursionlimit(50000)
     import msgspec
     import numpy as np
@@ -140,8 +147,16 @@ def main():
     tree = {"json": osrv._request_json_fast, "b64": vgu._decode_base64_media}
     mainv = {"json": main_request_json, "b64": main_decode_base64_media}
 
+    def fcopy(f):  # a second, distinct function object with main's verbatim code
+        g = types.FunctionType(f.__code__, f.__globals__, f.__name__, f.__defaults__, f.__closure__)
+        assert g is not f and g.__code__ is f.__code__
+        return g
+
+    mainv2 = {"json": fcopy(main_request_json), "b64": fcopy(main_decode_base64_media)}
+    ARMS = {"A": mainv, "A2": mainv2, "B": tree}
+
     def use(arm):
-        src = mainv if arm == "A" else tree
+        src = ARMS[arm]
         osrv._request_json_fast = src["json"]
         vgu._decode_base64_media = src["b64"]
         assert osrv._request_json_fast is src["json"] and vgu._decode_base64_media is src["b64"]
@@ -387,12 +402,22 @@ def main():
         "mask_set": edit_body("check00", mask="QUJD"),
         "list_images": edit_body("check00", image=[b64s["check00"]]),
         "empty_list": edit_body("check00", image=[]),
+        "deep_nesting_3000": b"[" * 3000 + b"]" * 3000,
+        "deep_nesting_obj_3000": b'{"a":' * 3000 + b"1" + b"}" * 3000,
     }
+    DEEP = ("deep_nesting_3000", "deep_nesting_obj_3000")
     err = {"A": {}, "B": {}}
     for arm in ("A", "B"):
         use(arm)
         for tag, body in bad.items():
-            r = call("edit", body)
+            if tag in DEEP:  # run at the server's default recursion limit
+                sys.setrecursionlimit(DEFAULT_RECURSION_LIMIT)
+                try:
+                    r = call("edit", body)
+                finally:
+                    sys.setrecursionlimit(50000)
+            else:
+                r = call("edit", body)
             err[arm][tag] = (r.status_code, hashlib.sha256(norm(r.body)).hexdigest()[:16],
                              r.body[:160].decode(errors="replace") if r.status_code != 200 else "")
     diffs = {t: (err["A"][t], err["B"][t]) for t in bad if err["A"][t] != err["B"][t]}
@@ -400,6 +425,30 @@ def main():
         log(f"edge {t}: A={err['A'][t][:2]} {err['A'][t][2][:100]!r}")
     log(f"edge diffs A vs B: {diffs}")
     passed["error_parity"] = not diffs
+
+    # deep nesting at the server's default recursion limit: tree's decoder must
+    # raise exactly json.loads's error (msgspec's RecursionError is swallowed).
+    deep_ok = True
+    sys.setrecursionlimit(DEFAULT_RECURSION_LIMIT)
+    try:
+        for tag in DEEP:
+            body = bad[tag]
+
+            def exc_of(fn):
+                try:
+                    fn()
+                    return ("ok",)
+                except BaseException as e:  # noqa
+                    return (type(e).__name__, str(e))
+            ms = exc_of(lambda: msgspec.json.Decoder().decode(body))
+            jl = exc_of(lambda: json.loads(body))
+            tr = exc_of(lambda: asyncio.run(tree["json"](mk(body, "/v1/images/edits"))))
+            mn = exc_of(lambda: asyncio.run(main_request_json(mk(body, "/v1/images/edits"))))
+            log(f"deep {tag}: msgspec={ms} json.loads={jl} tree={tr} main={mn}")
+            deep_ok &= tr == jl == mn and tr[0] == "RecursionError"
+    finally:
+        sys.setrecursionlimit(50000)
+    passed["deep_nesting_fallback"] = deep_ok
     # ascii-only bodies: also msgpack-header route untouched (not exercised by this route's client)
 
     # ---------------- timing ----------------
@@ -411,28 +460,44 @@ def main():
         assert r.status_code == 200
         return ms
 
+    # Per iteration every arm runs the same input, order rotating ABA2 / BA2A / A2AB.
+    # Each iteration does one i2i call per arm (reference alternating by
+    # iteration) and then one t2i call per arm (same rotated order), so both
+    # cases get ITERS paired samples per arm. A round = PER_ROUND iterations.
+    ITERS = ROUNDS * PER_ROUND * 2  # default 400 -> 200 per i2i reference, 400 t2i
+    ORDERS = [("A", "B", "A2"), ("B", "A2", "A"), ("A2", "A", "B")]
+    AR = ("A", "A2", "B")
     l_start = load1()
-    log(f"timing: load1 {l_start}, rounds {ROUNDS} x {PER_ROUND}")
-    t = {"A": [], "B": [], "tA": [], "tB": []}
-    ratios = []
-    for arm in ("A", "B"):
+    log(f"timing: load1 {l_start}, iters {ITERS} (rounds of {PER_ROUND}), arms {AR}")
+    for arm in AR:  # 10 warmups per arm per case
         use(arm)
         for i in range(10):
             one(names[i % 2])
-        one("t2i")
-    for rd in range(ROUNDS):
-        meds = {}
-        for arm in (("A", "B") if rd % 2 == 0 else ("B", "A")):
+            one("t2i")
+    cases = ["i2i", "i2i:check10", "i2i:check00", "t2i"]
+    T = {c: {a: [] for a in AR} for c in cases}
+    rnd_of = {c: [] for c in cases}  # round index per sample
+    for it in range(ITERS):
+        order = ORDERS[it % 3]
+        ref = names[it % 2]
+        rd = it // PER_ROUND
+        for arm in order:
             use(arm)
-            xs = [one(names[i % 2]) for i in range(PER_ROUND)]
-            t[arm] += xs
-            meds[arm] = statistics.median(xs)
-            t["t" + arm].append(one("t2i"))
-        ratios.append(meds["B"] / meds["A"])
-        if rd % 5 == 4:
-            log(f"round {rd}: A {meds['A']:.2f} B {meds['B']:.2f} load1 {load1()}")
+            x = one(ref)
+            T["i2i"][arm].append(x)
+            T["i2i:" + ref][arm].append(x)
+        for arm in order:
+            use(arm)
+            T["t2i"][arm].append(one("t2i"))
+        rnd_of["i2i"].append(rd)
+        rnd_of["i2i:" + ref].append(rd)
+        rnd_of["t2i"].append(rd)
+        if it % 50 == 49:
+            log(f"iter {it}: i2i A {statistics.median(T['i2i']['A'][-50:]):.2f} "
+                f"A2 {statistics.median(T['i2i']['A2'][-50:]):.2f} B {statistics.median(T['i2i']['B'][-50:]):.2f} "
+                f"| t2i A {statistics.median(T['t2i']['A'][-50:]):.3f} A2 {statistics.median(T['t2i']['A2'][-50:]):.3f} "
+                f"B {statistics.median(T['t2i']['B'][-50:]):.3f} load1 {load1()}")
     l_end = load1()
-    paired = [b - a for a, b in zip(t["A"], t["B"])]
 
     def st(xs):
         q = statistics.quantiles(xs, n=10)
@@ -441,33 +506,48 @@ def main():
                 "noise_floor": round((q[-1] - q[0]) / med, 4),
                 "rel_std": round(statistics.pstdev(xs) / statistics.mean(xs), 4), "n": len(xs)}
 
-    sA, sB, stA, stB = st(t["A"]), st(t["B"]), st(t["tA"]), st(t["tB"])
-    rq = statistics.quantiles(ratios, n=10)
-    pq = statistics.quantiles(paired, n=4)
-    summary = {"A": sA, "B": sB, "t2i_A": stA, "t2i_B": stB,
-               "ratio_B_over_A_median": round(statistics.median(ratios), 4),
-               "ratio_p10_p90": [round(rq[0], 4), round(rq[-1], 4)],
-               "paired_diff_ms_median": round(statistics.median(paired), 3),
-               "paired_diff_iqr": [round(pq[0], 3), round(pq[-1], 3)],
-               "load1_start": l_start, "load1_end": l_end}
-    log(f"timing {summary}")
+    def cmp(case, arm):
+        a, b = T[case]["A"], T[case][arm]
+        d = [y - x for x, y in zip(a, b)]
+        dq = statistics.quantiles(d, n=4)
+        rr = []
+        for r in sorted(set(rnd_of[case])):
+            idx = [i for i, k in enumerate(rnd_of[case]) if k == r]
+            rr.append(statistics.median([b[i] for i in idx]) / statistics.median([a[i] for i in idx]))
+        rq = statistics.quantiles(rr, n=10)
+        return {"paired_diff_ms_median": round(statistics.median(d), 3),
+                "paired_diff_iqr": [round(dq[0], 3), round(dq[-1], 3)],
+                "ratio_median_of_rounds": round(statistics.median(rr), 4),
+                "ratio_p10_p90": [round(rq[0], 4), round(rq[-1], 4)], "rounds": len(rr),
+                "pairs": len(d)}
 
-    # ---------------- 4. untimed alternating A/B after timing ----------------
+    summary = {"load1_start": l_start, "load1_end": l_end}
+    for c in cases:
+        summary[c] = {"per_arm": {a: st(T[c][a]) for a in AR},
+                      "B_vs_A": cmp(c, "B"), "A2_vs_A (A/A)": cmp(c, "A2")}
+        log(f"timing {c}: {json.dumps(summary[c])}")
+    log(f"load1 start {l_start} end {l_end}")
+
+    # ---------------- 4. untimed interleaved sequence after timing ----------------
+    # Same shape as timing (rotated arm order, alternating reference, i2i then
+    # t2i per arm); every output must equal the arm-A pass-1 (iteration-0) body.
     post_ok = True
-    for i in range(8):
-        arm = "AB"[i % 2]
-        use(arm)
-        for k in ("check10", "check00", "t2i"):
-            r = call(k)
-            got = (r.status_code, hashlib.sha256(norm(r.body)).hexdigest(), r.media_type)
-            post_ok &= got == ref_resp[k]
+    for it in range(12):
+        order = ORDERS[it % 3]
+        ref = names[it % 2]
+        for k in (ref, "t2i"):
+            for arm in order:
+                use(arm)
+                r = call(k)
+                got = (r.status_code, hashlib.sha256(norm(r.body)).hexdigest(), r.media_type)
+                post_ok &= got == ref_resp[k]
     passed["post_timing_alternating"] = post_ok
-    log(f"post-timing alternating A/B == arm-A refs: {post_ok}")
+    log(f"post-timing interleaved A/A2/B == arm-A iteration-0 refs: {post_ok}")
     use("B")
     ok = all(passed.values())
     if ARM in ("A", "B"):
-        s = sA if ARM == "A" else sB
-        s2 = stA if ARM == "A" else stB
+        s = summary["i2i"]["per_arm"][ARM]
+        s2 = summary["t2i"]["per_arm"][ARM]
         out = {"batch": {"i2i-2048": {"step_ms": s["step_ms"], "noise_floor": s["noise_floor"]},
                          "t2i-2048": {"step_ms": s2["step_ms"], "noise_floor": s2["noise_floor"]}},
                "output": {"class": "exact"}, "passed": ok, "checks": passed, "summary": summary,
@@ -476,7 +556,8 @@ def main():
         out = {"passed": ok, "checks": passed, "summary": summary,
                "compared": "arm A (main code swapped in) vs arm B (tree): msgspec corpus vs json.loads, "
                            "b64 corpus vs base64.b64decode(validate=True), handler bodies + VisualGenParams "
-                           "dump + ref sha256 (A,B,A,t2i), malformed-request status+body, post-timing A/B"}
+                           "dump + ref sha256 (A,B,A,t2i), malformed-request status+body (incl. 3000-deep "
+                           "nesting at default recursion limit), post-timing interleaved A/A2/B"}
     print(json.dumps(out), flush=True)
 
 
