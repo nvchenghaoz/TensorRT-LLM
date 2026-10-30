@@ -19,6 +19,7 @@ import torch
 
 CKPT = sys.argv[1]
 ROUNDS = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+SOAK = int(sys.argv[3]) if len(sys.argv) > 3 else 2  # untimed t2i+i2i rounds (clock heat soak)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -120,7 +121,7 @@ def generate(case):
     return s.elapsed_time(e), h.hexdigest()
 
 
-for case in ("t2i", "i2i", "t2i", "i2i"):  # untimed: graph capture + warm
+for case in ("t2i", "i2i") * max(SOAK, 2):  # untimed: graph capture + warm + heat soak
     ms, hx = generate(case)
     log("WARM", case, round(ms, 2), hx[:16])
 den = {"t2i": [], "i2i": []}
