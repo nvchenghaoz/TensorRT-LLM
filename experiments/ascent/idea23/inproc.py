@@ -562,6 +562,114 @@ def ibench():
     print(json.dumps(out))
 
 
+def pbench():
+    """Per-iteration paired interleave in ONE process on ONE pipeline (top-lead ruling 17:12).
+
+    Arm A = main's _load_image_pixels / pack_i2i_image_condition / _prepare_i2i (copied
+    verbatim above); arm B = this tree's functions (in the base tree: main's code again, an
+    A/A). Per case: N_ARM_WARM warmup iterations, then N_PAIRED iterations; iteration i runs
+    both arms on the same input (i2i alternates the two frozen references by i), order AB on
+    even i and BA on odd i. Reports per-arm stats and the per-iteration paired difference
+    B - A (median, IQR) and ratio B / A. load1 recorded at start/end of each timed section
+    (no load gate). Then an untimed interleaved sequence of the same shape: every
+    transformer input at the first denoise call bitwise equal between arms and to iter 0.
+    """
+    from tensorrt_llm._torch.visual_gen.models.flux3 import pipeline_flux3 as flux3
+
+    n_warm = int(os.environ.get("N_ARM_WARM", "10"))
+    n_paired = int(os.environ.get("N_PAIRED", "200"))
+    pipe = load_pipe()
+    probe = Probe(pipe)
+    refs = find_refs()
+    cand_load = flux3._load_image_pixels
+    cand_prep = type(pipe)._prepare_i2i
+
+    def use(arm):
+        if arm == "A":
+            flux3._load_image_pixels = ref_load_image_pixels
+            pipe._prepare_i2i = types.MethodType(ref_prepare_i2i, pipe)
+        else:
+            flux3._load_image_pixels = cand_load
+            pipe.__dict__.pop("_prepare_i2i", None)
+        assert flux3._load_image_pixels is (ref_load_image_pixels if arm == "A" else cand_load)
+        assert pipe._prepare_i2i.__func__ is (ref_prepare_i2i if arm == "A" else cand_prep)
+
+    def req(kind):  # rebuilt from the immutable reference bytes every call (pristine inputs)
+        if kind == "t2i":
+            return make_req(*T2I)
+        return make_req(PROMPTS[kind][0], PROMPTS[kind][1], refs[kind])
+
+    cases = {"i2i-2048": ["A", "B"], "t2i-2048": ["t2i"]}
+
+    def q(v, n):
+        return statistics.quantiles(sorted(v), n=n)
+
+    out = {"batch": {}, "output": {"class": "exact"}, "arms": {}, "paired": {}, "load1": {}}
+    for case, kinds in cases.items():
+        for i in range(n_warm):
+            for arm in "AB":
+                use(arm)
+                span(pipe, probe, req(kinds[i % len(kinds)]))
+        out["load1"][f"{case}_start"] = loadavg1()
+        log(f"{case}: timed start, load1={out['load1'][case + '_start']:.2f}")
+        t = {"A": [], "B": []}
+        by_ref = {"A": {}, "B": {}}
+        for i in range(n_paired):
+            kind = kinds[i % len(kinds)]
+            for arm in ("AB" if i % 2 == 0 else "BA"):
+                use(arm)
+                g, _ = span(pipe, probe, req(kind))
+                t[arm].append(g)
+                by_ref[arm].setdefault(kind, []).append(g)
+            if i % 25 == 0:
+                log(f"{case} iter {i}: A {t['A'][-1]:.2f} ms, B {t['B'][-1]:.2f} ms")
+        out["load1"][f"{case}_end"] = loadavg1()
+        log(f"{case}: timed end, load1={out['load1'][case + '_end']:.2f}")
+        diff = [b - a for a, b in zip(t["A"], t["B"])]
+        ratio = [b / a for a, b in zip(t["A"], t["B"])]
+        dq, rq = q(diff, 4), q(ratio, 4)
+        out["arms"][case] = {"A_main_copy": stats(t["A"]), "B_tree": stats(t["B"]),
+                             "per_reference": {arm: {k: stats(v) for k, v in by_ref[arm].items()}
+                                               for arm in "AB"}}
+        out["paired"][case] = {
+            "diff_B_minus_A_ms": {"median": statistics.median(diff), "p25": dq[0], "p75": dq[2],
+                                  "iqr": dq[2] - dq[0]},
+            "ratio_B_over_A": {"median": statistics.median(ratio), "p25": rq[0], "p75": rq[2]},
+            "n": len(diff)}
+        nf = max(stats(v)["p10_p90_over_median"] for v in by_ref["B"].values())
+        out["batch"][case] = {"step_ms": statistics.median(t["B"]), "noise_floor": nf}
+        log(f"{case}: {json.dumps(out['paired'][case])}")
+    # Untimed interleaved sequence, same shape, bitwise.
+    probe.capture = True
+    first, bad, n_seq = {}, [], 0
+    for case, kinds in cases.items():
+        for i in range(n_warm + n_paired):
+            kind = kinds[i % len(kinds)]
+            for arm in ("AB" if i % 2 == 0 else "BA"):
+                use(arm)
+                span(pipe, probe, req(kind))
+                kw = probe.kwargs
+                n_seq += 1
+                if kind not in first:
+                    first[kind] = kw
+                    continue
+                f = first[kind]
+                if not (kw.keys() == f.keys() and all(
+                        same(kw[n][0], f[n][0]) and kw[n][1] == f[n][1] for n in kw)):
+                    bad.append((case, i, arm))
+    probe.capture = False
+    use("B")
+    log(f"untimed interleaved sequence: {n_seq} calls, ok={not bad}, bad={bad[:10]}")
+    out.update({
+        "untimed_interleaved_bitwise_ok": not bad, "untimed_calls": n_seq, "untimed_bad": bad[:20],
+        "n_arm_warm": n_warm, "n_paired": n_paired,
+        "measure": "Flux3Pipeline.infer entry (ref PNG bytes in) -> first transformer forward, "
+                   "after cuda sync there; served engine.json pipeline, 2048^2; arms A (main's "
+                   "functions copied) and B (tree) interleaved per iteration in one process",
+    })
+    print(json.dumps(out))
+
+
 def check():
     import torch._dynamo.utils as dyn_utils
 
@@ -696,4 +804,4 @@ def check():
 
 
 if __name__ == "__main__":
-    {"unit": unit, "bench": bench, "ibench": ibench, "check": check}[MODE]()
+    {"unit": unit, "bench": bench, "ibench": ibench, "pbench": pbench, "check": check}[MODE]()
