@@ -43,6 +43,10 @@ PLAN_NAME: Dict[tuple, str] = {
     (256, 256, 512): "eng1_k24=1",  # up[1]: 1.556 ms (main fprop + interleave 2.269 ms)
     (512, 512, 256): "eng1_k24=1",  # up[2]: 1.451 ms (main aten dgrad + helpers 1.598 ms)
     (512, 512, 128): "eng1_k24=4",  # up[3]: 0.395 ms (main aten dgrad + helpers + bias 0.464 ms)
+    # 2048x2048-output decode (branch 22 / idea 20, step-0 job 355): bitwise identical to the
+    # plan-0 fallback eng1_k24=10 on real and random operands; interleaved per-call medians.
+    (512, 512, 512): "eng1_k24=1",  # up[2]: 7.632 -> 6.180 ms
+    (256, 256, 1024): "eng1_k24=1",  # up[1]: 8.185 -> 6.636 ms
 }
 
 # Decoder up levels (besides up[1], which always uses the op) whose transpose-path upsample
