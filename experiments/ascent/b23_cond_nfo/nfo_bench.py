@@ -189,8 +189,9 @@ def inputs_unchanged(key):
 
 
 def restore(key):
-    for a, b in zip(tensors(captured[key]), tensors(pristine[key])):
-        a.copy_(b)
+    with torch.inference_mode():
+        for a, b in zip(tensors(captured[key]), tensors(pristine[key])):
+            a.copy_(b)
 
 
 def call(b, key):
