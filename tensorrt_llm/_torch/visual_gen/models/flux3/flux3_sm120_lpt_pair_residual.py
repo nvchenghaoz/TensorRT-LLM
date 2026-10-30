@@ -71,9 +71,9 @@ def raster_enabled() -> bool:
 _RASTER_MID_MIN = 8192  # 8192 <= M < 24576: t2i single 16464, mode / image_cond 16384
 _RASTER_LARGE_MIN = 24576  # M >= 24576: i2i single 32848
 _RASTER_MID = 2  # AlongN: 16464 1033.6 -> 1003.2 us, 16384 1012.6 -> 985.0 us (jobs 332/344)
-# M >= 24576 keeps main's launch: the module is not reached there on this base, and the route
-# decision belongs to idea 62 (job 344 prior at 32848 u8 K=3: AlongM 3356 us, AlongN 1853 us).
-_RASTER_LARGE = 0
+# M >= 24576: AlongN (idea 62). At i2i single 32848 ([1,3,D] table + u8 index) AlongM re-streams
+# down's >L2 A panel per N column; AlongN beats main's flux3_tres tail (STEP 0, job 529).
+_RASTER_LARGE = 2
 
 
 def raster_for(rows: int) -> int:
@@ -141,12 +141,27 @@ def available(device: torch.device) -> bool:
 # (1.009 vs 1.114 ms). So M >= _DECLINE_MIN_ROWS takes main's route (range check, never an M
 # equality). Before branch 15 no caller reached this op at M >= 24576 (the i2i singles carried a
 # per-token gate), so every route that existed is unchanged.
+# Idea 62: at raster 2 (AlongN, raster_for's M >= 24576 bucket) the fused op beats main's
+# flux3_tres one-launch tail at 32848 (STEP 0, job 529), bitwise equal, so M >= _DECLINE_MIN_ROWS
+# is served when large_m_enabled(). TRTLLM_FLUX3_PAIR_RESIDUAL_LARGE_M=0 or
+# TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_RASTER=0 restores the decline (flux3_tres takes those rows).
 _DECLINE_MIN_ROWS = 24576
 
 
 def serves(rows: int) -> bool:
     """Whether the fused op takes a call of `rows` output rows (see _DECLINE_MIN_ROWS)."""
-    return 0 < rows < _DECLINE_MIN_ROWS
+    if rows >= _DECLINE_MIN_ROWS:
+        return large_m_enabled()
+    return 0 < rows
+
+
+@lru_cache(maxsize=1)
+def large_m_enabled() -> bool:
+    """M >= _DECLINE_MIN_ROWS is served only at raster 2 (AlongN); static by M range.
+    TRTLLM_FLUX3_PAIR_RESIDUAL_LARGE_M=0 keeps main's decline."""
+    if os.environ.get("TRTLLM_FLUX3_PAIR_RESIDUAL_LARGE_M", "1").strip() == "0":
+        return False
+    return raster_for(_DECLINE_MIN_ROWS) == 2
 
 
 def gate_form(
