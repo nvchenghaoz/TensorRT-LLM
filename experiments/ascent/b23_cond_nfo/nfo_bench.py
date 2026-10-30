@@ -254,18 +254,23 @@ def spread(xs):
 loaded_nfo = [route_of(b)["attn_nvfp4_out"] for b in cond_blocks]
 
 if MODE == "bench":
-    passes = [pass_times(f"loaded{i}") for i in range(3)]
-    per_block = {k: min(p[k]["median_ms"] for p in passes) for k in cond_keys}
-    total = sum(per_block.values())
-    noise = max(max(p[k]["noise"] for p in passes) for k in cond_keys)
+    # Measured quantity: S = sum over the 5 cond blocks of the per-block median (50 timed calls).
+    # Repeated timings of this configuration = S of each of 5 passes; step_ms = median of them,
+    # noise_floor = (max - min) / median of them (the per-call p90-p10 spread is also reported).
+    passes = [pass_times(f"loaded{i}") for i in range(5)]
+    per_block = {k: statistics.median(p[k]["median_ms"] for p in passes) for k in cond_keys}
     sums = [p["sum_ms"] for p in passes]
+    total = statistics.median(sums)
+    noise = spread(sums)
+    per_call_noise = max(max(p[k]["noise"] for p in passes) for k in cond_keys)
     ctrl = time_block(img_block1, "image.1")
     log("loadavg end", loadavg())
     print(json.dumps({
         "batch": {"i2i-2048": {"step_ms": round(total, 4), "noise_floor": round(noise, 4)}},
-        "what": "sum over the 5 image_cond blocks of per-block median ms (min over 3 passes), real "
-                "step-0 i2i inputs, graphs off",
-        "pass_sums_ms": sums, "pass_sum_spread": round(spread(sums), 4),
+        "what": "median over 5 passes of the sum over the 5 image_cond blocks of per-block median "
+                "ms (50 timed calls), real step-0 i2i inputs, graphs off; noise_floor = "
+                "(max-min)/median of the 5 pass sums",
+        "pass_sums_ms": sums, "per_call_p90_p10_max": round(per_call_noise, 4),
         "per_block_ms": per_block, "loaded_cond_nfo": loaded_nfo,
         "control_image1_ms": ctrl["median_ms"], "routes": routes,
         "output": {"class": "exact"},
