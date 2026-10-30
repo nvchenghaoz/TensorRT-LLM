@@ -186,6 +186,30 @@ class _MsgspecRequest(Request):
         return self._json_body
 
 
+_json_fast_decoder = msgspec.json.Decoder()
+
+
+async def _request_json_fast(raw_request: Request):
+    """``await raw_request.json()``, decoding plain JSON bodies with msgspec.
+
+    msgspec decodes a multi-MB body (an inline base64 image) ~2.5x faster
+    than ``json.loads``. Anything msgspec rejects -- and every body that is
+    empty, msgpack, already parsed or not on ``_MsgspecRequest`` -- goes
+    through ``raw_request.json()`` unchanged, so error types and messages are
+    exactly ``json.loads``'s.
+    """
+    if (isinstance(raw_request, _MsgspecRequest)
+            and not hasattr(raw_request, "_json_body")
+            and raw_request.headers.get("x-trtllm-msgpack") != "1"):
+        body = await raw_request.body()
+        if body:
+            try:
+                raw_request._json_body = _json_fast_decoder.decode(body)
+            except (msgspec.DecodeError, UnicodeError, ValueError):
+                pass
+    return await raw_request.json()
+
+
 class _MsgspecRoute(APIRoute):
     """APIRoute that parses request bodies via :class:`_MsgspecRequest`."""
 
@@ -3965,7 +3989,7 @@ class OpenAIServer(_VideoRoutesMixin):
         normalized_content_type = content_type.lower()
 
         if "application/json" in normalized_content_type:
-            body = await raw_request.json()
+            body = await _request_json_fast(raw_request)
             if not isinstance(body, dict):
                 raise ValueError(
                     "JSON image edit request body must be an object")
