@@ -24,6 +24,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_core.text_encoder import 
     Qwen3VLEmbedder,
     Qwen3VLEmbedderParams,
 )
+from tensorrt_llm._torch.visual_gen.models.flux3 import png_fast
 from tensorrt_llm._torch.visual_gen.models.flux3.flux3_lora import apply_flux3_runtime_lora
 from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import Flux3Model
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
@@ -280,8 +281,21 @@ def _load_image_pixels(source: str | bytes, *, device: torch.device) -> Tensor:
     host allocator keeps the block until the copy completes) and are cast there: the same
     fp32 values and strides as a CPU cast + pageable 4x-larger H2D, without blocking the
     host behind the queued text encoder.
+
+    8-bit RGB non-interlaced PNG bytes on CUDA take png_fast (host inflate + GPU unfilter,
+    bitwise PIL's pixels) unless TRTLLM_FLUX3_PNG_FAST=0; anything else returns None
+    there and takes the PIL path below.
     """
     device = torch.device(device)
+    if isinstance(source, bytes) and device.type == "cuda" and png_fast.enabled():
+        hwc = png_fast.decode_png_rgb8_to_device(source, device)
+        if hwc is not None:
+            # png_fast only accepts 16 <= w, h <= 4096: no resize, no empty crop.
+            full_h, full_w = hwc.shape[:2]
+            width, height = full_w // 16 * 16, full_h // 16 * 16
+            left, top = (full_w - width) // 2, (full_h - height) // 2
+            hwc = hwc[top : top + height, left : left + width].contiguous()
+            return hwc.permute(2, 0, 1).unsqueeze(0).to(torch.float32) / 127.5 - 1
     with Image.open(BytesIO(source) if isinstance(source, bytes) else source) as original:
         original.load()
         image = original
@@ -413,7 +427,11 @@ class Flux3Pipeline(BasePipeline):
             with self.offloader.context_if_requested("text_encoder"):
                 self.text_encoder.warmup_buckets()
         ctx = self._encode_prompt("warmup", "")
-        for mode in self.pipeline_config.compilation.modes or ["t2i", "i2i"]:
+        modes = self.pipeline_config.compilation.modes or ["t2i", "i2i"]
+        if "i2i" in modes:
+            # Compile the reference PNG decoder kernels here, not in the first i2i request.
+            png_fast.warmup(self.device)
+        for mode in modes:
             kwargs = dict(ctx=ctx, height=height, width=width, num_inference_steps=steps)
             if mode == "i2i":
                 kwargs["image_cond"] = torch.zeros(1, 3, height, width, device=self.device)
