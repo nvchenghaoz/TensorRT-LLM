@@ -218,13 +218,78 @@ def _fp8r_qkv_qknorm_rope_cg_fake(
     return activation.new_empty((activation.shape[0], weight.shape[0]), dtype=torch.bfloat16)
 
 
+@torch.library.custom_op(
+    "trtllm::flux3_sm120_fp8r_qkv_rope_fp8_cg", mutates_args=(), device_types="cuda"
+)
+def fp8r_qkv_rope_fp8_cg(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    cos_sin: torch.Tensor,
+    sm_scale: float,
+    keep_v: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """flux3_fp8r_qkv.fp8r_qkv_rope_fp8 with its torch._scaled_mm replaced by ``gemm`` (bitwise
+    equal; large-M arm from flux3_sm120_large_m); the qknorm_rope_fp8 pass and its arguments are
+    exactly the original's (dynamic Q/K amax, static_qk=False)."""
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.sm120.flux3_sm120_qknorm_rope_fp8 import (
+        qknorm_rope_fp8,
+    )
+
+    from .flux3_primsts import _token_positions
+
+    out = gemm(
+        activation.contiguous(),
+        weight.contiguous(),
+        activation_scale.float().reshape(-1).contiguous(),
+        weight_scale.float().reshape(-1).contiguous(),
+    )
+    width = out.shape[1] // 3
+    QKV_FP8_ROUTES["fp8r_qkv_rope_fp8_cg"] += 1
+    qkv8, scales = qknorm_rope_fp8(
+        out[:, :width],
+        out[:, width:2 * width],
+        out[:, 2 * width:],
+        q_norm.detach(),
+        k_norm.detach(),
+        cos_sin.detach(),
+        _token_positions(out.shape[0], out.device),
+        sm_scale,
+        discard_qk=True,
+        keep_v=keep_v,
+        static_qk=False,  # main's image.0 path quantizes with the dynamic K1/K2 amax
+    )
+    return qkv8, scales, out
+
+
+@fp8r_qkv_rope_fp8_cg.register_fake
+def _fp8r_qkv_rope_fp8_cg_fake(
+    activation, weight, activation_scale, weight_scale, q_norm, k_norm, cos_sin, sm_scale,
+    keep_v=True,
+):
+    rows, columns = activation.shape[0], weight.shape[0]
+    return (
+        activation.new_empty((3, rows, columns // 3), dtype=torch.float8_e4m3fn),
+        activation.new_empty((8,), dtype=torch.float32),
+        activation.new_empty((rows, columns), dtype=torch.bfloat16),
+    )
+
+
+# Calls of the direct FP8R QKV twin (worker process; census/route log).
+QKV_FP8_ROUTES: Counter = Counter()
+
 # The original flux3_fp8r_qkv.fp8r_qkv_qknorm_rope, saved exactly once by install().
 _ORIGINAL_QKV_OP = None
+# The original flux3_fp8r_qkv.fp8r_qkv_rope_fp8 (torch._scaled_mm), saved exactly once by install().
+_ORIGINAL_QKV_FP8_OP = None
 
 
 def install(device: torch.device) -> bool:
     """Build at load and rebind the FP8R QKV op (idempotent). Returns True when routed."""
-    global _ORIGINAL_QKV_OP
+    global _ORIGINAL_QKV_OP, _ORIGINAL_QKV_FP8_OP
     if not enabled():
         return False
     preload(device)
@@ -233,4 +298,7 @@ def install(device: torch.device) -> bool:
     if _ORIGINAL_QKV_OP is None:
         _ORIGINAL_QKV_OP = flux3_fp8r_qkv.fp8r_qkv_qknorm_rope
     flux3_fp8r_qkv.fp8r_qkv_qknorm_rope = fp8r_qkv_qknorm_rope_cg
+    if _ORIGINAL_QKV_FP8_OP is None:
+        _ORIGINAL_QKV_FP8_OP = flux3_fp8r_qkv.fp8r_qkv_rope_fp8
+    flux3_fp8r_qkv.fp8r_qkv_rope_fp8 = fp8r_qkv_rope_fp8_cg
     return True
