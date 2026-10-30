@@ -70,9 +70,17 @@ def main():
     meta = Path(ckpt) / ".cache" / "huggingface" / "download" / "config.json.metadata"
     revision = meta.read_text().splitlines()[0].strip() if meta.is_file() else None
     harness = {"workload_identity": {
+        # Same parameters the serving pair's proxy reports (job 369 execution.parameters).
         "workload": {"kind": "visual-gen", "model": "black-forest-labs/flux-3-image-klein",
                      "variant": "nvfp4", "num_inference_steps": 16, "concurrency": [1],
-                     "tensor_parallel": 1, "cases": ["t2i-2048", "i2i-2048"]},
+                     "tensor_parallel": 1, "runtime": "tensorrt-llm",
+                     "cases": [
+                         {"name": "t2i-2048", "task": "text-to-image", "width": 2048,
+                          "height": 2048},
+                         {"name": "i2i-2048", "task": "image-to-image", "width": 2048,
+                          "height": 2048, "reference_images": 1, "reference_width": 2048,
+                          "reference_height": 2048},
+                     ]},
         "resolved_model": {"checkpoint": ckpt, "revision": revision}}}
     log(f"harness {json.dumps(harness)}")
     proc = subprocess.Popen([sys.executable, str(dst / "check.py"), json.dumps(harness)],
