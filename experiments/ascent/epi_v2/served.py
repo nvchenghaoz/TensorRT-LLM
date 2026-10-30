@@ -127,28 +127,49 @@ def check():
 
     graphs = {"t2i": (capture(run_graph_fn((16464, 16384))), (16464, 16384)),
               "i2i": (capture(run_graph_fn((32848, 16384))), (32848, 16384))}
-    seq = ["t2i", "i2i", "t2i", "i2i", "t2i"]
-    mism, n_cmp = 0, 0
-    for step, name in enumerate(seq):
-        g, Ms = graphs[name]
-        for M in Ms:
-            gbufs[M][0].fill_(0xFF)
-            gbufs[M][1].fill_(0xFF)
-        g.replay()
-        torch.cuda.synchronize()
-        for M in Ms:
+    # >= 50 rounds after warmup of t2i -> i2i (then the next round's t2i), eager 4176 between,
+    # outputs 0xFF-poisoned before every call, each output bitwise vs round 0 AND vs the
+    # kill-switch arm (main's _dyn_ev on the original weights); pristine inputs checked and
+    # restored every round.
+    rounds = int(os.environ.get("EPI_V2_SEQ_ROUNDS", "50"))
+    for name in ("t2i", "i2i"):  # warmup
+        graphs[name][0].replay()
+    torch.cuda.synchronize()
+    mism, mism_r0, n_cmp, first = 0, 0, 0, {}
+    for rnd in range(rounds):
+        for name in ("t2i", "i2i"):
+            g, Ms = graphs[name]
+            for M in Ms:
+                gbufs[M][0].fill_(0xFF)
+                gbufs[M][1].fill_(0xFF)
+            g.replay()
+            torch.cuda.synchronize()
+            for M in Ms:
+                n_cmp += 1
+                key = (name, M)
+                if key not in first:
+                    first[key] = [t.clone() for t in gbufs[M]]
+                mism += 0 if all(torch.equal(x, y) for x, y in zip(gbufs[M], cases[M][2])) else 1
+                mism_r0 += 0 if all(torch.equal(x, y) for x, y in zip(gbufs[M], first[key])) else 1
+            e = call(cases[4176][1], None, gbufs[4176])
+            torch.cuda.synchronize()
             n_cmp += 1
-            mism += 0 if all(torch.equal(x, y) for x, y in zip(gbufs[M], cases[M][2])) else 1
-        e = call(cases[4176][1], None, gbufs[4176])
-        torch.cuda.synchronize()
-        n_cmp += 1
-        mism += 0 if all(torch.equal(x, y) for x, y in zip(e, cases[4176][2])) else 1
+            mism += 0 if all(torch.equal(x, y) for x, y in zip(e, cases[4176][2])) else 1
         for M in cases:
             if not all(torch.equal(pristine[M][k], cases[M][1][k]) for k in KEYS):
                 mism += 1
-                log(f"inputs changed at step {step} M={M}")
+                log(f"inputs changed at round {rnd} M={M}")
+                for k in KEYS:
+                    cases[M][1][k].copy_(pristine[M][k])
+        if rnd % 10 == 0:
+            log(f"sequence round {rnd}: comparisons {n_cmp} mismatches {mism} vs-round0 {mism_r0}")
     del graphs
-    results["graph_sequence"] = {"sequence": seq, "comparisons": n_cmp, "mismatches": mism}
+    seq = ["t2i", "i2i"] * rounds
+    results["graph_sequence"] = {"rounds": rounds, "order": "t2i(16464+16384) -> eager 4176 -> "
+                                 "i2i(32848+16384) -> eager 4176, repeated",
+                                 "comparisons": n_cmp, "mismatches_vs_kill_switch_ref": mism,
+                                 "mismatches_vs_round0": mism_r0}
+    mism += mism_r0
     passed &= mism == 0
     log(f"graph sequence: {results['graph_sequence']}")
 
