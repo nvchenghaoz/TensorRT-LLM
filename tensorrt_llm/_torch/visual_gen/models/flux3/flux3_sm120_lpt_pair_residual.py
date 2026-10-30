@@ -89,6 +89,10 @@ def raster_for(rows: int) -> int:
 # bound is explicit (serves() is not relied on to keep M >= 24576 off t256).
 _T256_MIN = 8192
 _T256_MAX = 24576
+# Idea 95: M >= 24576 (i2i single 32848, [1,3,D] table + u8 index) also takes the t256 instance,
+# at raster_for's AlongN (r2). Bitwise equal to fused-128 r2 (same k64 MMA chain per element, same
+# epilogue math). TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_T256_LARGE=0 keeps fused-128 there (main's).
+_T256_LARGE_MIN = 24576
 
 
 @lru_cache(maxsize=1)
@@ -97,9 +101,17 @@ def t256_enabled() -> bool:
     return os.environ.get("TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_T256", "1").strip() != "0"
 
 
+@lru_cache(maxsize=1)
+def t256_large_enabled() -> bool:
+    """TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_T256_LARGE=0 keeps the 128 instance at M >= 24576."""
+    return os.environ.get("TRTLLM_FLUX3_SM120_PAIR_RESIDUAL_T256_LARGE", "1").strip() != "0"
+
+
 def _launcher(rows: int):
     """The kernel entry for a launch of M=rows (same arguments for both instances)."""
-    if t256_enabled() and _T256_MIN <= rows < _T256_MAX:
+    if t256_enabled() and (
+        _T256_MIN <= rows < _T256_MAX or (rows >= _T256_LARGE_MIN and t256_large_enabled())
+    ):
         return t256_module().lpt_pair_residual_t256
     return module().lpt_pair_residual
 
