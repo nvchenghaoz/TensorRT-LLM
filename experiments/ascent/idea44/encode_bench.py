@@ -196,12 +196,14 @@ class Arms:
 def build_content(osrv, images, prompt=PROMPT, ambiguous=False):
     from tensorrt_llm.serve.openai_protocol import ImageGenerationResponse, ImageObject
     sp = osrv._B64JsonSplicer()
+    if ambiguous:  # fixed prefix so both arms render the same body
+        sp._prefix = "trtllm-b64-00000000000000000000000000000000-"
     data = []
     for img in images:
         token = sp.placeholder(osrv.image_to_b64(img, format="PNG"))
         rp = prompt
         if ambiguous:
-            rp = f'"{token}"'  # the quoted placeholder appears twice -> JSONResponse fallback
+            rp = token  # the quoted placeholder appears twice -> JSONResponse fallback
         data.append(ImageObject(b64_json=token, revised_prompt=rp))
     resp = ImageGenerationResponse(created=0, data=data, output_format="png",
                                    size=f"{images[0].shape[1]}x{images[0].shape[0]}")
@@ -601,6 +603,8 @@ def main():
               and res["B"]["final_is_last"] and res["B"]["attr_body_eq"])
         cl = dict(res["B"]["headers"]).get(b"content-length")
         ok &= cl == str(len(res["B"]["body"])).encode()
+        if amb:
+            ok &= res["A"]["type"] == res["B"]["type"] == "JSONResponse"
         asgi[tag] = {"ok": ok, "A_type": res["A"]["type"], "B_type": res["B"]["type"],
                      "B_body_msgs": res["B"]["n_body_msgs"], "headers": [(k.decode(), v.decode()[:40]) for k, v in res["B"]["headers"]],
                      "body_len": len(res["B"]["body"]),
