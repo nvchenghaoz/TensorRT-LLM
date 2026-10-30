@@ -31,6 +31,7 @@ import torch
 CKPT = sys.argv[1]
 CENSUS_ROUNDS = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 ABA_ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 6
+NAME_LEN = int(sys.argv[4]) if len(sys.argv) > 4 else 160
 HERE = os.path.dirname(os.path.abspath(__file__))
 fails = []
 
@@ -111,9 +112,11 @@ args = VisualGenArgs(
     **engine,
 )
 log("engine", json.dumps(engine), "pipeline_config", json.dumps(pipeline_config))
-log("module default _X_POLICY", wk._X_POLICY)
-note(wk._X_POLICY == 2, "module default X_POLICY is 2 (main's default)")
-set_arm("X2")
+DEFAULT_XP = wk._X_POLICY
+DEFAULT_ARM = {0: "X0", 1: "X1", 2: "X2"}[DEFAULT_XP]
+log("module default _X_POLICY", DEFAULT_XP, "reference arm", DEFAULT_ARM)
+INFO["module_default_x_policy"] = DEFAULT_XP
+set_arm(DEFAULT_ARM)
 t0 = time.time()
 pipe = PipelineLoader(args, device="cuda:0").load()
 torch.cuda.synchronize()
@@ -218,7 +221,7 @@ def summarize_prof(prof):
         else:
             kind = "kernel"
         d = ev.device_time_total
-        r = per[(kind, ev.name[:160])]
+        r = per[(kind, ev.name[:NAME_LEN])]
         r[0] += 1
         r[1] += d
         iv.append((ev.time_range.start, ev.time_range.end))
@@ -279,7 +282,7 @@ def run(arm, case, profile=False, tag=""):
 results = {"info": INFO}
 # capture requests: X2 first (the reference = main default), alternate t2i/i2i
 caprecs = []
-for arm in ("X2", "X0", "X1", "X2b"):
+for arm in [DEFAULT_ARM] + [a for a in ARMS if a != DEFAULT_ARM]:
     for case in ("t2i", "i2i"):
         caprecs.append(run(arm, case, tag="capture"))
 results["capture_record"] = {a: {f"capturing={k[0]} defines={list(k[1])}": n
