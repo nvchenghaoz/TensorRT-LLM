@@ -483,7 +483,11 @@ with torch.inference_mode():
                            "cand_ref_rand": ref_stats(ryc, rref32), "base_ref_rand": ref_stats(ryb, rref32),
                            "cand_vs_ref_bf16_real": cmp(yc, ref_bf),
                            "cand_repeat_bitwise": bool(torch.equal(yc, yc2)),
-                           "ops_unchanged": all(torch.equal(ops[n], ops0[n]) for n in ops)}
+                           # inputs only (Y is the uninitialized output slot captured before the
+                           # call; it is never read), compared bytewise so NaN bit patterns match
+                           "ops_unchanged": all(torch.equal(ops[n].contiguous().view(torch.uint8),
+                                                            ops0[n].contiguous().view(torch.uint8))
+                                                for n in ops if n != "Y")}
                     per[keystr(*k)] = row
                     ks_ = keystr(*k)
                     # Independent-reference guard (stated before this run): the pinned plan's output
