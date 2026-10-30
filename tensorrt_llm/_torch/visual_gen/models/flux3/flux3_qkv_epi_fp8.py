@@ -33,6 +33,13 @@ _PARTS: dict[tuple[int, int], torch.Tensor] = {}
 # captured under the other setting must be cleared before replaying).
 ENABLED = os.environ.get("TRTLLM_FLUX3_QKV_EPI_FP8", "1").strip() != "0"
 
+# Idea 51: v_quant walks the BF16 v plane from its last 16-B chunk down. The GEMM's L=3 tile
+# order writes the v plane last, its last rows last, so the lines still in L2 are read first
+# (32848: 202 MB of v does not fit the 128 MB L2). Elementwise with the same scale: v8 bitwise.
+# TRTLLM_FLUX3_QKV_EPI_VQ_REVERSE=0 keeps the forward walk (read at import; module-level so one
+# process can A/B it; graphs captured under the other setting must be re-captured).
+VQ_REVERSE = os.environ.get("TRTLLM_FLUX3_QKV_EPI_VQ_REVERSE", "1").strip() != "0"
+
 
 def enabled() -> bool:
     return ENABLED
@@ -159,5 +166,6 @@ def qkv_rope_fp8(
         float(_MIN_SCALING_FACTOR),
         int(grid),
         0 if keep_v else 1,
+        1 if VQ_REVERSE else 0,
     )
     return qkv8, scales, out

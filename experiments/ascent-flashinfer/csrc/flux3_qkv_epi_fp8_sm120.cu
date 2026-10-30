@@ -31,6 +31,8 @@
  *   RoPE row = token row (the route passes identity positions; cos_sin is [M, 128] FP32).
  * v_quant (second entry) then reduces the V partials, writes scales[0..7] exactly as the VEC
  * mode 2 does and quantizes V (16-B loads, 8-B stores, optional L2 discard of the dead V lines).
+ * Its walk may run from the plane's last chunk down (reverse, idea 51): the GEMM writes the v
+ * plane (L = 2) last, so its last lines are the ones still in L2; v8 is bitwise either way.
  */
 #include <cuda_bf16.h>
 
@@ -639,7 +641,7 @@ __global__ void __launch_bounds__(kVThreads) v_quant_kernel(
     __nv_bfloat16 const* __restrict__ v, uint8_t* __restrict__ v8,
     float const* __restrict__ parts, int n_part, __nv_bfloat16 const* __restrict__ q_norm,
     __nv_bfloat16 const* __restrict__ k_norm, float* __restrict__ scales, int64_t chunks,
-    float sm_scale, float min_scale, int discard) {
+    float sm_scale, float min_scale, int discard, int reverse) {
   __shared__ float red[kVThreads / 32];
   int const tid = threadIdx.x;
   int const lane = tid & 31;
@@ -672,17 +674,22 @@ __global__ void __launch_bounds__(kVThreads) v_quant_kernel(
   }
   // 16-B chunks of 8 BF16; a warp covers 512 contiguous bytes (4 lines) per iteration.
   int64_t const stride = static_cast<int64_t>(gridDim.x) * kVThreads;
+  // reverse (TRTLLM_FLUX3_QKV_EPI_VQ_REVERSE): walk the plane from its last chunk down, so the
+  // lines the GEMM wrote last (the likeliest to still be in L2) are read first. Each element's
+  // arithmetic is unchanged (same f_v), so v8 is bitwise the forward walk's.
+  int const line_lane = reverse ? 7 : 0;  // the lane holding a line's first chunk
   for (int64_t c = static_cast<int64_t>(blockIdx.x) * kVThreads + tid; c < chunks; c += stride) {
-    uint4 w = ldg_nc_u4(v + c * 8);
+    int64_t const idx = reverse ? (chunks - 1 - c) : c;
+    uint4 w = ldg_nc_u4(v + idx * 8);
     uint2 o;
     o.x = e4m3x4(w.x, w.y, f_v);
     o.y = e4m3x4(w.z, w.w, f_v);
-    *reinterpret_cast<uint2*>(v8 + c * 8) = o;
+    *reinterpret_cast<uint2*>(v8 + idx * 8) = o;
     if (discard) {
       // Every lane of this line (8 lanes, chunks % 8 == 0) has consumed its loaded words.
       __syncwarp(__activemask());
-      if ((lane & 7) == 0) {
-        asm volatile("discard.global.L2 [%0], 128;" ::"l"(v + c * 8) : "memory");
+      if ((lane & 7) == line_lane) {
+        asm volatile("discard.global.L2 [%0], 128;" ::"l"(v + idx * 8) : "memory");
       }
     }
   }
@@ -762,7 +769,7 @@ void qkv3_epi_fp8(TensorView a, TensorView b, TensorView sfa, TensorView sfb, Te
 // L2 (the caller never reads v again; its contents become undefined).
 void v_quant(TensorView v, TensorView v8, TensorView v_parts, int64_t n_part, TensorView q_norm,
              TensorView k_norm, TensorView scales, double sm_scale, double min_scale,
-             int64_t grid, int64_t discard) {
+             int64_t grid, int64_t discard, int64_t reverse) {
   TVM_FFI_ICHECK_EQ(v.dtype(), dl_bfloat16);
   TVM_FFI_ICHECK_EQ(scales.dtype(), dl_float32);
   TVM_FFI_ICHECK(scales.numel() >= 8);
@@ -780,7 +787,7 @@ void v_quant(TensorView v, TensorView v8, TensorView v_parts, int64_t n_part, Te
       static_cast<__nv_bfloat16 const*>(q_norm.data_ptr()),
       static_cast<__nv_bfloat16 const*>(k_norm.data_ptr()), static_cast<float*>(scales.data_ptr()),
       elems / 8, static_cast<float>(sm_scale), static_cast<float>(min_scale),
-      static_cast<int>(discard));
+      static_cast<int>(discard), static_cast<int>(reverse));
   cudaError_t err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess) << "v_quant launch: " << cudaGetErrorString(err);
 }

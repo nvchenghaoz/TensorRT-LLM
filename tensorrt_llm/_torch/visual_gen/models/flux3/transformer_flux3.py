@@ -2503,8 +2503,6 @@ class Flux3Model(BaseDiffusionModel):
         )
         for _, block in cond:
             target = getattr(block, "_orig_mod", block)
-            # Main's generic cond route quantizes Q/K with the dynamic per-tensor amax.
-            target.attn._flux3_static_qk = False
             prepare_fp8_block(target)
             prepare_nvfp4_block(target)
         cond = [
