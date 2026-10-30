@@ -1314,6 +1314,12 @@ def qkv_forward(
 # _attend -> FlashInferAttention FP8). Module-level so one process can compare (Dynamo guards on it);
 # TRTLLM_FLUX3_QKV_FP8_DIRECT=0 keeps main's path.
 FLUX3_QKV_FP8_DIRECT = os.environ.get("TRTLLM_FLUX3_QKV_FP8_DIRECT", "1").strip() != "0"
+# Last single block (keep_rows > 0): its NVFP4-out G3 FMHA computes only the Q-row prefix
+# [0, keep_rows) over all S K/V rows (fmha_v2_flux3 q_rows launch; i2i S=32848 grid.x 172 -> 86,
+# t2i S=16464 keeps 86). Bitwise the first keep_rows rows of the full launch, which are the only
+# rows the keep_rows tail reads. Module-level (Dynamo guards on it);
+# TRTLLM_FLUX3_LAST_BLOCK_QPREFIX=0 keeps landing 18's full-row FMHA.
+FLUX3_LAST_BLOCK_QPREFIX = os.environ.get("TRTLLM_FLUX3_LAST_BLOCK_QPREFIX", "1").strip() != "0"
 
 
 def _fp8_direct_backend(attn: nn.Module):
@@ -1442,7 +1448,7 @@ def qkv_fp8_attention_forward(
                 qkv8, fp8_scales, batch, heads, up_data[:n], up_weight,
                 up_scales.reshape(-1)[: n * up_cols], up_weight_scale, inverse_scale,
                 up_original.reshape(-1, up_original.shape[-1])[:n], source, mode,
-                attn_nvfp4_out,
+                attn_nvfp4_out, n if FLUX3_LAST_BLOCK_QPREFIX else 0,
             )
             # The attention output's first n rows: fp4 rows and the leading n / 128 row blocks.
             out_cols = (fp4.shape[-1] * 2 // 16 + 3) // 4 * 4

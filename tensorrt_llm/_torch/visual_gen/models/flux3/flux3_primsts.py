@@ -1620,9 +1620,13 @@ def attn_nvfp4_out_module(key: torch.Tensor | None = None, value: torch.Tensor |
     return fx.get_flux3_d128_module((*levers, "nvfp4_out"))
 
 
-def _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight):
+def _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight, q_rows: int = 0):
     """visual_gen_fp8_attention_sm120_prequant's fmha_v2 call (routed levers + nvfp4_out) writing
-    nvfp4_quantize_prepared(O, attn_weight) directly: (fp4 [B, S, W/2] uint8, sf flat uint8)."""
+    nvfp4_quantize_prepared(O, attn_weight) directly: (fp4 [B, S, W/2] uint8, sf flat uint8).
+
+    q_rows > 0 (B = 1, last single block's keep_rows): the G3 launch computes only the Q-row
+    prefix (fmha_v2_flux3_d128_nvfp4_out_q_rows) over every K/V row; only fp4 rows [0, q_rows)
+    and the leading q_rows / 128 SF row blocks are defined (bitwise the full launch's)."""
     from tensorrt_llm._torch.visual_gen.attention.backends import fmha_v2_flux3 as fx
 
     _, rows, width = qkv8.shape
@@ -1631,6 +1635,13 @@ def _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight):
     q8, k8, v8 = (plane.view(batch, seq_len, heads, head_dim) for plane in qkv8.unbind(0))
     fp4 = torch.empty((batch, seq_len, width // 2), dtype=torch.uint8, device=qkv8.device)
     sf = torch.empty((fx.nvfp4_scale_bytes(rows, width),), dtype=torch.uint8, device=qkv8.device)
+    if q_rows > 0 and batch == 1:
+        fx.fmha_v2_flux3_d128_nvfp4_out_q_rows(
+            q8, k8, v8, fp4, sf, nvfp4_owner(attn_weight).inverse_scale, heads, head_dim, seq_len,
+            min(int(q_rows), seq_len), scale_bmm1_d=scales[3:4], scale_bmm2_d=scales[2:3],
+            module=attn_nvfp4_out_module(k8, v8),
+        )
+        return fp4, sf
     fx.fmha_v2_flux3_d128_nvfp4_out(
         q8, k8, v8, fp4, sf, nvfp4_owner(attn_weight).inverse_scale, heads, head_dim, seq_len,
         scale_bmm1_d=scales[3:4], scale_bmm2_d=scales[2:3], module=attn_nvfp4_out_module(k8, v8),
@@ -1657,11 +1668,13 @@ def fp8_prequant_attention_nvfp4_out_side_gate_up(
     source_weight: torch.Tensor | None,
     mode: int,
     attn_weight: torch.Tensor,
+    q_rows: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """fp8_prequant_attention_side_gate_up whose FMHA writes attn_out's NVFP4 activation
     (nvfp4_quantize_prepared(O, attn_weight): fp4 [B, S, W/2], 128x4 sf) instead of BF16 O. The
     fork, side stream, gate_up kernel and join are fp8_prequant_attention_side_gate_up's.
-    Returns (fp4, sf, packed, packed_scales), bitwise to the two ops plus the quantize."""
+    Returns (fp4, sf, packed, packed_scales), bitwise to the two ops plus the quantize.
+    q_rows > 0: the FMHA computes only the Q-row prefix (_prequant_attention_nvfp4_out)."""
     device = qkv8.device
     owner = nvfp4_owner(up_weight)
     up_activation, up_activation_scale = _prepared_activation(
@@ -1669,7 +1682,7 @@ def fp8_prequant_attention_nvfp4_out_side_gate_up(
     )
     if not _side_gate_up_supported(device, mode, up_activation, up_weight):
         SIDE_GATE_UP_COUNTERS["sync_fallback"] += 1
-        fp4, sf = _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight)
+        fp4, sf = _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight, q_rows)
         packed, packed_scales = nvfp4_swiglu_packed(
             up_activation, up_weight, up_activation_scale, up_weight_scale,
             owner.input_global_scale, owner.weight_global_scale, output_inverse_scale,
@@ -1681,11 +1694,11 @@ def fp8_prequant_attention_nvfp4_out_side_gate_up(
     )
     if side_gate_up_order() == "fmha_first":
         launch_gate_up.fork()
-        fp4, sf = _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight)
+        fp4, sf = _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight, q_rows)
         launch_gate_up.enqueue()
     else:
         launch_gate_up()
-        fp4, sf = _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight)
+        fp4, sf = _prequant_attention_nvfp4_out(qkv8, scales, batch, heads, attn_weight, q_rows)
     join()
     return fp4, sf, *outputs
 
@@ -1693,7 +1706,7 @@ def fp8_prequant_attention_nvfp4_out_side_gate_up(
 @fp8_prequant_attention_nvfp4_out_side_gate_up.register_fake
 def _fp8_prequant_attention_nvfp4_out_side_gate_up_fake(
     qkv8, scales, batch, heads, up_activation, up_weight, up_activation_scale, up_weight_scale,
-    output_inverse_scale, original, source_weight, mode, attn_weight,
+    output_inverse_scale, original, source_weight, mode, attn_weight, q_rows=0,
 ):
     _, rows, width = qkv8.shape
     packed, packed_scales = _nvfp4_swiglu_packed_fake(
