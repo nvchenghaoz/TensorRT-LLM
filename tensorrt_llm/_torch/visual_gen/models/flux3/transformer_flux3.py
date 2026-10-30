@@ -888,6 +888,22 @@ FLUX3_JOINT_TABLE = os.environ.get("TRTLLM_FLUX3_JOINT_TABLE", "1").strip().lowe
 )
 
 
+def _cond_step_batch_enabled() -> bool:
+    """TRTLLM_FLUX3_COND_STEP_BATCH (default 1): step-batch the flow-map text stream and the
+    image vec rows also when a conditioning image stream (i2i image_cond) is present. Neither
+    depends on image_cond. Output class reordered: the text blocks run at M=N*T and the vec
+    GEMVs at M=N, whose BF16 kernels reduce in another order than at M=T / M=1. 0 keeps
+    main's per-step i2i path."""
+    return os.environ.get("TRTLLM_FLUX3_COND_STEP_BATCH", "1").strip() != "0"
+
+
+def _has_cond_stream(layout) -> bool:
+    """True when a conditioning stream that blocks step batching is present (see above)."""
+    if _cond_step_batch_enabled():
+        return False
+    return any(name.endswith("_cond") and any(lengths) for name, lengths in layout)
+
+
 def _cond_primsts_enabled() -> bool:
     """TRTLLM_FLUX3_COND_PRIMSTS (default 1): prepare the i2i reference-stream mode blocks
     (content_mode_blocks.image_cond) for the SM120 NVFP4 block route; 0 keeps main's route."""
@@ -2011,7 +2027,7 @@ class Flux3Model(BaseDiffusionModel):
         inputs, layout, _ = self._packed_inputs(inputs, layout)
         if not inputs.get("_flux3_uniform_timesteps", False):
             return None
-        if any(name.endswith("_cond") and any(lengths) for name, lengths in layout):
+        if _has_cond_stream(layout):
             return None
         text_lengths = dict(layout).get("text", ())
         if len(text_lengths) != 1 or targets.ndim != 1 or not targets.shape[0]:
@@ -2099,7 +2115,7 @@ class Flux3Model(BaseDiffusionModel):
         inputs, layout, _ = self._packed_inputs(inputs, layout)
         if not inputs.get("_flux3_uniform_timesteps", False):
             return None
-        if any(name.endswith("_cond") and any(lengths) for name, lengths in layout):
+        if _has_cond_stream(layout):
             return None
         image_lengths = dict(layout).get("image", ())
         if len(image_lengths) != 1 or not image_lengths[0]:
