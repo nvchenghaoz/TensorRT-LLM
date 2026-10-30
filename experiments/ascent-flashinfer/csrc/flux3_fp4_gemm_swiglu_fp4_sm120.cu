@@ -161,6 +161,37 @@ __device__ __forceinline__ bool div_safe(float a, float b) {
 #ifndef FLUX3_EPI_VEC
 #define FLUX3_EPI_VEC 0
 #endif
+// Epilogue v2 (requires FLUX3_EPI_VEC=1's 64 columns per warp). 0 (default): EPI_VEC's epilogue.
+// 1: hierarchical N permutation ((2, 4), 2, 8):((1, 16), 64, 2), so lane q of a quad owns the 8
+// CONSECUTIVE value/gate pairs 8q..8q+7 of its warp's 32 outputs per row (block q>>1). The amax
+// needs one xor-1 shuffle, the e2m1 bytes pack lane-locally into one u32 per row, one xor-1
+// shuffle of a word forms an 8-B (row, block) chunk per lane (one STG.64), and every lane stores
+// its own (row, block) scale byte. Same bytes to the same addresses, same per-column K chain.
+#ifndef FLUX3_EPI_V2
+#define FLUX3_EPI_V2 0
+#endif
+// 2: the same lane-local epilogue on EPI_VEC's MMA permutation (unchanged mainloop); the caller
+// passes gate_up weight rows (and their scale rows) permuted within every 64-row group so that
+// accumulator pair slot q + 4r + 16nb holds output 8q + 4nb + r (see flux3_swiglu_fp4_cutlass.py
+// permute_weight_v2w). Mode 1's stride-16 lane columns put the 8 B rows of each ldmatrix on one
+// smem swizzle phase (measured +3.5% on the mainloop).
+#if FLUX3_EPI_V2 != 0 && FLUX3_EPI_VEC != 1
+#error "FLUX3_EPI_V2 needs FLUX3_EPI_VEC=1"
+#endif
+// STEP 0 diagnostics (WRONG numerics, timing only). FLUX3_DIAG_NOEPI: no epilogue work (the
+// accumulators are consumed only under a never-taken runtime branch). FLUX3_DIAG_NOSHFL: every
+// epilogue shuffle returns its own input. FLUX3_DIAG_NOSTORE: full epilogue, stores under a
+// never-taken runtime branch.
+#ifdef FLUX3_DIAG_NOSHFL
+#define FLUX3_SHFL_XOR(v, m) (v)
+#else
+#define FLUX3_SHFL_XOR(v, m) __shfl_xor_sync(0xffffffffu, (v), (m))
+#endif
+#ifdef FLUX3_DIAG_NOSTORE
+#define FLUX3_STORE_OK(p) ((p).rows_padded < 0)
+#else
+#define FLUX3_STORE_OK(p) true
+#endif
 
 struct SwigluParts {
   float prod;
@@ -272,6 +303,71 @@ class SwigluFp4Epilogue {
     int const q = lane & 3;
     int const row_base = static_cast<int>(m_coord) * BM;
     int const col_base = static_cast<int>(n_coord) * BN;
+#ifdef FLUX3_DIAG_NOEPI
+    if (params.rows_padded < 0) {  // never taken: keeps the MMA chain live
+      float s = 0.0f;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(accumulators); ++i) s += accumulators(i);
+      params.out[thread_idx] = static_cast<uint8_t>(__float_as_uint(s));
+    }
+    return;
+#endif
+#if FLUX3_EPI_V2 != 0
+    static_assert(MMA_N == 8, "EPI_V2: each lane owns 8 consecutive pairs of a 32-output span");
+    // Lane q: accumulator pair ni (0..7) of row half hh is output 8q + ni of its warp's 32 outputs
+    // (col = 16q + 64w + 2ni: value even, gate odd); outputs 0..15 = scale block 0 (q = 0, 1),
+    // 16..31 = block 1 (q = 2, 3).
+    int const odd = q & 1;
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < MMA_M; ++mi) {
+      float h[2][8];
+      CUTLASS_PRAGMA_UNROLL
+      for (int hh = 0; hh < 2; ++hh) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < 8; ++ni) {
+          h[hh][ni] = swiglu_h(accumulators(2 * hh, mi, ni), accumulators(2 * hh + 1, mi, ni),
+                               factor);
+        }
+      }
+      uint32_t word[2];
+      uint32_t enc[2];
+      CUTLASS_PRAGMA_UNROLL
+      for (int hh = 0; hh < 2; ++hh) {
+        float m = max_f32(0.0f, abs_f32(h[hh][0]));
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 1; ni < 8; ++ni) m = max_f32(m, abs_f32(h[hh][ni]));
+        float const amax = max_f32(m, FLUX3_SHFL_XOR(m, 1));
+        enc[hh] = e4m3_byte(div_rn(mul_rn(amax, inverse), 6.0f));
+        float const mult = div_rn(inverse, max_f32(e4m3_to_f32(enc[hh]), 1.0e-12f));
+        uint32_t w = 0;
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < 4; ++j) {
+          w |= e2m1x2_byte(mul_rn(h[hh][2 * j + 1], mult), mul_rn(h[hh][2 * j], mult)) << (8 * j);
+        }
+        word[hh] = w;  // bytes 4q..4q+3 of the row's 16-B (block_col even, +1) span
+      }
+      // Even lane: row g, its word + the odd partner's row-g word (8 B of its block).
+      // Odd lane: row g+8, the even partner's row-g+8 word + its own.
+      uint32_t const send = odd ? word[0] : word[1];
+      uint32_t const recv = FLUX3_SHFL_XOR(send, 1);
+      uint2 v;
+      v.x = odd ? recv : word[0];
+      v.y = odd ? word[1] : recv;
+      int const row = row_base + get<0>(tCcD(2 * odd, mi, 0));
+      // Warp's 64-column span (both permutations keep it contiguous) + lane's block (q >> 1).
+      int const span = get<1>(tCcD(0, mi, 0)) & ~63;
+      int const block_col = ((col_base + span) >> 5) + (q >> 1);
+      if (row < params.rows_padded && FLUX3_STORE_OK(params)) {
+        *reinterpret_cast<uint2*>(params.out + static_cast<int64_t>(row) * params.out_row_bytes +
+                                  block_col * 8) = v;
+        int64_t const idx = (block_col & 3) + (block_col >> 2) * 512 + (row & 31) * 16 +
+                            ((row & 127) >> 5) * 4 +
+                            static_cast<int64_t>(row >> 7) * 128 * params.sf_cols;
+        params.out_sf[idx] = static_cast<uint8_t>(odd ? enc[1] : enc[0]);
+      }
+    }
+  }
+#else
 #if FLUX3_EPI_VEC == 1
     static_assert(MMA_N == 8, "EPI_VEC: each warp owns exactly two adjacent scale blocks");
 #endif
@@ -321,8 +417,8 @@ class SwigluFp4Epilogue {
           float m = max_f32(0.0f, abs_f32(h[hh][0]));
           CUTLASS_PRAGMA_UNROLL
           for (int r = 1; r < 4; ++r) m = max_f32(m, abs_f32(h[hh][r]));
-          m = max_f32(m, __shfl_xor_sync(0xffffffffu, m, 1));
-          amax[hh] = max_f32(m, __shfl_xor_sync(0xffffffffu, m, 2));
+          m = max_f32(m, FLUX3_SHFL_XOR(m, 1));
+          amax[hh] = max_f32(m, FLUX3_SHFL_XOR(m, 2));
         }
         uint32_t enc[2];
         float mults[2];
@@ -362,15 +458,15 @@ class SwigluFp4Epilogue {
           CUTLASS_PRAGMA_UNROLL
           for (int r = 0; r < 4; ++r) {
             float const mine = h[hh][r];
-            float const partner = __shfl_xor_sync(0xffffffffu, mine, 1);
+            float const partner = FLUX3_SHFL_XOR(mine, 1);
             float const lo = (q & 1) ? partner : mine;
             float const hi = (q & 1) ? mine : partner;
             w |= e2m1x2_byte(mul_rn(hi, mult), mul_rn(lo, mult)) << (8 * r);
           }
           word_a[hh] = w;  // lanes q=0,1: bytes 0,2,4,6; lanes q=2,3: bytes 1,3,5,7
         }
-        uint32_t word_b0 = __shfl_xor_sync(0xffffffffu, word_a[0], 2);
-        uint32_t word_b1 = __shfl_xor_sync(0xffffffffu, word_a[1], 2);
+        uint32_t word_b0 = FLUX3_SHFL_XOR(word_a[0], 2);
+        uint32_t word_b1 = FLUX3_SHFL_XOR(word_a[1], 2);
 
         int const hh_store = q & 1;
 #if FLUX3_EPI_VEC == 1
@@ -388,7 +484,7 @@ class SwigluFp4Epilogue {
         int const row = row_base + get<0>(tCcD(2 * hh_store, mi, 0));
         int const col = col_base + get<1>(tCcD(0, mi, 0));
         int const block_col = col >> 5;
-        if (row < params.rows_padded) {
+        if (row < params.rows_padded && FLUX3_STORE_OK(params)) {
           if (q < 2) {
             uint4 v;
             v.x = vec_v[0].x;
@@ -432,6 +528,7 @@ class SwigluFp4Epilogue {
     }
   }
 #endif
+#endif  // FLUX3_EPI_V2
 
  private:
   Params params;
@@ -462,7 +559,11 @@ using StockBuilder = cutlass::gemm::collective::CollectiveBuilder<
 
 // N permutation: logical (atom col 8, warp 2, rep 4) -> col i + 32*w + 8*r, so each warp owns 32
 // contiguous accumulator columns (one 16-output scale block of the interleaved weight).
-#if FLUX3_EPI_VEC == 1
+#if FLUX3_EPI_V2 == 1
+// EPI_V2: ((pair 2, quad lane 4), warp 2, rep 8) -> col e + 16*q + 64*w + 2*r: each warp still owns
+// 64 contiguous columns, and lane q's pairs of rep 0..7 are the consecutive pairs 8q..8q+7.
+using PermTileN = Layout<Shape<Shape<_2, _4>, _2, _8>, Stride<Stride<_1, _16>, _64, _2>>;
+#elif FLUX3_EPI_VEC == 1
 // EPI_VEC: (atom col 8, warp 2, rep 8) -> col i + 64*w + 8*r, so each warp owns 64 contiguous
 // columns (two adjacent scale blocks per lane row; see FLUX3_EPI_VEC).
 using PermTileN = Layout<Shape<_8, _2, _8>, Stride<_1, _64, _8>>;
