@@ -2057,10 +2057,14 @@ def nvfp4_qkv_rope_fp8_impl(
     sm_scale: float,
     keep_v: bool = True,
     static_qk: bool = True,
+    rope_tab: torch.Tensor | None = None,
+    rope_idx: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(qkv8 [3, M, W] E4M3, scales [8] FP32, gemm [M, 3W] BF16 planar GEMM output).
 
     static_qk=True: the module's STATIC_QK rule (main); False: dynamic Q/K amax for this call.
+    rope_tab / rope_idx: flux3_qkv_epi_fp8.build_rope_compact(cos_sin) or None; read only by the
+    fused epilogue route (same values as cos_sin, idea 84).
 
     Same GEMMs as main's route; then flux3_sm120_qknorm_rope_fp8 instead of the in-place BF16
     norm/RoPE pass + fp8_sm12x K1/K2. gemm.view(3, M, W)[2] is v, the plane main hands PAG.
@@ -2090,6 +2094,8 @@ def nvfp4_qkv_rope_fp8_impl(
             cos_sin.detach(),
             sm_scale,
             keep_v,
+            None if rope_tab is None else rope_tab.detach(),
+            None if rope_idx is None else rope_idx.detach(),
         )
     out = _sm120_qkv_planar_gemms(
         activation.detach(),
@@ -2132,6 +2138,8 @@ def nvfp4_qkv_rope_fp8_prepared(
     sm_scale: float,
     keep_v: bool = True,
     static_qk: bool = True,
+    rope_tab: torch.Tensor | None = None,
+    rope_idx: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """nvfp4_qkv_prepared + fp8_sm12x's quantize, straight from the NVFP4 QKV GEMM to E4M3.
 
@@ -2155,6 +2163,8 @@ def nvfp4_qkv_rope_fp8_prepared(
         sm_scale,
         keep_v,
         static_qk,
+        rope_tab,
+        rope_idx,
     )
 
 
@@ -2173,6 +2183,8 @@ def _nvfp4_qkv_rope_fp8_prepared_fake(
     sm_scale,
     keep_v=True,
     static_qk=True,
+    rope_tab=None,
+    rope_idx=None,
 ):
     rows, columns = activation.shape[0], weight.shape[0]
     return (

@@ -40,9 +40,86 @@ ENABLED = os.environ.get("TRTLLM_FLUX3_QKV_EPI_FP8", "1").strip() != "0"
 # process can A/B it; graphs captured under the other setting must be re-captured).
 VQ_REVERSE = os.environ.get("TRTLLM_FLUX3_QKV_EPI_VQ_REVERSE", "1").strip() != "0"
 
+# Idea 84: the Q/K epilogue reads RoPE through a compact per-axis index instead of each row's
+# [128] FP32 cos_sin (re-read by all 48 Q/K tiles of every 128-row band). Axis a = pairs
+# 16a..16a+15. rope_tab [4M, 32] is cos_sin permuted into the epilogue's lane order (entry
+# 4r + a = row r's axis-a slice); rope_idx [M, 4] int32 points each row's axis at the entry of the
+# FIRST row with the same slice bits, so a tile reads a few hundred hot entries (L1/L2) instead of
+# 128 rows x 512 B. Fixed shapes, no host sync: every index is checked on device bit for bit
+# (all 32 words) and a row whose slice differs points at its own entry. Same values, so outputs
+# are bitwise. Built once per request with the cos_sin table (_packed_positions).
+# TRTLLM_FLUX3_QKV_EPI_ROPE_COMPACT=0: no table, landing 22's kernel and inputs (read at import;
+# module-level so one process can A/B it; graphs captured under the other setting must be
+# re-captured).
+ROPE_COMPACT = os.environ.get("TRTLLM_FLUX3_QKV_EPI_ROPE_COMPACT", "1").strip() != "0"
+# Test hook: make the compact table's verification fail (the full table is used).
+_ROPE_COMPACT_FORCE_MISMATCH_ENV = "TRTLLM_FLUX3_QKV_EPI_ROPE_COMPACT_FORCE_MISMATCH"
+_ROPE_AXES = 4
+_ROPE_SLOTS = 8  # lane slot s = q + 4 wn of the epilogue (its pair p0)
+
 
 def enabled() -> bool:
     return ENABLED
+
+
+@lru_cache(maxsize=None)
+def _rope_columns(device: torch.device) -> torch.Tensor:
+    """[4, 32] cos_sin columns of each axis entry: slot s, k -> cos(16a+s), cos(16a+s+8),
+    sin(16a+s), sin(16a+s+8) (k = 0..3)."""
+    cols = [
+        [(k >> 1) * 64 + 16 * a + s + 8 * (k & 1) for s in range(_ROPE_SLOTS) for k in range(4)]
+        for a in range(_ROPE_AXES)
+    ]
+    return torch.tensor(cols, dtype=torch.long, device=device)
+
+
+def build_rope_compact(cos_sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """(rope_tab f32 [4M, 32], rope_idx i32 [M, 4]) for the FP32 [M, 128] cos_sin table, or None
+    (route off, unsupported table, or the forced-mismatch test hook: the full table is used).
+
+    Device ops of fixed shape only (no host sync). rope_tab[4r + a] is row r's axis-a slice in
+    the epilogue's lane order; rope_idx[r][a] = 4 rep + a for the first row rep whose slice key
+    (its first cos and sin words) matches, kept only where all 32 words of the two slices are
+    bit-equal, else 4r + a (the row's own entry). So rope_tab[rope_idx[r][a]] == row r's slice
+    bit for bit for every row and axis."""
+    if not (ENABLED and ROPE_COMPACT):
+        return None
+    if (cos_sin.dtype != torch.float32 or cos_sin.dim() != 2 or cos_sin.shape[1] != 128
+            or not cos_sin.is_contiguous() or not cos_sin.is_cuda or cos_sin.shape[0] == 0
+            or 4 * cos_sin.shape[0] >= 2**31):
+        return None
+    if os.environ.get(_ROPE_COMPACT_FORCE_MISMATCH_ENV, "0").strip() == "1":
+        return None
+    rows = cos_sin.shape[0]
+    dev = cos_sin.device
+    perm = _rope_columns(dev).reshape(-1)
+    tab = cos_sin.view(torch.int32)[:, perm].contiguous()  # [M, 4 * 32]
+    slab = tab.view(rows, _ROPE_AXES, 32)
+    key = (slab[:, :, 0].long() << 32) | (slab[:, :, 2].long() & 0xFFFFFFFF)  # [M, 4]
+    sorted_key, order = torch.sort(key.t().contiguous(), dim=1, stable=True)  # [4, M]
+    start = torch.ones_like(sorted_key, dtype=torch.bool)
+    start[:, 1:] = sorted_key[:, 1:] != sorted_key[:, :-1]
+    pos = torch.arange(rows, device=dev).expand(_ROPE_AXES, rows)
+    seg = torch.where(start, pos, torch.zeros_like(pos)).cummax(dim=1).values
+    rep = torch.empty_like(order).scatter_(1, order, order.gather(1, seg)).t()  # [M, 4]
+    axis = torch.arange(_ROPE_AXES, device=dev)
+    ent = rep * _ROPE_AXES + axis
+    own = torch.arange(rows, device=dev).unsqueeze(1) * _ROPE_AXES + axis
+    entries = tab.view(rows * _ROPE_AXES, 32)
+    match = (entries[ent.reshape(-1)].view(rows, _ROPE_AXES, 32) == slab).all(dim=-1)
+    idx = torch.where(match, ent, own).to(torch.int32).contiguous()
+    return entries.view(torch.float32), idx
+
+
+def _rope_compact_ok(rows: int, cos_sin, rope_tab, rope_idx) -> bool:
+    if not ROPE_COMPACT or rope_tab is None or rope_idx is None:
+        return False
+    return (rope_tab.dtype == torch.float32 and rope_tab.dim() == 2 and rope_tab.shape[1] == 32
+            and rope_idx.dtype == torch.int32 and rope_idx.dim() == 2 and rope_idx.shape[1] == 4
+            and rope_idx.shape[0] == cos_sin.shape[0] and rope_idx.shape[0] >= rows
+            and rope_tab.shape[0] == _ROPE_AXES * rope_idx.shape[0]
+            and rope_tab.is_contiguous() and rope_idx.is_contiguous()
+            and rope_tab.data_ptr() % 16 == 0 and rope_idx.data_ptr() % 16 == 0)
 
 
 @lru_cache(maxsize=1)
@@ -117,11 +194,14 @@ def qkv_rope_fp8(
     cos_sin: torch.Tensor,
     sm_scale: float,
     keep_v: bool = True,
+    rope_tab: torch.Tensor | None = None,
+    rope_idx: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(qkv8 [3, M, W] E4M3, scales [8] FP32, gemm [M, 3W] BF16 with only its v plane defined).
 
     cos_sin: FP32 [M, 128] RoPE table indexed by token row (identity positions).
     keep_v=False: the caller never reads gemm's v plane; v_quant drops its L2 lines.
+    rope_tab / rope_idx: build_rope_compact(cos_sin) (idea 84), or None for the full table.
     """
     from tensorrt_llm._torch.visual_gen.attention.backends.fp8_sm12x import _MIN_SCALING_FACTOR
 
@@ -138,7 +218,7 @@ def qkv_rope_fp8(
     n_part = ((rows + 127) // 128) * (width // 128)
     parts = _parts(device, n_part)
     qkv8_u8 = qkv8.view(torch.uint8)
-    mod.qkv3_epi_fp8(
+    gemm_args = (
         activation,
         weight,
         activation_scale,
@@ -153,6 +233,10 @@ def qkv_rope_fp8(
         strided.workspace(device, 0),
         float(_MIN_SCALING_FACTOR),
     )
+    if _rope_compact_ok(rows, cos_sin, rope_tab, rope_idx):
+        mod.qkv3_epi_fp8_compact(*gemm_args, rope_tab, rope_idx)
+    else:
+        mod.qkv3_epi_fp8(*gemm_args)
     grid = max(1, min(_VQ_CTAS_PER_SM * _sm_count(device), (rows * width // 8 + 511) // 512))
     mod.v_quant(
         v,
