@@ -111,17 +111,25 @@ def real_gate(gen):
     ck = sys.argv[2] if len(sys.argv) > 2 else ""
     try:
         from safetensors import safe_open
-        for f in sorted(glob.glob(os.path.join(ck, "*.safetensors"))):
+        import re
+        pat = re.compile(r"(^|\.)layers\.0\..*gate\.weight$")
+        files = sorted(glob.glob(os.path.join(ck, "*.safetensors")))
+        log("checkpoint shards:", len(files))
+        for f in files:
             with safe_open(f, "pt", device="cpu") as h:
-                keys = [k for k in h.keys() if k.endswith(".gate.weight") and ".layers.0." in k]
+                if f == files[0]:
+                    log("sample keys:", [k for k in h.keys() if "gate" in k][:8])
+                keys = [k for k in h.keys() if pat.search(k) and "proj" not in k]
                 if keys:
                     k = keys[0]
                     w = h.get_tensor(k).to(torch.bfloat16).cuda()
-                    bk = k.replace(".weight", ".e_score_correction_bias")
-                    b = h.get_tensor(bk).float().cuda() if bk in h.keys() else None
-                    if b is None:
-                        bk2 = k.replace("gate.weight", "gate.bias")
-                        b = h.get_tensor(bk2).float().cuda() if bk2 in h.keys() else None
+                    names = set(h.keys())
+                    b = None
+                    for bk in (k.replace(".weight", ".e_score_correction_bias"), k.replace("gate.weight", "gate.bias"),
+                               k.replace(".weight", ".bias")):
+                        if bk in names:
+                            b = h.get_tensor(bk).float().cuda()
+                            break
                     log("real gate:", k, tuple(w.shape), "bias:", None if b is None else tuple(b.shape))
                     if tuple(w.shape) == (EXPERTS, HIDDEN):
                         return w, b, k
@@ -191,8 +199,9 @@ def check():
                 x = torch.randn((m, HIDDEN), generator=gen, device="cuda").to(torch.bfloat16)
                 lk = router(x, w)
                 lc = cublas_ref(x, w)
-                wk, ik = route(lk, bias)
-                wc, ic = route(lc, bias)
+                ik, wk = route(lk, bias)  # apply() returns (indices int32, weights fp32)
+                ic, wc = route(lc, bias)
+                assert ik.dtype == torch.int32 and wk.dtype == torch.float32
                 same = (ik == ic).all(dim=1)
                 n_rows += m
                 idx_eq += int(same.sum())
@@ -204,7 +213,7 @@ def check():
                     sc = torch.nn.functional.softplus(lc.double()).sqrt() + bias.double()
                     srt = sc.sort(dim=1, descending=True).values
                     for r in (~same).nonzero().flatten().tolist():
-                        if len(ties) < 20:
+                        if len(ties) < 5:
                             ties.append({"call": c, "row": r, "gap_6th_7th": (srt[r, 5] - srt[r, 6]).item(),
                                          "idx_kernel": sorted(ik[r].tolist()), "idx_cublas": sorted(ic[r].tolist())})
             rate = idx_eq / n_rows
