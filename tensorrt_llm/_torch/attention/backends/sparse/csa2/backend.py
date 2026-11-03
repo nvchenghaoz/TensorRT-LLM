@@ -777,6 +777,9 @@ class CSA2FlashInfer:
         self._paged_plans: dict[tuple, CSA2FlashInfer._Plan] = {}
         # Fused mask/rows staging and sink epilogue (bitwise equal to _forward).
         self.fused_glue = os.environ.get("TRTLLM_CSA2_FLASHINFER_FUSED_GLUE", "1") != "0"
+        # Generation-only rows: two-launch Triton split-KV sink attention.
+        self.split_sink_decode = os.environ.get("TRTLLM_CSA2_SPLIT_SINK_DECODE", "1") != "0"
+        self._decode_workspaces: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def __call__(
         self,
@@ -840,6 +843,45 @@ class CSA2FlashInfer:
         )
         output, lse = plan.wrapper.run(q.contiguous(), rows, rows, return_lse=True)
         return sink_epilogue(output, lse, sink.float().contiguous(), lengths, out)
+
+    def _forward_pools_decode(self, q, swa, extra, lengths, sink, scale, protect=False, out=None):
+        """Generation-only ``_forward_pools``: two Triton launches reading the pools in place.
+
+        Split-KV sink attention over ``(swa[i] ++ extra[i])[:lengths[i]]`` (same math as
+        ``_forward_pools`` in another order). Falls back to ``_forward_pools`` for
+        geometry the kernel does not cover.
+        """
+        from . import split_sink_decode as ssd
+
+        count, heads, dim = q.shape
+        width = swa.shape[1] + (0 if extra is None else extra.shape[1])
+        if (
+            not self.split_sink_decode
+            or dim != 512
+            or q.dtype != torch.bfloat16
+            or swa.dtype != torch.bfloat16
+            or (extra is not None and extra.dtype != torch.bfloat16)
+            or count == 0
+            or width == 0
+            or not ssd.supported(q, swa, extra)
+        ):
+            return self._forward_pools(q, swa, extra, lengths, sink, scale, protect, out)
+        if out is None:
+            out = torch.empty_like(q)
+        key = (count, heads, width, q.device)
+        ws = self._decode_workspaces.get(key)
+        if ws is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Warm up the CSA2 split sink decode shape before CUDA Graph capture")
+            o_shape, ml_shape = ssd.workspace_shapes(count, heads, width, dim)
+            ws = (
+                torch.empty(o_shape, dtype=torch.float32, device=q.device),
+                torch.empty(ml_shape, dtype=torch.float32, device=q.device),
+            )
+            self._decode_workspaces[key] = ws
+        if sink.dtype != torch.float32 or not sink.is_contiguous():
+            sink = sink.float().contiguous()
+        return ssd.split_sink_decode(q, swa, extra, lengths, sink, scale, out, *ws)
 
     def _ragged_plan(self, count, heads, width, dim, device, scale):
         from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
@@ -982,8 +1024,13 @@ class CSA2FlashInfer:
             key = (query.shape[0], query.shape[1], width, q.device, scale)
             self._evict_eager_plans(metadata, key)
             output = forward_args.output
+            forward = (
+                self._forward_pools_decode
+                if forward_args.attention_input_type == AttentionInputType.generation_only
+                else self._forward_pools
+            )
             with torch.cuda.device(q.device):
-                result = self._forward_pools(
+                result = forward(
                     query,
                     swa,
                     extra,
