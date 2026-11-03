@@ -144,6 +144,79 @@ def stage_rows_and_mask(
 
 
 @triton.jit
+def _stage_shared_indices_and_mask_kernel(
+    indices_ptr,
+    plan_indices_ptr,
+    mask_ptr,
+    flag_ptr,
+    indices_stride0,
+    width,
+    mask_bytes,
+    MASK_BLOCK: tl.constexpr,
+):
+    query = tl.program_id(0)
+    byte = tl.arange(0, MASK_BLOCK)
+    bit = tl.arange(0, 8)
+    cols = byte[:, None] * 8 + bit[None, :]
+    in_width = cols < width
+    idx = tl.load(
+        indices_ptr + query.to(tl.int64) * indices_stride0 + cols, mask=in_width, other=-1
+    )
+    valid = (idx >= 0) & in_width
+    tl.store(
+        plan_indices_ptr + query.to(tl.int64) * width + cols, tl.maximum(idx, 0), mask=in_width
+    )
+    # Integer sums are exact in any order.
+    packed = tl.sum(valid.to(tl.int32) << bit[None, :], axis=1)
+    tl.store(
+        mask_ptr + query.to(tl.int64) * mask_bytes + byte,
+        packed.to(tl.uint8),
+        mask=byte < mask_bytes,
+    )
+    any_valid = tl.max(tl.max(valid.to(tl.int32), axis=1), axis=0)
+    tl.store(flag_ptr + query, any_valid)
+
+
+def stage_shared_indices_and_mask(
+    indices: torch.Tensor,
+    plan_indices: torch.Tensor,
+    packed_mask: torch.Tensor,
+    valid_flag: torch.Tensor,
+) -> None:
+    """One launch: ``plan_indices = clamp_min(indices, 0).flatten()``, FlashInfer's
+    little-endian packed mask (bit ``j`` of query ``i`` iff ``indices[i, j] >= 0``) and
+    ``valid_flag[i] = any(indices[i] >= 0)``. Holes may sit anywhere in a row."""
+    count, width = indices.shape
+    mask_bytes = (width + 7) // 8
+    if (
+        indices.dtype != torch.int32
+        or indices.stride(1) != 1
+        or plan_indices.dtype != torch.int32
+        or not plan_indices.is_contiguous()
+        or plan_indices.numel() != count * width
+        or packed_mask.dtype != torch.uint8
+        or not packed_mask.is_contiguous()
+        or packed_mask.numel() != count * mask_bytes
+        or valid_flag.dtype != torch.int32
+        or valid_flag.numel() < count
+    ):
+        raise ValueError("CSA2 shared staging received unexpected buffer geometry")
+    if count == 0:
+        return
+    _stage_shared_indices_and_mask_kernel[(count,)](
+        indices,
+        plan_indices,
+        packed_mask,
+        valid_flag,
+        indices.stride(0),
+        width,
+        mask_bytes,
+        MASK_BLOCK=triton.next_power_of_2(mask_bytes),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _sink_epilogue_kernel(
     o_ptr,
     lse_ptr,
