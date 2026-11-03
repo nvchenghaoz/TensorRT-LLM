@@ -120,6 +120,9 @@ def make_prefill(seed, count=PREFILL_Q, width=WIDTH, bank_rows=BANK_ROWS):
     holes = torch.rand(count, width, generator=gen, device="cuda") < 0.1
     indices = torch.where(holes, torch.full_like(indices, -1), indices)
     indices[0, 1:] = -1  # a query with one valid row
+    indices[0, 0] = 5
+    # every query keeps >= 1 valid row (a fully masked row is NaN by design; run_shared zeroes it)
+    indices[:, 0] = indices[:, 0].clamp_min(0)
     sink = torch.randn(HEADS, generator=gen, device="cuda", dtype=torch.float32)
     return q, bank, indices, sink
 
