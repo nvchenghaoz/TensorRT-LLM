@@ -11,6 +11,7 @@ from torch import nn
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.modules.small_n_gemv import small_n_linear
 
 
 @dataclass(frozen=True)
@@ -74,13 +75,13 @@ class CSA2Compressor(nn.Module):
 
     def forward(self, x: torch.Tensor, batch: CSA2CompressionBatch | None = None) -> torch.Tensor:
         if self.ratio == 1:
-            latent = self.wkv(x)
+            latent = small_n_linear(self.wkv, x)
         else:
             if batch is None:
                 raise ValueError("Ratio-2 compression requires paged state metadata")
             if batch.kv_state.dtype != torch.float32 or batch.score_state.dtype != torch.float32:
                 raise ValueError("CSA2 partial compression state must remain FP32")
-            kv_score = self.wkv_gate(x)
+            kv_score = small_n_linear(self.wkv_gate, x)
             # Rows without a complete window are not written by the kernel and
             # must read as zero (chain rewind re-derives state from them).
             latent = torch.zeros((batch.output_rows, self.head_dim), device=x.device, dtype=x.dtype)

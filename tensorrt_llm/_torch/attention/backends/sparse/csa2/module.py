@@ -20,6 +20,7 @@ from tensorrt_llm._torch.modules.linear import (
 )
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.modules.small_n_gemv import small_n_linear
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -466,7 +467,7 @@ class DeepseekV41Attention(nn.Module):
                 latent = self.compressor(global_input, compression)
                 # The index-K norm and both RoPEs run inside the cache writes
                 # (see ``global_transforms``); the rows stay untransformed here.
-                index_k = self.index_wk(latent)
+                index_k = small_n_linear(self.index_wk, latent)
                 main_kv = latent
                 if self.rotary_emb.is_neox:
                     if index_k.shape[0]:
@@ -530,7 +531,7 @@ class DeepseekV41Attention(nn.Module):
         )
         index_weights = None
         if self.layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX):
-            projected = self.index_weights_proj(hidden_states)
+            projected = small_n_linear(self.index_weights_proj, hidden_states)
             # One launch for ``(projected * scale).float()``, bit for bit.
             index_weights = torch.mul(
                 projected,
