@@ -635,7 +635,8 @@ void launch_twoshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t
 }
 
 // CTAs per token for the plain one-shot all-reduce when cluster launch is unavailable (SM120/SM121).
-constexpr int kSm120DefaultCtasPerToken = 1;
+// 4 CTAs x 160 threads per 5120-wide bf16 token measured best at decode M=1..8 (4-rank PCIe, PDL on).
+constexpr int kSm120DefaultCtasPerToken = 4;
 
 bool use_oneshot(int token_num)
 {

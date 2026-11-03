@@ -58,7 +58,7 @@ class ChainRunner:
 
 
 def _time_chain(torch, run, m, rank, dev):
-    meds = []
+    meds, flat = [], []
     for s in range(SEQS):
         run.x.copy_(B._gen(torch, m, 0, rank, dev))
         torch.cuda.synchronize()
@@ -71,9 +71,14 @@ def _time_chain(torch, run, m, rank, dev):
             run()
             ev[i][1].record()
         torch.cuda.synchronize()
-        ts = sorted(a.elapsed_time(b) for a, b in ev)
-        meds.append(ts[len(ts) // 2] / CHAIN)
-    return {"per_call_ms": sorted(meds)[SEQS // 2], "seq": meds}
+        ts = sorted(a.elapsed_time(b) / CHAIN for a, b in ev)
+        flat += ts
+        meds.append(ts[len(ts) // 2])
+    flat.sort()
+    n = len(flat)
+    med = sorted(meds)[SEQS // 2]
+    return {"per_call_ms": med, "seq": meds, "noise_floor": (flat[(9 * n) // 10] - flat[n // 10]) / med,
+            "seq_spread": (max(meds) - min(meds)) / med}
 
 
 def _emul(torch, m, seed, dev):
@@ -82,7 +87,8 @@ def _emul(torch, m, seed, dev):
     return (((ins[0] + ins[1]) + ins[2]) + ins[3]).to(torch.bfloat16)
 
 
-def _check_save(torch, run, m, rank, dev, path):
+def _check_save(torch, run, m, rank, dev, path, bound):
+    """bound: 2^-8 for the lamport sum (fp32, one rounding); 2^-6 (method 491 B) for the NCCL bf16 ring control."""
     worst, bad, emul_mis, negz = 0.0, 0, 0, 0
     outs = torch.empty((WARMUP + ITERS, m, HIDDEN), dtype=torch.bfloat16, device=dev)
     per_iter_e = []
@@ -94,7 +100,7 @@ def _check_save(torch, run, m, rank, dev, path):
         e, fin, nz = B._err(torch, out, ref, absum)
         per_iter_e.append(e)
         worst = max(worst, e)
-        bad += int(e > 2.0 ** -8 or not fin)
+        bad += int(e > bound or not fin)
         negz += nz
         emul_mis += int(not torch.equal(out.view(torch.int16), _emul(torch, m, it + 1, dev).view(torch.int16)))
     torch.cuda.synchronize()
@@ -127,7 +133,8 @@ def rank_variant(env, do_time, do_check, do_robust):
         if do_check:
             run = B.Runner(torch, mapping, strat, m, graph=True)
             res["check"][str(m)] = _check_save(torch, run, m, rank, dev,
-                                               os.path.join(env["_outdir"], f"{name}_m{m}_r{rank}.pt"))
+                                               os.path.join(env["_outdir"], f"{name}_m{m}_r{rank}.pt"),
+                                               2.0 ** -8 if env["_strategy"] == "ONESHOT" else B.BOUND)
             del run
         torch.cuda.synchronize()
         if rank == 0:
@@ -190,7 +197,9 @@ def _summ_timing(res):
         per = [r["timing"][m] for r in res]
         out[m] = {"iso_us": round(max(p["median_ms"] for p in per) * 1e3, 2),
                   "burst_us": round(max(p["burst_mean_ms"] for p in per) * 1e3, 2),
-                  "chain_us": round(max(p["chain"]["per_call_ms"] for p in per) * 1e3, 2),
+                  "chain_us": round(max(p["chain"]["per_call_ms"] for p in per) * 1e3, 3),
+                  "chain_noise_floor": round(max(p["chain"]["noise_floor"] for p in per), 4),
+                  "chain_seq_spread": round(max(p["chain"]["seq_spread"] for p in per), 4),
                   "noise_floor": round(max(p["noise_floor"] for p in per), 4)}
     return out
 
@@ -210,8 +219,11 @@ def main():
         res = run_ranks(rank_variant, dict(base, _name="pair", _strategy="ONESHOT"), True, False, False)
         t = _summ_timing(res)
         log(json.dumps(t))
-        print(json.dumps({"batch": {m: {"step_ms": v["iso_us"] / 1e3, "noise_floor": v["noise_floor"],
-                                        "burst_us": v["burst_us"], "chain_us": v["chain_us"]}
+        # step_ms = per-call time of 8 ARs captured back to back in one graph (the in-graph launch PDL changes);
+        # iso_us (event per single-AR replay) is dominated by graph-launch jitter and kept for reference.
+        print(json.dumps({"batch": {m: {"step_ms": v["chain_us"] / 1e3, "noise_floor": v["chain_noise_floor"],
+                                        "seq_spread": v["chain_seq_spread"], "iso_us": v["iso_us"],
+                                        "iso_noise_floor": v["noise_floor"], "burst_us": v["burst_us"]}
                                     for m, v in t.items()},
                           "output": {"class": "exact"}}))
         return
@@ -236,7 +248,8 @@ def main():
                             "max_e": max(r["check"][m]["max_e"] for r in res),
                             "neg_zero_outputs": sum(r["check"][m]["neg_zero_outputs"] for r in res),
                             "not_bitwise_vs_emulation": sum(r["check"][m][
-                                "iters_not_bitwise_vs_fp32_rank_order_emulation"] for r in res)}
+                                "iters_not_bitwise_vs_fp32_rank_order_emulation"] for r in res),
+                            "bound": 2.0 ** -8 if strat == "ONESHOT" else B.BOUND}
                         for m in res[0]["check"]}
         for m, c in checks[name].items():
             allok = allok and c["bad_iters_e"] == 0
