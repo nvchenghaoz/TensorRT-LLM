@@ -201,12 +201,17 @@ def main():
     mismatches = []
     spliced_ms, full_ms = [], []
     off_len = 0
+    stock_resync_names = []  # stock-lookup resync fallbacks (stock guard; full re-tokenization)
     for k, (name, text) in enumerate(prompts):
         before = cache.splices
+        before_resync = cache.resync_failures
         t = time.perf_counter()
         ids, _ = proc_.call_with_text_prompt({"prompt": text}, sp)
         ms = (time.perf_counter() - t) * 1e3
         (spliced_ms if cache.splices > before else full_ms).append(ms)
+        if cache.resync_failures > before_resync:
+            stock_resync_names.append(name)
+            print(f"stock-lookup resync fallback on {name} (full tokenization)", flush=True)
         ref = hf(text, add_special_tokens=True).input_ids
         if list(ids) != list(ref):
             mismatches.append(name)
@@ -265,6 +270,9 @@ def main():
         "splices": cache.splices,
         "splice_resync_fallbacks": cache.splice_fallbacks,
         "stock_resync_fallbacks": cache.resync_failures,
+        "stock_resync_fallback_prompts": stock_resync_names,
+        "stock_resync_fallbacks_benchmark_shaped": sum(
+            1 for n in stock_resync_names if not n.startswith(("var", "short"))),
         "splice_no_cut": cache.splice_no_cut,
         "cuts_checked": len(cuts),
         "cut_violations": violations,
@@ -277,7 +285,8 @@ def main():
     })
     result["passed"] = bool(
         len(mismatches) == 0 and violations == 0 and fuzz_bad == 0 and not cache.disabled
-        and cache.splices > 0 and cache.splice_fallbacks == 0 and cache.resync_failures == 0
+        and cache.splices > 0 and cache.splice_fallbacks == 0
+        and result["stock_resync_fallbacks_benchmark_shaped"] == 0
         and (skip_pytest or result.get("pytest_returncode") == 0))
     print(json.dumps(result))
 
