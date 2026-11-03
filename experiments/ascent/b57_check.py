@@ -109,23 +109,34 @@ _ORIG = {}
 
 
 def _install_valid_recorder():
-    """Record the boolean validity the path computes (clone, also inside captures)."""
-    name = "mask_split_positions" if NEW else "mask_positions_"
-    orig = getattr(indexer_mod, name)
-    _ORIG[name] = orig
+    """Record the boolean validity the path computes (clone, also inside captures).
+
+    Wraps mask_positions_ (main, and the branch's eager path) and, on the branch,
+    mask_split_positions (its graph-only fused path; compile_only calls return None)."""
+    orig_mp = indexer_mod.mask_positions_
+
+    def rec_mp(*a, **k):
+        valid = orig_mp(*a, **k)
+        if RECORD[0]:
+            VALIDS.append(valid.clone())
+            PATHS.append("mask_positions_")
+        return valid
+
+    indexer_mod.mask_positions_ = rec_mp
     if NEW:
-        def rec(*a, **k):
-            logits, valid = orig(*a, **k)
-            if RECORD[0]:
-                VALIDS.append(valid.clone())
-            return logits, valid
-    else:
-        def rec(*a, **k):
-            valid = orig(*a, **k)
-            if RECORD[0]:
-                VALIDS.append(valid.clone())
-            return valid
-    setattr(indexer_mod, name, rec)
+        orig_ms = indexer_mod.mask_split_positions
+
+        def rec_ms(*a, **k):
+            r = orig_ms(*a, **k)
+            if r is not None and RECORD[0]:
+                VALIDS.append(r[1].clone())
+                PATHS.append("mask_split_positions")
+            return r
+
+        indexer_mod.mask_split_positions = rec_ms
+
+
+PATHS = []
 
 
 RECORD = [False]
@@ -134,6 +145,7 @@ RECORD = [False]
 def run_new(c, record):
     RECORD[0] = record
     VALIDS.clear()
+    PATHS.clear()
     c.hooked = []
     try:
         c.new(record=record)
@@ -205,10 +217,19 @@ def run_case(kind, m, args, device, failures):
     info = dict(kind=kind, m=m, width=c.width,
                 splits=indexer_mod._split_decode_count(m, c.width))
     # A. job 374's order: eager warmup, capture, eager BEFORE any replay.
+    ref0 = ref_select(ref_ind, c)
     for _ in range(3):
         c.reset()
         run_new(c, False)
     torch.cuda.synchronize()
+    c.reset()
+    p_sc, p_valid = run_new(c, True)
+    info["eager_mask_path"] = list(PATHS)
+    torch.cuda.synchronize()
+    pre = compare(ref0, c.out.clone(), p_sc, p_valid)
+    info["A_eager_before_capture"] = pre["ok"]
+    if not pre["ok"]:
+        failures.append(f"A eager-before-capture {kind} m{m}")
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream):
@@ -218,14 +239,15 @@ def run_case(kind, m, args, device, failures):
         with torch.cuda.graph(graph, stream=stream):
             RECORD[0] = True
             VALIDS.clear()
+            PATHS.clear()
             c.hooked = []
             try:
                 c.new(record=True)
             finally:
                 RECORD[0] = False
             g_sc, g_valid = c.hooked[0], VALIDS[0]
+            info["graph_mask_path"] = list(PATHS)
     torch.cuda.synchronize()
-    ref0 = ref_select(ref_ind, c)
     c.reset()
     e_sc, e_valid = run_new(c, True)
     torch.cuda.synchronize()
@@ -307,6 +329,7 @@ def run_case(kind, m, args, device, failures):
     del g2
     info["E_launches_eager"] = n_eager
     info["E_launches_graph"] = n_graph
+    info["E_kernels_eager"] = k_eager
     info["E_kernels_graph"] = k_graph
     log(json.dumps(info))
     del c, ref_ind

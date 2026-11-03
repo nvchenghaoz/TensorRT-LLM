@@ -1964,12 +1964,19 @@ def mask_split_positions(
     src_split_stride: int,
     positions: torch.Tensor,
     visible: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    compile_only: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Assembled, masked fp32 ``[count, splits * chunk]`` logits and their boolean validity.
 
     Equivalent to ``logits = src.as_strided((count, splits, chunk), (src_row_stride,
     src_split_stride, 1)).contiguous().view(count, -1)`` followed by
     ``mask_positions_(logits, positions, visible)``, in one launch.
+
+    ``compile_only`` compiles this call's specialization without launching (CuTe
+    kernels cannot compile inside a CUDA-graph capture). Returns ``None``, with
+    nothing launched, when called inside a capture before its specialization
+    was compiled; the caller then keeps the unfused path.
     """
     count = int(positions.shape[0])
     width = int(splits) * int(chunk)
@@ -1993,9 +2000,8 @@ def mask_split_positions(
     ns = _glue_kernels()
     position_int64 = positions.dtype == torch.int64
     visible_int64 = visible.dtype == torch.int64
-    _launch(
-        ("mask_split_positions", device.index),
-        lambda: ns.MaskSplitPositionsKernel(),
+    key = ("mask_split_positions", device.index)
+    args = (
         _ptr(src),
         _ptr(logits),
         _ptr(positions, align=8 if position_int64 else 4),
@@ -2011,6 +2017,16 @@ def mask_split_positions(
         width,
         _stream(device),
     )
+    full_key = (key, tuple(
+        arg._csa2_signature if isinstance(arg, ns.cute.Pointer) else None for arg in args
+    ))
+    if compile_only:
+        if full_key not in _COMPILED and not torch.cuda.is_current_stream_capturing():
+            _COMPILED[full_key] = ns.cute.compile(ns.MaskSplitPositionsKernel(), *args)
+        return None
+    if full_key not in _COMPILED and torch.cuda.is_current_stream_capturing():
+        return None
+    _launch(key, lambda: ns.MaskSplitPositionsKernel(), *args)
     return logits, valid
 
 
