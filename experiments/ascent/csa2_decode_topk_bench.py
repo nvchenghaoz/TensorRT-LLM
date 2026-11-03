@@ -334,10 +334,351 @@ def mode_profile(args):
     print(json.dumps({"done": True}))
 
 
+STEP = None  # filled lazily (needs CSA2Mode)
+
+
+def _step_layers():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Mode
+    return [(CSA2Mode.FULL, 18432)] * 3 + [(CSA2Mode.FULL, 36864)] + [(CSA2Mode.REINDEX, 16384)] * 4
+
+
+def _trace_section(indexers, old_indexers):
+    """torch.profiler (CUPTI) trace of one 8-layer decode top-K step, rows 4, both arms through
+    CSA2Indexer.select_prepared_scores with explicit row ends (as production passes them):
+    new_step = this tree's indexer (CuTe-DSL decode), old_step = same indexer class with the
+    decode implementation set to CUDA_RADIX (what main runs). Reduced in-job."""
+    from torch.profiler import ProfilerActivity, profile, record_function
+    import tempfile
+
+    rows = 4
+    bufs = []
+    for li, (m, width) in enumerate(_step_layers()):
+        ai, al = radix_aux(rows)
+        bufs.append((m, make_scores(rows, width, seed=li),
+                     torch.empty(rows, TOPK, dtype=torch.int32, device="cuda"), ai, al,
+                     torch.full((rows,), width, dtype=torch.int32, device="cuda")))
+
+    def new_step():
+        for m, s, o, ai, al, lens in bufs:
+            indexers[m].select_prepared_scores(s, o, None, lens, is_prefill=False,
+                                               radix_aux_indices=ai, radix_aux_logits=al)
+
+    def old_step():
+        for m, s, o, ai, al, lens in bufs:
+            old_indexers[m].select_prepared_scores(s, o, None, lens, is_prefill=False,
+                                                   radix_aux_indices=ai, radix_aux_logits=al)
+
+    for _ in range(2):
+        new_step()
+        old_step()
+    torch.cuda.synchronize()
+    reps = 3
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(reps):
+            for name, fn in (("new_step", new_step), ("old_step", old_step)):
+                torch.cuda.synchronize()
+                with record_function(name):
+                    fn()
+                    torch.cuda.synchronize()
+    path = os.path.join(tempfile.mkdtemp(), "trace.json")
+    prof.export_chrome_trace(path)
+    with open(path) as f:
+        ev = json.load(f)
+    ev = ev.get("traceEvents", ev)
+    wins = [(e["name"], float(e["ts"]), float(e["ts"]) + float(e.get("dur", 0)))
+            for e in ev if e.get("cat") == "user_annotation" and e.get("name") in ("new_step", "old_step")]
+    kern = [e for e in ev if e.get("cat") == "kernel"]
+    out = {n: {} for n in ("new_step", "old_step")}
+    unassigned = 0
+    for k in kern:
+        t0 = float(k["ts"])
+        hit = None
+        for n, a, b in wins:
+            if a <= t0 <= b:
+                hit = n
+                break
+        if hit is None:
+            unassigned += 1
+            continue
+        nm = k["name"][:120]
+        d = out[hit].setdefault(nm, {"count": 0, "total_us": 0.0})
+        d["count"] += 1
+        d["total_us"] += float(k.get("dur", 0))
+    summary = {}
+    for n, d in out.items():
+        per_step = {nm: {"per_step": v["count"] / reps, "us_per_step": round(v["total_us"] / reps, 2)}
+                    for nm, v in sorted(d.items(), key=lambda x: -x[1]["total_us"])}
+        summary[n] = {"kernels": per_step,
+                      "launches_per_step": sum(v["count"] for v in d.values()) / reps,
+                      "kernel_us_per_step": round(sum(v["total_us"] for v in d.values()) / reps, 2)}
+    bad_words = ("pad", "copy", "elementwise", "fill", "cat", "contiguous")
+    new_names = list(out["new_step"].keys())
+    extra = [nm for nm in new_names if any(w in nm.lower() for w in bad_words)]
+    only_topk = (len(new_names) >= 1 and not extra
+                 and summary["new_step"]["launches_per_step"] == len(bufs))
+    return {"rows": rows, "layers": len(bufs), "reps": reps, "windows": len(wins),
+            "unassigned_kernels": unassigned, "ranges": summary,
+            "new_step_extra_copy_pad_kernels": extra,
+            "new_step_one_topk_launch_per_layer_only": only_topk}
+
+
+def _coarse_bin(x):
+    # to_coarse_key: fp32 -> fp16, ordered transform of the 16 bits, high 8 bits. The ordered
+    # transform is a bijection that maps equal high bytes to equal high bytes, so two values
+    # share a coarse bin iff their fp16 bit patterns share the high byte.
+    return (x.half().view(torch.int16).to(torch.int32) >> 8) & 0xFF
+
+
+def _overflow_inputs(rows, width, kind, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    if kind == "all_equal":
+        s = torch.full((rows, width), 0.5, device="cuda")
+    elif kind == "few_distinct_dense":
+        # every column one of 4 values in the same coarse bin (fp16 0x3C00..0x3C03)
+        v = 1.0 + torch.randint(0, 4, (rows, width), generator=g, device="cuda").float() * 2.0 ** -10
+        s = v
+    elif kind == "few_distinct_tail":
+        # dense block of 4 near-top values + randn rest + -inf invisible tail
+        s = torch.randn(rows, width, generator=g, device="cuda") * 0.01
+        n = width * 3 // 4
+        s[:, :n] = 1.0 + torch.randint(0, 4, (rows, n), generator=g, device="cuda").float() * 2.0 ** -10
+        for r in range(rows):
+            t = (r * 997 + seed) % 2048
+            if t:
+                s[r, width - t:] = -torch.inf
+    else:
+        raise ValueError(kind)
+    return s.contiguous().float()
+
+
+def _kernel_geometry(rows, width):
+    import cutlass
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as C
+    from tensorrt_llm._torch.kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
+        FilteredTopKKernelVarlenDecode,
+    )
+    import math as _m
+
+    cs = C.CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.auto_cluster_size(width, rows, True)
+    bucket = 1 << (width - 1).bit_length()
+    try:
+        return _kernel_geometry_inner(rows, width, cs, bucket, cutlass, FilteredTopKKernelVarlenDecode, _m)
+    except Exception as e:  # noqa: BLE001
+        log("geometry introspection failed", e)
+        return {"cluster_size": cs, "chunk_cols_per_cta": _m.ceil(bucket / cs) if cs >= 2 else width,
+                "smem_candidate_capacity_S": -1, "reread_compiled_in": None,
+                "error": f"{type(e).__name__}: {e}"[:300]}
+
+
+def _kernel_geometry_inner(rows, width, cs, bucket, cutlass, FilteredTopKKernelVarlenDecode, _m):
+    if cs >= 2:
+        chunk = _m.ceil(bucket / cs)
+        k = FilteredTopKKernelVarlenDecode(cutlass.Float32, bucket, TOPK, 1, chunk_size_per_cta=chunk,
+                                           num_ctas_per_row=cs, overflow_policy="REREAD",
+                                           single_pass_multi_cta=True)
+    else:
+        chunk = width
+        k = FilteredTopKKernelVarlenDecode(cutlass.Float32, bucket, TOPK, 1,
+                                           large_occupancy=rows > torch.cuda.get_device_properties(0).multi_processor_count,
+                                           overflow_policy="REREAD")
+    return {"cluster_size": cs, "chunk_cols_per_cta": chunk,
+            "smem_candidate_capacity_S": int(k.filtered_topk_smem_input_size),
+            "reread_compiled_in": bool(k.enable_reread)}
+
+
+def _threshold_bin_counts(s, chunk):
+    """Per row: the coarse bin of the K-th largest value, and the max per-CTA-chunk count of
+    elements falling into it (what the kernel writes to its SMEM candidate buffer)."""
+    rows, width = s.shape
+    kth = torch.topk(s, TOPK, dim=1).values[:, -1:]
+    tb = _coarse_bin(kth)
+    bins = _coarse_bin(s)
+    inbin = (bins == tb)
+    mx = 0
+    for c0 in range(0, width, chunk):
+        mx = max(mx, int(inbin[:, c0:c0 + chunk].sum(1).max().item()))
+    return int(inbin.sum(1).max().item()), mx
+
+
+def _run_overflow_case(ix, ref, rows, width, kind, failures, stats, label):
+    lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    ai, al = radix_aux(rows)
+    ai2, al2 = radix_aux(rows)
+    o = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
+    o_ref = torch.empty_like(o)
+    s_buf = _overflow_inputs(rows, width, kind, seed=rows * 31 + width)
+    pristine = s_buf.clone()
+    for it in range(3 + 5):
+        o.fill_(-7)
+        if ix is None:
+            ref_dsl = stats["_dsl"]
+            ref_dsl(s_buf, o, is_prefill=False, sequence_lengths=lens, scan_lengths=lens, next_n=1,
+                    max_seq_len=width, radix_aux_indices=ai, radix_aux_logits=al)
+        else:
+            indexer_select(ix, s_buf, o, ai, al)
+        ref(pristine, o_ref, is_prefill=False, sequence_lengths=lens, scan_lengths=lens, next_n=1,
+            max_seq_len=width, radix_aux_indices=ai2, radix_aux_logits=al2)
+        torch.cuda.synchronize()
+        if not torch.equal(s_buf, pristine):
+            failures.append(f"{label}: scores mutated")
+        ex, tie, bad = compare(o_ref, o, pristine)
+        stats["iterations"] += 1
+        stats["rows"] += rows
+        stats["exact_rows"] += ex
+        stats["tie_rows"] += tie
+        if bad:
+            failures.append(f"{label}/it{it}: rows {bad}")
+    if ix is not None:
+        g_out = torch.empty_like(o)
+        st = torch.cuda.Stream()
+        st.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(st):
+            indexer_select(ix, s_buf, g_out, ai, al)
+        torch.cuda.current_stream().wait_stream(st)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            indexer_select(ix, s_buf, g_out, ai, al)
+        for step in range(4):
+            s_buf.copy_(_overflow_inputs(rows, width, kind, seed=900 + step))
+            g_out.fill_(-7)
+            g.replay()
+            ref(s_buf, o_ref, is_prefill=False, sequence_lengths=lens, scan_lengths=lens, next_n=1,
+                max_seq_len=width, radix_aux_indices=ai2, radix_aux_logits=al2)
+            torch.cuda.synchronize()
+            ex, tie, bad = compare(o_ref, g_out, s_buf)
+            stats["graph_replays"] += 1
+            if bad:
+                failures.append(f"graph {label}/step{step}: {bad}")
+    return s_buf
+
+
+def mode_evalchecks(args):
+    """Evaluator items: (1) per-range kernel list trace, (2) forced-overflow inputs (production
+    budget: bin count vs capacity; forced small budget: REREAD actually compiled in and taken),
+    (3) raw (unsorted) index-row equality vs CUDA radix."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Mode
+    from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+    import tensorrt_llm._torch.custom_ops  # noqa: F401
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as C
+    from tensorrt_llm._torch.kernels.blackwell.top_k import filtered_top_k_varlen_util as U
+
+    indexers = {m: build_indexer(args.checkpoint, m) for m in (CSA2Mode.FULL, CSA2Mode.REINDEX)}
+    impls = {str(m): ix.top_k.decode_implementation.value for m, ix in indexers.items()}
+    pre = {str(m): ix.top_k.prefill_implementation.value for m, ix in indexers.items()}
+    log("decode impls", impls, "prefill impls", pre)
+    ref = TopK(TOPK, decode_implementation=TopKImplementation.CUDA_RADIX)
+    dsl = TopK(TOPK, decode_implementation=TopKImplementation.CUTE_DSL_RADIX)
+    result = {"decode_impls": impls, "prefill_impls": pre}
+    failures = []
+
+    # (1) trace
+    try:
+        old_ix = {m: build_indexer(args.checkpoint, m) for m in (CSA2Mode.FULL, CSA2Mode.REINDEX)}
+        for ix in old_ix.values():
+            ix.top_k.decode_implementation = TopKImplementation.CUDA_RADIX
+        result["trace_old_arm_impl"] = {str(m): ix.top_k.decode_implementation.value
+                                        for m, ix in old_ix.items()}
+        result["trace"] = _trace_section(indexers, old_ix)
+        log("trace", json.dumps(result["trace"])[:3000])
+        if not result["trace"]["new_step_one_topk_launch_per_layer_only"]:
+            failures.append("trace: new_step has extra kernels")
+    except Exception as e:  # noqa: BLE001
+        result["trace"] = {"error": f"{type(e).__name__}: {e}"[:500]}
+        failures.append("trace error")
+        log("trace error", e)
+
+    # (2a) forced-overflow inputs on the production config (indexer path)
+    geo = {}
+    stats = {"exact_rows": 0, "tie_rows": 0, "rows": 0, "iterations": 0, "graph_replays": 0}
+    bins = {}
+    for m, width in ((CSA2Mode.FULL, 36864), (CSA2Mode.FULL, 18432), (CSA2Mode.REINDEX, 16384)):
+        for rows in ROWS:
+            gm = _kernel_geometry(rows, width)
+            geo[f"{rows}x{width}"] = gm
+            for kind in ("all_equal", "few_distinct_dense", "few_distinct_tail"):
+                label = f"prod/{kind}/{rows}x{width}"
+                s = _run_overflow_case(indexers[m], ref, rows, width, kind, failures, stats, label)
+                s0 = _overflow_inputs(rows, width, kind, seed=rows * 31 + width)
+                tot, per_cta = _threshold_bin_counts(s0, gm["chunk_cols_per_cta"])
+                bins[label] = {"threshold_bin_row_max": tot, "threshold_bin_per_cta_max": per_cta,
+                               "capacity_S": gm["smem_candidate_capacity_S"],
+                               "would_overflow": (gm["smem_candidate_capacity_S"] < 0
+                                                  or per_cta > gm["smem_candidate_capacity_S"])}
+            log(f"prod {rows}x{width} geo={gm}: failures so far {len(failures)}")
+    result["production_overflow"] = {"geometry": geo, "stats": stats, "threshold_bins": bins,
+                                     "any_case_reaches_overflow": any(v["would_overflow"] for v in bins.values())}
+
+    # (2b) shrink the candidate budget so REREAD is compiled in and the bin overflows; prove the
+    # SM120 REREAD fallback is exact. Kernel caches are cleared before and after.
+    caches = [C.CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.kernel_cache,
+              C.CuteDSLTopKDecodeSingleCTARunner.kernel_cache]
+    dev = torch.cuda.current_device()
+    forced = {"stats": {"exact_rows": 0, "tie_rows": 0, "rows": 0, "iterations": 0,
+                        "graph_replays": 0, "_dsl": dsl}, "geometry": {}, "threshold_bins": {}}
+    try:
+        for c in caches:
+            c.clear()
+        U._input_idx_budget_cache[dev] = 16 * 1024  # S = 16 KB / (2 bufs * 2 B) = 4096 < 8192 chunk
+        for width in (36864, 18432, 16384):
+            for rows in ROWS:
+                gm = _kernel_geometry(rows, width)
+                forced["geometry"][f"{rows}x{width}"] = gm
+                for kind in ("all_equal", "few_distinct_dense", "few_distinct_tail"):
+                    label = f"forced/{kind}/{rows}x{width}"
+                    _run_overflow_case(None, ref, rows, width, kind, failures, forced["stats"], label)
+                    s0 = _overflow_inputs(rows, width, kind, seed=rows * 31 + width)
+                    tot, per_cta = _threshold_bin_counts(s0, gm["chunk_cols_per_cta"])
+                    forced["threshold_bins"][label] = {
+                        "threshold_bin_per_cta_max": per_cta, "capacity_S": gm["smem_candidate_capacity_S"],
+                        "reread_compiled_in": gm["reread_compiled_in"],
+                        "overflow_taken": gm["reread_compiled_in"] and per_cta > gm["smem_candidate_capacity_S"]}
+                log(f"forced {rows}x{width} geo={gm}: failures so far {len(failures)}")
+        forced["all_cases_took_reread"] = all(v["overflow_taken"] for v in forced["threshold_bins"].values())
+    except Exception as e:  # noqa: BLE001
+        forced["error"] = f"{type(e).__name__}: {e}"[:500]
+        failures.append("forced-overflow error")
+        log("forced error", e)
+    finally:
+        U._input_idx_budget_cache.pop(dev, None)
+        for c in caches:
+            c.clear()
+    forced["stats"].pop("_dsl", None)
+    result["forced_reread"] = forced
+
+    # (3) raw (unsorted) row order vs CUDA radix, random (non-tie) inputs, production config
+    raw = {}
+    for m, width in ((CSA2Mode.FULL, 36864), (CSA2Mode.FULL, 18432), (CSA2Mode.REINDEX, 16384)):
+        for rows in ROWS:
+            s = make_scores(rows, width, seed=77 + rows)
+            lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+            ai, al = radix_aux(rows)
+            o = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
+            o_ref = torch.empty_like(o)
+            indexer_select(indexers[m], s, o, ai, al)
+            ref(s, o_ref, is_prefill=False, sequence_lengths=lens, scan_lengths=lens, next_n=1,
+                max_seq_len=width, radix_aux_indices=ai, radix_aux_logits=al)
+            torch.cuda.synchronize()
+            raw_eq = sum(int(torch.equal(o[r], o_ref[r])) for r in range(rows))
+            set_eq = sum(int(torch.equal(sorted_sel(o)[r], sorted_sel(o_ref)[r])) for r in range(rows))
+            raw[f"{rows}x{width}"] = {"raw_rows_equal": raw_eq, "sorted_rows_equal": set_eq, "rows": rows}
+            if set_eq != rows:
+                failures.append(f"raw-section set mismatch {rows}x{width}")
+    result["raw_order"] = {"per_shape": raw,
+                           "all_raw_equal": all(v["raw_rows_equal"] == v["rows"] for v in raw.values()),
+                           "all_sets_equal": all(v["sorted_rows_equal"] == v["rows"] for v in raw.values())}
+    result["passed"] = not failures
+    result["failures"] = failures[:30]
+    result["compared"] = ("CSA2Indexer / CuTe-DSL decode top-K vs CUDA radix indexer_topk_decode; "
+                          "3 warmup + 5 iterations each compared, graph replay; tie rows by "
+                          "selected-score multiset")
+    print(json.dumps({"passed": result.pop("passed"), **result}))
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["engines", "indexer", "check", "profile"])
+    p.add_argument("mode", choices=["engines", "indexer", "check", "profile", "evalchecks"])
     p.add_argument("--checkpoint", default="")
     a = p.parse_args()
     {"engines": mode_engines, "indexer": mode_indexer, "check": mode_check,
-     "profile": mode_profile}[a.mode](a)
+     "profile": mode_profile, "evalchecks": mode_evalchecks}[a.mode](a)
