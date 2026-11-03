@@ -41,6 +41,10 @@ _SPLIT_DECODE_BLOCK_Q = 4
 # this stopped helping at 1-8 rows of 16K-37K keys on SM120 (188 SMs).
 _SPLIT_DECODE_TARGET_BLOCKS = 128
 _SPLIT_DECODE_CHOICES = (64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1)
+# Eagerly built constant rows (Top-K row bounds) retained per indexer: rows of at
+# most this many queries (decode/graph batches), and at most this many entries.
+_CONSTANT_ROW_CACHE_COUNT = 256
+_CONSTANT_ROW_CACHE_ENTRIES = 1024
 
 
 def _split_decode_count(rows: int, width: int) -> int:
@@ -65,6 +69,7 @@ from .kernel import (
     index_key_gather_supported,
     mask_logits_,
     mask_positions_,
+    mask_split_positions,
     publish_candidates_,
 )
 from .metadata import CSA2TrtllmMetadata
@@ -239,19 +244,25 @@ class CSA2Indexer(Indexer):
     def _constant_rows(self, count: int, value: int, device: torch.device) -> torch.Tensor:
         """Int32 ``[count]`` tensor filled with ``value``; contents never change.
 
-        A captured graph keeps addressing these rows on every replay, so rows
-        created while capturing are retained for the indexer's lifetime (there
-        are few graph geometries). Eager calls see many query counts and get a
-        transient: an evictable cache entry could be freed and reused while a
-        graph that captured it still reads it.
+        Same pattern as ``_split_decode_bounds``: an eager call fills its row
+        now and retains it (small counts only, never evicted, so a graph that
+        captured it can keep reading it). A capture reuses a retained eager row
+        and records no fill; without one, the graph gets its own uncached row,
+        kept by the graph pool and refilled on every replay. Eager calls never
+        see a capture-time row, whose fill only runs when its graph replays.
         """
         cache = self.__dict__.setdefault("_constant_row_cache", {})
         key = (str(device), count, value)
         rows = cache.get(key)
-        if rows is None:
-            rows = torch.full((count,), value, dtype=torch.int32, device=device)
-            if rows.is_cuda and torch.cuda.is_current_stream_capturing():
-                cache[key] = rows
+        if rows is not None:
+            return rows
+        rows = torch.full((count,), value, dtype=torch.int32, device=device)
+        if (
+            count <= _CONSTANT_ROW_CACHE_COUNT
+            and len(cache) < _CONSTANT_ROW_CACHE_ENTRIES
+            and not (rows.is_cuda and torch.cuda.is_current_stream_capturing())
+        ):
+            cache[key] = rows
         return rows
 
     def _split_decode_supported(self, q_data: torch.Tensor, q_scale: Optional[torch.Tensor]) -> bool:
@@ -296,7 +307,7 @@ class CSA2Indexer(Indexer):
             cache[key] = bounds
         return bounds
 
-    def _split_key_decode_logits(
+    def _split_key_decode_raw(
         self,
         q_data: torch.Tensor,
         q_scale: torch.Tensor,
@@ -304,14 +315,11 @@ class CSA2Indexer(Indexer):
         k_data: torch.Tensor,
         k_scale: torch.Tensor,
         width: int,
-    ) -> torch.Tensor:
-        """FP32 ``[rows, width]`` logits of row ``r`` over keys ``[r * width, (r + 1) * width)``.
+    ) -> tuple[torch.Tensor, int, int, int, int]:
+        """Split-key DeepGEMM output and its layout ``(out, splits, chunk, row_stride, split_stride)``.
 
-        One DeepGEMM launch replaces one launch per row: each row is replicated
-        into ``splits`` query blocks that each scan a disjoint key sub-range, and
-        compressed logits put sub-range ``s`` of row ``r`` in replica row
-        ``(r * splits + s) * BLOCK_Q``. Every logit is the same per-(query, key)
-        computation as the per-row call, so the values are bitwise identical.
+        Logit ``k`` of sub-range ``s`` of row ``r`` (column ``s * chunk + k``) is
+        ``out.view(-1)[r * row_stride + s * split_stride + k]``.
         """
         rows, heads = q_data.shape[0], q_data.shape[1]
         splits = _split_decode_count(rows, width)
@@ -336,8 +344,31 @@ class CSA2Indexer(Indexer):
             max_seqlen_k=chunk,
         )
         stride = out.stride(0)
+        return out, splits, chunk, reps * stride, block * stride
+
+    def _split_key_decode_logits(
+        self,
+        q_data: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        """FP32 ``[rows, width]`` logits of row ``r`` over keys ``[r * width, (r + 1) * width)``.
+
+        One DeepGEMM launch replaces one launch per row: each row is replicated
+        into ``splits`` query blocks that each scan a disjoint key sub-range, and
+        compressed logits put sub-range ``s`` of row ``r`` in replica row
+        ``(r * splits + s) * BLOCK_Q``. Every logit is the same per-(query, key)
+        computation as the per-row call, so the values are bitwise identical.
+        """
+        rows = q_data.shape[0]
+        out, splits, chunk, row_stride, split_stride = self._split_key_decode_raw(
+            q_data, q_scale, weights, k_data, k_scale, width
+        )
         return (
-            out.as_strided((rows, splits, chunk), (reps * stride, block * stride, 1))
+            out.as_strided((rows, splits, chunk), (row_stride, split_stride, 1))
             .contiguous()
             .view(rows, width)
         )
@@ -366,9 +397,49 @@ class CSA2Indexer(Indexer):
         finalize run over every row.
         """
         width = logical_positions.shape[1]
-        logits = self._split_key_decode_logits(
-            q_data, q_scale, weights, k_data, k_scale, width
-        )
+        rows = q_data.shape[0]
+        masked_valid = None
+        if not (q_data.is_cuda and dsl_available() and rows > 0 and width > 0):
+            logits = self._split_key_decode_logits(
+                q_data, q_scale, weights, k_data, k_scale, width
+            )
+        else:
+            out, splits, chunk, row_stride, split_stride = self._split_key_decode_raw(
+                q_data, q_scale, weights, k_data, k_scale, width
+            )
+            fused = None
+            if torch.cuda.is_current_stream_capturing():
+                # CUDA-graph decode only: assemble the split-key output into
+                # row-major logits and mask them in one launch (the same bytes as
+                # the assembly copy + mask_positions_).
+                fused = mask_split_positions(
+                    out, splits, chunk, row_stride, split_stride, logical_positions,
+                    visible_lengths,
+                )
+            else:
+                # Eager (mixed) steps keep the assembly copy + mask launches; only
+                # compile the graph kernel here, once per signature (no launch).
+                warm = self.__dict__.setdefault("_split_mask_warm", set())
+                signature = (
+                    q_data.device.index,
+                    logical_positions.dtype,
+                    visible_lengths.dtype,
+                    logical_positions.stride(0) == 0,
+                )
+                if signature not in warm:
+                    mask_split_positions(
+                        out, splits, chunk, row_stride, split_stride, logical_positions,
+                        visible_lengths, compile_only=True,
+                    )
+                    warm.add(signature)
+            if fused is not None:
+                logits, masked_valid = fused
+            else:
+                logits = (
+                    out.as_strided((rows, splits, chunk), (row_stride, split_stride, 1))
+                    .contiguous()
+                    .view(rows, width)
+                )
         return self._select_mapped_logits(
             logits,
             None,
@@ -381,6 +452,7 @@ class CSA2Indexer(Indexer):
             radix_aux_indices,
             radix_aux_logits,
             gvr_prior_indices,
+            masked_valid=masked_valid,
         )
 
     def select_prepared_scores(
@@ -704,6 +776,7 @@ class CSA2Indexer(Indexer):
         radix_aux_logits: Optional[torch.Tensor] = None,
         gvr_prior_indices: Optional[torch.Tensor] = None,
         valid_counts: Optional[torch.Tensor] = None,
+        masked_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Select over logits whose columns map to ``logical_positions``.
 
@@ -712,7 +785,9 @@ class CSA2Indexer(Indexer):
         scores), which skips the column gather entirely. With ``valid_counts``
         the candidate source already made each row's valid columns its leading
         ones (sparse candidate logits), so the Top-K is bounded by the counts
-        instead of masking.
+        instead of masking. With ``masked_valid`` the caller already masked
+        ``logits`` in place with ``-inf`` and ``masked_valid`` is its boolean
+        validity (``mask_positions_`` semantics).
         """
         width = logical_positions.shape[1]
         if valid_counts is not None:
@@ -723,9 +798,11 @@ class CSA2Indexer(Indexer):
                     (prior >= 0) & (prior < valid_counts[:, None]), gvr_prior_indices, -1
                 )
         else:
-            offsets = torch.arange(width, device=logits.device)
             fused_mask = False
-            if row_starts is None and row_ends is None and logits.shape[1] == width:
+            if masked_valid is not None:
+                # The caller already assembled and masked ``logits`` (one launch).
+                scores, valid, fused_mask = logits, masked_valid, True
+            elif row_starts is None and row_ends is None and logits.shape[1] == width:
                 scores = logits
                 if scores.is_cuda and dsl_available() and scores.stride(1) == 1:
                     # One launch for the validity mask and the in-place -inf fill.
@@ -738,7 +815,7 @@ class CSA2Indexer(Indexer):
                     row_starts = self._constant_rows(logits.shape[0], 0, logits.device)
                 if row_ends is None:
                     row_ends = self._constant_rows(logits.shape[0], logits.shape[1], logits.device)
-                columns = row_starts.long()[:, None] + offsets
+                columns = row_starts.long()[:, None] + torch.arange(width, device=logits.device)
                 in_bounds = (columns >= 0) & (columns < row_ends[:, None])
                 in_bounds &= columns < logits.shape[1]
                 scores = logits.gather(1, columns.clamp(0, logits.shape[1] - 1))
@@ -757,6 +834,7 @@ class CSA2Indexer(Indexer):
                 else:
                     gvr_prior_indices = torch.full_like(gvr_prior_indices, -1)
             if not is_prefill and self.options.use_gvr_emission and self.top_k._gvr_emission_armed:
+                offsets = torch.arange(width, device=logits.device)
                 bad_rows = (
                     (offsets[None, :] < visible_lengths[:, None]) & (logical_positions < 0)
                 ).any(dim=1)

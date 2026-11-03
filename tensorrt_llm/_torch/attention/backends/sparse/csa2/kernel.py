@@ -1351,6 +1351,100 @@ def _glue_kernels():
                         logits_t[q, column] = Float32(float("-inf"))
                     valid_t[q, column] = flag
 
+    # ------------- K9b: assemble split-key logits and mask by logical positions
+
+    class MaskSplitPositionsKernel:
+        """``MaskPositionsKernel`` whose logits come from a split-key layout.
+
+        Column ``s * chunk + k`` of row ``q`` copies
+        ``src[q * src_row_stride + s * src_split_stride + k]`` into
+        ``logits[q, column]`` (``-inf`` where invalid) and writes ``valid``,
+        in one launch over ``[count, splits, chunk]``.
+        """
+
+        THREADS = 256
+        PER_THREAD = 4
+
+        @cute.jit
+        def __call__(
+            self,
+            src: cute.Pointer,  # float32 split-key output
+            logits: cute.Pointer,  # float32 [count, splits * chunk] (out)
+            positions: cute.Pointer,  # int32/int64 [count, width], row stride may be 0
+            visible: cute.Pointer,  # int32/int64 [count]
+            valid: cute.Pointer,  # uint8 [count, width] (out)
+            count: Int32,
+            splits: Int32,
+            chunk: Int32,
+            src_row_stride: Int64,
+            src_split_stride: Int64,
+            logits_stride: Int64,
+            position_stride: Int64,
+            valid_stride: Int64,
+            stream: cuda.CUstream,
+        ):
+            span = self.THREADS * self.PER_THREAD
+            self.kernel(
+                src,
+                logits,
+                positions,
+                visible,
+                valid,
+                count,
+                splits,
+                chunk,
+                src_row_stride,
+                src_split_stride,
+                logits_stride,
+                position_stride,
+                valid_stride,
+            ).launch(
+                grid=[count, splits, (chunk + span - 1) // span],
+                block=[self.THREADS, 1, 1],
+                stream=stream,
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            src: cute.Pointer,
+            logits: cute.Pointer,
+            positions: cute.Pointer,
+            visible: cute.Pointer,
+            valid: cute.Pointer,
+            count: Int32,
+            splits: Int32,
+            chunk: Int32,
+            src_row_stride: Int64,
+            src_split_stride: Int64,
+            logits_stride: Int64,
+            position_stride: Int64,
+            valid_stride: Int64,
+        ):
+            tid, _, _ = cute.arch.thread_idx()
+            q, split, part = cute.arch.block_idx()
+            n = Int64(count)
+            width = Int64(splits) * Int64(chunk)
+            src_t = tensor1d(src, n * src_row_stride)
+            logits_t = tensor2d(logits, n, width, logits_stride)
+            positions_t = tensor2d(positions, n, width, position_stride)
+            valid_t = tensor2d(valid, n, width, valid_stride)
+            bound = Int64(tensor1d(visible, n)[q])
+            base = Int64(q) * src_row_stride + Int64(split) * src_split_stride
+            first = part * self.THREADS * self.PER_THREAD + tid
+            for j in cutlass.range_constexpr(self.PER_THREAD):
+                k = first + j * self.THREADS
+                if k < chunk:
+                    column = split * chunk + k
+                    position = Int64(positions_t[q, column])
+                    flag = cutlass.Uint8(0)
+                    if (position >= 0) & (position < bound):
+                        flag = cutlass.Uint8(1)
+                        logits_t[q, column] = src_t[base + Int64(k)]
+                    else:
+                        logits_t[q, column] = Float32(float("-inf"))
+                    valid_t[q, column] = flag
+
     class Namespace:
         pass
 
@@ -1362,6 +1456,7 @@ def _glue_kernels():
     ns.T = T
     ns.IndexKeyGatherKernel = IndexKeyGatherKernel
     ns.MaskPositionsKernel = MaskPositionsKernel
+    ns.MaskSplitPositionsKernel = MaskSplitPositionsKernel
     ns.dsl_user_op = dsl_user_op
     ns.SmemAllocator = SmemAllocator
     ns.make_ptr = make_ptr
@@ -1859,6 +1954,80 @@ def mask_positions_(
         _stream(logits.device),
     )
     return valid
+
+
+def mask_split_positions(
+    src: torch.Tensor,
+    splits: int,
+    chunk: int,
+    src_row_stride: int,
+    src_split_stride: int,
+    positions: torch.Tensor,
+    visible: torch.Tensor,
+    *,
+    compile_only: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Assembled, masked fp32 ``[count, splits * chunk]`` logits and their boolean validity.
+
+    Equivalent to ``logits = src.as_strided((count, splits, chunk), (src_row_stride,
+    src_split_stride, 1)).contiguous().view(count, -1)`` followed by
+    ``mask_positions_(logits, positions, visible)``, in one launch.
+
+    ``compile_only`` compiles this call's specialization without launching (CuTe
+    kernels cannot compile inside a CUDA-graph capture). Returns ``None``, with
+    nothing launched, when called inside a capture before its specialization
+    was compiled; the caller then keeps the unfused path.
+    """
+    count = int(positions.shape[0])
+    width = int(splits) * int(chunk)
+    device = src.device
+    logits = torch.empty((count, width), dtype=torch.float32, device=device)
+    valid = torch.empty((count, width), dtype=torch.bool, device=device)
+    if count == 0 or width == 0:
+        return logits, valid
+    _check(src.dtype == torch.float32 and src.is_cuda, "split-key logits float32")
+    _check(chunk > 0 and src_split_stride >= chunk and src_row_stride >= 0, "split layout")
+    extent = src.untyped_storage().nbytes() // 4 - src.storage_offset()
+    last = (count - 1) * src_row_stride + (splits - 1) * src_split_stride + chunk
+    _check(last <= extent, "split layout within the source storage")
+    _check(positions.shape == (count, width), "positions [count, splits * chunk]")
+    _check(positions.dtype in (torch.int32, torch.int64), "positions int32/int64")
+    if width > 1 and positions.stride(1) != 1:
+        positions = positions.contiguous()
+    _check(visible.dtype in (torch.int32, torch.int64) and visible.shape == (count,), "visible")
+    if count > 1 and visible.stride(0) != 1:
+        visible = visible.contiguous()
+    ns = _glue_kernels()
+    position_int64 = positions.dtype == torch.int64
+    visible_int64 = visible.dtype == torch.int64
+    key = ("mask_split_positions", device.index)
+    args = (
+        _ptr(src),
+        _ptr(logits),
+        _ptr(positions, align=8 if position_int64 else 4),
+        _ptr(visible, align=8 if visible_int64 else 4),
+        _ptr(valid, torch.uint8, align=1),
+        count,
+        int(splits),
+        int(chunk),
+        int(src_row_stride),
+        int(src_split_stride),
+        width,
+        int(positions.stride(0)) if count > 1 else width,
+        width,
+        _stream(device),
+    )
+    full_key = (key, tuple(
+        arg._csa2_signature if isinstance(arg, ns.cute.Pointer) else None for arg in args
+    ))
+    if compile_only:
+        if full_key not in _COMPILED and not torch.cuda.is_current_stream_capturing():
+            _COMPILED[full_key] = ns.cute.compile(ns.MaskSplitPositionsKernel(), *args)
+        return None
+    if full_key not in _COMPILED and torch.cuda.is_current_stream_capturing():
+        return None
+    _launch(key, lambda: ns.MaskSplitPositionsKernel(), *args)
+    return logits, valid
 
 
 def gather_candidate_scores(
