@@ -99,6 +99,8 @@ def analyze_window(files):
         d = classes.setdefault(cls, {"calls": 0, "sum_dur": {r: 0.0 for r in ranks}, "sum_transfer": 0.0,
                                      "sum_wait": {r: 0.0 for r in ranks}, "transfers": []})
         d["calls"] += 1
+        kn = per_rank[ranks[0]][i]["name"][:60]
+        d.setdefault("names", {})[kn] = d.setdefault("names", {}).get(kn, 0) + 1
         d["sum_transfer"] += t
         d["transfers"].append(t)
         for r, x in zip(ranks, durs):
@@ -118,6 +120,7 @@ def analyze_window(files):
             "per_step_transfer_us": round(d["sum_transfer"] / steps, 1),
             "per_step_wait_us_per_rank": {r: round(d["sum_wait"][r] / steps, 1) for r in ranks},
             "top_predecessors": sorted(preds[cls].items(), key=lambda kv: -kv[1])[:6],
+            "ar_kernel_names_rank0": d.get("names", {}),
         }
     out["by_class"] = res
     out["note"] = (f"steps assumed {steps} (profile_run DECODE_STEPS); per-call numbers do not depend on it. "
@@ -163,6 +166,14 @@ def run_profile_adapter(checkpoint):
 
     common.workload = workload
     common.load_config = lambda argv: (harness, Path(os.getcwd()).resolve())
+
+    def no_analysis(paths, hb=None):
+        # The adapter's parallel analyse+gzip pool broke (BrokenProcessPool, job 248) and its summary raised
+        # (KeyError 'model', job 249). Leave the raw traces in place; this script reduces them sequentially.
+        log(f"skipping adapter trace analysis for {len(paths)} files")
+        return {p: (p, {"kernels": 0, "parser": "skipped"}) for p in paths}
+
+    profile_run.analyze_files = no_analysis
     try:
         profile_run.main()
     except SystemExit as e:  # common.final may exit
