@@ -93,6 +93,27 @@ def sel_ok(scores, mapped, a, b):
     return bool(t["ok"]), t
 
 
+_ORIG_REPLICATE = indexer_mod.replicate_split_queries
+NAN_FILLS = [0]
+
+
+def _nan_prefilled_replicate(q, scale, weights, reps, out=None):
+    """Capture-time wrapper: replica destinations are prefilled with NaN / 0xFF
+    inside the graph, so every replay checks the kernel overwrites all bytes."""
+    if out is None:
+        total = q.shape[0] * reps
+        out = (torch.full((total, q.shape[1], q.shape[2]), -1, dtype=q.dtype, device=q.device),
+               torch.full((total, scale.shape[1]), -1, dtype=scale.dtype, device=q.device),
+               torch.full((total, weights.shape[1]), float("nan"), dtype=weights.dtype,
+                          device=q.device))
+        NAN_FILLS[0] += 1
+    return _ORIG_REPLICATE(q, scale, weights, reps, out=out)
+
+
+def alloc_count():
+    return torch.cuda.memory_stats().get("allocation.all.allocated", 0)
+
+
 def capture(c, ref):
     use_ref(c, ref)
     stream = torch.cuda.Stream()
@@ -102,8 +123,20 @@ def capture(c, ref):
         c.new()
         stream.synchronize()
         c.hooked = []
-        with torch.cuda.graph(graph, stream=stream):
-            c.new(record=True)
+        indexer_mod.replicate_split_queries = _nan_prefilled_replicate
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                c.new(record=True)
+        finally:
+            indexer_mod.replicate_split_queries = _ORIG_REPLICATE
+    torch.cuda.synchronize()
+    # Production replays a captured graph right after capture (warmup). Replay
+    # once here too: main's CSA2Indexer._constant_rows caches rows created
+    # *during* capture whose torch.full only runs on replay, so an eager call
+    # before the first replay would read unwritten row_ends (main's latent
+    # issue, reported separately; the reference and branch graphs agree).
+    c.reset()
+    graph.replay()
     torch.cuda.synchronize()
     scores = c.hooked[0]
     use_ref(c, False)
@@ -234,6 +267,8 @@ def run_case(kind, m, args, device, failures):
     e_out, e_sc = eager(True)
     _, _, mp = c.new_keys()
     bad, total = 0, args.warmup + args.iters
+    torch.cuda.synchronize()
+    a0 = alloc_count()
     for _ in range(total):
         c.reset()
         g_new.replay()
@@ -241,6 +276,16 @@ def run_case(kind, m, args, device, failures):
         ok, _ = sel_ok(e_sc, mp, e_out, c.out)
         if not (ok and same(g_new_sc, e_sc)):
             bad += 1
+    # Replays alone: no caching-allocator allocation may happen.
+    torch.cuda.synchronize()
+    r0 = alloc_count()
+    for _ in range(total):
+        g_new.replay()
+    torch.cuda.synchronize()
+    info["allocs_during_bare_replays"] = alloc_count() - r0
+    info["allocs_during_checked_replays_incl_host_compare"] = r0 - a0
+    if info["allocs_during_bare_replays"]:
+        failures.append(f"alloc after capture {kind} m{m}")
     info["graph_bad_replays"] = bad
     info["graph_replays"] = total
     if bad:
@@ -307,6 +352,7 @@ def main():
                     "torch.equal / tie-aware on K-boundary ties), eager x2, 10-step advancing "
                     "decode window on graphs captured at warmup state, warmup+iters replays",
         "launches_per_step_8_layers": steps,
+        "nan_prefilled_replica_captures": NAN_FILLS[0],
         "cases": [{k: v for k, v in c.items() if k != "counts"} for c in cases]}), flush=True)
 
 
