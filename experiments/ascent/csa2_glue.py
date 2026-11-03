@@ -391,6 +391,7 @@ def check(args) -> dict:
         except Exception as exc:  # noqa: BLE001
             report.append(f"graph{label}: capture failed: {exc!r}")
             ok = False
+        replays = 0
         if ok:
             for rep in range(3):
                 for k, v in pristine.items():
@@ -402,7 +403,33 @@ def check(args) -> dict:
                 torch.cuda.synchronize()
                 got = outputs(meta, count, packed) | pool_state(pools)
                 ok &= compare(ref, got, f"graph{label}/replay{rep}", report)
-        summary[f"graph{label}"] = {"exact": bool(ok)}
+                replays += 1
+            # 8 more replays, each with NEW inputs copied in place into the captured tensors
+            # (positions advance, new rows/selections/slots), vs an eager reference of that step.
+            for rep in range(8):
+                new = make_case(count, requests, seed=5, step=rep + 1)
+                new["_gw"] = global_write_slots(new, pristine)
+                for key in ("swa_vals", "main_vals", "index_vals", "index_q", "swa_slots", "_gw",
+                            "swa_idx", "logical", "visible", "requests"):
+                    case[key].copy_(new[key])
+                for key in ("swa_tf", "main_tf", "index_tf"):
+                    case[key].rope[0].copy_(new[key].rope[0])
+                force_reference(True)
+                meta_r = FakeMeta(count)
+                pools_r = {k: v.clone() for k, v in pristine.items()}
+                ref_n = outputs(meta_r, count, run_step(new, pools_r, meta_r)) | pool_state(pools_r)
+                force_reference(False)
+                for k, v in pristine.items():
+                    pools[k].copy_(v)
+                meta.prepared_lens.zero_()
+                meta.swa_pool.fill_(1.0)
+                meta.extra_pool.fill_(1.0)
+                graph.replay()
+                torch.cuda.synchronize()
+                got = outputs(meta, count, packed) | pool_state(pools)
+                ok &= compare(ref_n, got, f"graph{label}/inplace_replay{rep}", report)
+                replays += 1
+        summary[f"graph{label}"] = {"exact": bool(ok), "replays": replays}
         log("graph", label, "exact" if ok else "MISMATCH")
         passed &= ok
     return {

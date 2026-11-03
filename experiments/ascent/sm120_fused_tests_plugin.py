@@ -23,6 +23,26 @@ def _sm100_or_sm120():
         pytest.skip("Fused CSA2 store/gather is enabled on SM100/SM120 only")
 
 
+_ORIG_SKIP = pytest.skip
+# Inline SM100-only skips guarding kernels behind the widened gates (not packed attention).
+_WIDENED_REASONS = ("Fused CSA2 gather requires SM100-family validation",)
+
+
+def _skip(reason="", *args, **kwargs):
+    if (
+        any(r in str(reason) for r in _WIDENED_REASONS)
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 12
+    ):
+        print(f"[sm120-plugin] ignoring SM100-only skip: {reason}")
+        return None
+    return _ORIG_SKIP(reason, *args, **kwargs)
+
+
+_skip.Exception = _ORIG_SKIP.Exception
+pytest.skip = _skip
+
+
 def pytest_collection_modifyitems(session, config, items):
     patched = set()
     for item in items:

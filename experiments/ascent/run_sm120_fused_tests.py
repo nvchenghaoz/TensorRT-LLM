@@ -33,9 +33,21 @@ def main():
     failed = [ln for ln in keep if ln.startswith(("FAILED", "ERROR"))]
     fused_ran = [ln for ln in keep if ln.startswith("PASSED") and
                  re.search(r"fused_store|fused_gather|native_staging|staging", ln)]
-    passed = proc.returncode == 0 and counts.get("passed", 0) > 0 and not failed
+    staging_1180 = [ln for ln in keep if "test_staging_excludes_out_of_capacity_rows" in ln]
+    # byte-exact fused vs reference check (csa2_glue.py check): per-iteration, 10-step windows,
+    # CUDA-graph capture + 3 fixed + 8 in-place-updated replays at batch 1/2/4/8.
+    chk = subprocess.run([sys.executable, str(HERE / "csa2_glue.py"), "check"], cwd=ROOT,
+                         capture_output=True, text=True)
+    print(chk.stdout[-8000:], flush=True)
+    sys.stderr.write(chk.stderr[-3000:])
+    jl = [ln for ln in chk.stdout.splitlines() if ln.startswith("{")]
+    check = json.loads(jl[-1]) if (chk.returncode == 0 and jl) else {"passed": False}
+    passed = (proc.returncode == 0 and counts.get("passed", 0) > 0 and not failed
+              and bool(check.get("passed")))
     print(json.dumps({
         "passed": passed,
+        "byte_exact_check": {k: check.get(k) for k in ("passed", "cases", "mismatches", "compared")},
+        "test_staging_excludes_out_of_capacity_rows": staging_1180,
         "returncode": proc.returncode,
         "summary": summary.strip("= "),
         "counts": counts,
