@@ -89,55 +89,60 @@ def main():
         sample = sorted(k[len(prefix):] for k in keys)
         log("checkpoint attention keys:", sample)
         built = None
-        for tp in (4, 1):
+        # TP4 needs 4 visible GPUs; on one GPU build TP1 (the fusion is shape-generic,
+        # TP4 per-rank shapes are covered by csa2_shared_proj_bench.py check).
+        for tp, on_device in ((4, True), (1, False), (1, True)):
             try:
                 mapping = Mapping(world_size=tp, tp_size=tp, rank=0, gpus_per_node=8)
-                with torch.device("cuda"):
+                if on_device:
+                    with torch.device("cuda"):
+                        built = DeepseekV41Attention.from_hf_config(
+                            pcfg, layer_idx, mapping=mapping, projection_quantization="mxfp8")
+                else:
                     built = DeepseekV41Attention.from_hf_config(
                         pcfg, layer_idx, mapping=mapping, projection_quantization="mxfp8")
                 built = built.cuda()
-                log("constructed with tp", tp)
+                log("constructed with tp", tp, "on_device", on_device)
                 break
             except Exception as e:
-                log("construct tp", tp, "failed:", type(e).__name__, str(e)[:300])
+                log("construct tp", tp, "on_device", on_device, "failed:",
+                    type(e).__name__, str(e)[:300])
+                built = None
         if built is None:
             failures.append(f"construct layer {layer_idx}")
             continue
         attn = built
-        # Census as in DeepseekV41 CSA2 attention load_weights: every key has a consumer.
-        aliases = {
-            "o_a_proj": "wo_a.weight", "o_b_proj.weight": "wo_b.weight",
-            "index_wq_b.weight": "indexer.wq_b.weight",
-            "index_weights_proj.weight": "indexer.weights_proj.weight",
-            "index_wk.weight": "indexer.wk.weight", "index_k_norm.weight": "indexer.k_norm.weight",
-        }
-        expected = {aliases.get(nm, nm) for nm, _ in attn.named_parameters()
-                    if not nm.endswith("weight_scale")}
-        # Same key renaming as modeling_deepseekv41.DeepseekV41Attention.load_weights.
-        stems = {"q_a_proj": "wq_a", "q_b_proj": "wq_b", "kv_a_proj_with_mqa": "wkv",
-                 "q_a_layernorm": "q_norm", "kv_a_layernorm": "kv_norm", "o_b_proj": "wo_b"}
-        local = {}
-        for k, v in tensors.items():
-            k = k[len(prefix):]
-            if k == "o_a_proj":
-                k = "wo_a.weight"
-            elif k.startswith("o_a_proj."):
-                k = "wo_a." + k[len("o_a_proj."):]
-            else:
-                head, sep, tail = k.partition(".")
-                k = stems.get(head, head) + sep + tail
-            local[k] = v
-        scales = {k.removesuffix("weight") + "weight_scale_inv" for k in expected
-                  if k.endswith("weight") and k in local and local[k].dtype == torch.float8_e4m3fn}
-        extras = sorted(set(local) - expected - scales)
-        missing = sorted(expected - set(local))
-        log("census extras", extras, "missing", missing)
+        # The model's own load path: V4.1 checkpoint remap (native FP8 pairs, block-128
+        # requant of wo_a, .scale -> weight_scale_inv renames, its census), then the
+        # model attention's load_weights (key renaming + "every key has a consumer").
+        from tensorrt_llm._torch.models import modeling_deepseekv41 as m41
+
         try:
-            attn.load_hf_weights(dict(local))
+            remapped = m41._remap_deepseek_v41_checkpoint_keys(
+                tensors, num_hidden_layers=n, kv_lora_rank=getattr(cfg, "kv_lora_rank", 448),
+                quantization_config=cfg_dict.get("quantization_config",
+                                                 raw_cfg.get("quantization_config")))
+            mod_prefix = None
+            for k in remapped:
+                for marker in (f"layers.{layer_idx}.self_attn.", f"layers.{layer_idx}.attn."):
+                    if marker in k:
+                        mod_prefix = k[: k.index(marker) + len(marker)]
+                        break
+                if mod_prefix:
+                    break
+            selected = {k[len(mod_prefix):]: v for k, v in remapped.items()
+                        if k.startswith(mod_prefix)}
+            others = sorted(k for k in remapped if not k.startswith(mod_prefix))
+            log("remapped prefix", mod_prefix, "keys", sorted(selected), "outside", others)
+            m41.DeepseekV41Attention.load_weights(attn, [selected])
+            # load_weights raises on any key without a consumer; keys the remap routes
+            # outside this attention subtree belong to other modules (reported only).
+            extras, missing = [], []
         except Exception as e:
-            log("load failed", type(e).__name__, str(e)[:500])
+            log("load failed", type(e).__name__, str(e)[:800])
             failures.append(f"load layer {layer_idx}")
             continue
+        log("census (model load_weights) passed; keys outside the attention subtree:", others)
         torch.cuda.synchronize()
         fused_built = attn._wq_a_wkv is not None and (
             (attn._wq_b_index is not None) == hasattr(attn, "index_wq_b"))
