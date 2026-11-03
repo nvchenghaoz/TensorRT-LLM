@@ -50,7 +50,8 @@ def run(args, plugin):
 def main():
     suite = run([SUITE], plugin=True)
     stale = run(["-k", " or ".join(STALE), SUITE], plugin=False)
-    repaired_ok = (len([n for n in suite["plugin_notes"] if "passed" in n]) >= 3
+    repaired_ok = (any("gathered replays" in n and "passed" in n for n in suite["plugin_notes"])
+                   and any("constant rows (a)-(d) passed" in n for n in suite["plugin_notes"])
                    and all(s.startswith("PASSED") for s in suite["stale_tests"])
                    and len(suite["stale_tests"]) == 2)
     passed = (suite["returncode"] == 0 and suite["counts"].get("passed", 0) > 100
