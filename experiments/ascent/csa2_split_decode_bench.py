@@ -302,9 +302,59 @@ def run_check(args, device):
         "cases": cases_out}), flush=True)
 
 
+def run_count(args, device):
+    """Kernel launches and per-kernel GPU time of one decode layer, old vs new.
+
+    Both paths run in the candidate tree (the old one is the unchanged per-request
+    production chain). torch.profiler CUDA kernel events of one warm eager call.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    report = {}
+    for m in [int(x) for x in args.batches.split(",")]:
+        for kind in ("r2", "r1", "cand"):
+            c = Case(kind, m, args, device)
+            entry = {}
+            for name, fn in (("old", c.old), ("new", c.new)):
+                for _ in range(2):
+                    c.reset()
+                    fn()
+                torch.cuda.synchronize()
+                with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    fn()
+                    torch.cuda.synchronize()
+                kernels = {}
+                for ev in prof.events():
+                    if ev.device_type == torch.autograd.DeviceType.CUDA and "memcpy" not in ev.name.lower() \
+                            and "memset" not in ev.name.lower():
+                        k = ev.name[:60]
+                        n, t = kernels.get(k, (0, 0.0))
+                        kernels[k] = (n + 1, t + float(getattr(ev, "device_time_total", 0.0)))
+                entry[name] = {
+                    "launches": sum(n for n, _ in kernels.values()),
+                    "gpu_us": round(sum(t for _, t in kernels.values()), 1),
+                    "kernels": {k: [n, round(t / n, 1)] for k, (n, t) in
+                                sorted(kernels.items(), key=lambda kv: -kv[1][1])[:12]},
+                }
+            report[f"{kind}_m{m}"] = entry
+            log(f"{kind} m={m}: old {entry['old']['launches']} launches {entry['old']['gpu_us']}us | "
+                f"new {entry['new']['launches']} launches {entry['new']['gpu_us']}us")
+            log("  old: " + json.dumps(entry["old"]["kernels"]))
+            log("  new: " + json.dumps(entry["new"]["kernels"]))
+            del c
+    steps = {}
+    for m in [int(x) for x in args.batches.split(",")]:
+        steps[str(m)] = {
+            p: 3 * report[f"r2_m{m}"][p]["launches"] + report[f"r1_m{m}"][p]["launches"]
+            + 4 * report[f"cand_m{m}"][p]["launches"] for p in ("old", "new")}
+    print(json.dumps({"passed": True, "launches_per_step_8_layers": steps, "layers": report}),
+          flush=True)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--check", action="store_true")
+    p.add_argument("--count", action="store_true")
     p.add_argument("--batches", default="1,2,4,8")
     p.add_argument("--tokens-per-block", type=int, default=128)
     p.add_argument("--max-seq-len", type=int, default=36864)
@@ -317,6 +367,8 @@ def main():
     log(f"device={torch.cuda.get_device_name(0)} new_path={NEW} check={args.check}")
     if args.check:
         run_check(args, device)
+    elif args.count:
+        run_count(args, device)
     else:
         run_bench(args, device)
 
