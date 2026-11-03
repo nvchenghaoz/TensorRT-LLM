@@ -84,9 +84,9 @@ def kernel_names(fn):
     return sorted({e.name[:80] for e in prof.events() if e.device_type.name == "CUDA"})
 
 
-def bench():
+def bench(warm=False):
     gen = torch.Generator(device="cuda").manual_seed(SEED)
-    ws = make_weights(gen)
+    ws = make_weights(gen, 1) * LAYERS if warm else make_weights(gen)  # warm: one L2-resident weight
     batch = {}
     for m in MS:
         xs = [torch.randn((m, HIDDEN), generator=gen, device="cuda").to(torch.bfloat16) for _ in range(LAYERS)]
@@ -272,4 +272,4 @@ if __name__ == "__main__":
     torch.manual_seed(SEED)
     load_ops()
     with torch.no_grad():
-        {"bench": bench, "check": check}[mode]()
+        {"bench": bench, "warm": lambda: bench(True), "check": check}[mode]()
