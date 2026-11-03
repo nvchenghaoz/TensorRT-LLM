@@ -1520,8 +1520,11 @@ private:
     }
 
 private:
-    // PCIe-only default cap for the custom kernels (see getPcieCustomAllReduceMaxBytes).
-    static constexpr size_t kPcieCustomAllReduceDefaultMaxBytes = 1024 * 1024;
+    // PCIe-only default cap for the custom kernels (see getPcieCustomAllReduceMaxBytes). On 4x RTX PRO 6000 (PCIe
+    // Gen5, TP4, bf16 x 5120) one-shot beats NCCL up to ~32 tokens (320 KiB) and loses from 64 tokens (640 KiB) up;
+    // two-shot wins only near 64 tokens (49 vs 53 us), and at prefill sizes both lose to NCCL (2048 tokens: one-shot
+    // 1.71 ms, two-shot 0.90 ms, NCCL with NCCL_P2P_LEVEL=PHB 0.78 ms).
+    static constexpr size_t kPcieCustomAllReduceDefaultMaxBytes = 512 * 1024;
 
     std::set<int> mGroup;
     bool mIsNVLINKSupported;

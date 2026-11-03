@@ -208,6 +208,9 @@ def _robust(torch, mapping, strategy, m, rank, dev):
             run.graph.replay()
             outs[i].copy_(run.out)
         torch.cuda.synchronize()
+        # every rank has finished the chunk before anyone inspects lamport state; otherwise a fast peer's next
+        # call (e.g. the next Runner's warm-up) may already be writing into this rank's next buffer.
+        _barrier()
         _, f1, l1 = _lamport_state(torch, mapping)
         for i in range(n):
             ref, absum = _ref(torch, m, 5000 + done + i, dev)
@@ -216,6 +219,7 @@ def _robust(torch, mapping, strategy, m, rank, dev):
             bad += int(e > BOUND or not fin)
             negz += nz
         uncleared = _next_buffer_cleared(torch, mapping, m) if strategy_is_oneshot(strategy, m) else 0
+        _barrier()
         chunks.append({"flags_before": f0, "flags_after": f1, "layout_after": l1, "uncleared_next": uncleared})
         done += n
     _, f_end, l_end = _lamport_state(torch, mapping)
@@ -346,11 +350,24 @@ def _combine_timing(results, row=None):
 def _robust_ok(results, key):
     """Lamport flag must advance by calls mod 3 identically on every rank; next buffer fully cleared."""
     rows = [r["robust"][key] for r in results]
-    ok = all(x["bad_calls"] == 0 and x["neg_zero_outputs"] == 0 for x in rows)
     flags = [x["flags_end"] for x in rows]
-    ok = ok and all(f == flags[0] for f in flags)
-    ok = ok and all(c["uncleared_next"] == 0 for x in rows for c in x["chunks"])
-    return ok, flags
+    reasons = []
+    for rk, x in enumerate(rows):
+        if x["bad_calls"]:
+            reasons.append(f"rank{rk}: {x['bad_calls']} calls over the bound")
+        if x["neg_zero_outputs"]:
+            reasons.append(f"rank{rk}: {x['neg_zero_outputs']} -0.0 outputs")
+        unc = [c["uncleared_next"] for c in x["chunks"]]
+        if any(unc):
+            reasons.append(f"rank{rk}: next lamport buffer not cleared per chunk {unc}")
+        steps = [(c["flags_after"][2] - c["flags_before"][2]) % 3 for c in x["chunks"]]
+        if "ONESHOT" in key and any(s != (ROBUST_CHUNK % 3) for s in steps):
+            reasons.append(f"rank{rk}: lamport flag advanced {steps} per chunk, expected {ROBUST_CHUNK % 3}")
+    if any(f != flags[0] for f in flags):
+        reasons.append(f"lamport/barrier flags differ across ranks: {flags}")
+    for r in reasons:
+        log(f"[robust:{key}] FAIL {r}")
+    return not reasons, flags
 
 
 def sh(cmd):
@@ -366,7 +383,7 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "sweep"
     log(sh(["nvidia-smi", "--query-gpu=index,pci.bus_id,clocks.sm,temperature.gpu,power.draw,"
             "clocks_throttle_reasons.active", "--format=csv"]))
-    if mode == "sweep":
+    if mode in ("sweep", "robust"):
         log(sh(["nvidia-smi", "topo", "-m"]))
         import torch
         peer = [[int(torch.cuda.can_device_access_peer(i, j)) for j in range(WORLD) if j != i] for i in range(WORLD)]
@@ -383,6 +400,9 @@ def main():
             ({"_name": "phb_pdl0", "NCCL_P2P_LEVEL": "PHB", "TLLM_PCIE_CUSTOM_AR_MAX_BYTES": big,
               "TRTLLM_ENABLE_PDL": "0"}, ["ONESHOT"], False, False),
         ]
+        if mode == "robust":  # only the 1000-replay pass, on the custom kernels with the PCIe cap lifted
+            configs = [({"_name": "phb", "NCCL_P2P_LEVEL": "PHB", "TLLM_PCIE_CUSTOM_AR_MAX_BYTES": big},
+                        [], False, True)]
         table, checks, robust, allok = {}, {}, {}, True
         for env, rows, do_check, do_robust in configs:
             res = run_ranks(rank_sweep, env, rows, do_check, do_robust)
@@ -428,6 +448,17 @@ def main():
             print(json.dumps(out))
         else:
             ok = True
+            # the custom kernels themselves (cap lifted): 1000 back-to-back replays, ONESHOT M=1/8, TWOSHOT M=8
+            rres = run_ranks(rank_sweep, {"_name": "robust_phb", "NCCL_P2P_LEVEL": "PHB",
+                                          "TLLM_PCIE_CUSTOM_AR_MAX_BYTES": str(1 << 40)}, [], False, True)
+            custom_rob = {}
+            for key in rres[0]["robust"]:
+                rok, flags = _robust_ok(rres, key)
+                custom_rob[key] = {"passed": rok, "flags_end_per_rank": flags,
+                                   "rank0_chunks": rres[0]["robust"][key]["chunks"],
+                                   "bad_calls": sum(r["robust"][key]["bad_calls"] for r in rres),
+                                   "max_e": max(r["robust"][key]["max_e"] for r in rres)}
+                ok = ok and rok
             summ = {}
             for m in res[0]["check"]:
                 bad = sum(r["check"][m]["bad_iters"] for r in res)
@@ -438,12 +469,14 @@ def main():
             for key in res[0]["robust"]:
                 rok, flags = _robust_ok(res, key)
                 rob[key] = {"passed": rok, "flags_end_per_rank": flags,
+                            "rank0_chunks": res[0]["robust"][key]["chunks"],
                             "bad_calls": sum(r["robust"][key]["bad_calls"] for r in res),
                             "max_e": max(r["robust"][key]["max_e"] for r in res)}
                 ok = ok and rok
             print(json.dumps({"passed": ok, "compared": "AUTO all-reduce (autotuned) vs fp32 sum of the 4 ranks' "
                               "bf16 inputs, e=max|out-ref|/sum|x_i| <= 2^-6, every call",
-                              "check": summ, "robust_1000_replays": rob}))
+                              "check": summ, "robust_1000_replays": rob,
+                              "custom_kernels_robust_1000_replays": custom_rob}))
         return
 
 
