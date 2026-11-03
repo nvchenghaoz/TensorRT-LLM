@@ -299,11 +299,13 @@ class CSA2Indexer(Indexer):
         chunk = width // splits
         reps = splits * block
         bounds = self._split_decode_bounds(rows, width, splits, q_data.device)
+        # Materialized replicas: with one row, reshape of the expand is a stride-0 view.
         q = q_data.view(torch.int8)
-        q = q[:, None].expand(rows, reps, heads, q.shape[2]).reshape(rows * reps, heads, q.shape[2])
+        q = q[:, None].expand(rows, reps, heads, q.shape[2]).contiguous()
+        q = q.view(rows * reps, heads, q.shape[3])
         scale = q_scale.contiguous().view(torch.int32).reshape(rows, heads)
-        scale = scale[:, None].expand(rows, reps, heads).reshape(rows * reps, heads)
-        w = weights[:, None].expand(rows, reps, heads).reshape(rows * reps, heads)
+        scale = scale[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+        w = weights[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
         out = _fp8_fp4_mqa_logits(
             (q, scale),
             (k_data.view(torch.int8), k_scale.contiguous().view(torch.int32).reshape(-1)),
