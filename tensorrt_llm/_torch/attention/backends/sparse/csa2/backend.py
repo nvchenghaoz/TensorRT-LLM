@@ -739,6 +739,7 @@ class CSA2FlashInfer:
         packed_mask: torch.Tensor
         indices: torch.Tensor | None = None
         protected: bool = False
+        split_rows: int | None = None
 
     @staticmethod
     def pack_query_masks(valid: torch.Tensor) -> torch.Tensor:
@@ -747,6 +748,27 @@ class CSA2FlashInfer:
         bits = padded.reshape(valid.shape[0], padded.shape[1] // 8, 8).to(torch.int32)
         shifts = torch.arange(8, device=valid.device, dtype=torch.int32)
         return (bits << shifts).sum(-1).to(torch.uint8).flatten()
+
+    # Decode split-KV: one CTA per query serializes the hd512 FA2 mainloop
+    # (shared K/V smem), so small counts split each query's rows into chunks
+    # of this many rows and FlashInfer merges the partial states.
+    # 64 rows = one FA2 hd512 KV tile per chunk; measured fastest of 64/128/320/auto
+    # at counts 1-8 (FA2 + merge 51 -> 18-25 us per call).
+    _SPLIT_KV_ROWS = 64
+    _SPLIT_KV_MAX_COUNT = 16
+    _WORKSPACE_BYTES = 8 * 1024 * 1024
+
+    def split_kv_rows(self, count: int, heads: int, width: int, dim: int) -> int | None:
+        """Rows per split-KV chunk for a ragged plan (0: FlashInfer's choice), or None."""
+        rows = self._SPLIT_KV_ROWS
+        if rows is None or count > self._SPLIT_KV_MAX_COUNT or width <= (rows or 128):
+            return None
+        chunks = -(-width // (rows or 128)) if rows else 8
+        # Partial O and LSE for every (query, chunk, head) live in the float
+        # workspace; keep them well inside it.
+        if count * chunks * heads * (dim + 1) * 4 > self._WORKSPACE_BYTES // 2:
+            return None
+        return rows
 
     def __init__(self, attention=None) -> None:
         self.attention = attention
@@ -823,16 +845,20 @@ class CSA2FlashInfer:
         from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
 
         key = (count, heads, width, device, scale)
+        split_rows = self.split_kv_rows(count, heads, width, dim)
         plan = self._plans.get(key)
-        if plan is None:
+        # The split size is part of the plan's identity: a policy change replans.
+        if plan is None or plan.split_rows != split_rows:
             with torch.cuda.device(device):
                 capturing = torch.cuda.is_current_stream_capturing()
             if capturing:
                 raise RuntimeError("Warm up the CSA2 FlashInfer shape before CUDA Graph capture")
             if device not in self._workspaces:
-                # Plans use fixed query geometry and disable split-KV.
+                # Plans use fixed query geometry. Split-KV partials of small
+                # decode plans fit in this buffer (see split_kv_rows); every
+                # run() merges them before it returns, so plans can share it.
                 self._workspaces[device] = torch.empty(
-                    8 * 1024 * 1024, dtype=torch.uint8, device=device
+                    self._WORKSPACE_BYTES, dtype=torch.uint8, device=device
                 )
             qo_host = torch.arange(count + 1, dtype=torch.int32, device="cpu")
             kv_host = qo_host * width
@@ -859,11 +885,13 @@ class CSA2FlashInfer:
                 sm_scale=scale,
                 q_data_type=torch.bfloat16,
                 kv_data_type=torch.bfloat16,
-                disable_split_kv=True,
+                disable_split_kv=split_rows is None,
+                fixed_split_size=split_rows or None,
             )
-            # plan() packs the bool mask into its own persistent byte buffer.
+            # plan() packs the bool mask into its own persistent byte buffer
+            # (layout set by qo/kv indptr only, so split-KV does not move it).
             # Update that exact buffer on replay, not the original bool mask.
-            plan = self._Plan(wrapper, wrapper._custom_mask_buf)
+            plan = self._Plan(wrapper, wrapper._custom_mask_buf, split_rows=split_rows)
             self._plans[key] = plan
         return plan
 
