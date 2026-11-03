@@ -937,18 +937,21 @@ class CSA2FlashInfer:
             self._plans[key] = plan
         return plan
 
-    def run_shared(self, q, bank, indices, sink, scale, protect=False) -> torch.Tensor:
-        """Use one-row pages to share converted KV across sparse queries."""
+    def run_shared(self, q, bank, indices, sink, scale, protect=False, out=None) -> torch.Tensor:
+        """Use one-row pages to share converted KV across sparse queries.
+
+        ``out`` (same shape as ``q``, BF16) receives the result directly on the fused path.
+        """
         from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
 
         count, heads, dim = q.shape
         if dim != 512 or q.dtype != torch.bfloat16 or bank.dtype != torch.bfloat16:
             raise ValueError("CSA2 FlashInfer requires BF16 Q/KV with head dimension 512")
         if count == 0:
-            return torch.empty_like(q)
+            return torch.empty_like(q) if out is None else out
         width = indices.shape[1]
         if width == 0:
-            return torch.zeros_like(q)
+            return torch.zeros_like(q) if out is None else out.zero_()
         key = (count, heads, width, q.device, scale)
         plan = self._paged_plans.get(key)
         if plan is None:
@@ -984,14 +987,39 @@ class CSA2FlashInfer:
             plan = self._Plan(wrapper, wrapper._custom_mask_buf, wrapper._paged_kv_indices_buf)
             self._paged_plans[key] = plan
         plan.protected |= protect or torch.cuda.is_current_stream_capturing()
+        pages = bank.view(-1, 1, 1, dim)
+        if (
+            self.fused_glue
+            and indices.shape[0] == count
+            and indices.dtype == torch.int32
+            and indices.stride(1) == 1
+            and plan.indices.dtype == torch.int32
+            and plan.indices.numel() == count * width
+            and plan.packed_mask.numel() == count * ((width + 7) // 8)
+            and (out is None or (out.shape == q.shape and out.dtype == torch.bfloat16))
+        ):
+            # Bitwise equal to the ATen glue below: one staging launch, one epilogue.
+            from .flashinfer_glue import sink_epilogue, stage_shared_indices_and_mask
+
+            valid_flag = torch.empty(count, dtype=torch.int32, device=q.device)
+            stage_shared_indices_and_mask(indices, plan.indices, plan.packed_mask, valid_flag)
+            output, lse = plan.wrapper.run(q.contiguous(), (pages, pages), return_lse=True)
+            if out is None:
+                out = torch.empty_like(q)
+            if sink.dtype != torch.float32 or not sink.is_contiguous():
+                sink = sink.float().contiguous()
+            return sink_epilogue(output, lse, sink, valid_flag, out)
         valid = indices >= 0
         plan.indices.copy_(indices.clamp_min(0).flatten())
         plan.packed_mask.copy_(self.pack_query_masks(valid))
-        pages = bank.view(-1, 1, 1, dim)
         output, lse = plan.wrapper.run(q.contiguous(), (pages, pages), return_lse=True)
         correction = torch.sigmoid(lse.float() * math.log(2.0) - sink.float()[None, :])
         output = output.float() * correction[..., None]
-        return torch.where(valid.any(-1)[:, None, None], output, 0).to(q.dtype)
+        result = torch.where(valid.any(-1)[:, None, None], output, 0).to(q.dtype)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
 
     def forward_context(self, q, metadata, forward_args):
         if forward_args.attention_input_type != AttentionInputType.context_only:
@@ -1046,6 +1074,19 @@ class CSA2FlashInfer:
         width = selection.shape[1] if shared else values.shape[1]
         self._evict_eager_plans(metadata, (query.shape[0], query.shape[1], width, q.device, scale))
         if shared:
+            output = forward_args.output
+            if (
+                output is not None
+                and output.is_contiguous()
+                and output.shape == (query.shape[0], query.shape[1] * query.shape[2])
+                and output.dtype == torch.bfloat16
+            ):
+                # The fused epilogue writes the layer output in place (no copy_).
+                with torch.cuda.device(q.device):
+                    self.run_shared(
+                        *inputs, protect=metadata._csa2_graph_reserved, out=output.view_as(query)
+                    )
+                return output
             with torch.cuda.device(q.device):
                 result = self.run_shared(*inputs, protect=metadata._csa2_graph_reserved).flatten(1)
         else:
