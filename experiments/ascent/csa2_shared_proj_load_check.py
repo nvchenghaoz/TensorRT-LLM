@@ -34,16 +34,21 @@ def main():
     cfg_dict = raw_cfg.get("text_config", raw_cfg)
 
     class Cfg:
-        pass
+        """Plain attribute view of text_config (transformers' generic PretrainedConfig
+        rejects this config: it standardizes RoPE and needs max_position_embeddings)."""
+
+        def update(self, d):
+            for k, v in d.items():
+                setattr(self, k, v)
 
     cfg = Cfg()
-    for k, v in cfg_dict.items():
-        setattr(cfg, k, v)
+    cfg.update(cfg_dict)
     if not hasattr(cfg, "rope_scaling"):
         cfg.rope_scaling = None
-    from transformers import PretrainedConfig
-
-    pcfg = PretrainedConfig(**cfg_dict)
+    if not hasattr(cfg, "max_position_embeddings"):
+        # Only sizes the RoPE table; the compared projections run before RoPE.
+        cfg.max_position_embeddings = raw_cfg.get("max_position_embeddings", 1 << 20)
+    pcfg = cfg
     layout = CSA2Layout(
         tuple(cfg.compress_ratios), tuple(cfg.kv_source_layer_ids),
         tuple(cfg.index_source_layer_ids), cfg.candidate_source_layer_id,
@@ -108,14 +113,27 @@ def main():
         }
         expected = {aliases.get(nm, nm) for nm, _ in attn.named_parameters()
                     if not nm.endswith("weight_scale")}
-        local = {k[len(prefix):]: v for k, v in tensors.items()}
+        # Same key renaming as modeling_deepseekv41.DeepseekV41Attention.load_weights.
+        stems = {"q_a_proj": "wq_a", "q_b_proj": "wq_b", "kv_a_proj_with_mqa": "wkv",
+                 "q_a_layernorm": "q_norm", "kv_a_layernorm": "kv_norm", "o_b_proj": "wo_b"}
+        local = {}
+        for k, v in tensors.items():
+            k = k[len(prefix):]
+            if k == "o_a_proj":
+                k = "wo_a.weight"
+            elif k.startswith("o_a_proj."):
+                k = "wo_a." + k[len("o_a_proj."):]
+            else:
+                head, sep, tail = k.partition(".")
+                k = stems.get(head, head) + sep + tail
+            local[k] = v
         scales = {k.removesuffix("weight") + "weight_scale_inv" for k in expected
                   if k.endswith("weight") and k in local and local[k].dtype == torch.float8_e4m3fn}
         extras = sorted(set(local) - expected - scales)
         missing = sorted(expected - set(local))
         log("census extras", extras, "missing", missing)
         try:
-            attn.load_hf_weights({prefix + k: v for k, v in local.items()}, prefix)
+            attn.load_hf_weights(dict(local))
         except Exception as e:
             log("load failed", type(e).__name__, str(e)[:500])
             failures.append(f"load layer {layer_idx}")
