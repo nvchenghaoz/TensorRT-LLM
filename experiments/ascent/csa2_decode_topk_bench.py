@@ -675,10 +675,145 @@ def mode_evalchecks(args):
     print(json.dumps({"passed": result.pop("passed"), **result}))
 
 
+def mode_padcheck(args):
+    """Top-lead item 3 evidence: eager torch.profiler kernel lists (launch order) of one 8-layer
+    decode top-K step, old (CUDA radix) vs new, rows 1/2/4/8; F.pad call counter under CUDA-graph
+    capture; scores alignment; near-constant scores at default policy and REREAD_ALWAYS."""
+    from torch.profiler import ProfilerActivity, profile
+    import torch.nn.functional as F
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Mode
+    from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+    import tensorrt_llm._torch.custom_ops  # noqa: F401
+
+    new_ix = {m: build_indexer(args.checkpoint, m) for m in (CSA2Mode.FULL, CSA2Mode.REINDEX)}
+    old_ix = {m: build_indexer(args.checkpoint, m) for m in (CSA2Mode.FULL, CSA2Mode.REINDEX)}
+    for ix in old_ix.values():
+        ix.top_k.decode_implementation = TopKImplementation.CUDA_RADIX
+    impls = {"new": {str(m): ix.top_k.decode_implementation.value for m, ix in new_ix.items()},
+             "old": {str(m): ix.top_k.decode_implementation.value for m, ix in old_ix.items()}}
+    log("impls", impls)
+    failures = []
+    pad_calls = {"n": 0}
+    orig_pad = F.pad
+
+    def counting_pad(*a, **k):
+        pad_calls["n"] += 1
+        return orig_pad(*a, **k)
+
+    F.pad = counting_pad
+    bad_words = ("pad", "copy", "elementwise", "fill")
+    steps = {}
+    try:
+        for rows in ROWS:
+            bufs = []
+            for li, (m, width) in enumerate(_step_layers()):
+                ai, al = radix_aux(rows)
+                bufs.append((m, make_scores(rows, width, seed=li + rows),
+                             torch.empty(rows, TOPK, dtype=torch.int32, device="cuda"), ai, al,
+                             torch.full((rows,), width, dtype=torch.int32, device="cuda")))
+            align = [{"width": s.shape[1], "stride0_mod8": s.stride(0) % 8,
+                      "ptr_mod32": s.data_ptr() % 32, "width_mod8": s.shape[1] % 8}
+                     for _, s, _, _, _, _ in bufs]
+
+            def step(ixs):
+                for m, s, o, ai, al, lens in bufs:
+                    ixs[m].select_prepared_scores(s, o, None, lens, is_prefill=False,
+                                                  radix_aux_indices=ai, radix_aux_logits=al)
+
+            for _ in range(2):
+                step(new_ix)
+                step(old_ix)
+            torch.cuda.synchronize()
+            rec = {"align": align}
+            for arm, ixs in (("old", old_ix), ("new", new_ix)):
+                pad_calls["n"] = 0
+                with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    step(ixs)
+                    torch.cuda.synchronize()
+                names = [e.name for e in sorted(
+                    (e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA),
+                    key=lambda e: e.time_range.start)]
+                rec[arm] = {"kernels_in_launch_order": [n[:90] for n in names],
+                            "launches": len(names),
+                            "pad_copy_elementwise_kernels": sum(
+                                1 for n in names if any(w in n.lower() for w in bad_words)),
+                            "F_pad_calls_eager": pad_calls["n"]}
+            # graph capture of the new step with the F.pad counter
+            pad_calls["n"] = 0
+            st = torch.cuda.Stream()
+            st.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(st):
+                step(new_ix)
+            torch.cuda.current_stream().wait_stream(st)
+            torch.cuda.synchronize()
+            pad_calls["n"] = 0
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                step(new_ix)
+            rec["new_F_pad_calls_under_capture"] = pad_calls["n"]
+            g.replay()
+            torch.cuda.synchronize()
+            n_new = rec["new"]["pad_copy_elementwise_kernels"]
+            n_old = rec["old"]["pad_copy_elementwise_kernels"]
+            rec["new_adds_pad_copy_kernels"] = n_new > n_old
+            if n_new > n_old or rec["new_F_pad_calls_under_capture"] or rec["new"]["F_pad_calls_eager"]:
+                failures.append(f"rows {rows}: pad/copy found {rec}")
+            if rec["new"]["launches"] != len(bufs):
+                failures.append(f"rows {rows}: new launches {rec['new']['launches']} != {len(bufs)}")
+            steps[str(rows)] = rec
+            log(f"rows {rows}: old {rec['old']['launches']} launches, new {rec['new']['launches']}, "
+                f"pad under capture {rec['new_F_pad_calls_under_capture']}")
+    finally:
+        F.pad = orig_pad
+
+    # near-constant scores 1 + 1e-6 * randn, default policy and REREAD_ALWAYS
+    ref = TopK(TOPK, decode_implementation=TopKImplementation.CUDA_RADIX)
+    near = {}
+    for width in WIDTHS:
+        for rows in ROWS:
+            g_ = torch.Generator(device="cuda").manual_seed(rows * 5 + width)
+            s = (1.0 + 1e-6 * torch.randn(rows, width, generator=g_, device="cuda")).float().contiguous()
+            lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+            ai, al = radix_aux(rows)
+            o_ref = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
+            ref(s, o_ref, is_prefill=False, sequence_lengths=lens, scan_lengths=lens, next_n=1,
+                max_seq_len=width, radix_aux_indices=ai, radix_aux_logits=al)
+            gm = _kernel_geometry(rows, width)
+            _, per_cta = _threshold_bin_counts(s, gm["chunk_cols_per_cta"])
+            rec = {"threshold_bin_per_cta_max": per_cta, "capacity_S": gm["smem_candidate_capacity_S"],
+                   "reread_compiled_in": gm["reread_compiled_in"], "cluster_size": gm["cluster_size"]}
+            for pol in ("REREAD", "REREAD_ALWAYS"):
+                o = torch.empty_like(o_ref)
+                tot = {"exact": 0, "tie": 0, "bad": 0, "iterations": 0}
+                try:
+                    for it in range(3 + 5):
+                        o.fill_(-7)
+                        torch.ops.trtllm.cute_dsl_indexer_topk_decode(s, lens, o, TOPK, 1,
+                                                                      overflow_policy=pol)
+                        torch.cuda.synchronize()
+                        ex, tie, bad = compare(o_ref, o, s)
+                        tot["exact"] += ex
+                        tot["tie"] += tie
+                        tot["bad"] += len(bad)
+                        tot["iterations"] += 1
+                        if bad:
+                            failures.append(f"near-const {pol} {rows}x{width} it{it}: rows {bad}")
+                except Exception as e:  # noqa: BLE001
+                    tot["error"] = f"{type(e).__name__}: {e}"[:300]
+                    failures.append(f"near-const {pol} {rows}x{width} error")
+                rec[pol] = tot
+            near[f"{rows}x{width}"] = rec
+            log(f"near-const {rows}x{width}: {rec}")
+    print(json.dumps({"passed": not failures, "impls": impls, "steps": steps,
+                      "near_constant": near, "failures": failures[:30],
+                      "compared": "kernel lists old (CUDA radix) vs new (CuTe-DSL) per 8-layer step; "
+                                  "near-constant scores vs CUDA radix, tie-aware (selected-score multiset)"}))
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["engines", "indexer", "check", "profile", "evalchecks"])
+    p.add_argument("mode", choices=["engines", "indexer", "check", "profile", "evalchecks", "padcheck"])
     p.add_argument("--checkpoint", default="")
     a = p.parse_args()
     {"engines": mode_engines, "indexer": mode_indexer, "check": mode_check,
-     "profile": mode_profile, "evalchecks": mode_evalchecks}[a.mode](a)
+     "profile": mode_profile, "evalchecks": mode_evalchecks, "padcheck": mode_padcheck}[a.mode](a)
