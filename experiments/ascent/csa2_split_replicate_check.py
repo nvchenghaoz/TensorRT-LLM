@@ -213,9 +213,18 @@ def run_case(kind, m, args, device, failures):
         b, tb = sel_ok(e_sc, mp, gr_out, gn_out)
         ties += int(not torch.equal(e_out, gn_out))
         if not (a and b and same(gn_sc, e_sc) and same(gn_sc, gr_sc)):
+            # Diagnostics: is the eager reference itself stable at this step, and
+            # does the main-path graph agree with it?
+            e2_out, _ = eager(True)
+            en_out, _ = eager(False)
             step_bad.append(dict(step=step, sel_vs_eager=a, sel_vs_refgraph=b,
                                  sc_vs_eager=same(gn_sc, e_sc), sc_vs_refgraph=same(gn_sc, gr_sc),
-                                 refgraph_vs_eager_sc=same(gr_sc, e_sc)))
+                                 refgraph_vs_eager_sc=same(gr_sc, e_sc),
+                                 refgraph_sel_vs_eager=bool(torch.equal(gr_out, e_out)),
+                                 eager_ref_repeat_equal=bool(torch.equal(e2_out, e_out)),
+                                 eager_new_vs_eager_ref=bool(torch.equal(en_out, e_out)),
+                                 graph_vs_eager_ref_repeat=bool(torch.equal(gn_out, e2_out)),
+                                 tie=ta))
     info["window_steps"] = steps
     info["window_bad_steps"] = step_bad
     info["window_tie_rows_steps"] = ties
