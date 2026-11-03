@@ -428,6 +428,17 @@ def bench(args) -> dict:
             for _ in range(3):  # compile CuTe kernels and create staging scratch outside capture
                 run_step(case, pools, meta, layer_kind=args.kind, group=None)
         torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        from torch.profiler import ProfilerActivity, profile
+
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            run_step(case, pools, meta, layer_kind=args.kind, group=None)
+            torch.cuda.synchronize()
+        kernels = [
+            e for e in prof.events()
+            if e.device_type == torch.autograd.DeviceType.CUDA and "memcpy" not in e.name.lower()
+        ]
+        kernel_count = len(kernels)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for _ in range(args.layers):
@@ -447,7 +458,11 @@ def bench(args) -> dict:
         times.sort()
         med = times[len(times) // 2]
         p10, p90 = times[int(0.1 * len(times))], times[int(0.9 * len(times)) - 1]
-        result[label] = {"kernel_ms": round(med, 5), "noise_floor": round((p90 - p10) / med, 4)}
+        result[label] = {
+            "kernel_ms": round(med, 5),
+            "noise_floor": round((p90 - p10) / med, 4),
+            "kernels_per_layer_step": kernel_count,
+        }
         log(label, result[label])
     return {"batch": result, "output": {"class": "exact"}, "kind": args.kind,
             "fused_active": bool(Q._fused_store_supported(DEV.index))}
@@ -458,7 +473,13 @@ def main():
     parser.add_argument("mode", choices=("check", "bench"))
     parser.add_argument("--kind", default="full", choices=("full", "reindex", "swa"))
     parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--force-ref", action="store_true", help="bench the PyTorch reference path")
+    parser.add_argument("--cases", default="", help="comma-separated case labels to bench")
     args = parser.parse_args()
+    if args.cases:
+        CASES[:] = [c for c in CASES if c[0] in args.cases.split(",")]
+    if args.force_ref:
+        force_reference(True)
     torch.cuda.set_device(DEV)
     log("device", torch.cuda.get_device_name(DEV), torch.cuda.get_device_capability(DEV))
     init_weights()
