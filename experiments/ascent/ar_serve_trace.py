@@ -239,11 +239,44 @@ def gpu_busy_and_graph(files):
     return out
 
 
+def successors(files):
+    """Per rank: the kernel launched right after each AR on the same stream (e.g. fused_hc / post_mapping)."""
+    out = {}
+    for f in files:
+        m = re.search(r"rank-(\d+)", os.path.basename(f))
+        r = int(m.group(1)) if m else len(out)
+        evs = atj.load_trace(f)
+        by_stream = {}
+        for e in evs:
+            by_stream.setdefault((e.get("pid"), e.get("tid")), []).append(e)
+        nxt = {}
+        for lst in by_stream.values():
+            lst.sort(key=lambda e: e["ts"])
+            for a, b in zip(lst, lst[1:]):
+                if atj.AR_RE.search(a.get("name", "")) and not atj.AR_RE.search(b.get("name", "")):
+                    k = b["name"][:80]
+                    d = nxt.setdefault(k, {"n": 0, "sum_us": 0.0, "gap_sum_us": 0.0})
+                    d["n"] += 1
+                    d["sum_us"] += b["dur"]
+                    d["gap_sum_us"] += b["ts"] - (a["ts"] + a["dur"])
+        out[r] = sorted(({"name": k, "n": v["n"], "mean_us": round(v["sum_us"] / v["n"], 2),
+                          "mean_gap_after_ar_us": round(v["gap_sum_us"] / v["n"], 2)} for k, v in nxt.items()),
+                        key=lambda x: -x["n"])[:6]
+    return out
+
+
 def main():
     ckpt = sys.argv[1]
     ART.mkdir(parents=True, exist_ok=True)
-    arms = [("armA_main_ar", {"TLLM_PCIE_CUSTOM_AR_MAX_BYTES": "0", "TLLM_NCCL_PCIE_DEFAULTS": "0"}),
-            ("armB_branch", {})]
+    arm_set = sys.argv[2] if len(sys.argv) > 2 else "nccl_vs_branch"
+    if arm_set == "sm120_launch":
+        # idea 70: arm A = branch 22's launch as landed on main (1 CTA per token, no PDL attribute), selected by the
+        # branch's env switches, which make the launcher identical to main's; arm B = the branch default.
+        arms = [("armA_branch22_launch", {"TLLM_AR_SM120_PDL": "0", "TLLM_AR_SM120_CTAS_PER_TOKEN": "1"}),
+                ("armB_candidate", {})]
+    else:
+        arms = [("armA_main_ar", {"TLLM_PCIE_CUSTOM_AR_MAX_BYTES": "0", "TLLM_NCCL_PCIE_DEFAULTS": "0"}),
+                ("armB_branch", {})]
     summary = {"prompt_shape": f"{PREFIX} shared prefix (primed) + {SUFFIX} unique suffix, {OUT} out, token ids",
                "steps_per_window": STEPS, "arms": {}}
     for i, (name, env) in enumerate(arms):
@@ -263,6 +296,10 @@ def main():
                 w["per_rank"] = gpu_busy_and_graph(files)
             except Exception as exc:  # noqa: BLE001
                 w["per_rank"] = {"error": repr(exc)[:300]}
+            try:
+                w["after_ar"] = successors(files)
+            except Exception as exc:  # noqa: BLE001
+                w["after_ar"] = {"error": repr(exc)[:300]}
             summary["arms"][name][f"c{c}"] = w
             log(f"{name} c{c}: {json.dumps(w)[:3000]}")
     (ART / "ar_serve_trace_summary.json").write_text(json.dumps(summary, indent=1, default=str))
