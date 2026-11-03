@@ -271,7 +271,14 @@ def tie_aware(masked, logical, out_a, out_b, topk):
         return bool(torch.equal(sel, top_vals))
 
     row_eq = (out_a == out_b).all(-1)
+    first = None
+    if not bool(row_eq.all()):
+        r = int((~row_eq).nonzero()[0, 0])
+        c = int((out_a[r] != out_b[r]).nonzero()[0, 0])
+        first = dict(row=r, column=c, a=int(out_a[r, c]), b=int(out_b[r, c]),
+                     boundary_tie=bool(tie[r]), kth_score=float(kth[r]))
     return dict(
+        first_difference=first,
         bitwise_equal=bool(row_eq.all()),
         boundary_tie_rows=int(tie.sum()),
         differing_rows=int((~row_eq).sum()),
