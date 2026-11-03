@@ -38,6 +38,44 @@ from .params import (
 )
 
 
+def concat_mxfp8_linears(first: Linear, second: Linear):
+    """Row-concatenate two native MXFP8 Linears that read the same input.
+
+    Returns ``(weight [N1 + N2, K], weight_scale)`` in the standard row-major
+    weight plus 1D swizzled UE8M0 scale layout, or ``None`` when the Linears
+    cannot share one GEMM. The swizzled layout tiles 128 rows by 4 scale
+    columns, tile-row major, so with ``N1 % 128 == 0`` the concatenated 1D
+    scale buffers are exactly the swizzle of the concatenated scales. Both
+    Linears become views of the fused storage (no extra weight memory), so
+    later in-place loads keep the two in step.
+    """
+    from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+
+    for linear in (first, second):
+        method = getattr(linear, "quant_method", None)
+        if not isinstance(method, MXFP8LinearMethod) or not method.use_cutlass:
+            return None
+        if linear.bias is not None or linear.weight.dtype != torch.float8_e4m3fn:
+            return None
+    if (
+        first.weight.shape[1] != second.weight.shape[1]
+        or first.weight.shape[0] % MXFP8LinearMethod._SF_ROW_PAD
+        or first.weight_scale.dim() != 1
+        or second.weight_scale.dim() != 1
+        or first.weight.device != second.weight.device
+    ):
+        return None
+    rows = first.weight.shape[0]
+    split = first.weight_scale.numel()
+    weight = torch.cat((first.weight.data, second.weight.data))
+    scale = torch.cat((first.weight_scale.data, second.weight_scale.data))
+    first.weight.data = weight[:rows]
+    second.weight.data = weight[rows:]
+    first.weight_scale.data = scale[:split]
+    second.weight_scale.data = scale[split:]
+    return weight, scale
+
+
 class DeepseekV41Attention(nn.Module):
     """Attention component with explicit CED and paged-cache inputs.
 
@@ -172,6 +210,11 @@ class DeepseekV41Attention(nn.Module):
         )
         self.index_heads = index_heads
         self.index_head_dim = index_head_dim
+        # Row-concatenated MXFP8 projections over a shared input, built after
+        # loading by ``fuse_shared_input_projections``: one activation quantize
+        # and one GEMM for wq_a||wkv (hidden_states) and wq_b||index_wq_b (qr).
+        self._wq_a_wkv = None
+        self._wq_b_index = None
         self.wq_a = Linear(
             hidden_size, q_lora_rank, bias=False, dtype=torch.bfloat16, quant_config=quant_config
         )
@@ -320,6 +363,63 @@ class DeepseekV41Attention(nn.Module):
             self.mapping.tp_rank,
         )
 
+    @torch.no_grad()
+    def fuse_shared_input_projections(self) -> None:
+        """Share one MXFP8 weight between the projections of each common input."""
+        self._wq_a_wkv = self._wq_b_index = None
+        if self.projection_quantization != "mxfp8":
+            return
+        self._wq_a_wkv = concat_mxfp8_linears(self.wq_a, self.wkv)
+        if hasattr(self, "index_wq_b"):
+            self._wq_b_index = concat_mxfp8_linears(self.wq_b, self.index_wq_b)
+
+    def _shared_mxfp8_active(self, hidden_states: torch.Tensor) -> bool:
+        # The shared-activation path calls the same FlashInfer GEMM the
+        # Linears dispatch to; other backends keep the per-Linear calls.
+        method = self.wq_a.quant_method
+        return (
+            self._wq_a_wkv is not None
+            and hidden_states.dim() == 2
+            and hidden_states.shape[0] > 0
+            and getattr(method, "backend", None) == "flashinfer"
+            and not getattr(method, "tune_decode_graph_backends", False)
+        )
+
+    def _mxfp8_mm(self, act, act_scale, weight, weight_scale):
+        return torch.ops.trtllm.flashinfer_mm_mxfp8(act, act_scale, weight, weight_scale, self.dtype)
+
+    def _project_inputs(self, hidden_states: torch.Tensor):
+        """Return ``(qr, q [tokens, heads*dim], swa, index_query or None)``.
+
+        ``index_query`` is the raw ``index_wq_b(qr)`` when it was computed with
+        the shared quantized ``qr``; ``None`` leaves it to ``_project_index_q``.
+        """
+        if not self._shared_mxfp8_active(hidden_states):
+            qr = self.q_norm(self.wq_a(hidden_states))
+            return qr, self.wq_b(qr), self.wkv(hidden_states), None
+        act, act_scale = torch.ops.trtllm.mxfp8_quantize(hidden_states.contiguous(), True)
+        rows = self._mxfp8_mm(act, act_scale, *self._wq_a_wkv)
+        q_rank = self.wq_a.weight.shape[0]
+        # Strided views for M > 1: the RMSNorm and the SWA row store take a row stride.
+        qr = self.q_norm(rows[:, :q_rank])
+        swa = rows[:, q_rank:]
+        index_query = None
+        if hasattr(self, "index_wq_b") and not (self._fuse_index_q and qr.shape[0] <= 16):
+            act, act_scale = torch.ops.trtllm.mxfp8_quantize(qr.contiguous(), True)
+            if qr.shape[0] == 1 and self._wq_b_index is not None:
+                # One row: both column slices are contiguous views.
+                rows = self._mxfp8_mm(act, act_scale, *self._wq_b_index)
+                q_width = self.wq_b.weight.shape[0]
+                q, index_query = rows[:, :q_width], rows[:, q_width:]
+            else:
+                q = self._mxfp8_mm(act, act_scale, self.wq_b.weight, self.wq_b.weight_scale)
+                index_query = self._mxfp8_mm(
+                    act, act_scale, self.index_wq_b.weight, self.index_wq_b.weight_scale
+                )
+        else:
+            q = self.wq_b(qr)
+        return qr, q, swa, index_query
+
     def _row_transform(self, positions, norm=None) -> RowTransform:
         """Norm and RoPE to apply while cache rows are quantized (interleaved RoPE only)."""
         rope = None
@@ -439,9 +539,12 @@ class DeepseekV41Attention(nn.Module):
             )
         return index_weights, main_kv, index_k
 
-    def _project_index_q(self, qr, positions):
+    def _project_index_q(self, qr, positions, projected=None):
         if self.layer.mode not in (CSA2Mode.FULL, CSA2Mode.REINDEX):
             return None, None
+        if projected is not None:
+            query = projected.reshape(-1, self.index_heads, self.index_head_dim)
+            return self._rope(query, positions, self.index_heads), None
         if self._fuse_index_q and qr.shape[0] <= 16:
             if qr.shape[0] == 0:
                 return (
@@ -564,14 +667,13 @@ class DeepseekV41Attention(nn.Module):
                     skip_global=precomputed,
                 )
                 self._prepare_done.record()
-        qr = self.q_norm(self.wq_a(hidden_states))
+        qr, q, swa, index_query = self._project_inputs(hidden_states)
         # CSA2 never applies V4's projected-Q per-head normalization.
         q = self._rope(
-            self.wq_b(qr).reshape(-1, self.num_heads_tp, self.qk_head_dim),
+            q.reshape(-1, self.num_heads_tp, self.qk_head_dim),
             positions,
             self.num_heads_tp,
         )
-        swa = self.wkv(hidden_states)
         swa_transform = None
         if self.rotary_emb.is_neox:
             swa = self._rope(self.kv_norm(swa).unsqueeze(1), positions, 1).squeeze(1)
@@ -580,7 +682,7 @@ class DeepseekV41Attention(nn.Module):
                 positions, norm=(self.kv_norm.weight, self.kv_norm.variance_epsilon)
             )
         main_transform, index_transform = self.global_transforms(compressed_positions)
-        index_q, index_q_scale = self._project_index_q(qr, positions)
+        index_q, index_q_scale = self._project_index_q(qr, positions, index_query)
         if overlap:
             self._prepare_done.wait()
             current = torch.cuda.current_stream(hidden_states.device)

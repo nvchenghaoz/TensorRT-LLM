@@ -207,3 +207,6 @@ def load_attention_weights(
                 )
             module.o_a_proj_scale = grouped_scales
             module._o_a_fp8_block128 = grouped_block128
+            fuse = getattr(module, "fuse_shared_input_projections", None)
+            if fuse is not None:
+                fuse()
