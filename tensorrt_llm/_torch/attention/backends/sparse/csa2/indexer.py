@@ -77,6 +77,12 @@ from .quantization import (
 )
 
 
+# Query rows per dense candidate-consumer tile: bounds the dense prefix logits
+# plus the gathered candidate scores and masks below the owner layer's own
+# prefill logits tile.
+_DENSE_CANDIDATE_TILE_ROWS = 512
+
+
 @dataclass
 class _ChunkInputs:
     """Packed owner keys and logical bounds for one CSA2 query tile."""
@@ -95,6 +101,10 @@ class _ChunkInputs:
     # Every row's domain is column ``[0, width)`` of the logits (one shared K
     # prefix), so selection reads the logits in place without a column gather.
     shared_columns: bool = False
+    # Candidate consumers on the dense kernels: each row's candidate logical
+    # positions ``[queries, candidates]`` into the shared K prefix. The prefix
+    # is scored densely once and each row gathers its candidate columns.
+    candidate_columns: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -466,6 +476,7 @@ class CSA2Indexer(Indexer):
         sparse_positions: Optional[torch.Tensor] = None,
         sparse_counts: Optional[torch.Tensor] = None,
         shared_columns: bool = False,
+        candidate_columns: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """CSA2 logical selection over the shared quantized MQA kernels.
 
@@ -509,6 +520,21 @@ class CSA2Indexer(Indexer):
                     )
                 )
             return output_indices.fill_(-1)
+        if candidate_columns is not None and score_hook is None and sparse_indices is None:
+            return self._select_candidate_columns(
+                q_data,
+                k_data,
+                k_scale,
+                weights,
+                row_starts,
+                row_ends,
+                q_scale,
+                logical_positions,
+                candidate_columns,
+                visible_lengths,
+                output_indices,
+                is_prefill,
+            )
         if (
             self.options.skip_indexer_for_short_seqs
             and sparse_indices is None
@@ -573,6 +599,61 @@ class CSA2Indexer(Indexer):
             radix_aux_indices,
             radix_aux_logits,
             gvr_prior_indices,
+        )
+
+    def _select_candidate_columns(
+        self,
+        q_data: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        q_scale: Optional[torch.Tensor],
+        shared_positions: torch.Tensor,
+        candidates: torch.Tensor,
+        visible_lengths: torch.Tensor,
+        output_indices: torch.Tensor,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        """Candidate selection over densely scored shared-prefix logits.
+
+        ``k_data`` is one request's shared prefix (logical positions
+        ``[0, width)``, unbacked ones ``-1`` in ``shared_positions``), every row
+        bounded by ``[0, width)``. A (query, key) logit does not depend on the
+        key's column, so gathering column ``candidates[r, c]`` of the dense
+        logits gives the bits the per-row candidate key gather scores. The
+        validity of each candidate is the per-row gather's: in-range and
+        backed; ``visible_lengths <= width`` masks the rest.
+        """
+        width = k_data.shape[0]
+        logits = self._call_mqa_logits(
+            q_data,
+            k_data,
+            k_scale,
+            weights,
+            row_starts,
+            row_ends,
+            q_scale,
+            clean_logits=False,
+        )
+        columns = candidates.clamp(0, width - 1).long()
+        scores = logits.gather(1, columns)
+        del logits
+        valid = (candidates >= 0) & (candidates < width)
+        valid &= shared_positions[0][columns] >= 0
+        del columns
+        logical = torch.where(valid, candidates, -1)
+        del valid
+        return self._select_mapped_logits(
+            scores,
+            None,
+            None,
+            logical,
+            visible_lengths,
+            output_indices,
+            None,
+            is_prefill,
         )
 
     def _invalidate_emission_holes(self, bad_rows: torch.Tensor) -> None:
@@ -870,6 +951,11 @@ class CSA2Indexer(Indexer):
                     ),
                     is_prefill=chunk.is_prefill,
                     shared_columns=inputs.shared_columns and inputs.sparse_indices is None,
+                    candidate_columns=(
+                        inputs.candidate_columns[row_slice]
+                        if inputs.candidate_columns is not None
+                        else None
+                    ),
                     score_hook=hook,
                     radix_aux_indices=radix_aux_indices[first:last]
                     if radix_aux_indices is not None
@@ -1540,6 +1626,37 @@ class CSA2Indexer(Indexer):
                     )
                     continue
                 if not is_prefill and (paged is not None or split_decode):
+                    continue
+                if (
+                    is_prefill
+                    and not graph_mode
+                    and score_hook is None
+                    and candidates.dtype in (torch.int32, torch.int64)
+                    and candidates.shape[1] > self.index_topk
+                ):
+                    # Score the request's shared prefix densely once and gather
+                    # each query's candidate columns: about one prefix of key
+                    # dots per query instead of the candidate key gather.
+                    width = min(
+                        max_positions, metadata.csa2_request_start_positions[request] + end - begin
+                    )
+
+                    def load_dense(begin=begin, end=end, width=width):
+                        inputs = shared_keys(begin, end, width)
+                        inputs.candidate_columns = candidates[begin:end]
+                        return inputs
+
+                    chunks.append(
+                        _QueryChunk(
+                            begin,
+                            end,
+                            width,
+                            load=load_dense,
+                            max_query_tokens=min(
+                                metadata.indexer_max_chunk_size, _DENSE_CANDIDATE_TILE_ROWS
+                            ),
+                        )
+                    )
                     continue
                 # Without the sparse kernels, gather each query's candidate rows
                 # and score them densely. Split across ranks before gathering;
