@@ -608,6 +608,68 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
 }
 
 // ===================================================================
+// M-tiled FMA-path fused hyper-connection launcher (prefill-size M).
+//
+// Same contract and outputs as mhcFusedHcFmaLaunch with num_k_splits = 1, but
+// step 1 runs fused_pmap_gemm_fma_mtile<tile_n, tile_m>: tile_m tokens per CTA
+// reuse each W_T register load.  Bitwise equal to the ks = 1 ksplit kernel.
+// ===================================================================
+
+using FmaMtileFn = void (*)(__nv_bfloat16 const*, __nv_bfloat16 const*, float const*, float const*, float const*,
+    float*, float*, int, int, int, int, __nv_bfloat16*);
+
+static FmaMtileFn pickFhcFmaMtile(int tile_n, int tile_m)
+{
+#define FHCFMA_MT_CASE(TN, TM)                                                                                         \
+    if (tile_n == (TN) && tile_m == (TM))                                                                              \
+    return &fused_fma_kernels::fused_pmap_gemm_fma_mtile<TN, TM>
+
+    FHCFMA_MT_CASE(24, 2);
+    FHCFMA_MT_CASE(24, 3);
+    FHCFMA_MT_CASE(24, 4);
+    FHCFMA_MT_CASE(12, 2);
+    FHCFMA_MT_CASE(12, 4);
+    FHCFMA_MT_CASE(8, 4);
+#undef FHCFMA_MT_CASE
+    TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaMtileLaunch: unsupported (tile_n=%d, tile_m=%d)", tile_n, tile_m);
+    return nullptr;
+}
+
+void mhcFusedHcFmaMtileLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
+    float const* post_mix_prev, float const* comb_mix_prev, float const* w_t, float const* hc_scale,
+    float const* hc_base, __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur,
+    __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size,
+    int hc_mult, int tile_n, int tile_m, int bigfuse_block_size, float rms_eps, float hc_pre_eps,
+    float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight,
+    float norm_eps, cudaStream_t stream, float const* pre_mix_ext, float* pre_mix_out)
+{
+    if (M <= 0)
+        return;
+
+    TLLM_CHECK_WITH_INFO(hc_mult == static_cast<int>(FHC_HC_MULT),
+        "mhcFusedHcFmaMtileLaunch: hc_mult=%d not supported (only %u)", hc_mult, FHC_HC_MULT);
+    TLLM_CHECK_WITH_INFO(hidden_size % static_cast<int>(FHC_BLOCK_K) == 0,
+        "mhc fused-HC FMA path requires hidden_size to be divisible by %u, got %d", FHC_BLOCK_K, hidden_size);
+    TLLM_CHECK_WITH_INFO(FHC_SHAPE_N % tile_n == 0, "mhcFusedHcFmaMtileLaunch: SHAPE_N=%u not divisible by tile_n=%d",
+        FHC_SHAPE_N, tile_n);
+
+    int const K = hc_mult * hidden_size;
+    int const N = static_cast<int>(FHC_SHAPE_N);
+
+    FmaMtileFn fn = pickFhcFmaMtile(tile_n, tile_m);
+    dim3 const grid(static_cast<unsigned>((M + tile_m - 1) / tile_m), static_cast<unsigned>(N / tile_n), 1u);
+    dim3 const block(256);
+    tensorrt_llm::common::launchWithPdlWhenEnabled("fused_pmap_gemm_fma_mtile", fn, grid, block, 0, stream,
+        residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, y_acc_workspace, r_acc_workspace, M, hidden_size, N,
+        K, residual_cur);
+
+    mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
+        layer_input_cur, M, /*K=*/K, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+        sinkhorn_repeat, /*num_splits=*/1, bigfuse_block_size, norm_weight, norm_eps, stream, pre_mix_ext,
+        pre_mix_out);
+}
+
+// ===================================================================
 // All-in-one single-kernel fused hyper-connection launcher (TF32 tcgen05).
 //
 // Wraps fused_allinone_tf32_pmap_gemm_atomic_impl: pmap + GEMM + bigfuse

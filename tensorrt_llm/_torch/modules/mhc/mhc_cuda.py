@@ -637,6 +637,18 @@ _FUSED_HC_HALF_FMA_TN_KS = (
     (12, 1),
     (24, 1),
 )
+# M-tiled half-fused FMA tactics (ks = 1): (tile_n, tile_m). tile_m tokens per CTA
+# reuse each W_T register load (mhcFusedHcFmaMtileLaunch); bitwise equal to the
+# (tile_n, 1) half-FMA tactics. Offered only for M > 32 when MMA is unavailable.
+# Must stay in sync with the C++ pickFhcFmaMtile() table.
+_FUSED_HC_HALF_FMA_MT_TN_TM = (
+    (24, 2),
+    (24, 3),
+    (24, 4),
+    (12, 2),
+    (12, 4),
+    (8, 4),
+)
 # Tactics for the half-fused MMA path: (num_k_splits,). Matches Path D
 # (pickFhcAllInOne) so the autotuner can compare half-fused vs all-in-one at
 # the same ks across the full range. Includes high-KS divisors of HIDDEN/64
@@ -843,7 +855,8 @@ class MhcFusedHcRunner(TunableRunner):
         num_k_splits:  HIDDEN-axis split (all backends)
         bigfuse_bs:    BigFuse CTA BLOCK_SIZE {128, 256, 512} (fused_half_* only;
                        fused_all_* runs bigfuse inline so this is 0)
-        tile_m:        M tokens per CTA (fused_all_fma only; 1 otherwise)
+        tile_m:        M tokens per CTA (fused_all_fma, and fused_half_fma with
+                       num_k_splits=1 at M > 32 without MMA; 1 otherwise)
 
     Backend selection strategy (M-bucketed):
         M <= 32:   prefer "fused_all_fma" (Path F) — single-kernel FMA wins
@@ -959,6 +972,8 @@ class MhcFusedHcRunner(TunableRunner):
             for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
                 if ks == 1:
                     add(("fused_half_fma", tn, ks, bs, 1))
+            for tn, tm in _FUSED_HC_HALF_FMA_MT_TN_TM:
+                add(("fused_half_fma", tn, 1, bs, tm))
 
         return tactics
 

@@ -200,6 +200,23 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
             pre_out_ptr);
         return;
     }
+    if (backend == 1 && tile_m > 1)
+    {
+        TORCH_CHECK(num_k_splits == 1, "mhc_fused_hc: fused_half_fma with tile_m > 1 requires num_k_splits == 1");
+        tk::mhcFusedHcFmaMtileLaunch(reinterpret_cast<__nv_bfloat16 const*>(x_prev.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16 const*>(residual_prev.data_ptr<at::BFloat16>()),
+            post_mix_prev.data_ptr<float>(), comb_mix_prev.data_ptr<float>(), w.data_ptr<float>(),
+            hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(residual_cur.data_ptr<at::BFloat16>()), post_mix_cur.data_ptr<float>(),
+            comb_mix_cur.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(layer_input_cur.data_ptr<at::BFloat16>()),
+            y_acc_workspace.data_ptr<float>(), r_acc_workspace.data_ptr<float>(), static_cast<int>(M),
+            static_cast<int>(hidden_size), static_cast<int>(hc_mult), static_cast<int>(tile_n),
+            static_cast<int>(tile_m), static_cast<int>(bigfuse_block_size), static_cast<float>(rms_eps),
+            static_cast<float>(hc_pre_eps), static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value),
+            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream, pre_ext_ptr,
+            pre_out_ptr);
+        return;
+    }
     if (backend == 1)
     {
         tk::mhcFusedHcFmaLaunch(reinterpret_cast<__nv_bfloat16 const*>(x_prev.data_ptr<at::BFloat16>()),
