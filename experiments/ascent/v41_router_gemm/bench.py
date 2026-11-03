@@ -114,6 +114,7 @@ def make_step(xs, ws, holder):
 
 
 def bench():
+    arm = sys.argv[2] if len(sys.argv) > 2 else "ARM?"  # BASE or CAND, printed on every timing line
     ws, per_m = setup_sequence()
     batch = {}
     for m in MS:
@@ -125,10 +126,11 @@ def bench():
         med2, nf2 = graph_sequence(step, holder)  # second graph instance: within-arm spread
         per_layer = min(med, med2) / LAYERS
         nfl = max(nf, nf2, abs(med - med2) / min(med, med2))
-        log(f"M={m}: {med / LAYERS:.3f} / {med2 / LAYERS:.3f} us per layer (noise {nfl:.3f}) kernels={names}")
+        log(f"{arm} M={m}: {per_layer:.3f} us/layer (best of this arm's 2 graph instances: inst1 {med / LAYERS:.3f}, "
+            f"inst2 {med2 / LAYERS:.3f}; noise {nfl:.3f}) {arm} kernels={names}")
         batch[str(m)] = {"kernel_ms": per_layer / 1000.0, "noise_floor": nfl, "per_layer_us": round(per_layer, 3),
                          "kernels": names}
-    print(json.dumps({"batch": batch, "output": {"class": "reordered"}}))
+    print(json.dumps({"arm": arm, "batch": batch, "output": {"class": "reordered"}}))
 
 
 def real_gate():
