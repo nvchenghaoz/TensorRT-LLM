@@ -127,7 +127,9 @@ def _fused_gather_supported(device_index: int) -> bool:
     from .kernel import dsl_available
 
     # Retain the reference route on other architectures until validated there.
-    return dsl_available() and torch.cuda.get_device_capability(device_index)[0] == 10
+    # The gather/staging kernels are SIMT CuTe DSL (no TMA/tcgen05/clusters);
+    # byte-exact parity with the reference is validated on SM100 and SM120.
+    return dsl_available() and torch.cuda.get_device_capability(device_index)[0] in (10, 12)
 
 
 @lru_cache(maxsize=None)
@@ -135,8 +137,8 @@ def _fused_store_supported(device_index: int) -> bool:
     from .kernel import dsl_available
 
     major, _ = torch.cuda.get_device_capability(device_index)
-    # Exact-byte parity (including nonfinite values) is validated on SM100.
-    return dsl_available() and major == 10
+    # Exact-byte parity (including nonfinite values) is validated on SM100 and SM120.
+    return dsl_available() and major in (10, 12)
 
 
 def apply_row_transform(values: torch.Tensor, transform) -> torch.Tensor:
