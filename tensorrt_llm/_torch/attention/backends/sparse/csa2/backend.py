@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -584,13 +585,37 @@ class CSA2TrtllmAttention(TrtllmAttention):
         if forward_args.attention_sinks is None:
             raise ValueError("CSA2 requires an attention sink")
 
-    def prepare_selected(self, q, metadata, forward_args):
+    def _stage_selected_query(self, q, metadata, forward_args):
         self._validate_helper_output(q, forward_args)
         if self.sparse_params.use_packed_sparse_attention:
             raise ValueError("Packed CSA2 must use forward_packed without BF16 staging")
         inputs = self.prepare_sparse_inputs(q, metadata, forward_args)
         metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices)
-        query = q.view(metadata.num_tokens, self.num_heads, _HEAD_DIM)
+        return q.view(metadata.num_tokens, self.num_heads, _HEAD_DIM)
+
+    def prepare_selected_pools(self, q, metadata, forward_args):
+        """Stage like ``prepare_selected`` but hand back the staging pools and lengths.
+
+        The selected rows are the dense prefix ``[0, prepared_lens[i])`` of the
+        concatenation ``swa_pool[i] ++ extra_pool[i]``; consumers that build the
+        ragged rows and mask themselves avoid materializing ``cat`` and ``valid``.
+        """
+        query = self._stage_selected_query(q, metadata, forward_args)
+        if metadata.shared_plan is not None:
+            raise ValueError("CSA2 shared staging has no per-query pools")
+        count = metadata.num_tokens
+        extra = metadata.extra_pool if metadata.num_sparse_topk > _SWA_TILE else None
+        return (
+            query,
+            metadata.swa_pool,
+            extra,
+            metadata.prepared_lens[:count],
+            forward_args.attention_sinks,
+            1.0 / (self.q_scaling * math.sqrt(_HEAD_DIM)),
+        )
+
+    def prepare_selected(self, q, metadata, forward_args):
+        query = self._stage_selected_query(q, metadata, forward_args)
         if metadata.shared_plan is not None:
             return (
                 query,
@@ -728,6 +753,8 @@ class CSA2FlashInfer:
         self._plans: dict[tuple[int, int, int, torch.device, float], CSA2FlashInfer._Plan] = {}
         self._workspaces: dict[torch.device, torch.Tensor] = {}
         self._paged_plans: dict[tuple, CSA2FlashInfer._Plan] = {}
+        # Fused mask/rows staging and sink epilogue (bitwise equal to _forward).
+        self.fused_glue = os.environ.get("TRTLLM_CSA2_FLASHINFER_FUSED_GLUE", "1") != "0"
 
     def __call__(
         self,
@@ -743,25 +770,69 @@ class CSA2FlashInfer:
             return self._forward(q, kv, valid, sink, scale, protect)
 
     def _forward(self, q, kv, valid, sink, scale, protect=False):
-        from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
-
         count, heads, dim = q.shape
         width = kv.shape[1]
         if dim != 512 or q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
             raise ValueError("CSA2 FlashInfer requires BF16 Q/KV with head dimension 512")
         if count == 0 or width == 0:
             return torch.zeros_like(q)
-        key = (count, heads, width, q.device, scale)
+        plan = self._ragged_plan(count, heads, width, dim, q.device, scale)
+        plan.protected |= protect or torch.cuda.is_current_stream_capturing()
+        # Updating the original bool mask would not update the planned wrapper.
+        plan.packed_mask.copy_(self.pack_query_masks(valid))
+        rows = torch.where(valid[..., None], kv, 0).reshape(-1, 1, dim).contiguous()
+        output, lse = plan.wrapper.run(q.contiguous(), rows, rows, return_lse=True)
+        # FA2 returns base-2 LSE. Restore the shared zero-valued sink without
+        # requantizing the input cache. Empty selections have zero output.
+        correction = torch.sigmoid(lse.float() * math.log(2.0) - sink.float()[None, :])
+        output = output.float() * correction[..., None]
+        return torch.where(valid.any(-1)[:, None, None], output, 0).to(q.dtype)
+
+    def _forward_pools(self, q, swa, extra, lengths, sink, scale, protect=False, out=None):
+        """Bitwise equivalent of ``_forward`` over a dense-prefix selection.
+
+        Row ``j < lengths[i]`` of query ``i`` is ``(swa[i] ++ extra[i])[j]``; the
+        mask/rows staging and the sink epilogue are one fused launch each, and
+        the epilogue writes ``out`` directly.
+        """
+        from .flashinfer_glue import sink_epilogue, stage_rows_and_mask
+
+        count, heads, dim = q.shape
+        width = swa.shape[1] + (0 if extra is None else extra.shape[1])
+        if (
+            dim != 512
+            or q.dtype != torch.bfloat16
+            or swa.dtype != torch.bfloat16
+            or (extra is not None and extra.dtype != torch.bfloat16)
+        ):
+            raise ValueError("CSA2 FlashInfer requires BF16 Q/KV with head dimension 512")
+        if out is None:
+            out = torch.empty_like(q)
+        if count == 0 or width == 0:
+            return out.zero_()
+        plan = self._ragged_plan(count, heads, width, dim, q.device, scale)
+        plan.protected |= protect or torch.cuda.is_current_stream_capturing()
+        rows = torch.empty(count * width, 1, dim, dtype=torch.bfloat16, device=q.device)
+        stage_rows_and_mask(
+            swa[:count], None if extra is None else extra[:count], lengths, rows, plan.packed_mask
+        )
+        output, lse = plan.wrapper.run(q.contiguous(), rows, rows, return_lse=True)
+        return sink_epilogue(output, lse, sink.float().contiguous(), lengths, out)
+
+    def _ragged_plan(self, count, heads, width, dim, device, scale):
+        from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
+
+        key = (count, heads, width, device, scale)
         plan = self._plans.get(key)
         if plan is None:
-            with torch.cuda.device(q.device):
+            with torch.cuda.device(device):
                 capturing = torch.cuda.is_current_stream_capturing()
             if capturing:
                 raise RuntimeError("Warm up the CSA2 FlashInfer shape before CUDA Graph capture")
-            if q.device not in self._workspaces:
+            if device not in self._workspaces:
                 # Plans use fixed query geometry and disable split-KV.
-                self._workspaces[q.device] = torch.empty(
-                    8 * 1024 * 1024, dtype=torch.uint8, device=q.device
+                self._workspaces[device] = torch.empty(
+                    8 * 1024 * 1024, dtype=torch.uint8, device=device
                 )
             qo_host = torch.arange(count + 1, dtype=torch.int32, device="cpu")
             kv_host = qo_host * width
@@ -770,7 +841,7 @@ class CSA2FlashInfer:
             # in FlashInfer 0.6.18. Use the fixed (non-padded) scheduler; run()
             # remains capturable because these plans and buffers never resize.
             wrapper = BatchPrefillWithRaggedKVCacheWrapper(
-                self._workspaces[q.device],
+                self._workspaces[device],
                 kv_layout="NHD",
                 backend="fa2",
                 use_cuda_graph=False,
@@ -782,7 +853,7 @@ class CSA2FlashInfer:
                 1,
                 dim,
                 head_dim_vo=dim,
-                custom_mask=torch.ones(count * width, dtype=torch.bool, device=q.device),
+                custom_mask=torch.ones(count * width, dtype=torch.bool, device=device),
                 causal=False,
                 pos_encoding_mode="NONE",
                 sm_scale=scale,
@@ -794,16 +865,7 @@ class CSA2FlashInfer:
             # Update that exact buffer on replay, not the original bool mask.
             plan = self._Plan(wrapper, wrapper._custom_mask_buf)
             self._plans[key] = plan
-        plan.protected |= protect or torch.cuda.is_current_stream_capturing()
-        # Updating the original bool mask would not update the planned wrapper.
-        plan.packed_mask.copy_(self.pack_query_masks(valid))
-        rows = torch.where(valid[..., None], kv, 0).reshape(-1, 1, dim).contiguous()
-        output, lse = plan.wrapper.run(q.contiguous(), rows, rows, return_lse=True)
-        # FA2 returns base-2 LSE. Restore the shared zero-valued sink without
-        # requantizing the input cache. Empty selections have zero output.
-        correction = torch.sigmoid(lse.float() * math.log(2.0) - sink.float()[None, :])
-        output = output.float() * correction[..., None]
-        return torch.where(valid.any(-1)[:, None, None], output, 0).to(q.dtype)
+        return plan
 
     def run_shared(self, q, bank, indices, sink, scale, protect=False) -> torch.Tensor:
         """Use one-row pages to share converted KV across sparse queries."""
@@ -871,22 +933,43 @@ class CSA2FlashInfer:
             raise ValueError("CSA2 generation helper requires generation_only inputs")
         return self._forward_selected(q, metadata, forward_args)
 
-    def _forward_selected(self, q, metadata, forward_args):
-        if self.attention is None:
-            raise ValueError("CSA2 helper requires its attention backend")
-        inputs = self.attention.prepare_selected(q, metadata, forward_args)
-        shared = metadata.shared_plan is not None
-        query, values, selection, _, scale = inputs
-        width = selection.shape[1] if shared else values.shape[1]
-        key = (query.shape[0], query.shape[1], width, q.device, scale)
-        real_context = metadata.num_contexts > 0
-        if real_context:
+    def _evict_eager_plans(self, metadata, key) -> None:
+        if metadata.num_contexts > 0:
             # Whole eager phases have variable Q. Preserve plans that CUDA graphs
             # warm up or capture, but do not retain every historical eager shape.
             for cache in (self._plans, self._paged_plans):
                 for previous, plan in tuple(cache.items()):
                     if previous != key and previous[1:] == key[1:] and not plan.protected:
                         del cache[previous]
+
+    def _forward_selected(self, q, metadata, forward_args):
+        if self.attention is None:
+            raise ValueError("CSA2 helper requires its attention backend")
+        shared = metadata.shared_plan is not None
+        if not shared and self.fused_glue:
+            query, swa, extra, lengths, sink, scale = self.attention.prepare_selected_pools(
+                q, metadata, forward_args
+            )
+            width = swa.shape[1] + (0 if extra is None else extra.shape[1])
+            key = (query.shape[0], query.shape[1], width, q.device, scale)
+            self._evict_eager_plans(metadata, key)
+            output = forward_args.output
+            with torch.cuda.device(q.device):
+                result = self._forward_pools(
+                    query,
+                    swa,
+                    extra,
+                    lengths,
+                    sink,
+                    scale,
+                    protect=metadata._csa2_graph_reserved,
+                    out=None if output is None else output.view_as(query),
+                )
+            return output if output is not None else result.flatten(1)
+        inputs = self.attention.prepare_selected(q, metadata, forward_args)
+        query, values, selection, _, scale = inputs
+        width = selection.shape[1] if shared else values.shape[1]
+        self._evict_eager_plans(metadata, (query.shape[0], query.shape[1], width, q.device, scale))
         if shared:
             with torch.cuda.device(q.device):
                 result = self.run_shared(*inputs, protect=metadata._csa2_graph_reserved).flatten(1)
