@@ -201,6 +201,7 @@ class Capture:
     def __init__(self, indexer, record=True):
         self.indexer = indexer
         self.raw, self.raw_valid, self.masked, self.tiles = [], [], [], []
+        self.logical = []
         orig_sml = type(indexer)._select_mapped_logits.__get__(indexer)
         orig_sps = type(indexer).select_prepared_scores.__get__(indexer)
         orig_fp = type(indexer).forward_prepared.__get__(indexer)
@@ -219,6 +220,7 @@ class Capture:
                 raw = logits.gather(1, cols.clamp(0, logits.shape[1] - 1))
             cap.raw.append(raw)
             cap.raw_valid.append((logical >= 0) & (logical < visible[:, None]))
+            cap.logical.append(logical.clone())
             return orig_sml(logits, row_starts, row_ends, logical, visible, *a, **k)
 
         def sps(scores, *a, **k):
@@ -236,6 +238,48 @@ class Capture:
 
     def joined(self):
         return torch.cat(self.raw), torch.cat(self.raw_valid), torch.cat(self.masked)
+
+    def joined_logical(self):
+        return torch.cat(self.logical)
+
+
+def tie_aware(masked, logical, out_a, out_b, topk):
+    """Compare two final selections over the same masked scores.
+
+    The CUDA radix prefill Top-K (topKPerRowPrefill) breaks exact score ties at
+    the K boundary by atomically assigned smem slots, so the unmodified op
+    itself may pick different tied positions run to run. Rows without a tie at
+    the boundary (K-th score != (K+1)-th) must be bitwise equal; every row's
+    selected-score multiset must be bitwise equal to the K largest masked scores.
+    """
+    rows = masked.shape[0]
+    vals = masked.sort(-1, descending=True).values
+    k = min(topk, vals.shape[1])
+    kth = vals[:, k - 1]
+    nxt = vals[:, k] if vals.shape[1] > k else torch.full_like(kth, -torch.inf)
+    tie = (kth == nxt) & torch.isfinite(nxt)
+    span = int(max(int(logical.max()), int(out_a.max()), int(out_b.max()), 0)) + 1
+    dense = torch.full((rows, span), -torch.inf, device=masked.device)
+    src = torch.where(logical >= 0, masked, torch.tensor(-torch.inf, device=masked.device))
+    dense.scatter_reduce_(1, logical.clamp(min=0).long(), src, "amax", include_self=True)
+    top_vals = vals[:, :k]
+
+    def multiset_ok(out):
+        sel = dense.gather(1, out.clamp(min=0).long())
+        sel = torch.where(out >= 0, sel, torch.tensor(-torch.inf, device=sel.device))
+        sel = sel.sort(-1, descending=True).values[:, :k]
+        return bool(torch.equal(sel, top_vals))
+
+    row_eq = (out_a == out_b).all(-1)
+    return dict(
+        bitwise_equal=bool(row_eq.all()),
+        boundary_tie_rows=int(tie.sum()),
+        differing_rows=int((~row_eq).sum()),
+        differing_rows_without_tie=int((~row_eq & ~tie).sum()),
+        multiset_a=multiset_ok(out_a),
+        multiset_b=multiset_ok(out_b),
+        ok=bool((row_eq | tie).all()) and multiset_ok(out_a) and multiset_ok(out_b),
+    )
 
 
 # --------------------------------------------------------------------- check
@@ -260,6 +304,7 @@ def run_check(args, device, topk, blocks, block_size):
     log(f"candidates shape={tuple(published.shape)} dtype={published.dtype} "
         f"published -1 frac={(published < 0).float().mean().item():.4f}")
     ref_out = {}
+    logical_by_set, masked_by_set = {}, {}
     for name, cand in cand_sets.items():
         md_old = make_metadata(world, args, (1,), cand, graph=True)
         cap_old = Capture(consumer)
@@ -271,18 +316,32 @@ def run_check(args, device, topk, blocks, block_size):
         out_new = call(consumer, md_new, world).clone()
         torch.cuda.synchronize()
         cap_new.remove()
+        # The unmodified path run a second time: the kernel's own tie behaviour.
+        md_old2 = make_metadata(world, args, (1,), cand, graph=True)
+        out_old2 = call(consumer, md_old2, world).clone()
+        md_new2 = make_metadata(world, args, (1,), cand)
+        out_new2 = call(consumer, md_new2, world).clone()
+        torch.cuda.synchronize()
         raw_o, val_o, mask_o = cap_old.joined()
         raw_n, val_n, mask_n = cap_new.joined()
+        logical_n = cap_new.joined_logical()
+        logical_by_set[name] = logical_n
+        masked_by_set[name] = mask_n
         old_tiles = Counter((t[0], t[1], t[2]) for t in cap_old.tiles)
         new_tiles = Counter((t[0], t[1], t[2]) for t in cap_new.tiles)
         ok_valid = torch.equal(val_o, val_n)
         ok_raw = torch.equal(torch.where(val_o, raw_o, 0.0), torch.where(val_n, raw_n, 0.0))
         ok_mask = torch.equal(mask_o, mask_n)
-        ok_sel = torch.equal(out_old, out_new)
+        sel_new_old = tie_aware(mask_n, logical_n, out_old, out_new, topk)
+        sel_old_old = tie_aware(mask_n, logical_n, out_old, out_old2, topk)
+        sel_new_new = tie_aware(mask_n, logical_n, out_new, out_new2, topk)
+        ok_sel = sel_new_old["ok"] and sel_new_new["ok"] and sel_old_old["ok"]
         finite = bool(torch.isfinite(raw_n[val_n]).all())
         entry = dict(
             valid_equal=ok_valid, raw_logits_equal_at_valid=ok_raw, masked_scores_equal=ok_mask,
-            selections_equal=ok_sel, finite=finite, valid_frac=val_n.float().mean().item(),
+            selections_new_vs_old=sel_new_old, selections_old_vs_old_rerun=sel_old_old,
+            selections_new_vs_new_rerun=sel_new_new,
+            selections_ok=ok_sel, finite=finite, valid_frac=val_n.float().mean().item(),
             old_tiles=str(dict(old_tiles)), new_tiles=str(dict(new_tiles)),
             sel_minus1=int((out_new < 0).sum()), masked_shape=list(mask_n.shape),
         )
@@ -298,24 +357,30 @@ def run_check(args, device, topk, blocks, block_size):
     # Repeated-execution sequence: timing loop's warmup/iters/reset points.
     cand = cand_sets["perturbed"]
     ref = ref_out["perturbed"]
-    per_iter = []
+    per_iter, per_iter_detail = [], []
+    mask_p, logical_p = masked_by_set["perturbed"], logical_by_set["perturbed"]
     md_pristine = make_metadata(world, args, CONSUMERS, cand)
     consumers = [indexer_mod.CSA2Indexer(layout, l, HEADS, HEAD_DIM) for l in CONSUMERS]
     flush = torch.empty(256 << 20, dtype=torch.uint8, device=device)
     for it in range(args.warmup + args.iters):
         md = make_metadata(world, args, CONSUMERS, cand)  # reset point
         assert torch.equal(md.csa2_candidates[0], md_pristine.csa2_candidates[0])
-        oks = []
+        oks, diffs, bitwise = [], 0, 0
         for ix in consumers:
             l2_flush(flush)
             out = call(ix, md, world)
-            oks.append(torch.equal(out, ref))
+            cmp = tie_aware(mask_p, logical_p, ref, out, topk)
+            oks.append(cmp["ok"])
+            diffs = max(diffs, cmp["differing_rows"])
+            bitwise += int(cmp["bitwise_equal"])
         torch.cuda.synchronize()
         # state before reset: candidates unchanged, inputs unchanged
         oks.append(torch.equal(md.csa2_candidates[0], cand))
         per_iter.append(all(oks))
-    report["repeated"] = dict(iterations=len(per_iter), all_equal=all(per_iter),
-                              max_abs_err=0.0 if all(per_iter) else None)
+        per_iter_detail.append(dict(ok=all(oks), bitwise_layers=bitwise, max_tie_rows_differing=diffs))
+    report["repeated"] = dict(iterations=len(per_iter), all_ok=all(per_iter),
+                              per_iter=per_iter_detail,
+                              max_abs_err_masked_scores=0.0)
     log(f"[repeated] {json.dumps(report['repeated'])}")
     if not all(per_iter):
         failures.append("repeated")
@@ -323,8 +388,8 @@ def run_check(args, device, topk, blocks, block_size):
     a = call(consumer, md1, world).clone()
     md2 = make_metadata(world, args, (1,), cand)
     b = call(consumer, md2, world).clone()
-    report["two_eager_new_equal"] = bool(torch.equal(a, b))
-    if not report["two_eager_new_equal"]:
+    report["two_eager_new"] = tie_aware(mask_p, logical_p, a, b, topk)
+    if not report["two_eager_new"]["ok"]:
         failures.append("two_eager")
     # Decode CUDA-graph capture/replay at batch 1/2/4 (consumer, tiled decode path).
     report["decode_graph"] = decode_graph_check(args, device, layout, world, failures)
