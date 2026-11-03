@@ -243,6 +243,22 @@ class Capture:
         return torch.cat(self.logical)
 
 
+def stage_ab(raw_a, val_a, mask_a, raw_b, val_b, mask_b):
+    """Stage (a): raw logits at every valid candidate; stage (b): masked scores."""
+    valid = bool(torch.equal(val_a, val_b))
+    raw = valid and bool(torch.equal(torch.where(val_a, raw_a, 0.0), torch.where(val_b, raw_b, 0.0)))
+    masked = bool(torch.equal(mask_a, mask_b))
+    out = dict(valid_equal=valid, a_raw_logits_equal=raw, b_masked_scores_equal=masked,
+               ok=valid and raw and masked)
+    if not masked and mask_a.shape == mask_b.shape:
+        diff = (mask_a != mask_b) & ~(torch.isnan(mask_a) & torch.isnan(mask_b))
+        if bool(diff.any()):
+            r, c = (int(x) for x in diff.nonzero()[0])
+            out["b_first_difference"] = dict(row=r, column=c, a=float(mask_a[r, c]),
+                                             b=float(mask_b[r, c]))
+    return out
+
+
 def tie_aware(masked, logical, out_a, out_b, topk):
     """Compare two final selections over the same masked scores.
 
@@ -325,12 +341,22 @@ def run_check(args, device, topk, blocks, block_size):
         cap_new.remove()
         # The unmodified path run a second time: the kernel's own tie behaviour.
         md_old2 = make_metadata(world, args, (1,), cand, graph=True)
+        cap_old2 = Capture(consumer)
         out_old2 = call(consumer, md_old2, world).clone()
+        torch.cuda.synchronize()
+        cap_old2.remove()
         md_new2 = make_metadata(world, args, (1,), cand)
+        cap_new2 = Capture(consumer)
         out_new2 = call(consumer, md_new2, world).clone()
         torch.cuda.synchronize()
+        cap_new2.remove()
         raw_o, val_o, mask_o = cap_old.joined()
         raw_n, val_n, mask_n = cap_new.joined()
+        stages_old_old = stage_ab(raw_o, val_o, mask_o, *cap_old2.joined())
+        stages_new_new = stage_ab(raw_n, val_n, mask_n, *cap_new2.joined())
+        del cap_old2, cap_new2
+        if name == "perturbed":
+            stage_ref = (raw_o, val_o, mask_o)
         logical_n = cap_new.joined_logical()
         logical_by_set[name] = logical_n
         masked_by_set[name] = mask_n
@@ -348,6 +374,8 @@ def run_check(args, device, topk, blocks, block_size):
             valid_equal=ok_valid, raw_logits_equal_at_valid=ok_raw, masked_scores_equal=ok_mask,
             selections_new_vs_old=sel_new_old, selections_old_vs_old_rerun=sel_old_old,
             selections_new_vs_new_rerun=sel_new_new,
+            stages_ab_old_vs_old_rerun=stages_old_old, stages_ab_new_vs_new_rerun=stages_new_new,
+            masked_has_nan=bool(torch.isnan(mask_n).any()),
             selections_ok=ok_sel, finite=finite, valid_frac=val_n.float().mean().item(),
             old_tiles=str(dict(old_tiles)), new_tiles=str(dict(new_tiles)),
             sel_minus1=int((out_new < 0).sum()), masked_shape=list(mask_n.shape),
@@ -358,7 +386,8 @@ def run_check(args, device, topk, blocks, block_size):
         entry["exact_ties_rows0_63"] = int(((srt[:, 1:] == srt[:, :-1]) & torch.isfinite(srt[:, 1:])).sum())
         report[name] = entry
         log(f"[{name}] {json.dumps(entry)}")
-        if not (ok_valid and ok_raw and ok_mask and ok_sel and finite):
+        if not (ok_valid and ok_raw and ok_mask and ok_sel and finite and stages_old_old["ok"]
+                and stages_new_new["ok"] and not entry["masked_has_nan"]):
             failures.append(name)
         ref_out[name] = out_old
     # Repeated-execution sequence: timing loop's warmup/iters/reset points.
@@ -372,19 +401,28 @@ def run_check(args, device, topk, blocks, block_size):
     for it in range(args.warmup + args.iters):
         md = make_metadata(world, args, CONSUMERS, cand)  # reset point
         assert torch.equal(md.csa2_candidates[0], md_pristine.csa2_candidates[0])
-        oks, diffs, bitwise = [], 0, 0
+        oks, diffs, bitwise, ab_ok = [], 0, 0, True
         for ix in consumers:
             l2_flush(flush)
+            cap = Capture(ix)
             out = call(ix, md, world)
+            torch.cuda.synchronize()
+            cap.remove()
+            ab = stage_ab(*stage_ref, *cap.joined())
+            del cap
+            ab_ok = ab_ok and ab["ok"]
             cmp = tie_aware(mask_p, logical_p, ref, out, topk)
-            oks.append(cmp["ok"])
+            oks.append(cmp["ok"] and ab["ok"])
             diffs = max(diffs, cmp["differing_rows"])
             bitwise += int(cmp["bitwise_equal"])
         torch.cuda.synchronize()
         # state before reset: candidates unchanged, inputs unchanged
         oks.append(torch.equal(md.csa2_candidates[0], cand))
         per_iter.append(all(oks))
-        per_iter_detail.append(dict(ok=all(oks), bitwise_layers=bitwise, max_tie_rows_differing=diffs))
+        per_iter_detail.append(dict(ok=all(oks), stages_ab_equal_all_layers=ab_ok,
+                                    selections_bitwise_layers=bitwise,
+                                    max_tie_rows_differing=diffs))
+        log(f"[repeated iter {it}] {json.dumps(per_iter_detail[-1])}")
     report["repeated"] = dict(iterations=len(per_iter), all_ok=all(per_iter),
                               per_iter=per_iter_detail,
                               max_abs_err_masked_scores=0.0)
@@ -392,11 +430,20 @@ def run_check(args, device, topk, blocks, block_size):
     if not all(per_iter):
         failures.append("repeated")
     md1 = make_metadata(world, args, (1,), cand)
+    cap1 = Capture(consumer)
     a = call(consumer, md1, world).clone()
+    torch.cuda.synchronize()
+    cap1.remove()
     md2 = make_metadata(world, args, (1,), cand)
+    cap2 = Capture(consumer)
     b = call(consumer, md2, world).clone()
+    torch.cuda.synchronize()
+    cap2.remove()
     report["two_eager_new"] = tie_aware(mask_p, logical_p, a, b, topk)
-    if not report["two_eager_new"]["ok"]:
+    report["two_eager_new"]["stages_ab"] = stage_ab(*cap1.joined(), *cap2.joined())
+    del cap1, cap2
+    log(f"[two_eager_new] {json.dumps(report['two_eager_new'])}")
+    if not (report["two_eager_new"]["ok"] and report["two_eager_new"]["stages_ab"]["ok"]):
         failures.append("two_eager")
     # Decode CUDA-graph capture/replay at batch 1/2/4 (consumer, tiled decode path).
     report["decode_graph"] = decode_graph_check(args, device, layout, world, failures)
