@@ -245,6 +245,11 @@ class DeepseekV41Attention(nn.Module):
             requires_grad=False,
         )
         self._o_a_fp8_block128 = False
+        # SM120 decode wo_a on b12x (csa2/b12x_wo.py), built lazily from the
+        # loaded weights on the first eager forward.
+        self._o_a_proj_block_scale = None
+        self._b12x_wo = None
+        self._b12x_wo_built = False
         self.o_a_proj_dequant = None
         self.register_buffer("o_a_proj_scale", None)
         self.register_buffer("_fp8_alpha", torch.ones(1, dtype=torch.float32), persistent=False)
@@ -578,6 +583,19 @@ class DeepseekV41Attention(nn.Module):
                 grouped.transpose(0, 1), self.o_a_proj.transpose(1, 2), latent.transpose(0, 1)
             )
             return self.o_b_proj(latent.flatten(1))
+        if self._o_a_fp8_block128 and not inverse_rope_applied:
+            # TRTLLM_B12X_WO_PROJECTION (SM120 decode, M <= 8): exact BF16
+            # inverse RoPE + 1x128 quant in one launch, one grouped b12x wo_a
+            # GEMM and o_b_proj as one fused-quant b12x GEMM + its all-reduce,
+            # bitwise equal to the chain below.
+            if not self._b12x_wo_built and not torch.cuda.is_current_stream_capturing():
+                from .b12x_wo import build_b12x_wo_projection
+
+                self._b12x_wo = build_b12x_wo_projection(self)
+                self._b12x_wo_built = True
+            b12x_wo = self._b12x_wo
+            if b12x_wo is not None and b12x_wo.accepts(output):
+                return b12x_wo(output, positions)
         if self._o_a_fp8_block128:
             # Preserve the existing inverse-RoPE/quantization/BMM path when
             # its 128-block contract fits; the packed reducer does not rotate.

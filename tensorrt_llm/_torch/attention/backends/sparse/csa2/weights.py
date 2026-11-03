@@ -197,6 +197,9 @@ def load_attention_weights(
                     module.o_a_proj, grouped_scales
                 )
                 module.o_a_proj.copy_(weight)
+                # Power-of-two 128x128 block scales, kept for the b12x decode
+                # WO projection (csa2/b12x_wo.py), which reads them as UE8M0.
+                module._o_a_proj_block_scale = grouped_scales.clone()
                 grouped_scales = fp8_utils.transform_sf_into_required_layout(
                     grouped_scales,
                     mn=weight.shape[1],
