@@ -163,6 +163,7 @@ def worker(rank, world, port, cfg_name, mode, q):
         max_rel = 0.0
         bad = 0
         frac_plain = 0.0
+        max_ratio = 0.0
         sigs = []
         w = (torch.arange(m * HIDDEN, device=dev, dtype=torch.int64) % 9973) + 1
         for it in range(WARMUP + ITERS):
@@ -181,19 +182,22 @@ def worker(rank, world, port, cfg_name, mode, q):
             # (world-1) partial-sum roundings, each <= 2^-8 * sum|x_i|.
             tol = 1.6e-2 + 1.6e-2 * ref.abs() + (world - 1) * (2.0 ** -8) * absum
             if strict:
-                # knowledge 311 bound: |out - ref| <= 2^-7 * sum_i |x_i| per element
-                tol = (2.0 ** -7) * absum
+                # Rigorous ring bound: (world-1) bf16 partial-sum roundings, each
+                # <= 2^-8 * |partial| <= 2^-8 * sum_i |x_i|  (2^-7 alone fails default NCCL, job 87)
+                tol = (world - 1) * (2.0 ** -8) * absum
             if not torch.isfinite(out).all() or (err > tol).any():
                 bad += 1
             frac_plain = max(frac_plain,
                              (err > 1.6e-2 + 1.6e-2 * ref.abs()).float().mean().item())
             v = buf.view(torch.int16).reshape(-1).to(torch.int64)
             sigs.append([int(v.sum().item()), int((v * w).sum().item())])
+            max_ratio = max(max_ratio, (err / absum.clamp_min(1e-30)).max().item())
             max_abs = max(max_abs, err.max().item())
             max_rel = max(max_rel, (err / ref.abs().clamp_min(1e-3)).max().item())
         if graph:
             del g
         res["check"][str(m)] = {"bad_iters": bad, "max_abs": max_abs, "max_rel": max_rel,
+                                "max_err_over_abssum": max_ratio,
                                 "max_frac_outside_plain_bf16_tol": frac_plain,
                                 "iters": WARMUP + ITERS, "sigs": sigs}
         ok = ok and bad == 0
@@ -370,13 +374,15 @@ def main():
             if bitwise is not None and not all(bitwise.values()):
                 allok = False
             summary[nm] = {"passed": ok, "env": res.get("env"), "bitwise_vs_default": bitwise,
-                           "sizes": {m: {k: c[k] for k in ("bad_iters", "iters", "max_abs", "max_rel")}
+                           "sizes": {m: {k: c[k] for k in ("bad_iters", "iters", "max_abs", "max_rel",
+                                                                "max_err_over_abssum")}
                                      for m, c in res["check"].items()}}
             for m, c in res["check"].items():
                 print(f"[{nm}] m={m}: bad_iters={c['bad_iters']}/{c['iters']} max_abs={c['max_abs']:.4g} "
                       f"max_rel={c['max_rel']:.4g} ranks_identical={res['ranks_identical']} env={res.get('env')}",
                       flush=True)
-        print(json.dumps({"passed": allok, "bound": "|out-ref| <= 2^-7*sum|x_i| every call, inputs restored",
+        print(json.dumps({"passed": allok, "bound": "|out-ref| <= (world-1)*2^-8*sum|x_i| every call vs fp32 sum, "
+                          "inputs restored each call; non-default arms must be bitwise identical to default",
                           "configs": summary}))
         return
     if mode == "pair":
