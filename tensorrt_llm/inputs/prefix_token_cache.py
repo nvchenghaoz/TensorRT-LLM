@@ -26,9 +26,13 @@ are documented in ``docs/source/features/prefix-tokenization-cache.md``.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
+import time
+import unicodedata
 from array import array
+from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import ClassVar, Mapping, Protocol, Sequence
@@ -50,6 +54,87 @@ LOG_EVERY_REQUESTS = 1000
 # candidate is only compared in full when the incoming text has that probe at the
 # same position.
 PROBE_CHARS = 256
+
+# Shared-prefix (longest-common-prefix) splice. Serving workloads often send
+# many prompts that share a long preamble and then diverge (a different
+# question after the same document). The stock lookup above never hits them,
+# because a sibling does not keep its cached neighbour's text up to the
+# neighbour's re-tokenization point. When the tokenizer's shape makes a cut at
+# "U+0020 after a non-space, non-digit, non-CJK character" provably exact (see
+# ``_lcp_splice_gate``), the cache instead measures the common prefix with the
+# most recent entries of the bucket, cuts at such a token start before the
+# divergence, and tokenizes only the rest.
+LCP_CANDIDATES = 8  # most recent entries of the bucket to measure
+LCP_MARGIN_CHARS = 512  # the cut lies at least this far before the divergence
+LCP_CHUNK_CHARS = 8192  # slice size of the common-prefix scan
+GRID_STRIDE = 16  # entries keep the start char of every GRID_STRIDE-th token
+SNAP_SEARCH = 64  # grid points searched backwards for an exact cut
+MAX_SHARED_PREFIX_SIBLINGS = 32  # a spliced prompt becomes an entry only below this
+# Byte-level BPE split patterns, as in tokenizer.json, for which a cut at a
+# U+0020 whose previous character is not whitespace, a \p{N} digit or CJK/kana
+# is a pre-token boundary that depends on neither side's other characters:
+# none has a lookbehind or anchor, and a space can only start a match or sit
+# inside an all-whitespace match. Digit runs group in threes from their left
+# end and CJK runs are isolated whole, so the cut never lands in or right
+# after one.
+_DEEPSEEK_V3_SPLIT_PATTERNS = (
+    "\\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+"
+    "| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+)
+_CUT_SAFE_SPLIT_SEQUENCES = (_DEEPSEEK_V3_SPLIT_PATTERNS,)
+
+
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return (
+        0x2E80 <= o <= 0x9FFF
+        or 0xF900 <= o <= 0xFAFF
+        or 0xFE30 <= o <= 0xFE4F
+        or 0xFF00 <= o <= 0xFFEF
+        or o >= 0x20000
+    )
+
+
+def _is_exact_cut(text: str, cut: int) -> bool:
+    """Whether ``ids(text) == ids(text[:cut]) + ids(text[cut:])`` under the gated shape."""
+    if cut <= 0 or cut >= len(text) or text[cut] != " ":
+        return False
+    prev = text[cut - 1]
+    return not (
+        prev.isspace()
+        or prev in "​⁠﻿"
+        or unicodedata.category(prev)[0] == "N"
+        or _is_cjk(prev)
+    )
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    """Length of the longest common prefix, by slice compares (no per-char loop)."""
+    n = min(len(a), len(b))
+    lo = 0
+    while lo < n:
+        hi = min(lo + LCP_CHUNK_CHARS, n)
+        if a[lo:hi] != b[lo:hi]:
+            break
+        lo = hi
+    else:
+        return n
+    # a[:lo] == b[:lo] and a[lo:hi] != b[lo:hi]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[lo:mid] == b[lo:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _offset_grid(offsets: Sequence[tuple[int, int]], base_char: int, base_token: int) -> array:
+    """Start chars of the grid tokens among ``offsets``, whose first token is ``base_token``."""
+    first = -base_token % GRID_STRIDE
+    return array("i", [base_char + off[0] for off in offsets[first::GRID_STRIDE]])
 
 
 class OffsetTokenizer(Protocol):
@@ -115,6 +200,9 @@ class _Entry:
     split_token: int
     split_char: int
     probe: str  # the PROBE_CHARS characters of ``text`` before ``split_char``
+    # Start char of tokens 0, GRID_STRIDE, 2 * GRID_STRIDE, ... (int32), kept
+    # only when the shared-prefix splice is on.
+    grid: array | None = None
 
 
 class PrefixTokenCache:
@@ -129,8 +217,10 @@ class PrefixTokenCache:
     tokenized in full from then on: a cache bug must never fail a request.
     """
 
-    def __init__(self, config: PrefixTokenCacheConfig) -> None:
+    def __init__(self, config: PrefixTokenCacheConfig, lcp_splice: bool = False) -> None:
         self._config = config
+        # Shared-prefix splice; only for a tokenizer that passed _lcp_splice_gate.
+        self._lcp_splice = lcp_splice
         self._lock = threading.Lock()
         self._entries: OrderedDict[int, _Entry] = OrderedDict()  # LRU order
         self._buckets: dict[int, dict[int, _Entry]] = {}
@@ -143,6 +233,15 @@ class PrefixTokenCache:
         self.hits = 0
         self.misses = 0
         self.resync_failures = 0
+        # Shared-prefix splice counters. A splice is not a hit: ``misses``
+        # counts every prompt the stock lookup missed, and ``splices`` how many
+        # of those the shared-prefix splice still served.
+        self.splices = 0
+        self.splice_fallbacks = 0  # splices refused by the resync check
+        self.splice_no_cut = 0  # long common prefix but no exact cut found
+        self._splice_ms = 0.0
+        self._full_ms = 0.0
+        self._full_count = 0
 
     def encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
         """Return the token ids of ``text`` without special tokens."""
@@ -161,28 +260,76 @@ class PrefixTokenCache:
         """One-line hit-rate and occupancy summary. Caller need not hold the lock."""
         total = self.hits + self.misses
         rate = self.hits / total if total else 0.0
-        return (
+        text = (
             f"{self.hits}/{total} hits ({rate:.1%}), "
             f"{self.resync_failures} resync fallbacks, "
             f"{len(self._entries)} entries, {self._total_chars} cached chars"
         )
+        if self._lcp_splice:
+            splice_ms = self._splice_ms / self.splices if self.splices else 0.0
+            full_ms = self._full_ms / self._full_count if self._full_count else 0.0
+            text += (
+                f"; pid {os.getpid()}: {self.splices} shared-prefix splices, "
+                f"{self._full_count} full tokenizations, "
+                f"{self.splice_fallbacks} splice resync fallbacks, "
+                f"{self.splice_no_cut} without an exact cut, "
+                f"{splice_ms:.2f} ms per spliced vs {full_ms:.2f} ms per full request"
+            )
+        return text
 
     def _encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
+        start = time.perf_counter()
         found = self._lookup(text)
+        if (
+            found is not None
+            and self._lcp_splice
+            and not (
+                _is_exact_cut(text, found[1].split_char)
+                and _is_exact_cut(found[1].text, found[1].split_char)
+            )
+        ):
+            # With the splice on, re-tokenize only from provably exact cuts;
+            # the shared-prefix path below serves this prompt instead.
+            found = None
         ids = None
+        spliced = None  # (entry, lcp chars) when the shared-prefix splice served it
+        splice_fallback = splice_no_cut = False
         if found is not None:
             eid, entry = found
             tail_ids, tail_offsets = self._tokenize(tokenizer, text[entry.split_char :])
             if self._resynced(entry, tail_ids):
                 ids = entry.ids[: entry.split_token].tolist() + list(tail_ids)
                 base_token, base_char = entry.split_token, entry.split_char
+                base_entry = entry
+        elif self._lcp_splice:
+            cand = self._lcp_lookup(text)
+            if cand is not None:
+                entry, tok, cut, lcp = cand
+                if tok < 0:
+                    splice_no_cut = True
+                else:
+                    tail_ids, tail_offsets = self._tokenize(tokenizer, text[cut:])
+                    if self._lcp_resynced(entry, tok, tail_ids):
+                        ids = entry.ids[:tok].tolist() + list(tail_ids)
+                        base_token, base_char = tok, cut
+                        base_entry = entry
+                        spliced = (entry, lcp)
+                    else:
+                        splice_fallback = True
         if ids is None:
             tail_ids, tail_offsets = self._tokenize(tokenizer, text)
             ids, base_token, base_char = tail_ids, 0, 0
+            base_entry = None
 
         # Where a prompt extending this one will be re-tokenized from.
         split_token = len(ids) - self._config.overlap
         tail_index = split_token - base_token
+        grid = None
+        if self._lcp_splice and split_token > 0 and tail_index >= 0:
+            grid = _offset_grid(tail_offsets, base_char, base_token)
+            if base_entry is not None:
+                grid = base_entry.grid[: (base_token + GRID_STRIDE - 1) // GRID_STRIDE] + grid
+        elapsed_ms = (time.perf_counter() - start) * 1e3
 
         with self._lock:
             if found is None:
@@ -192,11 +339,30 @@ class PrefixTokenCache:
                 self.resync_failures += 1
             else:
                 self.hits += 1
+            if spliced is not None:
+                self.splices += 1
+                self._splice_ms += elapsed_ms
+            elif base_token == 0:
+                self._full_count += 1
+                self._full_ms += elapsed_ms
+            self.splice_fallbacks += splice_fallback
+            self.splice_no_cut += splice_no_cut
             if found is not None:
                 self._remove(found[0])
-            if split_token > 0 and tail_index >= 0:
-                self._insert(text, ids, split_token, base_char + tail_offsets[tail_index][0])
-            report = (self.hits + self.misses) % LOG_EVERY_REQUESTS == 0
+            insert = split_token > 0 and tail_index >= 0
+            if spliced is not None:
+                # One shared-prefix workload must not grow its bucket without
+                # bound: lookups scan the bucket.
+                bucket = self._buckets.get(self._bucket_key(text))
+                insert = insert and (bucket is None or len(bucket) < MAX_SHARED_PREFIX_SIBLINGS)
+            if insert:
+                self._insert(
+                    text, ids, split_token, base_char + tail_offsets[tail_index][0], grid
+                )
+            n = self.hits + self.misses
+            # Power-of-two counts as well, so a short serving lifetime still
+            # shows whether the splice works.
+            report = n % LOG_EVERY_REQUESTS == 0 or (self._lcp_splice and n & (n - 1) == 0)
             summary = self.summary() if report else None
         if summary is not None:
             logger.info(f"Prefix token cache: {summary}")
@@ -214,6 +380,46 @@ class PrefixTokenCache:
         cached_tail = entry.ids[entry.split_token :]
         span = min(self._config.resync, len(tail_ids), len(cached_tail))
         return span > 0 and list(tail_ids[:span]) == cached_tail[:span].tolist()
+
+    def _lcp_lookup(self, text: str) -> tuple[_Entry, int, int, int] | None:
+        """The recent entry sharing the longest prefix with ``text``, and where to cut.
+
+        Returns None if no entry shares a long enough prefix, else
+        ``(entry, token, cut, lcp)``: ``text[:cut]`` is exactly the cached
+        tokens ``entry.ids[:token]``, and ``lcp`` is the common prefix length in
+        chars. ``token`` is -1 if no exact cut was found near the divergence.
+        """
+        with self._lock:
+            bucket = self._buckets.get(self._bucket_key(text))
+            candidates = list(bucket.values())[-LCP_CANDIDATES:] if bucket else []
+        best, best_lcp = None, 0
+        for entry in reversed(candidates):  # most recent first
+            if entry.grid is None:
+                continue
+            lcp = _common_prefix_len(text, entry.text)
+            if lcp > best_lcp:
+                best, best_lcp = entry, lcp
+        if best is None or best_lcp < max(self._config.min_chars, len(text) // 2) + LCP_MARGIN_CHARS:
+            return None
+        grid = best.grid
+        g = bisect_right(grid, best_lcp - LCP_MARGIN_CHARS) - 1
+        for g in range(g, max(g - SNAP_SEARCH, 0), -1):
+            cut = grid[g]
+            # The resync span (the next 2 grid strides) must lie inside the
+            # common prefix, where the cached ids are the ids of ``text``.
+            if (
+                g + 2 < len(grid)
+                and grid[g + 2] <= best_lcp
+                and _is_exact_cut(text, cut)
+                and (g == 0 or grid[g - 1] < cut)
+            ):
+                return best, g * GRID_STRIDE, cut, best_lcp
+        return best, -1, -1, best_lcp
+
+    def _lcp_resynced(self, entry: _Entry, token: int, tail_ids: Sequence[int]) -> bool:
+        """Whether the tail's first ``resync`` ids equal the cached ids after ``token``."""
+        span = min(self._config.resync, len(tail_ids), len(entry.ids) - token)
+        return span > 0 and list(tail_ids[:span]) == entry.ids[token : token + span].tolist()
 
     def _bucket_key(self, text: str) -> int:
         return hash(text[: self._config.min_chars])
@@ -243,7 +449,14 @@ class PrefixTokenCache:
             # splice from; _remove() on it is a no-op.
         return best
 
-    def _insert(self, text: str, ids: Sequence[int], split_token: int, split_char: int) -> None:
+    def _insert(
+        self,
+        text: str,
+        ids: Sequence[int],
+        split_token: int,
+        split_char: int,
+        grid: array | None = None,
+    ) -> None:
         """Caller holds the lock."""
         key = self._bucket_key(text)
         bucket = self._buckets.setdefault(key, {})
@@ -251,7 +464,7 @@ class PrefixTokenCache:
             return  # concurrent misses on the same prompt
         eid, self._next_id = self._next_id, self._next_id + 1
         probe = text[max(split_char - PROBE_CHARS, 0) : split_char]
-        entry = _Entry(text, array("i", ids), split_token, split_char, probe)
+        entry = _Entry(text, array("i", ids), split_token, split_char, probe, grid)
         self._entries[eid] = entry
         bucket[eid] = entry
         self._total_chars += len(text)
@@ -290,5 +503,99 @@ def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
         )
         return None
     config = PrefixTokenCacheConfig.from_env()
-    logger.info(f"Prefix token cache enabled: {config}")
-    return PrefixTokenCache(config)
+    lcp_splice, why = _lcp_splice_gate(tokenizer)
+    logger.info(
+        f"Prefix token cache enabled: {config}; shared-prefix splice "
+        f"{'on' if lcp_splice else 'off'} ({why})"
+    )
+    return PrefixTokenCache(config, lcp_splice=lcp_splice)
+
+
+def _lcp_splice_gate(tokenizer: object) -> tuple[bool, str]:
+    """Whether a U+0020 cut (see ``_is_exact_cut``) is exact for ``tokenizer``, and why.
+
+    Requires, from the backend's serialized form: no normalizer (or an empty
+    Sequence, or NFC, which never composes across U+0020); a pre-tokenizer
+    ``Sequence[Split(Isolated) for a pattern set in _CUT_SAFE_SPLIT_SEQUENCES,
+    ByteLevel(add_prefix_space=False, use_regex=False)]``; a BPE model without
+    dropout; a post-processor that keeps untrimmed offsets; and added tokens
+    with no whitespace and no strip or single-word flags. Then checks a probe
+    text empirically. Anything else keeps the splice off.
+    """
+    try:
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        if backend is None:
+            return False, "no backend tokenizer"
+        spec = json.loads(backend.to_str())
+        norm = spec.get("normalizer")
+        if norm is not None and not (
+            norm.get("type") == "NFC"
+            or (norm.get("type") == "Sequence" and not norm.get("normalizers"))
+        ):
+            return False, f"normalizer {norm.get('type')}"
+        pre = spec.get("pre_tokenizer") or {}
+        steps = pre.get("pretokenizers") or []
+        if pre.get("type") != "Sequence" or len(steps) < 2:
+            return False, f"pre_tokenizer {pre.get('type')}"
+        *splits, last = steps
+        if not (
+            last.get("type") == "ByteLevel"
+            and last.get("add_prefix_space") is False
+            and last.get("use_regex") is False
+        ):
+            return False, "pre_tokenizer does not end in ByteLevel without regex/prefix space"
+        patterns = []
+        for split in splits:
+            if (
+                split.get("type") != "Split"
+                or split.get("behavior") != "Isolated"
+                or split.get("invert")
+                or "Regex" not in (split.get("pattern") or {})
+            ):
+                return False, f"pre_tokenizer step {split.get('type')}"
+            patterns.append(split["pattern"]["Regex"])
+        if tuple(patterns) not in _CUT_SAFE_SPLIT_SEQUENCES:
+            return False, f"split patterns {patterns!r} not known cut-safe"
+        model = spec.get("model") or {}
+        if model.get("type") != "BPE" or model.get("dropout"):
+            return False, f"model {model.get('type')} dropout {model.get('dropout')}"
+        post = spec.get("post_processor")
+        if post is not None:
+            kind = post.get("type")
+            if kind == "ByteLevel":
+                if post.get("trim_offsets"):
+                    return False, "post_processor trims offsets"
+            elif kind != "TemplateProcessing":
+                return False, f"post_processor {kind}"
+        for added in spec.get("added_tokens") or []:
+            content = added.get("content", "")
+            if any(c.isspace() for c in content) or (
+                added.get("lstrip") or added.get("rstrip") or added.get("single_word")
+            ):
+                return False, f"added token {content!r} may straddle a cut"
+        # Empirical probe: contiguous offsets, and the split identity at every
+        # qualifying cut.
+        probe = (
+            "Alpha beta,  gamma\t delta 12345 x中文 y こん z.  "
+            "<|end|> été \U0001f600 ok\n\n  next (paren) 'quote' end"
+        )
+        enc = tokenizer(probe, add_special_tokens=False, return_offsets_mapping=True)
+        ids, offsets = list(enc["input_ids"]), list(enc["offset_mapping"])
+        ascii_offsets = [o for o in offsets if o[1] <= 33]  # probe[:33] is ASCII
+        if not ascii_offsets or ascii_offsets[0][0] != 0:
+            return False, "probe offsets do not start at 0"
+        for a, b in zip(ascii_offsets, ascii_offsets[1:]):
+            if a[1] != b[0]:
+                return False, "probe offsets are not contiguous"
+        for cut in range(1, len(probe)):
+            if not _is_exact_cut(probe, cut):
+                continue
+            left = tokenizer(probe[:cut], add_special_tokens=False)["input_ids"]
+            right = tokenizer(probe[cut:], add_special_tokens=False)["input_ids"]
+            if list(left) + list(right) != ids:
+                return False, f"probe split at {cut} is not exact"
+            if cut not in {o[0] for o in offsets}:
+                return False, f"probe cut {cut} is not a token start"
+        return True, "byte-level BPE with cut-safe split patterns"
+    except Exception as e:  # noqa: BLE001 - any doubt keeps the splice off
+        return False, f"gate error {e!r}"
