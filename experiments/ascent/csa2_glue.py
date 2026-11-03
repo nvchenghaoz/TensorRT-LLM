@@ -425,9 +425,8 @@ def bench(args) -> dict:
         s = torch.cuda.Stream(DEV)
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
-            for _ in range(3):
-                run_step(case, pools, meta, layer_kind=args.kind, group=("G", "G", 0))
-                meta._csa2_stage_epoch += 1
+            for _ in range(3):  # compile CuTe kernels and create staging scratch outside capture
+                run_step(case, pools, meta, layer_kind=args.kind, group=None)
         torch.cuda.current_stream().wait_stream(s)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
