@@ -1,8 +1,8 @@
-"""Branch 57: run the full csa2 test_indexer.py with its two stale tests replaced by the
-repaired copies in b57_repaired_tests.py (tests/ is protected). Also reports the
-status of the two original tests (expected: the stale-hook test fails on main and
-branch alike with calls == []; the old constant-rows test fails on the branch
-because it asserted the buggy capture-only caching)."""
+"""Branch 57: run the FULL csa2 test_indexer.py with its two stale tests repaired in
+place by b57_tests_plugin (tests/ is protected for workers), then the two original
+stale tests unrepaired for the record (expected: the stale-hook test fails on main
+and branch alike with calls == []; the old constant-rows test passes on main and
+fails on the branch, because it asserted the buggy capture-only caching)."""
 
 import json
 import os
@@ -18,41 +18,50 @@ STALE = ["test_gathered_decode_graph_grows_past_warmup_prefix",
          "test_constant_rows_retained_only_for_captured_graphs"]
 
 
-def run(args):
-    cmd = [sys.executable, "-m", "pytest", "-q", "-rA", "-p", "no:cacheprovider", "-s", *args]
+def run(args, plugin):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(HERE) + os.pathsep + env.get("PYTHONPATH", "")
+    cmd = [sys.executable, "-m", "pytest", "-q", "-rA", "-p", "no:cacheprovider", "-s"]
+    if plugin:
+        cmd += ["-p", "b57_tests_plugin"]
+    cmd += args
     print(" ".join(cmd), flush=True)
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
     out = proc.stdout
     lines = out.strip().splitlines()
     summary = ""
     for ln in reversed(lines):
-        if re.search(r"\d+ (passed|failed)", ln):
+        if re.search(r"\d+ (passed|failed|error)", ln):
             summary = ln
             break
     counts = {k: int(v) for v, k in re.findall(r"(\d+) (passed|failed|skipped|error|errors)",
                                               summary)}
     failed = [ln for ln in lines if ln.startswith(("FAILED", "ERROR"))]
-    extra = [ln for ln in lines if "[repaired]" in ln]
-    print(out[-5000:], flush=True)
-    sys.stderr.write(proc.stderr[-2000:])
+    stale_status = [ln for ln in lines if ln.startswith(("PASSED", "FAILED", "ERROR"))
+                    and any(t in ln for t in STALE)]
+    notes = [ln for ln in lines if "[b57-plugin]" in ln]
+    print("\n".join(notes), flush=True)
+    print(out[-6000:], flush=True)
+    sys.stderr.write(proc.stderr[-3000:])
     return dict(returncode=proc.returncode, summary=summary.strip("= "), counts=counts,
-                failed=failed[:30], notes=extra[:5])
+                failed=failed[:30], stale_tests=stale_status, plugin_notes=notes[:10])
 
 
 def main():
-    suite = run([SUITE, *[a for t in STALE for a in ("--deselect", f"{SUITE}::{t}")]])
-    repaired = run([str(HERE / "b57_repaired_tests.py")])
-    stale = run([f"{SUITE}::{t}" for t in STALE])
+    suite = run([SUITE], plugin=True)
+    stale = run(["-k", " or ".join(STALE), SUITE], plugin=False)
+    repaired_ok = (len([n for n in suite["plugin_notes"] if "passed" in n]) >= 3
+                   and all(s.startswith("PASSED") for s in suite["stale_tests"])
+                   and len(suite["stale_tests"]) == 2)
     passed = (suite["returncode"] == 0 and suite["counts"].get("passed", 0) > 100
-              and repaired["returncode"] == 0 and repaired["counts"].get("passed", 0) == 5)
+              and not suite["counts"].get("failed") and repaired_ok)
     print(json.dumps({
         "passed": bool(passed),
-        "suite_minus_two_stale": suite,
-        "repaired_tests": repaired,
-        "original_stale_tests": stale,
-        "compared": "csa2 test_indexer.py (all tests except the two stale ones) + repaired "
-                    "gathered-decode graph test (hook counts both gather routes, all replay "
-                    "asserts kept) + constant-rows (a)-(d)",
+        "full_suite_with_repaired_tests": suite,
+        "original_stale_tests_unrepaired": stale,
+        "compared": "full csa2 test_indexer.py; the stale gathered-decode graph test runs with "
+                    "its hook counting both gather routes (all replay asserts kept) and the "
+                    "old constant-rows test is replaced by (a)-(d)",
     }))
 
 
