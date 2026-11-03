@@ -36,7 +36,10 @@ from .kernel import (
     dsl_available,
     finalize_selection_,
     gather_candidate_scores,
+    gather_owner_index_keys,
+    index_key_gather_supported,
     mask_logits_,
+    mask_positions_,
     publish_candidates_,
 )
 from .metadata import CSA2TrtllmMetadata
@@ -476,9 +479,15 @@ class CSA2Indexer(Indexer):
                 )
         else:
             offsets = torch.arange(width, device=logits.device)
+            fused_mask = False
             if row_starts is None and row_ends is None and logits.shape[1] == width:
                 scores = logits
-                valid = logical_positions >= 0
+                if scores.is_cuda and dsl_available() and scores.stride(1) == 1:
+                    # One launch for the validity mask and the in-place -inf fill.
+                    valid = mask_positions_(scores, logical_positions, visible_lengths)
+                    fused_mask = True
+                else:
+                    valid = logical_positions >= 0
             else:
                 if row_starts is None:
                     row_starts = self._constant_rows(logits.shape[0], 0, logits.device)
@@ -489,10 +498,11 @@ class CSA2Indexer(Indexer):
                 in_bounds &= columns < logits.shape[1]
                 scores = logits.gather(1, columns.clamp(0, logits.shape[1] - 1))
                 valid = in_bounds & (logical_positions >= 0)
-            valid &= logical_positions < visible_lengths[:, None]
-            # The logits are this call's own transient: mask them in place so
-            # the boolean mask is the only full-width temporary.
-            scores.masked_fill_(~valid, -torch.inf)
+            if not fused_mask:
+                valid &= logical_positions < visible_lengths[:, None]
+                # The logits are this call's own transient: mask them in place so
+                # the boolean mask is the only full-width temporary.
+                scores.masked_fill_(~valid, -torch.inf)
             if gvr_prior_indices is not None:
                 if width:
                     prior = gvr_prior_indices.long()
@@ -1213,8 +1223,45 @@ class CSA2Indexer(Indexer):
                 metadata.publish_indexer_prior(self.layer_idx, logical)
             return logical
 
+        fused_geometry = []
+
+        def fused_keys():
+            # One CuTe launch maps owner slots, gathers the FP4 key rows and
+            # writes logical positions and row bounds (bitwise the ATen chain).
+            if not fused_geometry:
+                geometry = None
+                owner = metadata.csa2_kv_sources[self.layer_idx]
+                if q_fp8.is_cuda and dsl_available() and owner is not None:
+                    pages = manager.get_index_pages(layer.kv_source)
+                    table = metadata.csa2_global_page_tables[owner]
+                    if index_key_gather_supported(pages, table):
+                        geometry = (
+                            pages,
+                            table,
+                            metadata.csa2_global_page_sizes[owner],
+                            metadata.csa2_global_max_positions[owner],
+                        )
+                fused_geometry.append(geometry)
+            return fused_geometry[0]
+
         def candidate_tile(start: int, end: int) -> _ChunkInputs:
             positions = candidates[start:end]
+            geometry = fused_keys() if positions.dtype in (torch.int32, torch.int64) else None
+            if geometry is not None:
+                pages, table, page_size, owner_positions = geometry
+                width = positions.shape[1]
+                keys, scales, mapped, starts, ends = gather_owner_index_keys(
+                    pages,
+                    table,
+                    metadata.csa2_token_requests[start:end],
+                    page_size,
+                    owner_positions,
+                    width,
+                    end - start,
+                    positions=positions,
+                    start_step=width,
+                )
+                return _ChunkInputs(keys, scales, starts, ends, mapped, visible[start:end])
             slots = metadata.global_slot_tile(self.layer_idx, start, end, positions)
             keys, scales = manager.gather_indexer_keys(layer.kv_source, slots.flatten())
             width = positions.shape[1]
@@ -1231,6 +1278,27 @@ class CSA2Indexer(Indexer):
         def shared_keys(start: int, end: int, width: int) -> _ChunkInputs:
             # A request's compressed prefix is gathered once and shared by all
             # query tiles. Cached and newly published keys have the same owner.
+            geometry = fused_keys()
+            if geometry is not None:
+                pages, table, page_size, owner_positions = geometry
+                keys, scales, mapped, starts, ends = gather_owner_index_keys(
+                    pages,
+                    table,
+                    metadata.csa2_token_requests[start : start + 1],
+                    page_size,
+                    owner_positions,
+                    width,
+                    end - start,
+                )
+                return _ChunkInputs(
+                    keys,
+                    scales,
+                    starts,
+                    ends,
+                    mapped.expand(end - start, -1),
+                    visible[start:end],
+                    shared_columns=True,
+                )
             positions = torch.arange(width, device=q_fp8.device)
             slots = metadata.global_slot_tile(self.layer_idx, start, start + 1, positions[None, :])[
                 0
