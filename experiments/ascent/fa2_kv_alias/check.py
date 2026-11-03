@@ -205,6 +205,8 @@ def main():
         pools_graph_case(count)
     prefill_case(adapter, fa.PREFILL_Q, fa.WIDTH)
     prefill_case(adapter, 256, 600)
+    prefill_case(adapter, 128, fa.WIDTH)
+    prefill_case(adapter, 256, fa.WIDTH)
     fa.log_jit_modules("after paged")
     if os.environ.get("FA2_ALIAS_HD128", "1") == "1":
         # Fresh adapter: plan keys do not include head_dim.

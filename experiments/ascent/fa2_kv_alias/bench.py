@@ -163,6 +163,19 @@ def main():
     mc, nc = time_eager(lambda: plan.wrapper.run(qc, (pages, pages_c), return_lse=True), flush)
     diag["prefill2048"] = {"alias_ms": round(med, 5), "clone_ms": round(mc, 5), "nf_clone": round(nc, 4)}
     log(f"prefill 2048x640 paged clone-V: {mc:.4f} ms nf {nc:.4f}")
+    # Bounded-replay shapes (layers 20-39 run 128 rows): 128 and 256 rows x 640.
+    for rows_q in (128, 256):
+        q, bank, indices, sink = make_prefill(4242 + rows_q, count=rows_q)
+        plan, pages = prefill_plan(adapter, q, bank, indices, sink)
+        pages_c = pages.clone()
+        qc = q.contiguous()
+        med, nf = time_eager(lambda: plan.wrapper.run(qc, (pages, pages), return_lse=True), flush)
+        results[str(rows_q)] = {"kernel_ms": round(med, 5), "noise_floor": round(nf, 5)}
+        log(f"prefill {rows_q}x640 paged alias: {med:.4f} ms nf {nf:.4f}")
+        mc, nc = time_eager(lambda: plan.wrapper.run(qc, (pages, pages_c), return_lse=True), flush)
+        diag[f"prefill{rows_q}"] = {"alias_ms": round(med, 5), "clone_ms": round(mc, 5),
+                                    "nf_clone": round(nc, 4)}
+        log(f"prefill {rows_q}x640 paged clone-V: {mc:.4f} ms nf {nc:.4f}")
     log(json.dumps({"diagnostics": diag}))
     print(json.dumps({"batch": results, "output": {"class": "exact"}, "diagnostics": diag}))
 
