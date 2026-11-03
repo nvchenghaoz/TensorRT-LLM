@@ -152,6 +152,27 @@ def main():
             traceback.print_exc()
             record(f"leaf_M{m}", False, error=repr(ex))
 
+    # 1b. dirty caching allocator: free 0x7F (e4m3 NaN) bytes before every call; the chain's
+    # intermediates must not read stale memory (job 525: torch.empty q1 gave NaN).
+    for m, nl in ((1, 3), (2, 2), (4, 2), (8, 2), (8, 1), (4, 6)):
+        try:
+            x = torch.randn(m, H, dtype=torch.bfloat16, device="cuda")
+            ids, w = make_routing(m, nl, seed=900 + m * 10 + nl)
+            oc = cut(x, ids, w).clone()
+            worst, finite = 0.0, True
+            for _ in range(5):
+                junk = torch.full((256 * 1024 * 1024,), 0x7F, dtype=torch.uint8, device="cuda")
+                del junk
+                of = st.run(x, ids, w)
+                e = err_stats(of, oc.float())
+                finite = finite and e["finite"]
+                worst = max(worst, e["calc_diff"] if e["finite"] else 1.0)
+            record(f"poisoned_alloc_M{m}_nl{nl}", finite and worst < 1e-3, worst_calc_diff_vs_cutlass=worst,
+                   finite=finite)
+        except Exception as ex:  # noqa: BLE001
+            traceback.print_exc()
+            record(f"poisoned_alloc_M{m}_nl{nl}", False, error=repr(ex))
+
     # 2-4. repeated execution matching bench.py, graph capture without JIT
     flush = torch.empty(512 * 1024 * 1024 // 4, dtype=torch.int32, device="cuda")
     cases = [(str(m), m, N_LOCAL[m], None) for m in (1, 2, 4, 8)] + [("4e", 4, 2, 1)]

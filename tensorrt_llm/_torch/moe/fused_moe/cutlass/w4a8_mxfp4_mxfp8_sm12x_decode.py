@@ -110,6 +110,10 @@ def swizzled_sf_to_fi(sf_swizzled: torch.Tensor, num_experts: int, rows: int, k:
     return out
 
 
+def _align(n: int, a: int) -> int:
+    return (n + a - 1) // a * a
+
+
 def _workspace(x: torch.Tensor, local_ids: torch.Tensor, num_experts: int):
     """Route workspace shared by every layer: layers run one after another on one stream."""
     key = (x.device, x.shape[0], x.shape[1], local_ids.shape[1], num_experts)
@@ -168,10 +172,19 @@ class Sm12xW4a8DecodeState:
         weights = token_final_scales.to(torch.float32)
         pairs = local.numel()
         ws = _workspace(x, local, self.num_experts)
-        q1 = torch.empty(pairs, self.inter, dtype=torch.float8_e4m3fn, device=x.device)
-        sf1 = torch.zeros(out_sf_shape(pairs, self.inter, self.num_experts),
-                          dtype=torch.int32, device=x.device)
-        out = torch.zeros(m, self.hidden, dtype=torch.bfloat16, device=x.device)
+        # q1, sf1 and the output all have to start at zero: FC2 reads rows of q1 that FC1
+        # leaves unwritten (stale bytes there are NaN often enough to poison real rows), the
+        # padded rows of sf1 likewise, and FC2 scatter-adds into the output. One zeroed
+        # buffer, one memset.
+        sf1_shape = out_sf_shape(pairs, self.inter, self.num_experts)
+        n_q1 = pairs * self.inter
+        n_sf1 = sf1_shape[0] * sf1_shape[1] * 4
+        off_sf1 = _align(n_q1, 256)
+        off_out = _align(off_sf1 + n_sf1, 256)
+        buf = torch.zeros(off_out + m * self.hidden * 2, dtype=torch.uint8, device=x.device)
+        q1 = buf[:n_q1].view(torch.float8_e4m3fn).view(pairs, self.inter)
+        sf1 = buf[off_sf1:off_sf1 + n_sf1].view(torch.int32).view(sf1_shape)
+        out = buf[off_out:].view(torch.bfloat16).view(m, self.hidden)
         offsets, token_map, route_weights, a_q, a_sf = route(
             x, local, weights, self.num_experts, workspace=ws, enable_pdl=self.enable_pdl
         )
