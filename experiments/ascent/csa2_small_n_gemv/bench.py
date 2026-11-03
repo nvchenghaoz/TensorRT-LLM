@@ -244,7 +244,6 @@ def sweep():
 
 def check():
     from tensorrt_llm._torch.modules import small_n_gemv as sg
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2Compressor
     gen = torch.Generator(device="cuda").manual_seed(SEED)
     failures, report = [], {}
     shapes = ((32, 5120), (512, 5120), (1024, 5120), (128, 512))
@@ -257,7 +256,7 @@ def check():
             cub = F.linear(x, w)
             routed = sg.maybe_small_n_gemv(x, w)
             key = f"{n}x{k}_M{m}"
-            if m > sg.MAX_M:
+            if m > sg.MAX_M or n > sg.MAX_N:
                 ok = routed is None and torch.equal(sg.small_n_linear(
                     type("L", (), {"weight": w, "bias": None, "__call__": lambda s, t: F.linear(t, w)})(), x), cub)
                 report[key] = {"routed": routed is not None, "cublas_bitwise": ok}
@@ -284,19 +283,13 @@ def check():
             log(key, report[key])
             if not (det and tol_ok and cmp_ok and report[key]["finite"] and report[key]["shape_ok"]):
                 failures.append(key)
-    # Module hook: CSA2Compressor ratio 1 routes through the GEMV at decode M.
-    with torch.device("cuda"):
-        comp = CSA2Compressor(HIDDEN, HEAD_DIM, 1, EPS)
-    with torch.no_grad():
-        comp.wkv.weight.copy_(torch.randn((HEAD_DIM, HIDDEN), generator=gen, device="cuda") * 0.014)
-        comp.norm.weight.fill_(1.0)
+    # Module hook: small_n_linear on an nn.Linear equals the GEMV at decode M.
+    lin = nn_linear(HIDDEN, IDX_HEADS, gen)
     for m in MS:
         x = torch.randn((m, HIDDEN), generator=gen, device="cuda").to(torch.bfloat16)
-        got = comp(x)
-        exp = comp.norm(sg.small_n_gemv(x, comp.wkv.weight))
-        if not torch.equal(got, exp):
-            failures.append(f"compressor hook M={m}")
-    report["compressor_hook"] = "checked M=1,2,4,8"
+        if not torch.equal(sg.small_n_linear(lin, x), sg.small_n_gemv(x, lin.weight)):
+            failures.append(f"hook M={m}")
+    report["hook"] = "checked M=1,2,4,8"
     # CUDA-graph capture/replay, single stream and fork/join, repeated with fresh inputs.
     gq = {}
     for two in (False, True):
@@ -339,9 +332,8 @@ def check():
                 torch.cuda.synchronize()
                 eager = aux(x)
                 bit = all(torch.equal(a, b) for a, b in zip(outs, eager))
-                kv_ref = x.double() @ aux.comp.weight.double().t()
-                kv = sg.maybe_small_n_gemv(x, aux.comp.weight)
-                errs.append((kv.double() - kv_ref).abs().max().item())
+                p_ref = (x.double() @ aux.iwp.weight.double().t()) * aux.scale
+                errs.append((outs[-1].double() - p_ref).abs().max().item())
                 if not bit:
                     failures.append(f"graph two={two} M={m} iter {i}")
             gq[f"{'two_stream' if two else 'single'}_M{m}"] = {

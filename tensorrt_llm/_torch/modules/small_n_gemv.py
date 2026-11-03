@@ -31,7 +31,9 @@ except ImportError:  # pragma: no cover
     tl = None
 
 MAX_M = 8
-MAX_N = 1024
+# cuBLAS already streams N >= 512 at K=5120 as fast as this kernel (sweep);
+# its slow one-warp wmma pick is at small N.
+MAX_N = 128
 MAX_K = 16384
 _ENABLED = os.environ.get("TRTLLM_SMALL_N_BF16_GEMV", "1") != "0" and triton is not None
 _SM_OK: dict = {}
@@ -83,13 +85,19 @@ def _sm120(device: torch.device) -> bool:
 
 
 def default_config(m: int, n: int, k: int):
-    """(BLOCK_N, BLOCK_K, num_warps) for an [m, k] x [n, k]^T GEMV."""
-    block_k = 512 if k % 512 == 0 else 256
-    if n >= 512:
-        block_n = 2
-    else:
-        block_n = 1
-    return block_n, block_k, 4
+    """(BLOCK_N, BLOCK_K, num_warps) for an [m, k] x [n, k]^T GEMV.
+
+    Picked from a cold-L2 CUDA-graph sweep on RTX PRO 6000 (SM120) at
+    N=32/K=5120 and N=128/K=512, M=1-8 (experiments/ascent/csa2_small_n_gemv).
+    """
+    if k >= 4096:
+        if m == 1:
+            return 1, 256, 8
+        if k % 1024 == 0:
+            return 1, 1024, 4
+    if k % 512 == 0:
+        return 1, 512, 4
+    return 1, 256, 4
 
 
 def small_n_gemv(x: torch.Tensor, weight: torch.Tensor, config=None) -> torch.Tensor:
