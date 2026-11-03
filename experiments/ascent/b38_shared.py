@@ -83,7 +83,7 @@ def call(fi, attn, case):
 
 
 def plan_of(fi, case):
-    return fi._paged_plans[(case.count, HEADS, case.width, dev, SCALE)]
+    return fi._paged_plans[(case.count, HEADS, case.width, case.q.device, SCALE)]
 
 
 def common():
