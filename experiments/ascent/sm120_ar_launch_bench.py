@@ -110,7 +110,67 @@ def _check_save(torch, run, m, rank, dev, path, bound):
             "e_first_last": [per_iter_e[0], per_iter_e[-1]]}
 
 
-def rank_variant(env, do_time, do_check, do_robust):
+def _flag_all_ranks(torch, mapping):
+    """Lamport triple-buffer flag of every rank, read after a 4-rank barrier (fact 736 harness pitfall)."""
+    torch.cuda.synchronize()
+    B._barrier()
+    _, flags, layout = B._lamport_state(torch, mapping)
+    allf = B._allgather((flags, layout))
+    B._barrier()
+    return allf
+
+
+def _replica(torch, mapping, strat, m, rank, dev, ref_path, own_path):
+    """Untimed replica of the timed pair sequence (same counts, same reset points, same seed-0 input):
+    single-AR graph: SEQS x (WARMUP + ITERS isolated + ITERS burst) replays; 8-AR chain graph: SEQS x (WARMUP +
+    ITERS) replays. Every output of every replay is compared bitwise with the k1_pdl0 output on the same input
+    (and with the fp32 rank-order emulation); lamport flags of all ranks are compared at every reset point."""
+    emul = _emul(torch, m, 0, dev).view(torch.int16)
+    ref = torch.load(ref_path).to(dev).view(torch.int16) if ref_path and os.path.exists(ref_path) else None
+    stats = {"single_replays": 0, "chain_outputs": 0, "not_bitwise_vs_ref": 0, "not_bitwise_vs_emulation": 0,
+             "flag_mismatch_resets": 0, "flags_at_resets": []}
+
+    def cmp(out):
+        o = out.view(torch.int16)
+        stats["not_bitwise_vs_emulation"] += int(not torch.equal(o, emul))
+        if ref is not None:
+            stats["not_bitwise_vs_ref"] += int(not torch.equal(o, ref))
+
+    run = B.Runner(torch, mapping, strat, m, graph=True)
+    first = None
+    for s in range(SEQS):
+        run.x.copy_(B._gen(torch, m, 0, rank, dev))  # reset point, as in the timed sequence
+        allf = _flag_all_ranks(torch, mapping)
+        stats["flags_at_resets"].append([f[0][2] for f in allf])
+        stats["flag_mismatch_resets"] += int(any(f != allf[0] for f in allf))
+        for _ in range(WARMUP + 2 * ITERS):
+            out = run()
+            cmp(out)
+            if first is None:
+                first = out.clone()
+            stats["single_replays"] += 1
+    del run
+    ch = ChainRunner(torch, mapping, strat, m)
+    for s in range(SEQS):
+        ch.x.copy_(B._gen(torch, m, 0, rank, dev))
+        allf = _flag_all_ranks(torch, mapping)
+        stats["flags_at_resets"].append([f[0][2] for f in allf])
+        stats["flag_mismatch_resets"] += int(any(f != allf[0] for f in allf))
+        for _ in range(WARMUP + ITERS):
+            ch.graph.replay()
+            for o in ch.outs:
+                cmp(o)
+                stats["chain_outputs"] += 1
+    del ch
+    allf = _flag_all_ranks(torch, mapping)
+    stats["flag_mismatch_resets"] += int(any(f != allf[0] for f in allf))
+    torch.cuda.synchronize()
+    torch.save(first.cpu(), own_path)
+    stats["flags_at_resets"] = stats["flags_at_resets"][:4]
+    return stats
+
+
+def rank_variant(env, do_time, do_check, do_robust, do_replica=False):
     torch, rank, mapping, _ = B._setup(env)
     from tensorrt_llm._torch.distributed import AllReduceStrategy
     dev = torch.device("cuda", rank)
@@ -136,6 +196,13 @@ def rank_variant(env, do_time, do_check, do_robust):
                                                os.path.join(env["_outdir"], f"{name}_m{m}_r{rank}.pt"),
                                                2.0 ** -8 if env["_strategy"] == "ONESHOT" else B.BOUND)
             del run
+        if do_replica:
+            refp = None if name == "k1_pdl0" else os.path.join(env["_outdir"], f"k1_pdl0_replica_m{m}_r{rank}.pt")
+            res.setdefault("replica", {})[str(m)] = _replica(
+                torch, mapping, strat, m, rank, dev, refp,
+                os.path.join(env["_outdir"], f"{name}_replica_m{m}_r{rank}.pt"))
+            if rank == 0:
+                log(f"[{name}] replica m={m} {res['replica'][str(m)]}")
         torch.cuda.synchronize()
         if rank == 0:
             t = res["timing"].get(str(m), {})
@@ -233,7 +300,7 @@ def main():
                     ("k5_pdl0", "ONESHOT", 5, 0), ("k5_pdl1", "ONESHOT", 5, 1)]
     else:  # check: candidate defaults vs explicit branch-22 launch
         variants = [("k1_pdl0", "ONESHOT", 1, 0), ("default", "ONESHOT", None, None)]
-    table, checks, robust, bitwise = {}, {}, {}, {}
+    table, checks, robust, bitwise, replica = {}, {}, {}, {}, {}
     allok = True
     for name, strat, k, pdl in variants:
         env = dict(base, _name=name, _strategy=strat)
@@ -241,7 +308,18 @@ def main():
             env["TLLM_AR_SM120_CTAS_PER_TOKEN"] = str(k)
             env["TLLM_AR_SM120_PDL"] = str(pdl)
         is_custom = strat == "ONESHOT"
-        res = run_ranks(rank_variant, env, mode == "sweep", True, is_custom)
+        res = run_ranks(rank_variant, env, mode == "sweep", True, is_custom, mode == "check")
+        if mode == "check":
+            rep = {}
+            for m in res[0].get("replica", {}):
+                per = [r["replica"][m] for r in res]
+                rep[m] = {k: sum(p[k] for p in per) for k in ("single_replays", "chain_outputs", "not_bitwise_vs_ref",
+                                                              "not_bitwise_vs_emulation", "flag_mismatch_resets")}
+                rep[m]["flags_at_resets_rank0"] = per[0]["flags_at_resets"]
+                allok = allok and rep[m]["not_bitwise_vs_ref"] == 0 and rep[m]["flag_mismatch_resets"] == 0 \
+                    and rep[m]["not_bitwise_vs_emulation"] == 0
+            replica[name] = rep
+            log(f"[replica] {name}: {rep}")
         if mode == "sweep":
             table[name] = _summ_timing(res)
         checks[name] = {m: {"bad_iters_e": sum(r["check"][m]["bad_iters_e_gt_2^-8"] for r in res),
@@ -277,7 +355,7 @@ def main():
                       "compared": "every ONESHOT variant's outputs bitwise vs the k1_pdl0 (branch 22) lamport output "
                                   "on the same inputs, every iteration, M=1..16, 4 ranks; e vs fp32 sum <= 2^-8; "
                                   "1000 replays at M=1/8 with lamport flag/clear checks",
-                      "bitwise_vs_k1_pdl0": bitwise, "table_us": table, "checks": checks, "robust": robust}))
+                      "bitwise_vs_k1_pdl0": bitwise, "timed_sequence_replica": replica, "table_us": table, "checks": checks, "robust": robust}))
 
 
 if __name__ == "__main__":
