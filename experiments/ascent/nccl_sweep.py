@@ -64,7 +64,7 @@ def worker(rank, world, port, cfg_name, mode, q):
     import torch.distributed as dist
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
-    if mode == "pair":
+    if mode in ("pair", "pair_check"):
         try:
             from tensorrt_llm._torch.distributed import nccl_tuning  # candidate only
             applied = nccl_tuning.apply_pcie_nccl_defaults(list(range(world)))
@@ -75,8 +75,13 @@ def worker(rank, world, port, cfg_name, mode, q):
     dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}",
                             rank=rank, world_size=world, device_id=dev)
     res = {"timing": {}, "check": {}}
+    check_sizes = DECODE_M + PREFILL_M
+    strict = mode in ("check", "pair_check")
+    res["env"] = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+    if strict:
+        check_sizes = [1, 8, 2048]
     # ---------- timing ----------
-    for m in DECODE_M + PREFILL_M:
+    for m in ([] if strict else DECODE_M + PREFILL_M):
         graph = m in DECODE_M
         seq_meds = []
         all_t = []
@@ -136,7 +141,7 @@ def worker(rank, world, port, cfg_name, mode, q):
                   f"seqs={[round(x*1e3,1) for x in seq_meds]}", flush=True)
     # ---------- untimed correctness: same warmup/iter counts, every iteration checked ----------
     ok = True
-    for m in DECODE_M + PREFILL_M:
+    for m in check_sizes:
         graph = m in DECODE_M
         src = torch.empty((m, HIDDEN), device=dev, dtype=torch.bfloat16)
         buf = torch.empty_like(src)
@@ -175,6 +180,9 @@ def worker(rank, world, port, cfg_name, mode, q):
             # bf16 output tolerance (1.6e-2) plus the bound of a bf16 multi-step reduction:
             # (world-1) partial-sum roundings, each <= 2^-8 * sum|x_i|.
             tol = 1.6e-2 + 1.6e-2 * ref.abs() + (world - 1) * (2.0 ** -8) * absum
+            if strict:
+                # knowledge 311 bound: |out - ref| <= 2^-7 * sum_i |x_i| per element
+                tol = (2.0 ** -7) * absum
             if not torch.isfinite(out).all() or (err > tol).any():
                 bad += 1
             frac_plain = max(frac_plain,
@@ -232,6 +240,7 @@ def child(cfg_name, mode, world):
     # combine: per size take max median across ranks (collective completes when slowest does)
     comb = {"timing": {}, "check_passed": all(results[r]["check_passed"] for r in results),
             "check": results[0]["check"], "nccl_version": results[0]["nccl_version"],
+            "env": results[0].get("env"),
             "ranks_identical": all(results[r]["check"][m]["sigs"] == results[0]["check"][m]["sigs"]
                                    for r in results for m in results[0]["check"])}
     for m in results[0]["timing"]:
@@ -337,6 +346,30 @@ def main():
         return
     print(sh(["nvidia-smi", "--query-gpu=index,clocks.sm,temperature.gpu,power.draw,"
               "clocks_throttle_reasons.active", "--format=csv"]), flush=True)
+    if mode == "check":
+        allok = True
+        summary = {}
+        for nm in sys.argv[2:] or ["default", "p2p_sys", "p2p_phb", "pair"]:
+            if nm == "pair":  # whatever tensorrt_llm's nccl_tuning sets in this tree
+                res, _ = run_config("pair", {}, mode="pair_check")
+            else:
+                res, _ = run_config(nm, CONFIGS[nm], mode="check")
+            if res is None:
+                allok = False
+                summary[nm] = None
+                continue
+            ok = res["check_passed"] and res["ranks_identical"]
+            allok = allok and ok
+            summary[nm] = {"passed": ok, "env": res.get("env"),
+                           "sizes": {m: {k: c[k] for k in ("bad_iters", "iters", "max_abs", "max_rel")}
+                                     for m, c in res["check"].items()}}
+            for m, c in res["check"].items():
+                print(f"[{nm}] m={m}: bad_iters={c['bad_iters']}/{c['iters']} max_abs={c['max_abs']:.4g} "
+                      f"max_rel={c['max_rel']:.4g} ranks_identical={res['ranks_identical']} env={res.get('env')}",
+                      flush=True)
+        print(json.dumps({"passed": allok, "bound": "|out-ref| <= 2^-7*sum|x_i| every call, inputs restored",
+                          "configs": summary}))
+        return
     if mode == "pair":
         res, _ = run_config("pair", {}, mode="pair")
         out = {"batch": {}, "output": {"class": "exact"}, "check_passed": res["check_passed"],
