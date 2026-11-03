@@ -349,6 +349,7 @@ def main():
     if mode == "check":
         allok = True
         summary = {}
+        ref_sigs = None
         for nm in sys.argv[2:] or ["default", "p2p_sys", "p2p_phb", "pair"]:
             if nm == "pair":  # whatever tensorrt_llm's nccl_tuning sets in this tree
                 res, _ = run_config("pair", {}, mode="pair_check")
@@ -360,7 +361,15 @@ def main():
                 continue
             ok = res["check_passed"] and res["ranks_identical"]
             allok = allok and ok
-            summary[nm] = {"passed": ok, "env": res.get("env"),
+            if nm == "default":
+                ref_sigs = {m: c["sigs"] for m, c in res["check"].items()}
+            bitwise = None
+            if nm != "default" and ref_sigs is not None:
+                bitwise = {m: c["sigs"] == ref_sigs.get(m) for m, c in res["check"].items()}
+            print(f"[{nm}] bitwise identical to default (every call): {bitwise}", flush=True)
+            if bitwise is not None and not all(bitwise.values()):
+                allok = False
+            summary[nm] = {"passed": ok, "env": res.get("env"), "bitwise_vs_default": bitwise,
                            "sizes": {m: {k: c[k] for k in ("bad_iters", "iters", "max_abs", "max_rel")}
                                      for m, c in res["check"].items()}}
             for m, c in res["check"].items():
