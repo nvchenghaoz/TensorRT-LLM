@@ -297,14 +297,18 @@ def main():
     if mode == "sweep":
         variants = [("nccl_phb", "NCCL", None, None), ("k1_pdl0", "ONESHOT", 1, 0), ("k1_pdl1", "ONESHOT", 1, 1),
                     ("k2_pdl0", "ONESHOT", 2, 0), ("k2_pdl1", "ONESHOT", 2, 1), ("k4_pdl1", "ONESHOT", 4, 1),
-                    ("k5_pdl0", "ONESHOT", 5, 0), ("k5_pdl1", "ONESHOT", 5, 1)]
+                    ("k5_pdl0", "ONESHOT", 5, 0), ("k5_pdl1", "ONESHOT", 5, 1),
+                    ("cl4_pdl1", "ONESHOT", "cluster", 1)]
     else:  # check: candidate defaults vs explicit branch-22 launch
         variants = [("k1_pdl0", "ONESHOT", 1, 0), ("default", "ONESHOT", None, None)]
     table, checks, robust, bitwise, replica = {}, {}, {}, {}, {}
     allok = True
     for name, strat, k, pdl in variants:
         env = dict(base, _name=name, _strategy=strat)
-        if k is not None:
+        if k == "cluster":  # SM120 cluster launch opt-in: cluster 4 x 160 threads per token, upstream IndexHelper
+            env["TLLM_AR_SM120_CLUSTER"] = "1"
+            env["TLLM_AR_SM120_PDL"] = str(pdl)
+        elif k is not None:
             env["TLLM_AR_SM120_CTAS_PER_TOKEN"] = str(k)
             env["TLLM_AR_SM120_PDL"] = str(pdl)
         is_custom = strat == "ONESHOT"
@@ -351,6 +355,14 @@ def main():
         for name, t in table.items():
             log(f"{name:10} " + " ".join(f"{t[str(m)]['iso_us']:8.2f}/{t[str(m)]['burst_us']:7.2f}/"
                                          f"{t[str(m)]['chain_us']:7.2f}  " for m in MS))
+    full = {"bitwise_vs_k1_pdl0": bitwise, "timed_sequence_replica": replica, "table_us": table, "checks": checks,
+            "robust": robust}
+    with open(os.path.join(outdir, "summary_full.json"), "w") as f:
+        json.dump(full, f, indent=1)
+    robust = {k: {"passed": v["passed"], "bad_calls": v["bad_calls"], "max_e": v["max_e"],
+                  "flags_end_rank0": v["flags_end_per_rank"][0]} for k, v in robust.items()}
+    bitwise = {n: {m: b["not_bitwise"] for m, b in d.items()} for n, d in bitwise.items()}
+    checks = {n: {m: [c["bad_iters_e"], round(c["max_e"], 6)] for m, c in d.items()} for n, d in checks.items()}
     print(json.dumps({"passed": allok, "peer_12_pairs": peer,
                       "compared": "every ONESHOT variant's outputs bitwise vs the k1_pdl0 (branch 22) lamport output "
                                   "on the same inputs, every iteration, M=1..16, 4 ranks; e vs fp32 sum <= 2^-8; "
