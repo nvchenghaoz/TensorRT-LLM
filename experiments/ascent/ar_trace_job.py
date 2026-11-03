@@ -133,7 +133,8 @@ SERVER_SETTINGS = {
     "max_batch_size": 8, "max_num_tokens": 8192, "max_seq_len": 36864, "moe_expert_parallel_size": 4,
     "pipeline_parallel_size": 1, "tensor_parallel_size": 4, "trust_remote_code": True}
 WORKLOAD = {"cached_prefix_tokens": 32768, "unique_input_tokens": 2048, "output_tokens": 256,
-            "concurrency": [1, 2, 4]}
+            "concurrency": [1, 2, 4], "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "model_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170"}
 
 
 def run_profile_adapter(checkpoint):
@@ -166,6 +167,8 @@ def run_profile_adapter(checkpoint):
         profile_run.main()
     except SystemExit as e:  # common.final may exit
         log(f"profile adapter exit {e.code}")
+    except Exception as exc:  # noqa: BLE001  (its summary step; the traces are already on disk)
+        log(f"profile adapter raised {exc!r}; reducing the traces it wrote")
 
 
 def main():
