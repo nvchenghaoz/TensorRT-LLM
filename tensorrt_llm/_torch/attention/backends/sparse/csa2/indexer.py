@@ -69,6 +69,7 @@ from .kernel import (
 )
 from .metadata import CSA2TrtllmMetadata
 from .params import CSA2ForwardState, CSA2Layout, CSA2Mode, CSA2Params
+from .split_decode_replicate import replicate_split_queries, replicate_supported
 from .quantization import (
     INDEX_DATA_BYTES,
     INDEX_PAGE_ROWS,
@@ -286,6 +287,28 @@ class CSA2Indexer(Indexer):
             cache[key] = bounds
         return bounds
 
+    @staticmethod
+    def _split_decode_replicas(
+        q_data: torch.Tensor, q_scale: torch.Tensor, weights: torch.Tensor, reps: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Contiguous ``[rows * reps, ...]`` replicas of the query data, scales and weights.
+
+        Replica ``j`` of row ``r`` (row ``r * reps + j``) is a full copy of row ``r``.
+        One Triton launch writes all three (raw bit moves, byte-identical to the
+        ``expand(...).contiguous()`` copies it replaces); other dtypes keep them.
+        """
+        rows, heads = q_data.shape[0], q_data.shape[1]
+        q = q_data.view(torch.int8)
+        scale = q_scale.contiguous().view(torch.int32).reshape(rows, heads)
+        if replicate_supported(q, scale, weights):
+            return replicate_split_queries(q, scale, weights, reps)
+        # Materialized replicas: with one row, reshape of the expand is a stride-0 view.
+        q = q[:, None].expand(rows, reps, heads, q.shape[2]).contiguous()
+        q = q.view(rows * reps, heads, q.shape[3])
+        scale = scale[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+        w = weights[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+        return q, scale, w
+
     def _split_key_decode_logits(
         self,
         q_data: torch.Tensor,
@@ -309,13 +332,7 @@ class CSA2Indexer(Indexer):
         chunk = width // splits
         reps = splits * block
         bounds = self._split_decode_bounds(rows, width, splits, q_data.device)
-        # Materialized replicas: with one row, reshape of the expand is a stride-0 view.
-        q = q_data.view(torch.int8)
-        q = q[:, None].expand(rows, reps, heads, q.shape[2]).contiguous()
-        q = q.view(rows * reps, heads, q.shape[3])
-        scale = q_scale.contiguous().view(torch.int32).reshape(rows, heads)
-        scale = scale[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
-        w = weights[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+        q, scale, w = self._split_decode_replicas(q_data, q_scale, weights, reps)
         out = _fp8_fp4_mqa_logits(
             (q, scale),
             (k_data.view(torch.int8), k_scale.contiguous().view(torch.int32).reshape(-1)),
