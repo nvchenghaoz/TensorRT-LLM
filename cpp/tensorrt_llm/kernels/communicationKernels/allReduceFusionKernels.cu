@@ -15,7 +15,6 @@
  */
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
@@ -673,50 +672,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     // Cluster launch is supported on Hopper (SM90) and datacenter Blackwell/Rubin (SM100/SM103/SM107),
     // but NOT on workstation Blackwell (SM120/SM121) which lacks cluster launch hardware.
     int cluster_size;
-    bool supports_cluster = (SM >= 90 && SM < 120);
-    if constexpr (Pattern == AllReduceFusionPattern::kAllReduce)
-    {
-        // Opt-in (TLLM_AR_SM120_CLUSTER=1): use the cluster launch on SM120/SM121 for the plain one-shot all-reduce.
-        // Thread blocks clusters do launch on SM120 (fact 858); the plain all-reduce uses no DSMEM. The opt-in is
-        // checked once against cudaOccupancyMaxActiveClusters; if a 4-CTA cluster cannot be resident the launcher
-        // keeps the hand split below.
-        static bool const sm120_cluster_env = []()
-        {
-            char const* v = std::getenv("TLLM_AR_SM120_CLUSTER");
-            return v != nullptr && v[0] == '1';
-        }();
-        if (!supports_cluster && oneshot && SM >= 120 && sm120_cluster_env)
-        {
-            static bool const sm120_cluster_ok = []()
-            {
-                cudaLaunchConfig_t q = {};
-                cudaLaunchAttribute a[1];
-                q.gridDim = 4;
-                q.blockDim = 160;
-                q.dynamicSmemBytes = 0;
-                a[0].id = cudaLaunchAttributeClusterDimension;
-                a[0].val.clusterDim.x = 4;
-                a[0].val.clusterDim.y = 1;
-                a[0].val.clusterDim.z = 1;
-                q.attrs = a;
-                q.numAttrs = 1;
-                int n = 0;
-                cudaError_t err = cudaOccupancyMaxActiveClusters(
-                    &n, allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, true>, &q);
-                if (err != cudaSuccess)
-                {
-                    cudaGetLastError();
-                    TLLM_LOG_WARNING("TLLM_AR_SM120_CLUSTER=1 ignored: cluster occupancy query failed (%s)",
-                        cudaGetErrorString(err));
-                    return false;
-                }
-                TLLM_LOG_WARNING("TLLM_AR_SM120_CLUSTER=1: SM%d max active 4-CTA clusters = %d -> cluster launch %s", SM,
-                    n, n > 0 ? "on" : "off (hand split kept)");
-                return n > 0;
-            }();
-            supports_cluster = sm120_cluster_ok;
-        }
-    }
+    bool const supports_cluster = (SM >= 90 && SM < 120);
     if (supports_cluster)
     {
         cluster_size = 8;
@@ -800,11 +756,6 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
         return v == nullptr || v[0] != '0';
     }();
     cfg.numAttrs = supports_cluster ? 2 : ((sm120_pdl && SM >= 90) ? 1 : 0);
-    if (supports_cluster && SM >= 120 && !sm120_pdl)
-    {
-        // TLLM_AR_SM120_PDL=0 with the SM120 cluster opt-in: keep the cluster attribute, drop PDL.
-        attribute[0].val.programmaticStreamSerializationAllowed = 0;
-    }
     if (oneshot)
     {
         bool trigger_completion_at_end = params.trigger_completion_at_end;
