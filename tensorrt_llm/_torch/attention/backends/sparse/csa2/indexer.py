@@ -165,9 +165,19 @@ class CSA2Indexer(Indexer):
             if compatible and self.options.use_cute_dsl_topk
             else TopKImplementation.CUDA_RADIX
         )
+        # SM120 decode also runs the exact CuTe-DSL radix-filter Top-K (one
+        # cluster launch per call instead of CUDA radix split + merge); its
+        # prefill and the heuristic/GVR engines keep the SM100-only gate.
+        decode_exact = exact
+        if (
+            IS_CUTLASS_DSL_AVAILABLE
+            and 120 <= sm < 130
+            and self.options.use_cute_dsl_topk
+        ):
+            decode_exact = TopKImplementation.CUTE_DSL_RADIX
         if not torch.cuda.is_available():
-            exact = TopKImplementation.TORCH
-        prefill, decode = exact, exact
+            exact = decode_exact = TopKImplementation.TORCH
+        prefill, decode = exact, decode_exact
         if compatible and self.options.enable_heuristic_topk:
             if self.options.use_self_sampling_topk and use_self_sampling_gvr(
                 enable_heuristic_topk=True,
