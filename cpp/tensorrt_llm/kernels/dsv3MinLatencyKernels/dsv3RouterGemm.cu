@@ -368,8 +368,9 @@ void invokeRouterGemmMma(float* output, __nv_bfloat16 const* mat_a, __nv_bfloat1
     // 8 expert columns per CTA and 14 warps splitting K: for 896 x 7168 that is 112 CTAs (one wave on B200)
     // each doing 16 k-chunks per warp. Measured B200 (graph replay, L2-warm) vs the cuBLAS fallback:
     // M=1 2.79 vs 7.36 us, M=8 3.77 vs 7.62 us, M=16 4.70 vs 6.64 us.
+    // For 384 x 5120 (DeepSeek-V4.1-Flash) a 20-warp CTA gives 8 k-chunks per warp, all kept in flight.
     constexpr int kExpertsPerCta = 8;
-    constexpr int kBlockSize = 448;
+    constexpr int kBlockSize = kHiddenDim == 5120 ? 640 : 448;
     static_assert(kNumExperts % kExpertsPerCta == 0, "kNumExperts must be a multiple of kExpertsPerCta");
     cudaLaunchConfig_t config;
     config.gridDim = kNumExperts / kExpertsPerCta;
@@ -664,6 +665,27 @@ INSTANTIATE_ROUTER_GEMM_V41(14)
 INSTANTIATE_ROUTER_GEMM_V41(15)
 INSTANTIATE_ROUTER_GEMM_V41(16)
 #undef INSTANTIATE_ROUTER_GEMM_V41
+
+#define INSTANTIATE_ROUTER_GEMM_MMA_V41(kNumTokens)                                                                    \
+    template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemmMma<kNumTokens, 384, 5120>(            \
+        float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+INSTANTIATE_ROUTER_GEMM_MMA_V41(1)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(2)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(3)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(4)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(5)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(6)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(7)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(8)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(9)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(10)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(11)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(12)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(13)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(14)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(15)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(16)
+#undef INSTANTIATE_ROUTER_GEMM_MMA_V41
 
 } // namespace kernels::dsv3MinLatencyKernels
 

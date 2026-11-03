@@ -21,6 +21,7 @@
 #include "tensorrt_llm/thop/cublasScaledMM.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
+#include <cstdlib>
 #include <tuple>
 
 namespace th = torch;
@@ -214,9 +215,25 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     else if (shape_ok && num_experts == kNumExperts384 && hidden_dim == kHiddenDim5120)
     {
         // DeepSeek-V4.1-Flash: the cuBLAS fallback runs split-K dot_kernel + reduce (~13 us at M=1 on SM120).
-        LoopUnroller<1, 16, kNumExperts384, kHiddenDim5120>::unroll(num_tokens,
-            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
+        static char const* const kImpl = std::getenv("TLLM_V41_ROUTER_IMPL"); // TEMP sweep switch
+        if (kImpl != nullptr && kImpl[0] == 'm')
+        {
+            LoopUnroller<1, 16, kNumExperts384, kHiddenDim5120, /*kUseMma=*/true>::unroll(num_tokens,
+                reinterpret_cast<float*>(out.mutable_data_ptr()),
+                reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+                reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
+        }
+        else if (kImpl != nullptr && kImpl[0] == 'c')
+        {
+            cublas_mm_out(input, weights, bias, out);
+        }
+        else
+        {
+            LoopUnroller<1, 16, kNumExperts384, kHiddenDim5120>::unroll(num_tokens,
+                reinterpret_cast<float*>(out.mutable_data_ptr()),
+                reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+                reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
+        }
     }
     else // fallback to cublas, can be slow
     {
