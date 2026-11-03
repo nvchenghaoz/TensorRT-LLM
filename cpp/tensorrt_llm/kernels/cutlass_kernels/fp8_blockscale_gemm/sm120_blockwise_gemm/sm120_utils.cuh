@@ -72,7 +72,13 @@ struct SM120BlockScaledBuilder
     using PermMmaTileM = Int<32>;
     // using PermMmaTileN = Int<64>;
     // using PermMmaTileM = Layout<Shape<_16,_2,_2>, Stride<_1, _32, _16>>;
-    using PermMmaTileN = Layout<Shape<_8, _4, _4>, Stride<_1, _32, _8>>;
+    // N permutation: each of the 4 N-warps owns a contiguous kTileN/4 column slice.
+    // TileN 32/64 are small-M decode variants; every output element still runs the same
+    // MMA instruction chain over K, so the result is bitwise identical to TileN 128.
+    static_assert(kTileN == 32 || kTileN == 64 || kTileN == 128, "kTileN must be 32, 64 or 128");
+    using PermMmaTileN = std::conditional_t<(kTileN == 128), Layout<Shape<_8, _4, _4>, Stride<_1, _32, _8>>,
+        std::conditional_t<(kTileN == 64), Layout<Shape<_8, _4, _2>, Stride<_1, _16, _8>>,
+            Layout<Shape<_8, _4>, Stride<_1, _8>>>>;
     using PermMmaTileK = Underscore;
     using MMA_Atom = MMA_Atom<SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<float_e4m3_t, float_e4m3_t, float, float_ue8m0_t,
         32>>; // sm120 16x8x32 fp8 mma
@@ -80,7 +86,7 @@ struct SM120BlockScaledBuilder
         Tile<PermMmaTileM, PermMmaTileN, PermMmaTileK>>;
     static_assert(kTileM % cute::size(PermMmaTileM{}) == 0, "size<0>(TileShape{}) % size(PermMmaTileM{}) == 0");
     static_assert(kTileN % cute::size(PermMmaTileN{}) == 0, "size<1>(TileShape{}) % size(PermMmaTileN{}) == 0");
-    static constexpr int kNumMathThreads = size(TiledMma::ThrLayoutVMNK{});
+    static constexpr int kNumMathThreads = size(typename TiledMma::ThrLayoutVMNK{});
     static constexpr int kNumMathWarps = kNumMathThreads / 32;
 
     CUTE_HOST_DEVICE
@@ -256,7 +262,9 @@ struct SM120BlockScaledBuilder
 
     // ====== load smem -> rf ======
     using SmemCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, ElementA>;
-    using SmemCopyAtomB = Copy_Atom<SM75_U32x4_LDSM_N, ElementB>;
+    // TileN 32 gives each warp one 8-column MMA atom per K=32 step (8 fp8 per thread), so x2 LDSM.
+    using SmemCopyAtomB
+        = std::conditional_t<(kTileN >= 64), Copy_Atom<SM75_U32x4_LDSM_N, ElementB>, Copy_Atom<SM75_U32x2_LDSM_N, ElementB>>;
 
     // ====== smem layout ======
     using SmemLayoutAtomA = GMMA::Layout_K_SW128_Atom<ElementA>; // ((_8,_16),(_128,_1)):((_128,_1024),(_1,_0))
@@ -323,7 +331,9 @@ struct SM120BlockScaledBuilder
 
     using CopyAtomC = Copy_Atom<SM90_U32x2_STSM_N, cutlass::half_t>;
 
-    using SmemLayoutAtomD = GMMA::Layout_K_SW128_Atom<ElementD>; // ((_8,_16),(_128,_1)):((_128,_1024),(_1,_0))
+    // SW128 bf16 atom is 8x64; TileN 32 uses the 8x32 SW64 atom.
+    using SmemLayoutAtomD = std::conditional_t<(kTileN >= 64), GMMA::Layout_K_SW128_Atom<ElementD>,
+        GMMA::Layout_K_SW64_Atom<ElementD>>; // ((_8,_16),(_128,_1)):((_128,_1024),(_1,_0))
 
     static constexpr int StagesD = 1;
     using SmemLayoutD = decltype(tile_to_shape(SmemLayoutAtomD{},
@@ -336,8 +346,11 @@ struct SM120BlockScaledBuilder
         take<0, 2>(SmemLayoutD{}), EpilogueTile_MN{}));
 
     // ====== moe store ======
-    using SmemAtomLayoutO = decltype(composition(
-        Swizzle<3, 3, 3>{}, Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, _64>>>{})); //  8x64
+    // MoE store only (MoE kernel uses TileN 128); TileN 32 gets an 8x32 atom so the alias still instantiates.
+    using SmemAtomLayoutO = std::conditional_t<(kTileN >= 64),
+        decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, _64>>>{})),
+        decltype(composition(
+            Swizzle<2, 3, 3>{}, Layout<Shape<_8, Shape<_8, _4>>, Stride<_8, Stride<_1, _64>>>{}))>; //  8x64 / 8x32
 
     using SmemLayoutO = decltype(tile_to_shape(SmemAtomLayoutO{}, Shape<Int<kTileM>, Int<kTileN>>{}));
 

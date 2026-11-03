@@ -1330,16 +1330,56 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
 
-    if (shape_m <= 64)
+    // When the TileN 128 grid leaves most SMs idle (e.g. the DeepSeek-V4 wo_a BMM at decode: 2 groups x N=1024
+    // -> 16 work tiles on 188 SMs), use a narrower TileN so more SMs stream B. Every output element runs the same
+    // MMA chain over K for every TileN, so the output is bitwise identical; only the work split changes.
+    int const tile_m = shape_m <= 64 ? 32 : 64;
+    int64_t const tiles_128 = static_cast<int64_t>(num_problems) * ((shape_m + tile_m - 1) / tile_m)
+        * ((static_cast<int64_t>(shape_n) + 127) / 128);
+    int tile_n = 128;
+    if (shape_n % 32 == 0 && tiles_128 * 4 <= num_device_sms)
     {
-        launch_sm120_gemm_kernel<32, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
-            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+        tile_n = 32;
+    }
+    else if (shape_n % 64 == 0 && tiles_128 * 2 <= num_device_sms)
+    {
+        tile_n = 64;
+    }
+
+#define TLLM_SM120_STRIDED_BMM_LAUNCH(TM, TN)                                                                         \
+    launch_sm120_gemm_kernel<TM, TN, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,         \
+        scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms)
+    if (tile_m == 32)
+    {
+        if (tile_n == 32)
+        {
+            TLLM_SM120_STRIDED_BMM_LAUNCH(32, 32);
+        }
+        else if (tile_n == 64)
+        {
+            TLLM_SM120_STRIDED_BMM_LAUNCH(32, 64);
+        }
+        else
+        {
+            TLLM_SM120_STRIDED_BMM_LAUNCH(32, 128);
+        }
     }
     else
     {
-        launch_sm120_gemm_kernel<64, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
-            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+        if (tile_n == 32)
+        {
+            TLLM_SM120_STRIDED_BMM_LAUNCH(64, 32);
+        }
+        else if (tile_n == 64)
+        {
+            TLLM_SM120_STRIDED_BMM_LAUNCH(64, 64);
+        }
+        else
+        {
+            TLLM_SM120_STRIDED_BMM_LAUNCH(64, 128);
+        }
     }
+#undef TLLM_SM120_STRIDED_BMM_LAUNCH
 }
 
 void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a, int ld_a,
