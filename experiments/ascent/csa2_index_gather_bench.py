@@ -331,8 +331,11 @@ def run_bench(args, ratios, batches, device):
         cand = torch.randint(0, (args.context + 1), (m, cwidth), generator=g, dtype=torch.int32)
         cand[:, ::7] = -1
         cand = cand.to(device)
-        logits2_src = torch.randn((3, m, r2["width"]), device=device)
-        logits1_src = torch.randn((m, r1["width"]), device=device)
+        logits2_src = torch.randn((3, m, r2["width"]), generator=g).to(device)
+        logits1_src = torch.randn((m, r1["width"]), generator=g).to(device)
+        input_digest = digest([r2["pages"], r2["table"], r2["token_requests"], r2["visible"],
+                               r1["pages"], r1["table"], r1["token_requests"], r1["visible"],
+                               cand, logits2_src, logits1_src])
         logits2 = logits2_src.clone()
         logits1 = logits1_src.clone()
 
@@ -364,6 +367,11 @@ def run_bench(args, ratios, batches, device):
         label = str(m)
         result["batch"][label] = {"kernel_ms": med, "noise_floor": noise}
         result["digests"][label] = digest(flat)
+        result.setdefault("input_digests", {})[label] = input_digest
+        result.setdefault("output_digest_parts", {})[label] = {
+            "keys_scales_bounds_logical_valid": digest(flat[: len(flat) - 2]),
+            "masked_logits": digest(flat[-2:]),
+        }
         del graph
         comp = {}
         for name, fn in (("shared_r1_per_layer", shared_only), ("candidate_per_layer", cand_only)):
@@ -415,7 +423,7 @@ def run_check(args, ratios, batches, device):
                     compare(f"cand r{ratio} m{m} {dtype} [{s},{e})",
                             fused_candidate_tile(inp, c, s, e), ref_candidate_tile(inp, c, s, e))
             # 3. mask over logits: shared stride-0 and contiguous int32/int64 positions.
-            logits_src = torch.randn((m, width), device=device)
+            logits_src = torch.randn((m, width), generator=g).to(device)
             logits_src[:, ::97] = -torch.inf
             for r in range(m):
                 _, _, _, _, logical = ref_shared_keys(inp, r, r + 2)
