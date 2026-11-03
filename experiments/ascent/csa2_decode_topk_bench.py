@@ -77,6 +77,65 @@ def graph_time(fn, inner=20, reps=25):
     return med, (p90 - p10) / med
 
 
+_FLUSH = {}
+
+
+def _l2_flush():
+    buf = _FLUSH.get("b")
+    if buf is None:
+        buf = _FLUSH["b"] = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
+    buf.zero_()
+
+
+def _sm_clock_mhz():
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+        return int(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
+    except Exception:  # noqa: BLE001
+        try:
+            return int(torch.cuda.clock_rate())
+        except Exception:  # noqa: BLE001
+            return -1
+
+
+def graph_time_flushed(fn, reps=60):
+    """One step captured in a graph; L2 flushed (256 MB zero) before every replay, outside the
+    timed events. Returns (median_us, p10_us, p90_us, sm_clock_mhz sampled during the reps)."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    for _ in range(5):
+        _l2_flush()
+        g.replay()
+    torch.cuda.synchronize()
+    times, clocks = [], []
+    for i in range(reps):
+        _l2_flush()
+        a = torch.cuda.Event(enable_timing=True)
+        b = torch.cuda.Event(enable_timing=True)
+        a.record()
+        g.replay()
+        b.record()
+        if i % 15 == 7:
+            clocks.append(_sm_clock_mhz())
+        b.synchronize()
+        times.append(a.elapsed_time(b) * 1000.0)
+    times.sort()
+    med = times[len(times) // 2]
+    p10 = times[int(0.1 * (len(times) - 1))]
+    p90 = times[int(0.9 * (len(times) - 1))]
+    return med, p10, p90, (min(clocks) if clocks else -1)
+
+
 def sorted_sel(idx):
     return torch.sort(idx.long(), dim=1).values
 
@@ -208,9 +267,15 @@ def mode_indexer(args):
             for ix, s, o, ai, al in bufs:
                 indexer_select(ix, s, o, ai, al)
 
-        t, nf = graph_time(run_step, inner=5, reps=30)
-        batch[str(rows)] = {"kernel_ms": round(t / 1000.0, 5), "noise_floor": round(nf, 4)}
-        log(f"rows={rows}: 8-layer decode top-K {t:.2f} us (nf {nf:.3f})")
+        med, p10, p90, clk = graph_time_flushed(run_step)
+        tw, nfw = graph_time(run_step, inner=5, reps=30)
+        nf = (p90 - p10) / med
+        batch[str(rows)] = {"kernel_ms": round(med / 1000.0, 5), "noise_floor": round(nf, 4),
+                            "p10_ms": round(p10 / 1000.0, 5), "p90_ms": round(p90 / 1000.0, 5),
+                            "sm_clock_mhz_min": clk,
+                            "warm_l2_kernel_ms": round(tw / 1000.0, 5), "warm_l2_noise": round(nfw, 4)}
+        log(f"rows={rows}: 8-layer decode top-K L2-flushed median {med:.2f} us "
+            f"(p10 {p10:.2f}, p90 {p90:.2f}, nf {nf:.3f}, sm clk {clk} MHz); warm-L2 {tw:.2f} us")
         for m, width in ((CSA2Mode.FULL, 36864), (CSA2Mode.FULL, 18432), (CSA2Mode.REINDEX, 16384)):
             s = make_scores(rows, width, seed=rows + width)
             ai, al = radix_aux(rows)
