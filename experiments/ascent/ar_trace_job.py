@@ -125,34 +125,55 @@ def analyze_window(files):
     return out
 
 
+# Server settings of the frozen protocol (base proxy job 230's server_settings, engine overlay none).
+SERVER_SETTINGS = {
+    "context_parallel_size": 1, "cuda_graph_config": {"batch_sizes": [1, 2, 4, 8], "enable_padding": True},
+    "enable_attention_dp": False, "enable_chunked_prefill": True,
+    "kv_cache_config": {"enable_block_reuse": True, "free_gpu_memory_fraction": 0.5, "tokens_per_block": 128},
+    "max_batch_size": 8, "max_num_tokens": 8192, "max_seq_len": 36864, "moe_expert_parallel_size": 4,
+    "pipeline_parallel_size": 1, "tensor_parallel_size": 4, "trust_remote_code": True}
+WORKLOAD = {"cached_prefix_tokens": 32768, "unique_input_tokens": 2048, "output_tokens": 256,
+            "concurrency": [1, 2, 4]}
+
+
+def run_profile_adapter(checkpoint):
+    """Run the frozen profile_run.main() in-process with the protocol's server settings."""
+    pr = find_profile_run()
+    bench = str(Path(pr).parent)
+    log(f"profile adapter: {pr}")
+    sys.path.insert(0, bench)
+    import common  # noqa: E402  (frozen harness)
+    import profile_run  # noqa: E402
+    harness = {"server": dict(SERVER_SETTINGS), "server_start_timeout_s": 2700}
+    orig_wl = common.workload
+
+    def workload(h):
+        try:
+            wl = orig_wl(h)
+        except Exception as exc:  # noqa: BLE001
+            log(f"common.workload failed ({exc!r}); using the protocol workload")
+            wl = {}
+        wl = dict(wl or {})
+        for k, v in WORKLOAD.items():
+            wl.setdefault(k, v)
+        wl.setdefault("checkpoint", checkpoint)
+        log(f"workload: { {k: v for k, v in wl.items() if not isinstance(v, (list, dict)) or k == 'concurrency'} }")
+        return wl
+
+    common.workload = workload
+    common.load_config = lambda argv: (harness, Path(os.getcwd()).resolve())
+    try:
+        profile_run.main()
+    except SystemExit as e:  # common.final may exit
+        log(f"profile adapter exit {e.code}")
+
+
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     only = sys.argv[2] if len(sys.argv) > 2 else None
     art = Path(os.environ.get("AUTO_DEV_ARTIFACTS", "artifacts"))
     if only is None:
-        harness = arg
-        if arg and os.path.exists(arg):
-            harness = Path(arg).read_text()
-        pr = find_profile_run()
-        log(f"profile adapter: {pr}")
-        cmd = [sys.executable, pr, harness, os.getcwd()]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
-        last = ""
-        for line in p.stdout:
-            line = line.rstrip()
-            if line:
-                last = line
-            if len(line) < 2000:
-                print(line, flush=True)
-        p.wait()
-        log(f"profile adapter rc={p.returncode}")
-        try:
-            prof = json.loads(last)
-            log("profile windows:", json.dumps({k: v.get("rank0") for k, v in (prof.get("windows") or {}).items()}))
-            if prof.get("errors"):
-                log("profile errors:", prof["errors"][:10])
-        except Exception:  # noqa: BLE001
-            pass
+        run_profile_adapter(arg)
         root = art / "profile" / "traces"
     else:
         root = Path(only)
