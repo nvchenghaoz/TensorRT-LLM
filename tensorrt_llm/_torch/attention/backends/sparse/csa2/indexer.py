@@ -29,6 +29,31 @@ try:
 except ImportError:  # The bundled DeepGEMM predates the sparse indexer kernels
     _HAS_SPARSE_MQA_LOGITS = False
 
+try:
+    from tensorrt_llm.deep_gemm import fp8_fp4_mqa_logits as _fp8_fp4_mqa_logits
+except ImportError:
+    _fp8_fp4_mqa_logits = None
+
+# Query rows per CTA of DeepGEMM's sm120_fp4_mqa_logits (BLOCK_Q): a CTA scans the
+# union of its rows' key ranges, so each key split gets a whole query block.
+_SPLIT_DECODE_BLOCK_Q = 4
+# Target CTAs (rows x splits) for one split-key decode launch; more blocks than
+# this stopped helping at 1-8 rows of 16K-37K keys on SM120 (188 SMs).
+_SPLIT_DECODE_TARGET_BLOCKS = 128
+_SPLIT_DECODE_CHOICES = (64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1)
+
+
+def _split_decode_count(rows: int, width: int) -> int:
+    """Number of disjoint key sub-ranges per decode row (fixed per geometry)."""
+    for splits in _SPLIT_DECODE_CHOICES:
+        if (
+            rows * splits <= _SPLIT_DECODE_TARGET_BLOCKS
+            and width % splits == 0
+            and (width // splits) % 64 == 0
+        ):
+            return splits
+    return 1
+
 from ..dsa.indexer import _INDEXER_MQA_LOGITS_ELEM_BUDGET, Indexer, _split_prefill_queries
 from ..dsa.params import DSAParams
 from ..params import use_self_sampling_gvr
@@ -208,6 +233,135 @@ class CSA2Indexer(Indexer):
             if rows.is_cuda and torch.cuda.is_current_stream_capturing():
                 cache[key] = rows
         return rows
+
+    def _split_decode_supported(self, q_data: torch.Tensor, q_scale: Optional[torch.Tensor]) -> bool:
+        """One split-key DeepGEMM launch can score every decode row (SM120 FP4)."""
+        return (
+            _fp8_fp4_mqa_logits is not None
+            and q_scale is not None
+            and q_data.is_cuda
+            and self.use_fp4
+            and self.head_dim == 128
+            and self.n_heads in (16, 32, 64)
+            and dsl_available()
+            and 120 <= get_sm_version() < 130
+        )
+
+    def _split_decode_bounds(
+        self, rows: int, width: int, splits: int, device: torch.device
+    ) -> torch.Tensor:
+        """Int32 ``[2, rows * splits * BLOCK_Q]`` key starts/ends of the replicated rows.
+
+        Replica ``p`` of split ``s`` of row ``r`` starts at ``r * width + s * chunk``;
+        only ``p == 0`` scores (``chunk`` keys), the block's other rows are empty so
+        the block scans exactly its sub-range. Contents never change: built
+        eagerly once per geometry and retained; while capturing without an eager
+        entry the graph builds its own copy on every replay.
+        """
+        cache = self.__dict__.setdefault("_split_decode_cache", {})
+        key = (str(device), rows, width, splits)
+        bounds = cache.get(key)
+        if bounds is not None:
+            return bounds
+        block = _SPLIT_DECODE_BLOCK_Q
+        chunk = width // splits
+        index = torch.arange(rows * splits * block, dtype=torch.int64, device=device)
+        lane = index % block
+        split = (index // block) % splits
+        row = index // (block * splits)
+        starts = row * width + split * chunk
+        ends = torch.where(lane == 0, starts + chunk, starts)
+        bounds = torch.stack((starts, ends)).to(torch.int32)
+        if not (bounds.is_cuda and torch.cuda.is_current_stream_capturing()):
+            cache[key] = bounds
+        return bounds
+
+    def _split_key_decode_logits(
+        self,
+        q_data: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        """FP32 ``[rows, width]`` logits of row ``r`` over keys ``[r * width, (r + 1) * width)``.
+
+        One DeepGEMM launch replaces one launch per row: each row is replicated
+        into ``splits`` query blocks that each scan a disjoint key sub-range, and
+        compressed logits put sub-range ``s`` of row ``r`` in replica row
+        ``(r * splits + s) * BLOCK_Q``. Every logit is the same per-(query, key)
+        computation as the per-row call, so the values are bitwise identical.
+        """
+        rows, heads = q_data.shape[0], q_data.shape[1]
+        splits = _split_decode_count(rows, width)
+        block = _SPLIT_DECODE_BLOCK_Q
+        chunk = width // splits
+        reps = splits * block
+        bounds = self._split_decode_bounds(rows, width, splits, q_data.device)
+        # Materialized replicas: with one row, reshape of the expand is a stride-0 view.
+        q = q_data.view(torch.int8)
+        q = q[:, None].expand(rows, reps, heads, q.shape[2]).contiguous()
+        q = q.view(rows * reps, heads, q.shape[3])
+        scale = q_scale.contiguous().view(torch.int32).reshape(rows, heads)
+        scale = scale[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+        w = weights[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+        out = _fp8_fp4_mqa_logits(
+            (q, scale),
+            (k_data.view(torch.int8), k_scale.contiguous().view(torch.int32).reshape(-1)),
+            w,
+            bounds[0],
+            bounds[1],
+            clean_logits=False,
+            max_seqlen_k=chunk,
+        )
+        stride = out.stride(0)
+        return (
+            out.as_strided((rows, splits, chunk), (reps * stride, block * stride, 1))
+            .contiguous()
+            .view(rows, width)
+        )
+
+    def select_split_decode(
+        self,
+        q_data: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        logical_positions: torch.Tensor,
+        visible_lengths: torch.Tensor,
+        output_indices: torch.Tensor,
+        score_hook: Optional[Callable[[torch.Tensor], None]] = None,
+        radix_aux_indices: Optional[torch.Tensor] = None,
+        radix_aux_logits: Optional[torch.Tensor] = None,
+        gvr_prior_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Decode selection for all rows at once over per-row gathered keys.
+
+        Row ``r`` owns keys ``[r * width, (r + 1) * width)`` whose columns map to
+        ``logical_positions[r]`` (``[rows, width]``). Equivalent, row by row, to
+        ``forward_prepared`` on each row's own keys with full-width bounds: the
+        logits come from one split-key launch, then one mask, one Top-K and one
+        finalize run over every row.
+        """
+        width = logical_positions.shape[1]
+        logits = self._split_key_decode_logits(
+            q_data, q_scale, weights, k_data, k_scale, width
+        )
+        return self._select_mapped_logits(
+            logits,
+            None,
+            None,
+            logical_positions,
+            visible_lengths,
+            output_indices,
+            score_hook,
+            False,
+            radix_aux_indices,
+            radix_aux_logits,
+            gvr_prior_indices,
+        )
 
     def select_prepared_scores(
         self,
@@ -1344,6 +1498,18 @@ class CSA2Indexer(Indexer):
             sparse_descriptors = metadata.prepare_sparse_indexer(self.layer_idx, self.sparse_block)
             if sparse_descriptors is None:
                 paged = None
+        # SM120 has no paged decode indexer: score every decode row in one
+        # split-key launch, then mask, select and finalize once for all rows.
+        split_width = 0
+        if paged is None and decode_start < count:
+            split_width = candidates.shape[1] if candidates is not None else max_positions
+        split_decode = (
+            split_width > 0
+            and (candidates is None or candidates.dtype in (torch.int32, torch.int64))
+            and (split_width > self.index_topk or not self.options.skip_indexer_for_short_seqs)
+            and self._split_decode_supported(q_fp8, q_scale)
+            and fused_keys() is not None
+        )
         chunks = []
         for request, (begin, end) in enumerate(ranges):
             is_prefill = request < num_contexts
@@ -1373,7 +1539,7 @@ class CSA2Indexer(Indexer):
                         )
                     )
                     continue
-                if not is_prefill and paged is not None:
+                if not is_prefill and (paged is not None or split_decode):
                     continue
                 # Without the sparse kernels, gather each query's candidate rows
                 # and score them densely. Split across ranks before gathering;
@@ -1390,7 +1556,7 @@ class CSA2Indexer(Indexer):
                     )
                 )
                 continue
-            if not is_prefill and paged is not None:
+            if not is_prefill and (paged is not None or split_decode):
                 continue
             chunk_size = metadata.indexer_max_chunk_size
             for start in range(begin, end, chunk_size):
@@ -1420,7 +1586,7 @@ class CSA2Indexer(Indexer):
         # Exact radix decode scratch is also needed by non-native candidate
         # paths. Its rows correspond to model queries, not FMHA staging tiles.
         radix_indices = radix_logits = None
-        if any(not chunk.is_prefill for chunk in chunks):
+        if split_decode or any(not chunk.is_prefill for chunk in chunks):
             radix_indices = torch.empty(
                 (count, 10, self.index_topk), dtype=torch.int32, device=q_fp8.device
             )
@@ -1441,6 +1607,38 @@ class CSA2Indexer(Indexer):
             decode_start,
             sharded_outputs=sharded,
         )
+        if split_decode:
+            pages, table, page_size, owner_positions = fused_keys()
+            keys, scales, mapped, _, _ = gather_owner_index_keys(
+                pages,
+                table,
+                metadata.csa2_token_requests[decode_start:count],
+                page_size,
+                owner_positions,
+                split_width,
+                0,
+                positions=candidates[decode_start:count] if candidates is not None else None,
+            )
+            hook = None
+            if score_hook is not None:
+
+                def hook(scores: torch.Tensor) -> None:
+                    score_hook(scores, decode_start, count)
+
+            self.select_split_decode(
+                q_fp8[decode_start:count],
+                q_scale[decode_start:count],
+                weights[decode_start:count],
+                keys,
+                scales,
+                mapped,
+                visible[decode_start:count],
+                logical[decode_start:count],
+                hook,
+                radix_indices[decode_start:count],
+                radix_logits[decode_start:count],
+                prior[: count - decode_start] if prior is not None else None,
+            )
         if paged is not None:
             decode_count = count - decode_start
             hook = None
