@@ -298,9 +298,46 @@ def mode_check(args):
                       "failures": failures[:30]}))
 
 
+def mode_profile(args):
+    """One 8-layer decode top-K step at rows=4: the tree's CSA2Indexer path (NVTX new_step)
+    and the CUDA radix TopK (NVTX old_step, what main runs), each 5x eagerly."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Mode
+    from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+    import tensorrt_llm._torch.custom_ops  # noqa: F401
+
+    indexers = {m: build_indexer(args.checkpoint, m) for m in (CSA2Mode.FULL, CSA2Mode.REINDEX)}
+    ref = TopK(TOPK, decode_implementation=TopKImplementation.CUDA_RADIX)
+    rows = 4
+    step = [(CSA2Mode.FULL, 18432)] * 3 + [(CSA2Mode.FULL, 36864)] + [(CSA2Mode.REINDEX, 16384)] * 4
+    bufs = []
+    for li, (m, width) in enumerate(step):
+        ai, al = radix_aux(rows)
+        bufs.append((indexers[m], make_scores(rows, width, seed=li), torch.empty(
+            rows, TOPK, dtype=torch.int32, device="cuda"), ai, al,
+            torch.full((rows,), width, dtype=torch.int32, device="cuda")))
+    for _ in range(2):  # compile outside the ranges
+        for ix, s, o, ai, al, lens in bufs:
+            indexer_select(ix, s, o, ai, al)
+    torch.cuda.synchronize()
+    for _ in range(5):
+        torch.cuda.nvtx.range_push("new_step")
+        for ix, s, o, ai, al, lens in bufs:
+            indexer_select(ix, s, o, ai, al)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("old_step")
+        for ix, s, o, ai, al, lens in bufs:
+            ref(s, o, is_prefill=False, sequence_lengths=lens, scan_lengths=lens, next_n=1,
+                max_seq_len=s.shape[1], radix_aux_indices=ai, radix_aux_logits=al)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+    print(json.dumps({"done": True}))
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["engines", "indexer", "check"])
+    p.add_argument("mode", choices=["engines", "indexer", "check", "profile"])
     p.add_argument("--checkpoint", default="")
     a = p.parse_args()
-    {"engines": mode_engines, "indexer": mode_indexer, "check": mode_check}[a.mode](a)
+    {"engines": mode_engines, "indexer": mode_indexer, "check": mode_check,
+     "profile": mode_profile}[a.mode](a)
