@@ -643,29 +643,8 @@ template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__n
 template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 16, 288, 4096>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-// num_experts=384, hidden_dim=5120 instantiations (DeepSeek-V4.1-Flash). 5120 = 5 x the 1024-element K step
-// (VPT=8 x 128 threads); 384 CTAs fit in one wave on SM120 (188 SMs).
-#define INSTANTIATE_ROUTER_GEMM_V41(kNumTokens)                                                                        \
-    template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, kNumTokens, 384,      \
-        5120>(float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
-INSTANTIATE_ROUTER_GEMM_V41(1)
-INSTANTIATE_ROUTER_GEMM_V41(2)
-INSTANTIATE_ROUTER_GEMM_V41(3)
-INSTANTIATE_ROUTER_GEMM_V41(4)
-INSTANTIATE_ROUTER_GEMM_V41(5)
-INSTANTIATE_ROUTER_GEMM_V41(6)
-INSTANTIATE_ROUTER_GEMM_V41(7)
-INSTANTIATE_ROUTER_GEMM_V41(8)
-INSTANTIATE_ROUTER_GEMM_V41(9)
-INSTANTIATE_ROUTER_GEMM_V41(10)
-INSTANTIATE_ROUTER_GEMM_V41(11)
-INSTANTIATE_ROUTER_GEMM_V41(12)
-INSTANTIATE_ROUTER_GEMM_V41(13)
-INSTANTIATE_ROUTER_GEMM_V41(14)
-INSTANTIATE_ROUTER_GEMM_V41(15)
-INSTANTIATE_ROUTER_GEMM_V41(16)
-#undef INSTANTIATE_ROUTER_GEMM_V41
-
+// num_experts=384, hidden_dim=5120 instantiations (DeepSeek-V4.1-Flash), tensor-core variant: 48 CTAs of 20 warps,
+// 8 k-chunks per warp all in flight.
 #define INSTANTIATE_ROUTER_GEMM_MMA_V41(kNumTokens)                                                                    \
     template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemmMma<kNumTokens, 384, 5120>(            \
         float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);

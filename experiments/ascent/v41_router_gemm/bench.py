@@ -1,6 +1,6 @@
 """DeepSeek-V4.1-Flash router GEMM at decode: trtllm::dsv3_router_gemm_op [M,5120] x [5120,384] -> fp32.
 
-Base tree: the op falls back to cuBLAS (cublas_mm_out). Branch: router_gemm_kernel<bf16, M, 384, 5120>.
+Base tree: the op falls back to cuBLAS (cublas_mm_out). Branch: router_gemm_mma_kernel<M, 384, 5120> (mma.sync).
 
 Modes (argv[1]):
   bench - CUDA graph of 40 router calls, each on a distinct [384,5120] bf16 weight (157 MB > 128 MB L2, so the
