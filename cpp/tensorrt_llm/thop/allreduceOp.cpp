@@ -1462,6 +1462,12 @@ private:
             }
             return mStrategy;
         }
+        else if (!mIsNVLINKSupported)
+        {
+            // PCIe-only group with peer access (ifFallbackToNCCL already capped the size): the lookup table was
+            // tuned on NVLink, so take the one-shot lamport kernel, whose critical path is posted peer writes.
+            return AllReduceStrategyType::ONESHOT;
+        }
         else
         {
             return tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(
@@ -1469,12 +1475,30 @@ private:
         }
     }
 
+    static size_t getPcieCustomAllReduceMaxBytes()
+    {
+        // Largest message the custom ONESHOT/TWOSHOT kernels may take on a PCIe-only (no NVLink) group with full
+        // peer access; larger messages use NCCL. TLLM_PCIE_CUSTOM_AR_MAX_BYTES=0 keeps every size on NCCL.
+        static size_t const maxBytes = []()
+        {
+            char const* env = std::getenv("TLLM_PCIE_CUSTOM_AR_MAX_BYTES");
+            return env != nullptr ? static_cast<size_t>(std::strtoull(env, nullptr, 10))
+                                  : static_cast<size_t>(kPcieCustomAllReduceDefaultMaxBytes);
+        }();
+        return maxBytes;
+    }
+
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
         // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL fallback.
-        if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
+        if (message_size_bytes > max_workspace_size || !mIsP2PSupported)
         {
             return true;
+        }
+        // Without NVLink, the custom kernels still run over PCIe peer-to-peer up to a size cap.
+        if (!mIsNVLINKSupported)
+        {
+            return message_size_bytes > getPcieCustomAllReduceMaxBytes();
         }
 
         return false;
@@ -1496,6 +1520,9 @@ private:
     }
 
 private:
+    // PCIe-only default cap for the custom kernels (see getPcieCustomAllReduceMaxBytes).
+    static constexpr size_t kPcieCustomAllReduceDefaultMaxBytes = 1024 * 1024;
+
     std::set<int> mGroup;
     bool mIsNVLINKSupported;
     bool mIsP2PSupported;
