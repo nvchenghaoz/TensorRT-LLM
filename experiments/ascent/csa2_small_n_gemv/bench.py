@@ -350,4 +350,5 @@ def check():
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "bench"
     torch.manual_seed(SEED)
-    {"bench": bench, "sweep": sweep, "check": check}[mode]()
+    with torch.no_grad():  # the model's forward runs without autograd
+        {"bench": bench, "sweep": sweep, "check": check}[mode]()
