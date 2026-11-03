@@ -26,6 +26,29 @@ from cutlass.utils.distributed import atomicAdd
 
 from .block_scan import block_prefix_sum_kernel, fence_acq_rel_cta
 
+# Candidate-buffer budget (bytes) at 1 block/SM. 128 KB fits SM100's 227 KB
+# per-block opt-in; SM120 allows only 99 KB per block, so its budget halves
+# (REREAD stays exact when the threshold bin overflows the smaller buffer).
+_INPUT_IDX_BUDGET_SM100 = 128 * 1024
+_INPUT_IDX_BUDGET_SMALL_SMEM = 64 * 1024
+_input_idx_budget_cache = {}
+
+
+def _input_idx_budget_base() -> int:
+    if not torch.cuda.is_available():
+        return _INPUT_IDX_BUDGET_SM100
+    device = torch.cuda.current_device()
+    budget = _input_idx_budget_cache.get(device)
+    if budget is None:
+        optin = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+        budget = (
+            _INPUT_IDX_BUDGET_SM100
+            if optin >= _INPUT_IDX_BUDGET_SM100 + 32 * 1024
+            else _INPUT_IDX_BUDGET_SMALL_SMEM
+        )
+        _input_idx_budget_cache[device] = budget
+    return budget
+
 
 # ---------------------------------------------------------------------------
 # Cluster DSMEM primitives (inline PTX) — used only by the single-pass
@@ -300,7 +323,7 @@ class FilteredTopKKernelVarlen:
         idx_sz = 2 if self.index_type == cutlass.Uint16 else 4
         if not self.cache_smem_values:
             # cache_smem_values=False: reserve ~104 KB L1 for LDG caching.
-            INPUT_IDX_BUDGET_BASE = 128 * 1024  # 128 KB at 1 block/SM
+            INPUT_IDX_BUDGET_BASE = _input_idx_budget_base()  # 128 KB at 1 block/SM on SM100
             input_idx_budget = INPUT_IDX_BUDGET_BASE // target_blocks_per_sm
             max_S = input_idx_budget // (self.num_buffer_smem_input_idx * idx_sz)
         else:
@@ -309,7 +332,7 @@ class FilteredTopKKernelVarlen:
             # unchanged. A device-budget formula that maximises S (→4864 for fp32)
             # was tried but caused 5-9% regressions on large-num_tokens single-CTA
             # configs; root cause not yet confirmed, kept in git history.
-            INPUT_IDX_BUDGET_BASE = 128 * 1024  # 128 KB at 1 block/SM
+            INPUT_IDX_BUDGET_BASE = _input_idx_budget_base()  # 128 KB at 1 block/SM on SM100
             input_idx_budget = INPUT_IDX_BUDGET_BASE // target_blocks_per_sm
             val_sz = self.ordered_type.width // 8  # fp32→Uint32=4B, fp16/bf16→Uint16=2B
             slot_sz = idx_sz + val_sz
