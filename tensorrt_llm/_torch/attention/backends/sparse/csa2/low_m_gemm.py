@@ -10,7 +10,9 @@ reduction. It replaces ``mxfp8_quantize`` + ``flashinfer_mm_mxfp8`` (b12x) at de
 math in another summation order (reordered output class).
 
 Only the (N, K) projections where the port measured faster than quantize + b12x are routed here; everything else
-returns ``None`` and the caller keeps the existing path. ``TRTLLM_CSA2_LOW_M_GEMM=0`` disables it.
+returns ``None`` and the caller keeps the existing path. ``TRTLLM_LOW_M_MXFP8=0`` disables it.
+Every configuration of a projection's table is launched once eagerly on first use outside stream capture, so each
+kernel instance has its shared-memory attributes set before any CUDA graph is captured.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ def _available(device: torch.device) -> bool:
     ok = _state.get(device.index)
     if ok is None:
         ok = (
-            os.environ.get("TRTLLM_CSA2_LOW_M_GEMM", "1") != "0"
+            os.environ.get("TRTLLM_LOW_M_MXFP8", "1") != "0"
             and torch.cuda.get_device_capability(device) == (12, 0)
             and hasattr(torch.ops.trtllm, "csa2_mxfp8_low_m_gemm")
         )
@@ -52,6 +54,21 @@ def config_for(n: int, k: int, m: int):
     return None if table is None else table.get(m)
 
 
+def _warmup(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor) -> None:
+    """Launch every configuration of this (N, K) table once, eagerly, before any graph capture."""
+    n, k = weight.shape
+    key = (x.device.index, n, k)
+    if key in _warmed or torch.cuda.is_current_stream_capturing():
+        return
+    for m, cfg in sorted(_CONFIGS[(n, k)].items()):
+        xw = torch.zeros((m, k), dtype=torch.bfloat16, device=x.device)
+        torch.ops.trtllm.csa2_mxfp8_low_m_gemm(xw, weight, weight_scale, cfg[0], cfg[1], cfg[2], 0, True)
+    _warmed.add(key)
+
+
+_warmed: set = set()
+
+
 def low_m_mm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor):
     """``mxfp8(x) @ weight^T`` in BF16 through the fused kernel, or ``None`` when it does not apply."""
     if x.dim() != 2 or x.dtype != torch.bfloat16 or weight.dtype != torch.float8_e4m3fn:
@@ -62,6 +79,7 @@ def low_m_mm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor):
     cfg = config_for(weight.shape[0], k, m)
     if cfg is None or not _available(x.device):
         return None
+    _warmup(x, weight, weight_scale)
     if x.stride(1) != 1 or x.stride(0) % 8 != 0 or x.data_ptr() % 16 != 0:
         x = x.contiguous()
     return torch.ops.trtllm.csa2_mxfp8_low_m_gemm(x, weight, weight_scale, cfg[0], cfg[1], cfg[2], 0, True)[0]

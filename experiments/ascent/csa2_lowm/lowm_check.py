@@ -5,8 +5,9 @@ Sections (all untimed):
      dequant reference; x_q / SF bitwise vs trtllm::mxfp8_quantize(x, True); pre-quantized input bitwise equal.
   B  late NaN-poisoning PDL producer: a producer that triggers launch_dependents at once, sleeps, then writes x
      (poisoned with NaN before). The port must match isolation; the no-wait control (debug_flags=1) must not.
-  C  cross-stream DRAM aggressor (pitfall 1353): graph = 4x mul_ on 256 MB fp32 on a forked stream beside a
-     chain of victims; >= 30 replays, outputs poisoned before each replay, every replay bitwise vs isolated.
+  C  cross-stream aggressors (pitfall 1353, W-AGG): graph = aggressor on a forked stream beside a chain of
+     victims, for each of mul256 (4x mul_ on 256 MB fp32), stream copy (4x 256 MB copy_) and cuBLAS (4x bf16
+     4096^3 matmul); >= 30 replays each, outputs poisoned before each replay, every replay bitwise vs isolated.
      The b12x control arm (mxfp8_quantize + flashinfer_mm_mxfp8) runs in the same job. Overlap is logged.
   D  decode graphs: DeepseekV41Attention._project_inputs captured at batch 1/2/4/8, 8 consecutive replays with
      fresh inputs, each bitwise vs eager and within tolerance of the separate-Linear path.
@@ -194,8 +195,7 @@ def _overlap_case(make_victims, agg, replays):
                 if name != "vic":
                     s1.wait_stream(s0)
                     with torch.cuda.stream(s1):
-                        for _ in range(4):
-                            agg.mul_(1.0)
+                        agg()
                 if name != "agg":
                     outs = [v() for v in victims]
                 if name != "vic":
@@ -232,8 +232,31 @@ def _overlap_case(make_victims, agg, replays):
     return bad, bad_elems, info
 
 
+def _aggressors(gen):
+    """W-AGG: DRAM mul_ (mul256), DRAM stream copy, and back-to-back cuBLAS GEMMs, each ~1.4 ms on a side stream."""
+    big = torch.ones(64 * 1024 * 1024, dtype=torch.float32, device="cuda")
+    dst = torch.empty_like(big)
+    a = torch.randn((4096, 4096), generator=gen, device="cuda").to(torch.bfloat16)
+    b = torch.randn((4096, 4096), generator=gen, device="cuda").to(torch.bfloat16)
+    c = torch.empty((4096, 4096), dtype=torch.bfloat16, device="cuda")
+
+    def mul256():
+        for _ in range(4):
+            big.mul_(1.0)
+
+    def stream_copy():
+        for _ in range(4):
+            dst.copy_(big)
+
+    def cublas():
+        for _ in range(4):
+            torch.matmul(a, b, out=c)
+
+    return {"mul256": mul256, "stream_copy": stream_copy, "cublas": cublas}
+
+
 def section_c(gen, replays=30):
-    agg = torch.ones(64 * 1024 * 1024, dtype=torch.float32, device="cuda")
+    aggs = _aggressors(gen)
     out = {}
     for (n, k), table in BEST.items():
         w, sw, raw = lb.make_weight(n, k, gen)
@@ -249,19 +272,24 @@ def section_c(gen, replays=30):
             def b12x_victims():
                 return [(lambda wc=wc, sc=sc: lb.main_mm(x, wc, sc)) for _ in range(reps) for wc, sc in copies]
 
-            pb, pe, pinfo = _overlap_case(port_victims, agg, replays)
-            bb, be, binfo = _overlap_case(b12x_victims, agg, replays)
-            entry = {"cfg": cfg, "victims_per_replay": reps * len(copies), "replays": replays,
-                     "port_bad_replays": pb, "port_bad_elems": pe, "port_overlap": pinfo,
-                     "b12x_control_bad_replays": bb, "b12x_control_bad_elems": be, "b12x_overlap": binfo}
-            log(f"C {n}x{k} M={m} {json.dumps(entry)}")
-            if pb:
-                fail(f"C {n}x{k} M={m}: port wrong under the cross-stream aggressor {entry}")
+            entry = {"cfg": cfg, "victims_per_replay": reps * len(copies), "replays": replays}
+            b12x_bad_total = 0
+            for aname, agg in aggs.items():
+                pb, pe, pinfo = _overlap_case(port_victims, agg, replays)
+                bb, be, binfo = _overlap_case(b12x_victims, agg, replays)
+                entry[aname] = {"port_bad_replays": pb, "port_bad_elems": pe, "port_overlap": pinfo,
+                                "b12x_control_bad_replays": bb, "b12x_control_bad_elems": be,
+                                "b12x_overlap": binfo}
+                b12x_bad_total += bb
+                log(f"C {n}x{k} M={m} {aname} {json.dumps(entry[aname])}")
+                if pb:
+                    fail(f"C {n}x{k} M={m} {aname}: port wrong under the cross-stream aggressor {entry[aname]}")
+            entry["b12x_control_bad_replays"] = b12x_bad_total
             # Two DRAM-bound workloads sharing bandwidth add up in time even when they run concurrently, so
             # overlap_us (logged) cannot show concurrency. The test is sensitive when the b12x control faults in the
-            # same case, under the same aggressor graph.
-            if bb == 0:
-                fail(f"C {n}x{k} M={m}: b12x control did not fault, aggressor not shown to overlap {binfo}")
+            # same case under the same aggressor graphs.
+            if b12x_bad_total == 0:
+                fail(f"C {n}x{k} M={m}: b12x control did not fault under any aggressor (test not sensitive)")
             out[f"{n}x{k}_M{m}"] = entry
         del copies
         torch.cuda.empty_cache()
