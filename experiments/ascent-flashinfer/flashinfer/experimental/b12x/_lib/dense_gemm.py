@@ -3802,27 +3802,29 @@ class DenseGemmKernel:
                     _fqp_row0 = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
                     _fqp_k_last = k_tile_start + k_tile_iter_cnt - Int32(1)
                     if cutlass.const_expr(self.fused_quant_a_prefetch > 0):
-                        for _fqp_d in cutlass.range_constexpr(
+                        for _fqp_pd in cutlass.range_constexpr(
                             self.fused_quant_a_prefetch
                         ):
-                            _fqp_kt = cutlass.min(
-                                k_tile_start + Int32(_fqp_d), _fqp_k_last
-                            )
-                            for _fqp_p in cutlass.range_constexpr(
+                            for _fqp_pp in cutlass.range_constexpr(
                                 self.fused_quant_a_pipe_passes
                             ):
-                                _fqp_row = cutlass.min(
-                                    _fqp_row0 + Int32(_fqp_p * 2) + _fqp_rsub,
-                                    _fqp_m - Int32(1),
-                                )
                                 prefetch_global_l1(
                                     get_ptr_as_int64(
                                         quantA_mkl,
                                         self._fqp_src_offset(
                                             quantA_mkl,
                                             tile_coord_mnl[2],
-                                            _fqp_row,
-                                            _fqp_kt * Int32(self.tile_shape_mnk[2])
+                                            cutlass.min(
+                                                _fqp_row0
+                                                + Int32(_fqp_pp * 2)
+                                                + _fqp_rsub,
+                                                _fqp_m - Int32(1),
+                                            ),
+                                            cutlass.min(
+                                                k_tile_start + Int32(_fqp_pd),
+                                                _fqp_k_last,
+                                            )
+                                            * Int32(self.tile_shape_mnk[2])
                                             + _fqp_kblk,
                                         )
                                         + _fqp_elem0,
@@ -3845,25 +3847,27 @@ class DenseGemmKernel:
                                 ),
                             )
                         if cutlass.const_expr(self.fused_quant_a_prefetch > 0):
-                            _fqp_kt = cutlass.min(
-                                _fqp_kg + Int32(self.fused_quant_a_prefetch),
-                                _fqp_k_last,
-                            )
-                            for _fqp_p in cutlass.range_constexpr(
+                            for _fqp_p1 in cutlass.range_constexpr(
                                 self.fused_quant_a_pipe_passes
                             ):
-                                _fqp_row = cutlass.min(
-                                    _fqp_row0 + Int32(_fqp_p * 2) + _fqp_rsub,
-                                    _fqp_m - Int32(1),
-                                )
                                 prefetch_global_l1(
                                     get_ptr_as_int64(
                                         quantA_mkl,
                                         self._fqp_src_offset(
                                             quantA_mkl,
                                             tile_coord_mnl[2],
-                                            _fqp_row,
-                                            _fqp_kt * Int32(self.tile_shape_mnk[2])
+                                            cutlass.min(
+                                                _fqp_row0
+                                                + Int32(_fqp_p1 * 2)
+                                                + _fqp_rsub,
+                                                _fqp_m - Int32(1),
+                                            ),
+                                            cutlass.min(
+                                                _fqp_kg
+                                                + Int32(self.fused_quant_a_prefetch),
+                                                _fqp_k_last,
+                                            )
+                                            * Int32(self.tile_shape_mnk[2])
                                             + _fqp_kblk,
                                         )
                                         + _fqp_elem0,
@@ -3871,13 +3875,9 @@ class DenseGemmKernel:
                                 )
                         # Issue every pass's 16 B load before any math.
                         _fqp_words = []
-                        for _fqp_p in cutlass.range_constexpr(
+                        for _fqp_p2 in cutlass.range_constexpr(
                             self.fused_quant_a_pipe_passes
                         ):
-                            _fqp_row = cutlass.min(
-                                _fqp_row0 + Int32(_fqp_p * 2) + _fqp_rsub,
-                                _fqp_m - Int32(1),
-                            )
                             _fqp_words.append(
                                 ld_global_v4_u32(
                                     get_ptr_as_int64(
@@ -3885,7 +3885,12 @@ class DenseGemmKernel:
                                         self._fqp_src_offset(
                                             quantA_mkl,
                                             tile_coord_mnl[2],
-                                            _fqp_row,
+                                            cutlass.min(
+                                                _fqp_row0
+                                                + Int32(_fqp_p2 * 2)
+                                                + _fqp_rsub,
+                                                _fqp_m - Int32(1),
+                                            ),
                                             _fqp_kg * Int32(self.tile_shape_mnk[2])
                                             + _fqp_kblk,
                                         )
@@ -3929,7 +3934,7 @@ class DenseGemmKernel:
                                         _fqp_max, offset=1 << _fqp_sh
                                     ),
                                 )
-                            _, _fqp_sbyte = pow2_ceil_ue8m0(
+                            _fqp_unused, _fqp_sbyte = pow2_ceil_ue8m0(
                                 _fqp_max * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                             )
                             if _fqp_max == cutlass.Float32(0.0):

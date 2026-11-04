@@ -233,6 +233,38 @@ def time_graph(g, n):
             "noise": round((ts[int(0.9 * (len(ts) - 1))] - ts[int(0.1 * (len(ts) - 1))]) / med, 4)}
 
 
+WAGG = int(os.environ.get("WAGG_REPLAYS", "0"))  # replays per arm at M>=2; 3x at M=1
+AGG_ITERS = int(os.environ.get("AGG_ITERS", "8"))
+results["wagg"] = {}
+if WAGG:
+    agg_streams = [torch.cuda.Stream() for _ in range(4)]
+    agg_bufs = [torch.ones(64 * 1024 * 1024, device=C.DEV, dtype=torch.float32) for _ in range(4)]
+
+
+def wagg_run(g, n, check):
+    """Replay g n times, each overlapped by 4 streams of mul_ over 256 MB; check() -> bad elems."""
+    bad_reps, worst = 0, 0
+    main = torch.cuda.current_stream()
+    for _ in range(n):
+        check(reset=True)
+        ev = torch.cuda.Event()
+        ev.record(main)
+        for s, b in zip(agg_streams, agg_bufs):
+            s.wait_event(ev)
+            with torch.cuda.stream(s):
+                for _ in range(AGG_ITERS):
+                    b.mul_(1.0000001)
+        g.replay()
+        torch.cuda.synchronize()
+        nb = check(reset=False)
+        if nb:
+            bad_reps += 1
+            worst = max(worst, nb)
+    for b in agg_bufs:
+        b.fill_(1.0)
+    return {"replays": n, "bad_replays": bad_reps, "max_bad_elems": worst}
+
+
 for M in MS:
     o3, pos = C.make_inputs(dims, M, seed=100 + M)
     xq = W.empty_mxfp8_rows_for_dense_gemm(M, GW, num_groups=G, device=C.DEV)
@@ -288,6 +320,20 @@ for M in MS:
         if bad_iters or not inputs_ok:
             all_pass = False
         log(f"M={M} repeat {an}", json.dumps(rep[an]))
+        if WAGG:
+            def check(reset, refs_o=refs_out, refs_t=refs_tmp):
+                if reset:
+                    for t in tmps:
+                        t.fill_(float("nan"))
+                    for o in outs:
+                        o.fill_(float("nan"))
+                    return 0
+                return sum(bitdiff(outs[i], refs_o[i]) + bitdiff(tmps[i], refs_t[i]) for i in range(LAYERS))
+            wr = wagg_run(g, WAGG * (3 if M == 1 else 1), check)
+            results["wagg"].setdefault(M, {})[an] = wr
+            if wr["bad_replays"]:
+                all_pass = False
+            log(f"M={M} WAGG {an}", json.dumps(wr))
         if DO_TIMING:
             tim[f"chain_{an}"] = time_graph(g, LAYERS)
             del g
@@ -300,6 +346,32 @@ for M in MS:
             log(f"M={M} timing {an}", tim[f"chain_{an}"], tim[f"K2_{an}"], tim[f"K3_{an}"])
         else:
             del g
+    if WAGG:
+        # positive control: main's racy TMA-A K2 (V0) chain on the same slot
+        def v0_f(i):
+            k1(store=False)
+            W.wo_a_dense_gemm_mxfp8(xq, ws[i].wa_b12x, out=tmps[i], alpha=alpha, expected_m=M,
+                                    sfb_k_replicated=True)
+            k3(tmps[i], ws[i], outs[i], M, ARMS["off"])
+        for i in range(LAYERS):
+            v0_f(i)
+        v0_tmp = [t.clone() for t in tmps]
+        v0_out = [o.clone() for o in outs]
+        torch.cuda.synchronize()
+        g = capture([lambda i=i: v0_f(i) for i in range(LAYERS)])
+
+        def check_v0(reset):
+            if reset:
+                for t in tmps:
+                    t.fill_(float("nan"))
+                for o in outs:
+                    o.fill_(float("nan"))
+                return 0
+            return sum(bitdiff(outs[i], v0_out[i]) + bitdiff(tmps[i], v0_tmp[i]) for i in range(LAYERS))
+        wr = wagg_run(g, WAGG * (3 if M == 1 else 1), check_v0)
+        del g
+        results["wagg"].setdefault(M, {})["V0_tma_a_control"] = wr
+        log(f"M={M} WAGG V0 control", json.dumps(wr))
     if DO_TIMING:
         # old racy TMA-A chain (K1 E4M3+SF -> wo_a_dense_gemm_mxfp8 -> K3 off), timing only
         def old_f(i):
@@ -327,6 +399,8 @@ for M in MS:
     results["timing"][M] = tim
 
 summary = {"passed": all_pass}
+if WAGG:
+    summary["wagg_bad_replays"] = {M: {a: v["bad_replays"] for a, v in r.items()} for M, r in results["wagg"].items()}
 if DO_TIMING:
     summary["chain_us_per_layer"] = {
         M: {k[len("chain_"):]: v["us_per_layer"] for k, v in results["timing"][M].items() if k.startswith("chain_")}
