@@ -103,27 +103,54 @@ def inputs_for(m, n):
     return xs, idss, ws
 
 
+PAIR_LAYERS = int(os.environ.get("BENCH_PAIR_LAYERS", "40"))
+PAIR_WSETS = int(os.environ.get("BENCH_PAIR_WSETS", "8"))
+REPEATS = int(os.environ.get("BENCH_REPEATS", "5"))
+
+
 def mode_pair():
+    """40-layer chain (layer l uses weight set l % 8: >= 4 sets apart is > 128 MB of expert
+    weights, so every layer reads cold), REPEATS independent timing blocks per M."""
     import tensorrt_llm  # noqa: F401
     import tensorrt_llm._torch.custom_ops  # noqa: F401
-    sts = make_states(L)
-    log("states built, L", L)
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import w4a8_mxfp4_mxfp8_sm12x_decode as mod
+    fused = hasattr(mod, "_route_fuses_prologue") and mod._route_fuses_prologue()
+    arm = "CAND" if fused else "BASE"
+    kernels = ("route_assign_decode_kernel[+remap+zero-fill],_mxfp8_q0_route_direct_kernel,"
+               "fc1_act_q1,fc2_finalize" if fused else
+               "add,compare_scalar(ge),compare_scalar(lt),bitwise_and,FillFunctor<int>,where,"
+               "FillFunctor<uchar>,route_assign_decode_kernel,_mxfp8_q0_route_direct_kernel,"
+               "fc1_act_q1,fc2_finalize")
+    n_l = PAIR_LAYERS
+    sets = make_states(min(PAIR_WSETS, n_l))
+    sts = [sets[l % len(sets)] for l in range(n_l)]
+    log(arm, "states built: layers", n_l, "weight sets", len(sets), "kernels/layer:", kernels)
     batch = {}
     for m in MS:
-        xs, idss, ws = inputs_for(m, L)
+        xs, idss, ws = inputs_for(m, n_l)
 
         def fn():
-            return [sts[l].run(xs[l], idss[l], ws[l]) for l in range(L)]
+            return [sts[l].run(xs[l], idss[l], ws[l]) for l in range(n_l)]
 
-        stats, g, outs = time_graph(fn, ITERS)
-        batch[str(m)] = {"kernel_ms": stats["median_ms"] / L, "noise_floor": stats["noise"],
-                         "p10_ms": stats["p10_ms"] / L, "p90_ms": stats["p90_ms"] / L,
-                         "graph_ms": stats["median_ms"]}
-        log("M", m, json.dumps(batch[str(m)]))
-        del g
-    print(json.dumps({"batch": batch, "output": {"class": "exact"},
-                      "units": f"ms per layer (median of a {L}-layer CUDA-graph chain / {L}), "
-                               "routed-MoE FI SM12x decode leaf, one EP4 rank, cold L2"}))
+        meds = []
+        for r in range(REPEATS):
+            stats, g, outs = time_graph(fn, ITERS)
+            del g
+            meds.append(stats["median_ms"] / n_l)
+            log(arm, "M", m, "repeat", r, "per_layer_us", round(1000 * meds[-1], 3),
+                "within-block noise", round(stats["noise"], 4), "kernels:", kernels)
+        meds.sort()
+        med = meds[len(meds) // 2]
+        noise = max((meds[-1] - meds[0]) / med, stats["noise"])
+        batch[str(m)] = {"kernel_ms": med, "noise_floor": noise,
+                         "repeat_ms": meds, "graph_ms": med * n_l}
+        log(arm, "M", m, json.dumps(batch[str(m)]), "kernels:", kernels)
+    print(json.dumps({"batch": batch, "output": {"class": "exact"}, "arm": arm,
+                      "kernels_per_layer": kernels,
+                      "units": f"ms per layer: median over {REPEATS} timing blocks of "
+                               f"({ITERS}-replay median of a {n_l}-layer CUDA-graph chain) / "
+                               f"{n_l}; routed-MoE FI SM12x decode leaf, one EP4 rank, L2 "
+                               "flushed by a 512 MB read before every replay"}))
 
 
 def mode_stage0():
