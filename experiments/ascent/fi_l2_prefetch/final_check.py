@@ -94,6 +94,8 @@ def run_check():
         cases = [(1, 1), (1, 2), (4, 1), (4, 2), (4, 3)]  # S=4,4,4,4 and S=1 control
     else:
         cases = [(1, 1), (1, 2), (1, 5), (4, 2), (4, 5), (4, 6)]  # S=4 x5, S=1 control
+    if os.environ.get("FINAL_CASES"):  # e.g. "1x5,4x2"
+        cases = [tuple(int(v) for v in s.split("x")) for s in os.environ["FINAL_CASES"].split(",")]
     rows, ok = [], True
     for m, d in cases:
         x = torch.randn(m, H, dtype=torch.bfloat16, device="cuda")
@@ -121,7 +123,7 @@ def run_check():
             os.environ["TRTLLM_SM12X_FI_SPLITK"] = mode
             g = capture(fn)
             first = None
-            n_cnt_bad = n_det_bad = n_base_q_bad = n_base_o_bad = n_nonfinite = 0
+            n_cnt_bad = n_det_bad = n_base_q_bad = n_base_o_bad = n_nonfinite = n_qdet_bad = 0
             worst_cd, worst_rel = 0.0, 0.0
             for i in range(45):  # 5 warm + 40 traced, as bench_pair.trace
                 flush.sum()
@@ -133,6 +135,8 @@ def run_check():
                     first = cur
                 if not all(torch.equal(a, b) for a, b in zip(cur, first)):
                     n_det_bad += 1
+                if not (torch.equal(cur[0], first[0]) and torch.equal(cur[1], first[1])):
+                    n_qdet_bad += 1
                 if base is not None:
                     if not (torch.equal(cur[0], base[0]) and torch.equal(cur[1], base[1])):
                         n_base_q_bad += 1
@@ -144,6 +148,7 @@ def run_check():
                 worst_rel = max(worst_rel, e["max_abs_over_ref_absmax"])
             tag = "base" if mode == "0" else "cand"
             row[tag] = {"replays": 45, "counters_nonzero": n_cnt_bad, "nondeterministic": n_det_bad,
+                        "fc1_nondeterministic": n_qdet_bad,
                         "nonfinite": n_nonfinite, "ref_calc_diff_max": worst_cd,
                         "ref_maxabs_over_absmax_max": round(worst_rel, 5)}
             if mode == "1":
@@ -152,30 +157,44 @@ def run_check():
                 row["cand"]["q1_maxdiff_vs_base"] = (first[0].float() - base[0].float()).abs().max().item()
                 row["cand"]["out_maxdiff_vs_base"] = (first[2].float() - base[2].float()).abs().max().item()
                 if S > 1:
-                    pbad = 0
+                    pbad = pobad = 0
+                    pmax = 0.0
+                    amax = max(first[2].float().abs().max().item(), 1e-6)
                     for _ in range(5):
                         scratch.fill_(float("nan"))
                         flush.sum()
                         g.replay()
                         torch.cuda.synchronize()
                         same = (torch.equal(q1, first[0]) and torch.equal(sf1, first[1])
-                                and torch.equal(holder["o"], first[2])
-                                and int(cnt.abs().sum().item()) == 0)
+                                and int(cnt.abs().sum().item()) == 0
+                                and bool(torch.isfinite(holder["o"]).all().item()))
                         pbad += int(not same)
+                        pobad += int(not torch.equal(holder["o"], first[2]))
+                        pmax = max(pmax, (holder["o"].float() - first[2].float()).abs().max().item() / amax)
                     scratch.zero_()
                     row["cand"]["poison_replays"] = 5
+                    # fc1 q1/sf1 bitwise + counters 0 + finite out; leaf out compared separately
+                    # (bitwise unless fc2's scatter-add order is nondeterministic in BASE too)
                     row["cand"]["poison_not_bitwise"] = pbad
+                    row["cand"]["poison_out_not_bitwise"] = pobad
+                    row["cand"]["poison_out_maxdiff_over_absmax"] = pmax
             else:
                 base = first
             del g
         b, cd = row["base"], row["cand"]
         good = (b["counters_nonzero"] == 0 and cd["counters_nonzero"] == 0
-                and cd["nondeterministic"] == 0 and cd["nonfinite"] == 0
+                and cd["fc1_nondeterministic"] == 0 and cd["nonfinite"] == 0
                 and cd["ref_calc_diff_max"] < 2 * b["ref_calc_diff_max"] + 1e-4
                 and cd.get("poison_not_bitwise", 0) == 0)
+        base_out_det = b["nondeterministic"] == 0
+        row["base_out_deterministic"] = base_out_det
+        if base_out_det:  # leaf output must then be run-to-run bitwise in CAND too
+            good &= cd["nondeterministic"] == 0 and cd.get("poison_out_not_bitwise", 0) == 0
+        else:  # fc2 scatter-add order (main's own): out within 1.6e-2 of absmax
+            good &= cd.get("poison_out_maxdiff_over_absmax", 0.0) <= 1.6e-2
         if S == 1:
             good &= cd["fc1_q1sf1_not_bitwise_vs_base"] == 0
-            if b["nondeterministic"] == 0:
+            if base_out_det:
                 good &= cd["out_not_bitwise_vs_base"] == 0
         row["pass"] = bool(good)
         ok &= bool(good)
@@ -255,9 +274,10 @@ def run_ncu():
     print("NCU CMD: " + " ".join(cmd), flush=True)
     env = dict(os.environ, BENCH_SHAPE="ep4")
     rc, last = stream(cmd, env=env, timeout=1200)
-    if rc != 0 or not os.path.exists(rep + ".ncu-rep"):
-        return {"error": f"ncu rc {rc}", "probe": last}
-    raw = subprocess.run([ncu, "--import", rep + ".ncu-rep", "--csv", "--page", "raw",
+    found = sorted(glob.glob(rep + ".ncu-rep*"))  # ncu 2026.x writes .ncu-repz
+    if rc != 0 or not found:
+        return {"error": f"ncu rc {rc}, report {found}", "probe": last}
+    raw = subprocess.run([ncu, "--import", found[0], "--csv", "--page", "raw",
                           "--metrics", ",".join(METRICS)],
                          capture_output=True, text=True).stdout
     lines = [ln for ln in raw.splitlines() if ln.startswith('"')]
@@ -296,12 +316,16 @@ def run_ncu():
 def driver():
     res = {}
     ok = True
-    for shape in ("ep4", "ep2tp2"):
+    shapes = [s for s in os.environ.get("FINAL_SHAPES", "ep4,ep2tp2").split(",") if s]
+    for shape in shapes:
         env = dict(os.environ, BENCH_SHAPE=shape)
         rc, last = stream([sys.executable, os.path.abspath(__file__), "check"], env=env)
         res["check_" + shape] = last
         ok &= rc == 0 and bool(last and last.get("passed"))
-    res["ncu"] = run_ncu()
+    try:
+        res["ncu"] = run_ncu()
+    except Exception as e:  # noqa: BLE001
+        res["ncu"] = {"error": repr(e)[:500]}
     out_dir = os.environ.get("AUTO_DEV_ARTIFACTS", tempfile.gettempdir())
     with open(os.path.join(out_dir, "final_check.json"), "w") as f:
         json.dump(res, f, indent=1)
@@ -312,6 +336,9 @@ def driver():
         summ["check_" + shape] = [{"case": r["case"], "S": r["S"], "pass": r["pass"],
                                    "cnt_bad": r["cand"]["counters_nonzero"],
                                    "det_bad": r["cand"]["nondeterministic"],
+                                   "fc1_det_bad": r["cand"]["fc1_nondeterministic"],
+                                   "base_out_det": r["base_out_deterministic"],
+                                   "poison_out_maxrel": r["cand"].get("poison_out_maxdiff_over_absmax"),
                                    "q_vs_base_bad": r["cand"]["fc1_q1sf1_not_bitwise_vs_base"],
                                    "out_vs_base_bad": r["cand"]["out_not_bitwise_vs_base"],
                                    "base_det_bad": r["base"]["nondeterministic"],
