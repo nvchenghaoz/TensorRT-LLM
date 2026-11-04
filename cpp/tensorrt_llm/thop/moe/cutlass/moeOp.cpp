@@ -391,6 +391,12 @@ public:
         {
             // BF16/FP16 activations with MXFP4 weights + MXFP8 activation scaling: the MXFP8 quant of the input
             // is folded into expandInputRowsKernel (InputType = 16-bit, T = e4m3).
+            // The runner's InputType is its OutputType (switch_output_type<..., NeedQuant=true>), so a 16-bit input
+            // of another dtype than the output would be reinterpreted bit for bit.
+            TORCH_CHECK(mActivationDtype == mOutputDtype,
+                "16-bit input with MXFP4 weights and MXFP8 activation scaling (in-kernel MXFP8 quant) requires the "
+                "input dtype to equal the output dtype; got input ",
+                torch::toString(mActivationDtype), " and output ", torch::toString(mOutputDtype));
             mInnerDimMultiplier = 16; // 16 FP4 -> 1 LONG
             mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp4_e2m1, true>(mOutputDtype);
         }
