@@ -93,8 +93,15 @@ def capture(fn, args):
 FLUSH = None
 
 
+FLUSH_MODE = os.environ.get("CENSUS_FLUSH", "write")  # write: 512 MB zero_ (dirty L2, as pair
+# 537/538); read: 512 MB read-only reduction (L2 left clean, like ncu's cache flush)
+
+
 def flush():
-    FLUSH.zero_()
+    if FLUSH_MODE == "read":
+        FLUSH.sum()
+    else:
+        FLUSH.zero_()
 
 
 def time_g(g, iters=ITERS, warmup=10):
@@ -154,7 +161,9 @@ def trace_graph(g, tag):
     replays, cur = [], None
     for e in evs:
         grid = (e.get("args", {}).get("grid") or [0])[0]
-        if "FillFunctor<int>" in e["name"] and float(e["dur"]) > 100.0 and grid > 1000:  # 512 MB flush
+        is_fill = "FillFunctor<int>" in e["name"] and grid > 1000
+        is_red = "reduce_kernel" in e["name"]
+        if (is_fill or is_red) and float(e["dur"]) > 100.0:  # the 512 MB flush
             if cur is not None:
                 replays.append(cur)
             cur = {"flush_end": float(e["ts"]) + float(e["dur"]), "nodes": []}
@@ -252,7 +261,8 @@ def main():
         w3_w1_weight=w31, w3_w1_weight_scale=s31, w2_weight=w2v, w2_weight_scale=s2s,
         num_local_experts=E, slot_start=0, swiglu_limit=10.0, enable_pdl=pdl)
     log("state built, pdl", pdl)
-    FLUSH = torch.empty(512 * 1024 * 1024 // 4, dtype=torch.int32, device="cuda")
+    FLUSH = torch.ones(512 * 1024 * 1024 // 4, dtype=torch.int32, device="cuda")
+    log("flush mode", FLUSH_MODE)
 
     if ncu:
         cfgs = [(m, d) for m in (1, 4) for d in (3, 6)]
@@ -321,7 +331,7 @@ def main():
         for nd in first["trace"]["nodes"]:
             log("  ", nd["node"], nd["grid"], nd["block"], nd["name"])
     out_dir = os.environ.get("AUTO_DEV_ARTIFACTS", tempfile.gettempdir())
-    with open(os.path.join(out_dir, "census.json"), "w") as f:
+    with open(os.path.join(out_dir, f"census_{FLUSH_MODE}.json"), "w") as f:
         json.dump(results, f, indent=1)
     summ = [{"M": r["M"], "routing": r["routing"], "D": r["E_local"],
              "chain_us": r["chain_event"]["p50_us"], "noise": r["chain_event"]["noise"],
