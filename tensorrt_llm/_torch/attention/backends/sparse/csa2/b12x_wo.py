@@ -34,11 +34,23 @@ from tensorrt_llm.logger import logger
 
 _ENV = "TRTLLM_B12X_WO_PROJECTION"
 _ENV_WO_B = "TRTLLM_B12X_WO_B_FUSED"
+# wo_b fused-quant producer layout (FlashInfer b12x fq_pipeline wide=True: 16 lanes
+# per row, 2 rows per pass, packed sA stores). Bitwise equal to the pinned
+# producer; used only at the decode row counts where it is faster in main's chain.
+_ENV_WO_B_WIDE_ROWS = "TRTLLM_B12X_WO_B_WIDE_ROWS"
+_WO_B_WIDE_ROWS_DEFAULT = "2,3,4"
 MAX_DECODE_ROWS = 8
 
 
 def _env_on(name: str) -> bool:
     return os.environ.get(name, "1").strip().lower() not in ("0", "false", "off", "")
+
+
+def _wo_b_wide_rows() -> frozenset:
+    raw = os.environ.get(_ENV_WO_B_WIDE_ROWS, _WO_B_WIDE_ROWS_DEFAULT).strip().lower()
+    if raw in ("", "0", "off", "none", "false"):
+        return frozenset()
+    return frozenset(int(x) for x in raw.split(",") if x.strip())
 
 
 def b12x_wo_projection_enabled() -> bool:
@@ -256,7 +268,16 @@ class B12xWOProjection:
                 raise RuntimeError("b12x wo_b must view the live o_b_proj weight scales")
             self.wo_b = W.MXFP8Rows(values=wb, scale_rows=sfb, scale_mma=sfb)
             self.hidden = n
+        self._wo_b_wide = _wo_b_wide_rows()
         self._warm_rows = set()
+
+    def _wo_b(self, tmp: torch.Tensor, out: torch.Tensor, m: int) -> None:
+        # (b_first, wide, prefetch): b_first stays off (it races, see FlashInfer
+        # dense_gemm fused_quant_a_b_first); the pinned producer elsewhere.
+        pipe = (False, True, 0) if m in self._wo_b_wide else (False, False, 0)
+        self._W.wo_b_dense_gemm_fused_quant_mxfp8(
+            tmp, self.wo_b, out=out, expected_m=m, sfb_k_replicated=False, fq_pipeline=pipe
+        )
 
     def accepts(self, output: torch.Tensor) -> bool:
         m = output.shape[0]
@@ -325,9 +346,7 @@ class B12xWOProjection:
         tmp = self.o_lora(output, positions)
         if self._use_direct_wo_b():
             out = torch.empty((m, self.hidden, 1), dtype=torch.bfloat16, device=output.device)
-            self._W.wo_b_dense_gemm_fused_quant_mxfp8(
-                tmp, self.wo_b, out=out, expected_m=m, sfb_k_replicated=False
-            )
+            self._wo_b(tmp, out, m)
             result = out[:, :, 0]
             if self.o_b_proj.reduce_output:
                 result = self.o_b_proj.all_reduce(result, all_reduce_params=None)
@@ -348,9 +367,7 @@ class B12xWOProjection:
             tmp = self.o_lora(dummy, positions)
             if self.wo_b is not None:
                 out = torch.empty((m, self.hidden, 1), dtype=torch.bfloat16, device=device)
-                W.wo_b_dense_gemm_fused_quant_mxfp8(
-                    tmp, self.wo_b, out=out, expected_m=m, sfb_k_replicated=False
-                )
+                self._wo_b(tmp, out, m)
             self._warm_rows.add(m)
         torch.cuda.current_stream(device).synchronize()
 
