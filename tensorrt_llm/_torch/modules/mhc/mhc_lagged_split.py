@@ -14,13 +14,20 @@ which :func:`mhc_lagged_layer_input` (K1, one Triton program per token) computes
 ``mhc_fused_hc`` op (K2: post update + GEMM + Sinkhorn, unchanged) can then run on a side
 stream and join before the boundary's other outputs are read.
 
-K1 reproduces the CUDA kernels' arithmetic bit for bit, including the RMSNorm sum-of-squares
-reduction order, which depends on the tactic's thread count ``P``:
+K1 reproduces the CUDA kernels' arithmetic bit for bit (mhcKernels are built with
+--use_fast_math), including the RMSNorm sum-of-squares reduction order, which depends on the
+tactic's thread count ``P``:
   * ``fused_half_*`` (mhcBigFuseKernel Phase 2): ``P = bigfuse_bs - 32`` threads,
   * ``fused_all_fma`` (all-in-one Phase 4):       ``P = 256`` threads.
 Thread ``t`` sums the 8-element chunks ``t, t + P, ...`` sequentially, each pair as
-``fma(x, x, y * y)``; then a warp xor-butterfly (16, 8, 4, 2, 1) and a sequential sum over
-warps from 0.
+``fma(x, x, y * y)``; then lane 0 of a warp xor-butterfly (16, 8, 4, 2, 1), a sequential sum
+over warps from 0, and ``rsqrt.approx(fma(total, rcp.approx(hidden), eps))`` (the SASS of
+mhcBigFuseKernel: FFMA.FTZ total * MUFU.RCP(hidden) + eps, then MUFU.RSQ).
+
+Every order-sensitive step is written as explicit elementwise fp32 ops (no tl.sum / reshape
+reductions, whose association Triton may change with the layout): per-thread partials are
+sequential adds over reloaded pairs, the butterfly is an explicit 31-add tree over the
+partials staged in a scratch row, and the warp sum is sequential scalar adds.
 """
 
 import os
@@ -32,13 +39,49 @@ import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
-_VEC = 8  # bf16 elements per thread-chunk (uint4) in the CUDA kernels
+_DEFAULT_NUM_WARPS = 8
 
 
 @triton.jit
-def _extract_col(t, idx, q):
-    # Exactly t[:, q]: one nonzero term plus +0.0s, so the sum is exact in any order.
-    return tl.sum(tl.where(idx[None, :] == q, t, 0.0), axis=1)
+def _lane(scr, w, k: tl.constexpr):
+    # Partial of lane k of every warp w: scr[w * 32 + k].
+    return tl.load(scr + w * 32 + k)
+
+
+@triton.jit
+def _lane0_butterfly(scr, w):
+    """Lane 0 after `s += shfl_xor(s, off)` for off = 16, 8, 4, 2, 1, for every warp w."""
+    a0 = _lane(scr, w, 0) + _lane(scr, w, 16)
+    a1 = _lane(scr, w, 1) + _lane(scr, w, 17)
+    a2 = _lane(scr, w, 2) + _lane(scr, w, 18)
+    a3 = _lane(scr, w, 3) + _lane(scr, w, 19)
+    a4 = _lane(scr, w, 4) + _lane(scr, w, 20)
+    a5 = _lane(scr, w, 5) + _lane(scr, w, 21)
+    a6 = _lane(scr, w, 6) + _lane(scr, w, 22)
+    a7 = _lane(scr, w, 7) + _lane(scr, w, 23)
+    a8 = _lane(scr, w, 8) + _lane(scr, w, 24)
+    a9 = _lane(scr, w, 9) + _lane(scr, w, 25)
+    a10 = _lane(scr, w, 10) + _lane(scr, w, 26)
+    a11 = _lane(scr, w, 11) + _lane(scr, w, 27)
+    a12 = _lane(scr, w, 12) + _lane(scr, w, 28)
+    a13 = _lane(scr, w, 13) + _lane(scr, w, 29)
+    a14 = _lane(scr, w, 14) + _lane(scr, w, 30)
+    a15 = _lane(scr, w, 15) + _lane(scr, w, 31)
+    b0 = a0 + a8
+    b1 = a1 + a9
+    b2 = a2 + a10
+    b3 = a3 + a11
+    b4 = a4 + a12
+    b5 = a5 + a13
+    b6 = a6 + a14
+    b7 = a7 + a15
+    c0 = b0 + b4
+    c1 = b1 + b5
+    c2 = b2 + b6
+    c3 = b3 + b7
+    d0 = c0 + c2
+    d1 = c1 + c3
+    return d0 + d1
 
 
 @triton.jit
@@ -50,16 +93,17 @@ def _mhc_lagged_layer_input_kernel(
     pre_ptr,
     nw_ptr,
     out_ptr,
+    scr_ptr,
+    dbg_ptr,
     norm_eps,
     HIDDEN: tl.constexpr,
     P: tl.constexpr,
     P_PAD: tl.constexpr,
     NI: tl.constexpr,
-    NI_PAD: tl.constexpr,
     W: tl.constexpr,
     W_PAD: tl.constexpr,
-    SQ_MODE: tl.constexpr,
-    DIV_RN: tl.constexpr,
+    SCR: tl.constexpr,
+    DEBUG: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
 ):
     if LAUNCH_WITH_PDL:
@@ -68,79 +112,84 @@ def _mhc_lagged_layer_input_kernel(
         tl.extra.cuda.gdc_launch_dependents()
     tok = tl.program_id(0).to(tl.int64)
     NCHUNK: tl.constexpr = HIDDEN // 8
-    Q: tl.constexpr = NI_PAD * 4
 
     t = tl.arange(0, P_PAD)
-    it = tl.arange(0, NI_PAD)
     e = tl.arange(0, 8)
-    chunk = it[None, :] * P + t[:, None]  # [P_PAD, NI_PAD]
-    cmask = (t[:, None] < P) & (it[None, :] < NI) & (chunk < NCHUNK)
-    offs = chunk[:, :, None] * 8 + e[None, None, :]  # [P_PAD, NI_PAD, 8]
-    mask = cmask[:, :, None] & (e[None, None, :] < 8)
-
-    x = tl.load(x_ptr + tok * HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
+    obase = out_ptr + tok * HIDDEN
+    xbase = x_ptr + tok * HIDDEN
     rbase = res_ptr + tok * (4 * HIDDEN)
-    r0 = tl.load(rbase + offs, mask=mask, other=0.0).to(tl.float32)
-    r1 = tl.load(rbase + HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
-    r2 = tl.load(rbase + 2 * HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
-    r3 = tl.load(rbase + 3 * HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
 
-    li = tl.zeros([P_PAD, NI_PAD, 8], dtype=tl.float32)
-    for j in tl.static_range(4):
-        pj = tl.load(post_ptr + tok * 4 + j)
-        # new_r[j] = post[j] * x, then fma(comb[k][j], r[k], .) for k = 0..3 (pmap order).
-        nr = pj * x
-        nr = tl.fma(tl.load(comb_ptr + tok * 16 + 0 * 4 + j), r0, nr)
-        nr = tl.fma(tl.load(comb_ptr + tok * 16 + 1 * 4 + j), r1, nr)
-        nr = tl.fma(tl.load(comb_ptr + tok * 16 + 2 * 4 + j), r2, nr)
-        nr = tl.fma(tl.load(comb_ptr + tok * 16 + 3 * 4 + j), r3, nr)
-        nr = nr.to(tl.bfloat16).to(tl.float32)
-        # Lagged collapse: fma from 0 over j = 0..3 with the previous sublayer's pre.
-        li = tl.fma(tl.load(pre_ptr + tok * 4 + j), nr, li)
-    li = li.to(tl.bfloat16).to(tl.float32)
+    # ---- pass 1: post update + lagged collapse -> bf16 li (staged in out) ----
+    for i in tl.static_range(NI):
+        chunk = i * P + t
+        cm = (t < P) & (chunk < NCHUNK)
+        offs = chunk[:, None] * 8 + e[None, :]  # [P_PAD, 8]
+        m2 = cm[:, None] & (e[None, :] < 8)
+        x = tl.load(xbase + offs, mask=m2, other=0.0).to(tl.float32)
+        r0 = tl.load(rbase + offs, mask=m2, other=0.0).to(tl.float32)
+        r1 = tl.load(rbase + HIDDEN + offs, mask=m2, other=0.0).to(tl.float32)
+        r2 = tl.load(rbase + 2 * HIDDEN + offs, mask=m2, other=0.0).to(tl.float32)
+        r3 = tl.load(rbase + 3 * HIDDEN + offs, mask=m2, other=0.0).to(tl.float32)
+        li = tl.zeros([P_PAD, 8], dtype=tl.float32)
+        for j in tl.static_range(4):
+            pj = tl.load(post_ptr + tok * 4 + j)
+            # new_r[j] = post[j] * x, then fma(comb[k][j], r[k], .) for k = 0..3 (pmap order).
+            nr = pj * x
+            nr = tl.fma(tl.load(comb_ptr + tok * 16 + 0 * 4 + j), r0, nr)
+            nr = tl.fma(tl.load(comb_ptr + tok * 16 + 1 * 4 + j), r1, nr)
+            nr = tl.fma(tl.load(comb_ptr + tok * 16 + 2 * 4 + j), r2, nr)
+            nr = tl.fma(tl.load(comb_ptr + tok * 16 + 3 * 4 + j), r3, nr)
+            nr = nr.to(tl.bfloat16).to(tl.float32)
+            # Lagged collapse: fma from 0 over j = 0..3 with the previous sublayer's pre.
+            li = tl.fma(tl.load(pre_ptr + tok * 4 + j), nr, li)
+        tl.store(obase + offs, li.to(tl.bfloat16), mask=m2)
+    tl.debug_barrier()
 
-    # Sum of squares in the CUDA kernels' order.
-    li4 = tl.reshape(li, [P_PAD, Q, 2])
-    bx, by = tl.split(li4)  # [P_PAD, Q]; q = it * 4 + v
-    if SQ_MODE == 0:
-        term = tl.fma(bx, bx, by * by)
-    elif SQ_MODE == 1:
-        term = tl.fma(by, by, bx * bx)
-    else:
-        term = bx * bx + by * by
-    qidx = tl.arange(0, Q)
+    # ---- per-thread partials: chunks t, t + P, ...; pairs v = 0..3; fma(x, x, y * y) ----
     s = tl.zeros([P_PAD], dtype=tl.float32)
-    for q in tl.static_range(Q):
-        s = s + _extract_col(term, qidx, q)
-    # Warp xor-butterfly (16, 8, 4, 2, 1): lane 0's value. A size-2 sum is one add.
-    s = tl.reshape(s, [W_PAD, 2, 16])
-    s = tl.sum(s, axis=1)
-    s = tl.reshape(s, [W_PAD, 2, 8])
-    s = tl.sum(s, axis=1)
-    s = tl.reshape(s, [W_PAD, 2, 4])
-    s = tl.sum(s, axis=1)
-    s = tl.reshape(s, [W_PAD, 2, 2])
-    s = tl.sum(s, axis=1)
-    s = tl.reshape(s, [W_PAD, 2, 1])
-    s = tl.sum(s, axis=1)  # [W_PAD, 1]
-    s = tl.reshape(s, [1, W_PAD])
-    widx = tl.arange(0, W_PAD)
-    total = tl.zeros([1], dtype=tl.float32)
-    for w in tl.static_range(W):
-        total = total + _extract_col(s, widx, w)
-    # mhcKernels is built with --use_fast_math: `total / hidden` is div.full.f32 (approximate,
-    # not IEEE div.rn), which is also what Triton's fp32 `/` emits; rsqrtf is rsqrt.approx.
-    hidden_f = tl.full([1], HIDDEN, tl.float32)
-    if DIV_RN:
-        mean = tl.math.div_rn(total, hidden_f)
-    else:
-        mean = total / hidden_f
-    rstd = tl.math.rsqrt(mean + norm_eps)  # [1]
+    for i in tl.static_range(NI):
+        chunk = i * P + t
+        cm = (t < P) & (chunk < NCHUNK)
+        cbase = obase + chunk * 8
+        for v in tl.static_range(4):
+            lx = tl.load(cbase + 2 * v, mask=cm, other=0.0).to(tl.float32)
+            ly = tl.load(cbase + 2 * v + 1, mask=cm, other=0.0).to(tl.float32)
+            s = s + tl.fma(lx, lx, ly * ly)
+    sbase = scr_ptr + tok * SCR
+    tl.store(sbase + t, s)
+    tl.debug_barrier()
 
-    nw = tl.load(nw_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    rstd3 = tl.reshape(rstd, [1, 1, 1])
-    out = (li * rstd3) * nw
-    tl.store(out_ptr + tok * HIDDEN + offs, out.to(tl.bfloat16), mask=mask)
+    # ---- warp butterfly (lane 0), then the sequential sum over warps ----
+    w = tl.arange(0, W_PAD)
+    tl.store(sbase + P_PAD + w, _lane0_butterfly(sbase, w))
+    tl.debug_barrier()
+    # CUDA: total = 0; total += s_sumsq[w] for w = 0..W-1 (0 + w0 == w0 exactly).
+    total = tl.load(sbase + P_PAD)
+    for k in tl.static_range(1, W):
+        total = total + tl.load(sbase + P_PAD + k)
+    # mhcKernels (--use_fast_math): FFMA.FTZ total * MUFU.RCP(hidden) + eps, MUFU.RSQ.
+    hidden_f = tl.full([1], HIDDEN, tl.float32)
+    rcp = tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", "=f,f", [hidden_f],
+                                    dtype=tl.float32, is_pure=True, pack=1)
+    total1 = tl.full([1], 0.0, tl.float32) + total
+    arg = tl.fma(total1, rcp, tl.full([1], 0.0, tl.float32) + norm_eps)
+    rstd = tl.math.rsqrt(arg)  # [1]
+    if DEBUG:
+        z = tl.arange(0, 1)
+        tl.store(dbg_ptr + tok * 2 + z, total1)
+        tl.store(dbg_ptr + tok * 2 + 1 + z, rstd)
+
+    # ---- pass 2: normalize the staged li in place ----
+    if DEBUG != 2:
+        rstd2 = tl.reshape(rstd, [1, 1])
+        for i in tl.static_range(NI):
+            chunk = i * P + t
+            cm = (t < P) & (chunk < NCHUNK)
+            offs = chunk[:, None] * 8 + e[None, :]
+            m2 = cm[:, None] & (e[None, :] < 8)
+            li = tl.load(obase + offs, mask=m2, other=0.0).to(tl.float32)
+            nw = tl.load(nw_ptr + offs, mask=m2, other=0.0).to(tl.float32)
+            tl.store(obase + offs, ((li * rstd2) * nw).to(tl.bfloat16), mask=m2)
 
 
 _SPLIT_ENV_ON = os.environ.get("TRTLLM_MHC_SPLIT_LAGGED", "1") != "0"
@@ -212,7 +261,7 @@ def reducer_threads_for_tactic(tactic) -> Optional[int]:
     if tactic is None or tactic == -1:
         return None
     backend, _tile_n, _ks, bigfuse_bs, _tile_m = tactic
-    if backend in ("fused_half_fma", "fused_half_mma"):
+    if backend == "fused_half_fma":
         if bigfuse_bs >= 512:
             return 480
         if bigfuse_bs >= 256:
@@ -222,7 +271,7 @@ def reducer_threads_for_tactic(tactic) -> Optional[int]:
         return None  # C++ heuristic block size: not mirrored
     if backend == "fused_all_fma":
         return 256
-    return None
+    return None  # MMA backends (SM100 only) are not mirrored
 
 
 def mhc_lagged_layer_input(
@@ -235,14 +284,17 @@ def mhc_lagged_layer_input(
     norm_eps: float,
     reducer_threads: int,
     enable_pdl: Optional[bool] = None,
-    sq_mode: int = 0,
-    div_rn: bool = False,
     out: Optional[torch.Tensor] = None,
+    debug: Optional[torch.Tensor] = None,
+    debug_li: bool = False,
+    num_warps: Optional[int] = None,
 ) -> torch.Tensor:
     """K1: post update + lagged collapse + RMSNorm -> layer_input [M, hidden] bf16.
 
     Bitwise equal to the ``layer_input`` of ``mhc_fused_hc(..., pre_mix_ext=...)`` run with a
     tactic whose phase-2 thread count is ``reducer_threads`` (see module docstring).
+    ``debug`` (test-only, fp32 [M, 2]) receives (sum of squares, rstd); with ``debug_li`` the
+    output is the unnormalized collapse.
     """
     M, hidden = x_prev.shape
     assert residual_prev.shape == (M, 4, hidden) and residual_prev.is_contiguous()
@@ -261,10 +313,13 @@ def mhc_lagged_layer_input(
     NI = (nchunk + P - 1) // P
     P_PAD = triton.next_power_of_2(P)
     W = P // 32
+    W_PAD = max(triton.next_power_of_2(W), 1)
+    SCR = P_PAD + W_PAD
     if out is None:
         out = torch.empty_like(x_prev)
     if M == 0:
         return out
+    scratch = torch.empty((M, SCR), dtype=torch.float32, device=x_prev.device)
     _mhc_lagged_layer_input_kernel[(M,)](
         x_prev,
         residual_prev,
@@ -273,18 +328,19 @@ def mhc_lagged_layer_input(
         pre_mix_ext,
         norm_weight,
         out,
+        scratch,
+        debug if debug is not None else scratch,
         float(norm_eps),
         HIDDEN=hidden,
         P=P,
         P_PAD=P_PAD,
         NI=NI,
-        NI_PAD=triton.next_power_of_2(NI),
         W=W,
-        W_PAD=P_PAD // 32,
-        SQ_MODE=sq_mode,
-        DIV_RN=bool(div_rn),
+        W_PAD=W_PAD,
+        SCR=SCR,
+        DEBUG=0 if debug is None else (2 if debug_li else 1),
         LAUNCH_WITH_PDL=bool(enable_pdl),
-        num_warps=16 if P_PAD >= 512 else 8,
+        num_warps=num_warps if num_warps is not None else _DEFAULT_NUM_WARPS,
         enable_fp_fusion=False,
         launch_pdl=bool(enable_pdl),
     )

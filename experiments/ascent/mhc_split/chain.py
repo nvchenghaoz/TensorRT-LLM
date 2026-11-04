@@ -39,6 +39,9 @@ except Exception:  # baseline tree
     _split = None
 
 HAS_SPLIT = _split is not None
+# Non-deferred (pre_mapping_lagged) entries when config.json names no engram layers; the model
+# has 4 such entries per step at TP4 (layer 0 + engram/CED entries).
+ENTRY_IDS = [int(v) for v in os.environ.get("CHAIN_ENTRY_IDS", "13,26,39").split(",") if v]
 
 
 def log(*a):
@@ -77,6 +80,9 @@ def build_chain(cfg, n_layers, dev, gen):
     hc_eps = float(cfg.get("hc_eps", 1e-6))
     rms_eps = float(cfg.get("rms_norm_eps", 1e-6))
     engram_ids = set(cfg.get("engram_layer_ids", []) or [])
+    log("config engram keys:", {k: v for k, v in cfg.items() if "engram" in k.lower() and not isinstance(v, dict)})
+    if not engram_ids and ENTRY_IDS:
+        engram_ids = set(ENTRY_IDS)
     inter = 6144
     pool = []
     for _ in range(4):

@@ -59,8 +59,7 @@ def main():
     nw = (1.0 + 0.1 * torch.randn(hidden, generator=gen, device=dev)).to(torch.bfloat16)
     runner = mhc_cuda._get_fused_hc_runner(n, hidden, rms_eps, hc_eps, hc_eps, 2.0, iters)
 
-    modes = {"approxdiv": dict(sq_mode=0, div_rn=False), "div_rn": dict(sq_mode=0, div_rn=True),
-             "approxdiv_sq1": dict(sq_mode=1, div_rn=False)}
+    modes = {"approxdiv": dict(), "w4": dict(num_warps=4), "w16": dict(num_warps=16)}
     all_ok = {k: True for k in modes}
     bad_tot = {k: 0 for k in modes}
     trials = int(os.environ.get("K1_TRIALS", "4"))
