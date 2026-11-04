@@ -94,6 +94,68 @@ def stream(url, ids, n, first, out):
                 "completion_tokens": u.get("completion_tokens")})
 
 
+CHECK_SETS = {1: [0, 1], 2: [2, 3], 4: [4, 5, 6, 7]}  # prompt index -> run at that concurrency
+
+
+def check_prompt(i):
+    r = random.Random(50_000 + i)
+    return PREFIX_IDS + [95000 + i] + [r.randrange(1000, 60000) for _ in range(SUFFIX - 1)]
+
+
+def gen_one(url, i):
+    body = {"model": MODEL, "prompt": check_prompt(i), "max_tokens": OUT, "temperature": 0.0, "ignore_eos": True,
+            "logprobs": 2}
+    try:
+        d = http(f"{url}/v1/completions", body, timeout=900)
+        ch = (d.get("choices") or [{}])[0]
+        lp = ch.get("logprobs") or {}
+        return {"text": ch.get("text"), "tokens": lp.get("tokens"), "token_logprobs": lp.get("token_logprobs"),
+                "top_logprobs": lp.get("top_logprobs"), "usage": d.get("usage")}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": repr(exc)[:300]}
+
+
+def run_outputs(url):
+    """Greedy 256 tokens with top-2 logprobs for 8 fixed prompts at c1/c2/c4, two passes in one server lifetime."""
+    passes = []
+    for _ in range(2):
+        out = {}
+        for c, idx in CHECK_SETS.items():
+            res = [None] * len(idx)
+
+            def work(j):
+                res[j] = gen_one(url, idx[j])
+            ths = [threading.Thread(target=work, args=(j,)) for j in range(len(idx))]
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join(1200)
+            for i, r in zip(idx, res):
+                out[str(i)] = r
+        passes.append(out)
+    return passes
+
+
+def compare_outputs(a, b):
+    """Per prompt: tokens identical, logprobs bitwise identical, first token divergence, max |dlogprob|."""
+    rows = {}
+    for k in sorted(a, key=int):
+        x, y = a[k] or {}, b.get(k) or {}
+        if x.get("error") or y.get("error") or x.get("tokens") is None or y.get("tokens") is None:
+            rows[k] = {"ok": False, "error": x.get("error") or y.get("error") or "no tokens"}
+            continue
+        tx, ty = x["tokens"], y["tokens"]
+        first = next((j for j, (p, q) in enumerate(zip(tx, ty)) if p != q), None)
+        n = first if first is not None else min(len(tx), len(ty))
+        dl = [abs((p or 0.0) - (q or 0.0)) for p, q in zip(x["token_logprobs"][:n], y["token_logprobs"][:n])]
+        rows[k] = {"tokens_equal": tx == ty, "n_tokens": [len(tx), len(ty)], "first_divergence": first,
+                   "logprobs_bitwise": x["token_logprobs"] == y["token_logprobs"],
+                   "top2_bitwise": x.get("top_logprobs") == y.get("top_logprobs"),
+                   "max_abs_dlogprob_common_prefix": max(dl) if dl else 0.0,
+                   "ok": tx == ty and x["token_logprobs"] == y["token_logprobs"]}
+    return rows
+
+
 def run_requests(url, c, profile_dir=None):
     firsts = [threading.Event() for _ in range(c)]
     outs = []
@@ -134,7 +196,7 @@ def serve_cmd(ckpt, port, cfg):
                   "--config", str(cfg)]
 
 
-def run_arm(name, env_extra, ckpt, port):
+def run_arm(name, env_extra, ckpt, port, do_outputs=False):
     d = ART / "traces" / name
     d.mkdir(parents=True, exist_ok=True)
     cfg = ART / f"{name}_llm_api.yaml"
@@ -179,6 +241,10 @@ def run_arm(name, env_extra, ckpt, port):
             time.sleep(10)
             r["files"] = sorted(os.path.basename(f) for f in glob.glob(str(wd / "*")))
             res[f"c{c}"] = r
+        if do_outputs:
+            log(f"[{name}] output check: 8 prompts x 2 passes")
+            res["outputs"] = run_outputs(url)
+            log(f"[{name}] output check done")
     except Exception as exc:  # noqa: BLE001
         res["error"] = repr(exc)[:500]
         try:
@@ -355,20 +421,45 @@ def main_capture(ckpt):
             summary["arms"][name] = {"skipped": "deadline"}
             log(f"[{name}] skipped: {time.time() - T_START:.0f}s elapsed")
             continue
-        w = {"run": run_arm(name, env, ckpt, 8311 + i)}
+        w = {"run": run_arm(name, env, ckpt, 8311 + i, do_outputs=True)}
         for c in (1, 4):
             w[f"c{c}"] = reduce_window(name, c)
         rows = launch_log(name)
         w["launch_log"] = rows
         w["verdict"] = capture_verdict(name, w, rows, blk, ctas, pdl)
+        outs = w["run"].get("outputs")
+        if outs and len(outs) == 2:
+            rep = compare_outputs(outs[0], outs[1])
+            w["repeated_execution"] = {"per_prompt": rep, "passed": all(r["ok"] for r in rep.values())}
+            w["output_usage"] = {k: (v or {}).get("usage") for k, v in outs[0].items()}
         log(f"[{name}] verdict {json.dumps(w['verdict'], default=str)[:4000]}")
+        log(f"[{name}] repeated execution {json.dumps(w.get('repeated_execution'), default=str)[:3000]}")
         summary["arms"][name] = w
         out_path.write_text(json.dumps(summary, indent=1, default=str))
     b = summary["arms"]["armB_branch"]
+    a = summary["arms"].get("armA_k1_pdl0", {})
+    vs_main = None
+    if b.get("run", {}).get("outputs") and a.get("run", {}).get("outputs"):
+        rows = compare_outputs(b["run"]["outputs"][0], a["run"]["outputs"][0])
+        vs_main = {"definition": "arm B (branch launch: k=4 x 160 threads + PDL attr) vs arm A (main's launch via "
+                                 "TLLM_AR_SM120_PDL=0 TLLM_AR_SM120_CTAS_PER_TOKEN=1), same server settings, same 8 "
+                                 "prompts (c1: 0-1, c2: 2-3, c4: 4-7), greedy 256 tokens + top-2 logprobs",
+                   "per_prompt": rows, "passed": all(r["ok"] for r in rows.values())}
+        summary["outputs_branch_vs_main_launch"] = vs_main
+        out_path.write_text(json.dumps(summary, indent=1, default=str))
     usage_ok = all(b.get("run", {}).get(f"c{c}", {}).get("usage_ok") for c in (1, 4))
-    compact = {n: (a.get("verdict") or a) for n, a in summary["arms"].items()}
-    print(json.dumps({"passed": bool(b.get("verdict", {}).get("passed")) and usage_ok, "usage_ok_armB": usage_ok,
-                      "verdicts": compact}, default=str))
+    compact = {n: {"verdict": x.get("verdict") or x,
+                   "repeated_execution_passed": (x.get("repeated_execution") or {}).get("passed"),
+                   "output_usage": x.get("output_usage")} for n, x in summary["arms"].items()}
+    passed = (bool(b.get("verdict", {}).get("passed")) and usage_ok
+              and bool((b.get("repeated_execution") or {}).get("passed")))
+    print(json.dumps({"passed": passed, "usage_ok_armB": usage_ok,
+                      "repeated_execution_passed_armB": (b.get("repeated_execution") or {}).get("passed"),
+                      "outputs_branch_vs_main_launch_passed": (vs_main or {}).get("passed"),
+                      "outputs_branch_vs_main_launch": {k: {kk: v.get(kk) for kk in (
+                          "tokens_equal", "logprobs_bitwise", "top2_bitwise", "first_divergence",
+                          "max_abs_dlogprob_common_prefix")} for k, v in ((vs_main or {}).get("per_prompt") or {}).items()},
+                      "arms": compact}, default=str))
 
 
 def main():
