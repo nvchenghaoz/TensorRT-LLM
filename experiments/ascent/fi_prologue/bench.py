@@ -71,10 +71,13 @@ def time_graph(fn, iters, warmup=20, flush_mb=512):
     with torch.cuda.graph(g):
         out = fn()
     torch.cuda.synchronize()
-    flush = torch.empty(flush_mb * 1024 * 1024 // 4, dtype=torch.int32, device="cuda")
+    # Read-only L2 flush (pitfall 1356): a write flush leaves L2 full of dirty lines and
+    # inflates the chain; reading >= 512 MB evicts clean.
+    flush = torch.ones(flush_mb * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
+    sink = torch.empty((), dtype=torch.float32, device="cuda")
     ts = []
     for i in range(warmup + iters):
-        flush.zero_()
+        torch.sum(flush, dim=0, out=sink)
         a = torch.cuda.Event(enable_timing=True)
         b = torch.cuda.Event(enable_timing=True)
         a.record()
