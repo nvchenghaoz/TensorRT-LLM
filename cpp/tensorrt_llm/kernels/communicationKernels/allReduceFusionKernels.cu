@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
+#include <cstdio>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -756,6 +757,36 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
         return v == nullptr || v[0] != '0';
     }();
     cfg.numAttrs = supports_cluster ? 2 : ((sm120_pdl && SM >= 90) ? 1 : 0);
+    // Diagnostics only (no effect on the launch): TLLM_AR_LOG_LAUNCH=1 prints the launch shape and attributes once
+    // per (token count, capture state, pattern) to stdout, so a server run can show what decode graphs capture.
+    static bool const log_launch = []()
+    {
+        char const* v = std::getenv("TLLM_AR_LOG_LAUNCH");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (log_launch)
+    {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(params.stream, &cap);
+        int const capturing = cap == cudaStreamCaptureStatusActive ? 1 : 0;
+        static unsigned char seen[2][2][1024] = {};
+        int const tk = token_num < 1023 ? token_num : 1023;
+        int const pat = Pattern == AllReduceFusionPattern::kAllReduce ? 0 : 1;
+        if (!seen[pat][capturing][tk])
+        {
+            seen[pat][capturing][tk] = 1;
+            int dev = -1;
+            cudaGetDevice(&dev);
+            std::printf(
+                "[TLLM_AR_LAUNCH] dev=%d sm=%d pattern=%d oneshot=%d tokens=%d hidden=%d grid=%d block=%d "
+                "ctas_per_token=%d cluster=%d numAttrs=%d attr0_pdl=%d trigger_at_end=%d capturing=%d\n",
+                dev, SM, static_cast<int>(Pattern), oneshot ? 1 : 0, token_num, params.hidden_dim, grid_size,
+                block_size, ctas_per_token, cluster_size, static_cast<int>(cfg.numAttrs),
+                cfg.numAttrs >= 1 ? static_cast<int>(attribute[0].val.programmaticStreamSerializationAllowed) : -1,
+                params.trigger_completion_at_end ? 1 : 0, capturing);
+            std::fflush(stdout);
+        }
+    }
     if (oneshot)
     {
         bool trigger_completion_at_end = params.trigger_completion_at_end;

@@ -29,6 +29,12 @@ atj.DECODE_STEPS = STEPS
 PREFIX, SUFFIX, OUT = 32768, 2048, 256
 MODEL = "dsv41-flash"
 SETTINGS = dict(atj.SERVER_SETTINGS)
+_ENGINE = Path(__file__).resolve().parents[1] / "ascent-config" / "engine.json"
+if _ENGINE.exists():  # the tree's served engine overlay (main 18027035: enable_tokenization_cache)
+    SETTINGS.update(json.loads(_ENGINE.read_text() or "{}"))
+DEADLINE_S = float(os.environ.get("AR_SERVE_TRACE_DEADLINE_S", "3300"))
+T_START = time.time()
+LAUNCH_RE = re.compile(r"\[TLLM_AR_LAUNCH\] (.*)")
 ART = Path(os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp/ar_serve_trace"))
 log = atj.log
 
@@ -224,6 +230,13 @@ def gpu_busy_and_graph(files):
                     graph_keys.setdefault(k, set()).add(str(v))
         lam = [e["dur"] for e in ar if "lamport" in e["name"]]
         nc = [e["dur"] for e in ar if "nccl" in e["name"].lower()]
+        shapes = {}
+        for e in ar:
+            if "lamport" not in e["name"]:
+                continue
+            a = e.get("args") or {}
+            k = f"grid={a.get('grid')} block={a.get('block')}"
+            shapes[k] = shapes.get(k, 0) + 1
 
         def st(x):
             x = sorted(x)
@@ -232,7 +245,9 @@ def gpu_busy_and_graph(files):
         out[r] = {"kernels": len(evs), "gpu_busy_us_per_step": round(busy / STEPS, 1),
                   "span_us_per_step": round(span / STEPS, 1),
                   "ar_us_per_step": round(sum(e["dur"] for e in ar) / STEPS, 1),
-                  "ar_kinds": names, "lamport": st(lam), "nccl": st(nc),
+                  "ar_kinds": names, "lamport": st(lam), "nccl": st(nc), "lamport_launch_shapes": shapes,
+                  "lamport_arg_keys": sorted({k for e in ar if "lamport" in e["name"]
+                                              for k in (e.get("args") or {})})[:30],
                   "ar_graph_arg_keys": {k: len(v) for k, v in graph_keys.items()},
                   "ar_with_graph_arg": sum(1 for e in ar if any("graph" in k.lower() for k in (e.get("args") or {}))),
                   "ar_names": sorted({e["name"][:90] for e in ar})[:6]}
@@ -265,6 +280,97 @@ def successors(files):
     return out
 
 
+def reduce_window(name, c):
+    wd = ART / "traces" / name / f"decode_c{c}"
+    files = sorted(f for f in glob.glob(str(wd / "**" / "*.json*"), recursive=True))
+    log(f"{name} c{c}: {len(files)} files {[os.path.basename(f) for f in files]}")
+    w = {"files": len(files)}
+    for key, fn in (("ar_match", atj.analyze_window), ("per_rank", gpu_busy_and_graph)):
+        try:
+            w[key] = fn(files)
+        except Exception as exc:  # noqa: BLE001
+            w[key] = {"error": repr(exc)[:300]}
+    return w
+
+
+def launch_log(name):
+    """Unique [TLLM_AR_LAUNCH] lines the launcher printed in this arm's server (one per token count/capture)."""
+    try:
+        txt = (ART / f"{name}_server.log").read_text(errors="replace")
+    except Exception:  # noqa: BLE001
+        return []
+    rows = []
+    seen = set()
+    for m in LAUNCH_RE.finditer(txt):
+        s = m.group(1).strip()
+        if s in seen:
+            continue
+        seen.add(s)
+        rows.append(dict(kv.split("=", 1) for kv in s.split() if "=" in kv))
+    return rows
+
+
+def capture_verdict(name, w, rows, expect_block, ctas, expect_pdl):
+    """Pass rules of plan 1340 C for one arm."""
+    v = {}
+    for c in (1, 4):
+        pr = w.get(f"c{c}", {}).get("per_rank", {})
+        ok_rank = {}
+        for r, d in (pr.items() if isinstance(pr, dict) else []):
+            if not isinstance(d, dict) or "lamport" not in d:
+                ok_rank[r] = False
+                continue
+            n = d["lamport"]["n"]
+            want = f"grid=[{ctas * c}, 1, 1] block=[{expect_block}, 1, 1]"
+            ok_rank[r] = {"lamport_per_step": d["lamport"]["per_step"], "nccl_n": d["nccl"]["n"],
+                          "ar_with_graph_arg": d["ar_with_graph_arg"], "lamport_n": n,
+                          "shapes": d["lamport_launch_shapes"], "expected_shape": want,
+                          "ok": (n > 0 and n % 80 == 0 and d["nccl"]["n"] == 0
+                                 and d["ar_with_graph_arg"] == n and d["lamport_launch_shapes"].get(want, 0) == n)}
+        v[f"c{c}"] = {"ranks": ok_rank, "passed": len(ok_rank) == 4 and all(
+            isinstance(x, dict) and x["ok"] for x in ok_rank.values())}
+    cap = {}
+    for m in (1, 2, 4, 8):
+        hits = [x for x in rows if x.get("pattern") == "0" and x.get("oneshot") == "1" and x.get("tokens") == str(m)
+                and x.get("capturing") == "1"]
+        devs = sorted({x.get("dev") for x in hits})
+        good = [x for x in hits if x.get("grid") == str(ctas * m) and x.get("block") == str(expect_block)
+                and x.get("attr0_pdl") == expect_pdl[0] and x.get("numAttrs") == expect_pdl[1]]
+        cap[str(m)] = {"devices": devs, "lines": hits[:4], "passed": len(devs) == 4 and len(good) == len(hits)}
+    v["capture_log"] = cap
+    v["passed"] = v["c1"]["passed"] and v["c4"]["passed"] and all(x["passed"] for x in cap.values())
+    return v
+
+
+def main_capture(ckpt):
+    arms = [("armB_branch", {"TLLM_AR_LOG_LAUNCH": "1"}, 160, 4, ("1", "1")),
+            ("armA_k1_pdl0", {"TLLM_AR_LOG_LAUNCH": "1", "TLLM_AR_SM120_PDL": "0",
+                              "TLLM_AR_SM120_CTAS_PER_TOKEN": "1"}, 640, 1, ("-1", "0"))]
+    summary = {"settings": SETTINGS, "commit_env": {k: v for k, v in os.environ.items()
+                                                    if k.startswith(("NCCL_", "TRTLLM_", "TLLM_"))},
+               "steps_per_window": STEPS, "arms": {}}
+    out_path = ART / "ar_serve_trace_summary.json"
+    for i, (name, env, blk, ctas, pdl) in enumerate(arms):
+        if i > 0 and time.time() - T_START > DEADLINE_S - 1500:
+            summary["arms"][name] = {"skipped": "deadline"}
+            log(f"[{name}] skipped: {time.time() - T_START:.0f}s elapsed")
+            continue
+        w = {"run": run_arm(name, env, ckpt, 8311 + i)}
+        for c in (1, 4):
+            w[f"c{c}"] = reduce_window(name, c)
+        rows = launch_log(name)
+        w["launch_log"] = rows
+        w["verdict"] = capture_verdict(name, w, rows, blk, ctas, pdl)
+        log(f"[{name}] verdict {json.dumps(w['verdict'], default=str)[:4000]}")
+        summary["arms"][name] = w
+        out_path.write_text(json.dumps(summary, indent=1, default=str))
+    b = summary["arms"]["armB_branch"]
+    usage_ok = all(b.get("run", {}).get(f"c{c}", {}).get("usage_ok") for c in (1, 4))
+    compact = {n: (a.get("verdict") or a) for n, a in summary["arms"].items()}
+    print(json.dumps({"passed": bool(b.get("verdict", {}).get("passed")) and usage_ok, "usage_ok_armB": usage_ok,
+                      "verdicts": compact}, default=str))
+
+
 def main():
     ckpt = sys.argv[1]
     ART.mkdir(parents=True, exist_ok=True)
@@ -274,6 +380,10 @@ def main():
         # branch's env switches, which make the launcher identical to main's; arm B = the branch default.
         arms = [("armA_branch22_launch", {"TLLM_AR_SM120_PDL": "0", "TLLM_AR_SM120_CTAS_PER_TOKEN": "1"}),
                 ("armB_candidate", {})]
+    elif arm_set == "capture":
+        # branch 61 item 3(c): arm B (branch default launch) first, then arm A (main's launch: k=1, no PDL attribute)
+        # if time remains. TLLM_AR_LOG_LAUNCH=1 only prints the launcher's shape/attributes once per token count.
+        return main_capture(ckpt)
     else:
         arms = [("armA_main_ar", {"TLLM_PCIE_CUSTOM_AR_MAX_BYTES": "0", "TLLM_NCCL_PCIE_DEFAULTS": "0"}),
                 ("armB_branch", {})]
