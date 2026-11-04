@@ -37,11 +37,15 @@ The kernel change is frozen at the evidence commit. This file only records how t
   - 679's model-load phase may overlap 673's timed windows.
 - Pair 672/673 TTFT is flat, so no verdict hinges on an overlapped TTFT (rule 2 not triggered).
 
-## Open gaps
-1. Item 3's clause "check.py passes incl. repeated_execution_passed" is not met by any job on this branch.
-   - Worker jobs cannot reach the frozen adapter (pitfall 812; top lead ruling 1836 / plan 845).
-   - run_serving_pair runs the proxy adapter only.
-   - The area lead asked the top lead (22:10, plan 1434) either for a runner-side check on this head or for a ruling that the landing check covers the clause.
-2. Untested but unreached: TWOSHOT and the fused RMS_NORM patterns of allreduce_fusion_kernel_launcher.
-   - AUTO on a PCIe-only group returns ONESHOT at <=512 KiB (allreduceOp.cpp L1466-1505).
-   - modeling_deepseekv4.py L2134/L2139 force PRE/POST_MOE_FUSION False.
+## check.py source
+- Item 3's clause "check.py passes incl. repeated_execution_passed" is met by the landing check, per top lead ruling 4071 (plan 1445).
+  - The landing check runs check.py, including its repeated pass, runner-side on the merged tree.
+  - No branch job ran check.py: worker jobs cannot reach the frozen adapter (pitfall 812; ruling 1836).
+- Branch-side repeated-execution evidence is job 644.
+
+## Gaps
+- The check.py clause is not closed by a branch job. Its source is the landing check (ruling 4071).
+- Untested but unreached: TWOSHOT and the fused RMS_NORM patterns of allreduce_fusion_kernel_launcher. Scope as accepted by the top lead on main 6bf8acc1:
+  - allreduceOp.cpp L1465-1470: AUTO returns ONESHOT on PCIe-only groups.
+  - allreduceOp.cpp L1481-1484: ONESHOT is capped at 512 KiB; ifFallbackToNCCL (L1491-1505) sends larger messages to NCCL.
+  - modeling_deepseekv4.py L2258/L2263 set PRE_MOE_FUSION/POST_MOE_FUSION False.
