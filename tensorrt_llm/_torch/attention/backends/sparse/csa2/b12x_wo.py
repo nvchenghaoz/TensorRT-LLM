@@ -38,7 +38,7 @@ _ENV_WO_B = "TRTLLM_B12X_WO_B_FUSED"
 # per row, 2 rows per pass, packed sA stores). Bitwise equal to the pinned
 # producer; used only at the decode row counts where it is faster in main's chain.
 _ENV_WO_B_WIDE_ROWS = "TRTLLM_B12X_WO_B_WIDE_ROWS"
-_WO_B_WIDE_ROWS_DEFAULT = "2"
+_WO_B_WIDE_ROWS_DEFAULT = "2,3,4"
 MAX_DECODE_ROWS = 8
 
 
