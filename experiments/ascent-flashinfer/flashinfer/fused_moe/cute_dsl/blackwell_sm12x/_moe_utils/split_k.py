@@ -50,8 +50,13 @@ def min_splits() -> int:
     return max(2, int(os.environ.get(ENV_MIN, "4")))
 
 
+def debug_nocount() -> bool:
+    """Diagnostic only: keep the split-K kernel but never split (no tile count)."""
+    return os.environ.get("TRTLLM_SM12X_FI_SPLITK_DEBUG_NOCOUNT", "0") == "1"
+
+
 def key():
-    return (enabled(), max_splits(), min_splits())
+    return (enabled(), max_splits(), min_splits(), debug_nocount())
 
 
 _WS: dict = {}
@@ -218,15 +223,22 @@ def count_m_blocks_lane(l0, h0, l1, h1, l2, h2, l3, h3, offsets: cute.Tensor, nu
     return total
 
 
-@cute.jit
-def warp_total(v):
-    lane = cute.arch.lane_idx()
-    incl = v
-    for i in cutlass.range_constexpr(5):
-        d = 1 << i
-        up = cute.arch.shuffle_sync_up(incl, Int32(d), mask_and_clamp=0)
-        incl = incl + up * (Int32(1) + ((lane - Int32(d)) >> Int32(31)))
-    return cute.arch.shuffle_sync(incl, Int32(31))
+@dsl_user_op
+def warp_total(v: Int32, *, loc=None, ip=None) -> Int32:
+    """Sum over the full warp in one instruction (redux.sync, SM80+)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(v).ir_value(loc=loc, ip=ip)],
+            "redux.sync.add.s32 $0, $1, 0xffffffff;",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 
@@ -246,12 +258,14 @@ def cycle_range(valid, bidx, cycles):
 def choose_splits(T_tiles, grid_x: int, s_max: int, cycles, s_min: int):
     """S = min(grid // T, s_max, cycles), or 1 when that is below s_min (measured: at S = 2
     the partial write + ordered reduction costs about what the split saves)."""
-    S = Int32(grid_x) // cute.max(T_tiles, Int32(1))
-    S = cute.min(S, Int32(s_max))
-    S = cute.min(S, Int32(cycles))
-    S = cute.max(S, Int32(1))
-    below = Int32(0) - ((S - Int32(s_min)) >> Int32(31))  # 1 if S < s_min else 0
-    return S + (Int32(1) - S) * below
+    # Division-free (it sits on the first tile's critical path): the largest
+    # c in [s_min, s_max] with c * T <= grid and c <= cycles, else 1.
+    S = Int32(1)
+    for c in range(s_min, s_max + 1):
+        fits = (Int32(grid_x) - Int32(c) * T_tiles) | (Int32(cycles) - Int32(c))
+        ok = Int32(1) + (fits >> Int32(31))  # 1 if both >= 0 else 0
+        S = S + (Int32(c) - S) * ok
+    return S
 
 
 @cute.jit

@@ -761,6 +761,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
         self.split_k = split_k.enabled() and cfg.mma.swap_ab
         self.split_max = split_k.max_splits()
         self.split_min = split_k.min_splits()
+        self.split_nocount = split_k.debug_nocount()
         self.epi_q = EPI_CONFIGS[cfg.epi.METHOD](
             cutlass.Float8E4M3FN,
             cfg.mma_threads,
@@ -1123,7 +1124,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
             cute.arch.setmaxregister_decrease(cfg.reg_prod)
 
             if warp_idx == cfg.sched_warp:
-                if cutlass.const_expr(self.split_k):
+                if cutlass.const_expr(self.split_k and not self.split_nocount):
                     # Dynamic split-K: S from the live tile count T (no host sync).
                     prod = moe_scheduler.MoeSchedProducer.create(cfg.sched_stages)
                     # Count loads and the scheduler's own loads are issued back to back,
