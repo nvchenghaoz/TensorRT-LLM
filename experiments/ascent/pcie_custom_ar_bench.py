@@ -205,6 +205,7 @@ def _robust(torch, mapping, strategy, m, rank, dev):
         _, f0, _ = _lamport_state(torch, mapping)
         for i in range(n):  # enqueued back to back, no host sync
             run.x.copy_(bank[i])
+            run.out.fill_(float("nan"))  # NaN-poison the output: a call that skips a write shows up as non-finite
             run.graph.replay()
             outs[i].copy_(run.out)
         torch.cuda.synchronize()
