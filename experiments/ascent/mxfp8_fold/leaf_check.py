@@ -201,7 +201,39 @@ def fresh_runners():
     torch.cuda.synchronize()
 
 
+def item6(main_det, MoERunner):
+    """Half x + BF16 output on the in-kernel-quant runner must raise the moeOp.cpp TORCH_CHECK."""
+    x, ids, w = make_inputs(64)
+    r = {}
+    try:
+        main_det.op(x.half(), None, ids, w, out_dtype=torch.bfloat16)
+        torch.cuda.synchronize()
+        r = {"raised": False, "clear_message": False}
+    except Exception as ex:  # noqa: BLE001
+        msg = str(ex)
+        r = {"raised": True, "type": type(ex).__name__,
+             "clear_message": "requires the input dtype to equal the output dtype" in msg,
+             "message": msg.splitlines()[0][:400] if msg else ""}
+    # The rejected construction leaves no runner behind; BF16 in/out and FP8 in still work.
+    bad_left = [str(k) for k in MoERunner.runner_dict if k[0] == torch.float16]
+    torch.cuda.synchronize()
+    o_bf = main_det.fold(x, ids, w)
+    o_f8 = main_det(x, ids, w)
+    torch.cuda.synchronize()
+    r.update(half_runner_cached=bad_left, bf16_after_finite=bool(torch.isfinite(o_bf.float()).all()),
+             fp8_after_finite=bool(torch.isfinite(o_f8.float()).all()))
+    r["ok"] = bool(r["raised"] and r["clear_message"] and not bad_left and r["bf16_after_finite"]
+                   and r["fp8_after_finite"])
+    return r
+
+
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--part", choices=["item46", "item5"], required=True)
+    ap.add_argument("--ff", type=int, default=0, help="use_fused_finalize for every call of this process")
+    args = ap.parse_args()
+    do46 = args.part == "item46"
     import tensorrt_llm  # noqa: F401
     import tensorrt_llm._torch.custom_ops  # noqa: F401
     from common import make_weights, trtllm_layout
@@ -228,45 +260,30 @@ def main():
 
     # ---------------- item 6 ----------------
     fresh_runners()
-    main_det = Main(w31, s31, w2v, s2s, ff=False)
-    x, ids, w = make_inputs(64)
-    try:
-        main_det.op(x.half(), None, ids, w, out_dtype=torch.bfloat16)
-        torch.cuda.synchronize()
-        res["items"]["6"] = {"raised": False}
-        ok["6"] = False
-    except Exception as ex:  # noqa: BLE001
-        msg = str(ex)
-        hit = "requires the input dtype to equal the output dtype" in msg
-        res["items"]["6"] = {"raised": True, "type": type(ex).__name__, "clear_message": hit,
-                             "message": msg.splitlines()[0][:400] if msg else ""}
-        ok["6"] = hit
-    # The rejected construction must not leave a runner behind, and BF16->BF16 must still work.
-    bad_left = [k for k in MoERunner.runner_dict if k[0] == torch.float16]
-    torch.cuda.synchronize()
-    o = main_det.fold(x, ids, w)
-    torch.cuda.synchronize()
-    res["items"]["6"].update(half_runner_cached=bool(bad_left), bf16_after_ok=bool(torch.isfinite(o.float()).all()))
-    ok["6"] = ok["6"] and not bad_left and res["items"]["6"]["bf16_after_ok"]
-    log("item6", ok["6"], json.dumps(res["items"]["6"]))
+    main_det = Main(w31, s31, w2v, s2s, ff=bool(args.ff))
+    if do46:
+        res["items"]["6"] = item6(main_det, MoERunner)
+        ok["6"] = res["items"]["6"]["ok"]
+        log("item6", ok["6"], json.dumps(res["items"]["6"]))
 
     # ---------------- item 4 ----------------
-    st = Sm12xW4a8DecodeState(w3_w1_weight=w31, w3_w1_weight_scale=s31, w2_weight=w2v, w2_weight_scale=s2s,
-                              num_local_experts=E, slot_start=0, swiglu_limit=LIMIT,
-                              enable_pdl=os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
-    st.warmup(TOPK)
-    leaf = make_leaf(st, w31, s31, w2v, s2s, ff=False)
-    probe = Probe(leaf, st, leaf_mod)
-    fresh_runners()
-    AutoTuner.get().clear_cache()
-    xt, it, wt = make_inputs(max(MS))
-    with autotune():  # production order: main's FP8 runner tunes; the fold runner shares its id
-        main_det(xt, it, wt)
-    torch.cuda.synchronize()
-    log("item4: tuned (unfused finalize) at M", max(MS))
+    if do46:
+        st = Sm12xW4a8DecodeState(w3_w1_weight=w31, w3_w1_weight_scale=s31, w2_weight=w2v, w2_weight_scale=s2s,
+                                  num_local_experts=E, slot_start=0, swiglu_limit=LIMIT,
+                                  enable_pdl=os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
+        st.warmup(TOPK)
+        leaf = make_leaf(st, w31, s31, w2v, s2s, ff=bool(args.ff))
+        probe = Probe(leaf, st, leaf_mod)
+        fresh_runners()
+        AutoTuner.get().clear_cache()
+        xt, it, wt = make_inputs(max(MS))
+        with autotune():  # production order: main's FP8 runner tunes; the fold runner shares its id
+            main_det(xt, it, wt)
+        torch.cuda.synchronize()
+        log("item4: tuned at M", max(MS), "fused finalize", bool(args.ff))
 
     cases = []
-    for m in MS:
+    for m in (MS if do46 else []):
         cases += [(m, 0, False, None), (m, 1, False, None), (m, 0, True, None)]
         if m <= FI_DECODE_MAX_TOKENS:
             cases.append((m, 2, False, 2))
@@ -361,8 +378,8 @@ def main():
         return orig_fwd(self, inputs, gemm_idx=gemm_idx, tactic=tactic, do_preparation=do_preparation)
 
     MoERunner.forward = fwd
-    for ff in (False, True):
-        for m in (33, 2048, 6144):
+    for ff in (bool(args.ff),):  # one finalize mode per fresh process (pitfall 1332, ruling event 3759)
+        for m in ((33, 2048, 6144) if not do46 else ()):
             key = f"M{m}_fused_finalize{int(ff)}"
             try:
                 fresh_runners()
@@ -394,19 +411,50 @@ def main():
                 tac_tuned = [c["tactic"] for c in tune_calls]
                 same_tac = (len(fp8_calls) == 2 and all(c["hit"] for c in fp8_calls)
                             and [c["tactic"] for c in fp8_calls] == [c["tactic"] for c in bf_calls] == tac_tuned)
+                # The shared id is only safe if both C++ runners index the same tactic lists.
+                fp8_rt = [v for k, v in MoERunner.runner_dict.items() if k[0] == torch.float8_e4m3fn]
+                lists = {}
+                for g in (1, 2):
+                    d_bf = list(bf16_rt[0].get_tactic_descs(g)) if bf16_rt else None
+                    d_f8 = list(fp8_rt[0].get_tactic_descs(g)) if fp8_rt else None
+                    lists[g] = {"n_bf16_runner": len(d_bf or []), "n_fp8_runner": len(d_f8 or []),
+                                "elementwise_equal": d_bf is not None and d_bf == d_f8,
+                                "picked": (d_f8[tac_tuned[g - 1]].replace("\n\t", "; ")
+                                           if d_f8 and 0 <= tac_tuned[g - 1] < len(d_f8) else None)}
+                lists_ok = all(v["elementwise_equal"] for v in lists.values())
+                if m == 33:
+                    log("GEMM_1 list:", " | ".join(s.replace("\n\t", ";") for s in fp8_rt[0].get_tactic_descs(1)))
+                    log("GEMM_2 list:", " | ".join(s.replace("\n\t", ";") for s in fp8_rt[0].get_tactic_descs(2)))
+                # Warm cache, tuning off: job-617 protocol (eager + graph replays), every output vs the FP8 call.
+                stx = {"iters": 0, "mismatch": 0, "max_rel": 0.0}
                 if not ff:
+                    def cmpw(o):
+                        stx["iters"] += 1
+                        if not torch.equal(o, fp8_out):
+                            stx["mismatch"] += 1
+                            stx["max_rel"] = max(stx["max_rel"], rel_err(o, fp8_out))
                     eq = bool(torch.equal(tuned, fp8_out) and torch.equal(bf16_out, fp8_out))
-                    num_ok, num = eq, {"bitwise_tuned_vs_fp8": eq}
                 else:
                     spread = max(rel_err(mm(x, ids, w), fp8_out) for _ in range(5))
-                    e_fold = max(rel_err(mm.fold(x, ids, w), fp8_out) for _ in range(5))
-                    num_ok = e_fold <= max(2 * spread, 1e-2)
-                    num = {"fold_vs_fp8_max_rel": e_fold, "fp8_self_spread_rel": spread}
+
+                    def cmpw(o):
+                        stx["iters"] += 1
+                        e = rel_err(o, fp8_out)
+                        stx["max_rel"] = max(stx["max_rel"], e)
+                        stx["mismatch"] += int(e > max(2 * spread, 1e-2))
+                    eq = True
+                sequence(lambda: mm.fold(x, ids, w), cmpw)
+                num_ok = eq and stx["mismatch"] == 0
+                num = {"tuned_call_equal_fp8": eq, "warm_iters": stx["iters"], "warm_mismatch": stx["mismatch"],
+                       "warm_max_rel": stx["max_rel"]}
+                if ff:
+                    num["fp8_self_spread_rel"] = spread
                 r = {"tune_calls": tune_calls, "failed_profiling": failed, "cache_entries": len(keys),
                      "cache_keys_fp8_id": ids_ok, "tactic_num": n_tac, "profiled_distinct_tactics": prof,
                      "all_tactics_profiled": all_prof, "infer_calls": infer_calls, "fp8_hits_same_tactics": same_tac,
+                     "tactic_lists": lists, "tactic_lists_equal": lists_ok,
                      **num, "example_key": str(keys[0])[:300] if keys else None}
-                case_ok = (not failed) and ids_ok and all_prof and same_tac and num_ok and bool(
+                case_ok = (not failed) and ids_ok and all_prof and same_tac and lists_ok and num_ok and bool(
                     torch.isfinite(tuned.float()).all())
                 r["ok"] = bool(case_ok)
                 ok["5"] = ok["5"] and case_ok
@@ -420,8 +468,9 @@ def main():
     MoERunner.forward = orig_fwd
     tuner.choose_one = orig_choose
 
-    res["ok"] = ok
-    res["passed"] = all(ok.values())
+    ok = {k: v for k, v in ok.items() if (k in ("4", "6")) == do46}
+    res["items"] = {k: v for k, v in res["items"].items() if k in ok}
+    res.update(part=args.part, use_fused_finalize=bool(args.ff), ok=ok, passed=all(ok.values()))
     res["compared"] = ("item 4: leaf (quantize_input + run_moe) vs main's path in-process (FI chain direct at "
                        "M<=32, mxfp8_quantize + fused_moe(fp8) above), torch.equal every iteration, unfused "
                        "finalize; item 5: tuned BF16-input call vs FP8-input call; item 6: Half x + BF16 out raises")
