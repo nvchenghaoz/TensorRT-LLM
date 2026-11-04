@@ -26,6 +26,7 @@ are documented in ``docs/source/features/prefix-tokenization-cache.md``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -70,6 +71,19 @@ LCP_CHUNK_CHARS = 8192  # slice size of the common-prefix scan
 GRID_STRIDE = 16  # entries keep the start char of every GRID_STRIDE-th token
 SNAP_SEARCH = 64  # grid points searched backwards for an exact cut
 MAX_SHARED_PREFIX_SIBLINGS = 32  # a spliced prompt becomes an entry only below this
+
+# Cross-process sharing of full tokenizations. Several serving frontend
+# processes (num_serve_frontends > 1) each own a cache; without sharing, each
+# one pays a full tokenization of the shared preamble on its first request.
+# When this env var names a directory, a process that tokenizes a prompt in
+# full publishes the entry to <dir>/<tokenizer fingerprint>/, and a process
+# whose shared-prefix lookup misses loads the entries it has not seen yet and
+# looks again. The launcher sets it to a directory inside its multi-frontend
+# ipc dir (serve.py ``_share_prefix_token_dir``). Unset: no file I/O.
+SHARED_DIR_ENV = "TLLM_PREFIX_TOKEN_CACHE_SHARED_DIR"
+SHARED_MAX_FILES = 64  # entries published per fingerprint directory
+SHARED_SUFFIX = ".ptc"
+SHARED_VERSION = 1
 # Byte-level BPE split patterns, as in tokenizer.json, for which a cut at a
 # U+0020 whose previous character is not whitespace, a \p{N} digit or CJK/kana
 # is a pre-token boundary that depends on neither side's other characters:
@@ -217,10 +231,24 @@ class PrefixTokenCache:
     tokenized in full from then on: a cache bug must never fail a request.
     """
 
-    def __init__(self, config: PrefixTokenCacheConfig, lcp_splice: bool = False) -> None:
+    def __init__(
+        self,
+        config: PrefixTokenCacheConfig,
+        lcp_splice: bool = False,
+        fingerprint: str | None = None,
+    ) -> None:
         self._config = config
         # Shared-prefix splice; only for a tokenizer that passed _lcp_splice_gate.
         self._lcp_splice = lcp_splice
+        # Tokenizer fingerprint naming the cross-process directory; None keeps
+        # the cache process-local. Resolved lazily (SHARED_DIR_ENV may be set
+        # after the cache is built), see _shared_dir.
+        self._fingerprint = fingerprint if lcp_splice else None
+        self._shared_path: str | None = None
+        self._shared_seen: set[str] = set()  # file names loaded, published or rejected
+        self.shared_loads = 0
+        self.shared_publishes = 0
+        self.shared_skipped = 0
         self._lock = threading.Lock()
         self._entries: OrderedDict[int, _Entry] = OrderedDict()  # LRU order
         self._buckets: dict[int, dict[int, _Entry]] = {}
@@ -275,6 +303,11 @@ class PrefixTokenCache:
                 f"{self.splice_no_cut} without an exact cut, "
                 f"{splice_ms:.2f} ms per spliced vs {full_ms:.2f} ms per full request"
             )
+            if self._shared_path is not None:
+                text += (
+                    f"; shared: {self.shared_loads} loaded, "
+                    f"{self.shared_publishes} published, {self.shared_skipped} skipped"
+                )
         return text
 
     def _encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
@@ -303,6 +336,9 @@ class PrefixTokenCache:
                 base_entry = entry
         elif self._lcp_splice:
             cand = self._lcp_lookup(text)
+            if cand is None and self._fingerprint is not None and self._load_shared():
+                # Another process may already have tokenized this preamble.
+                cand = self._lcp_lookup(text)
             if cand is not None:
                 entry, tok, cut, lcp = cand
                 if tok < 0:
@@ -355,18 +391,175 @@ class PrefixTokenCache:
                 # bound: lookups scan the bucket.
                 bucket = self._buckets.get(self._bucket_key(text))
                 insert = insert and (bucket is None or len(bucket) < MAX_SHARED_PREFIX_SIBLINGS)
+            publish = None
             if insert:
-                self._insert(
-                    text, ids, split_token, base_char + tail_offsets[tail_index][0], grid
-                )
+                split_char = base_char + tail_offsets[tail_index][0]
+                self._insert(text, ids, split_token, split_char, grid)
+                if (
+                    self._fingerprint is not None
+                    and found is None
+                    and base_entry is None
+                    and grid is not None
+                ):
+                    publish = (split_token, split_char)
             n = self.hits + self.misses
             # Power-of-two counts as well, so a short serving lifetime still
             # shows whether the splice works.
             report = n % LOG_EVERY_REQUESTS == 0 or (self._lcp_splice and n & (n - 1) == 0)
             summary = self.summary() if report else None
+        if publish is not None:
+            self._publish_shared(text, ids, publish[0], publish[1], grid)
         if summary is not None:
             logger.info(f"Prefix token cache: {summary}")
         return ids
+
+    # ------------------------------------------------------------------
+    # Cross-process sharing (SHARED_DIR_ENV). Every failure here only skips
+    # sharing; it never disables the cache or fails a request.
+
+    def _shared_dir(self) -> str | None:
+        """This tokenizer's shared directory, or None while SHARED_DIR_ENV is unset."""
+        if self._shared_path is None and self._fingerprint is not None:
+            root = os.environ.get(SHARED_DIR_ENV)
+            if root:
+                self._shared_path = os.path.join(root, self._fingerprint)
+        return self._shared_path
+
+    def _publish_shared(
+        self, text: str, ids: Sequence[int], split_token: int, split_char: int, grid: array
+    ) -> None:
+        """Write a fully tokenized entry for other processes; skip if already there."""
+        path = self._shared_dir()
+        if path is None:
+            return
+        start = time.perf_counter()
+        text_bytes = text.encode("utf-8")
+        name = hashlib.sha1(text_bytes).hexdigest()[:16] + SHARED_SUFFIX
+        with self._lock:
+            if name in self._shared_seen:
+                return
+            self._shared_seen.add(name)
+        try:
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            target = os.path.join(path, name)
+            if os.path.exists(target):
+                return
+            if sum(1 for e in os.scandir(path) if e.name.endswith(SHARED_SUFFIX)) >= (
+                SHARED_MAX_FILES
+            ):
+                return
+            ids_arr = array("i", ids)
+            grid_arr = array("i", grid)
+            payload = text_bytes + ids_arr.tobytes() + grid_arr.tobytes()
+            header = {
+                "v": SHARED_VERSION,
+                "fp": self._fingerprint,
+                "pid": os.getpid(),
+                "itemsize": ids_arr.itemsize,
+                "n_chars": len(text),
+                "n_text_bytes": len(text_bytes),
+                "n_ids": len(ids_arr),
+                "n_grid": len(grid_arr),
+                "split_token": split_token,
+                "split_char": split_char,
+                "sha1": hashlib.sha1(payload).hexdigest(),
+            }
+            tmp = f"{target}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(json.dumps(header).encode("utf-8") + b"\n")
+                f.write(payload)
+            os.replace(tmp, target)
+        except OSError as e:
+            logger.warning(f"Prefix token cache: pid {os.getpid()} could not publish {name}: {e!r}")
+            return
+        self.shared_publishes += 1
+        logger.info(
+            f"Prefix token cache: pid {os.getpid()} published shared entry {name} "
+            f"({len(text)} chars, {len(ids_arr)} ids, {len(payload)} bytes) in "
+            f"{(time.perf_counter() - start) * 1e3:.2f} ms"
+        )
+
+    def _load_shared(self) -> bool:
+        """Insert the shared entries not seen yet; whether any was inserted."""
+        path = self._shared_dir()
+        if path is None:
+            return False
+        try:
+            names = sorted(
+                e.name for e in os.scandir(path) if e.name.endswith(SHARED_SUFFIX)
+            )
+        except OSError:
+            return False
+        with self._lock:
+            fresh = [n for n in names if n not in self._shared_seen]
+            self._shared_seen.update(fresh)
+        loaded = False
+        for name in fresh:
+            start = time.perf_counter()
+            entry, why = self._read_shared(os.path.join(path, name))
+            elapsed_ms = (time.perf_counter() - start) * 1e3
+            if entry is None:
+                self.shared_skipped += 1
+                logger.info(
+                    f"Prefix token cache: pid {os.getpid()} skipped shared entry {name}: {why}"
+                )
+                continue
+            text, ids, split_token, split_char, grid, src_pid = entry
+            with self._lock:
+                self._insert(text, ids, split_token, split_char, grid)
+                self.shared_loads += 1
+            loaded = True
+            logger.info(
+                f"Prefix token cache: pid {os.getpid()} loaded shared entry {name} "
+                f"from pid {src_pid} ({len(text)} chars, {len(ids)} ids) in {elapsed_ms:.2f} ms"
+            )
+        return loaded
+
+    def _read_shared(self, file: str) -> tuple[tuple | None, str]:
+        """Parse and validate one shared file: ((text, ids, split_token, split_char, grid, pid), why)."""
+        try:
+            with open(file, "rb") as f:
+                data = f.read()
+            nl = data.find(b"\n")
+            if nl < 0:
+                return None, "no header"
+            header = json.loads(data[:nl])
+            if not isinstance(header, dict) or header.get("v") != SHARED_VERSION:
+                return None, "unknown version"
+            if header.get("fp") != self._fingerprint:
+                return None, "foreign tokenizer fingerprint"
+            ids = array("i")
+            if header.get("itemsize") != ids.itemsize:
+                return None, "itemsize mismatch"
+            fields = ("n_chars", "n_text_bytes", "n_ids", "n_grid", "split_token", "split_char")
+            if not all(type(header.get(k)) is int and header[k] >= 0 for k in fields):
+                return None, "malformed header"
+            n_chars, n_text_bytes, n_ids, n_grid, split_token, split_char = (
+                header[k] for k in fields
+            )
+            payload = memoryview(data)[nl + 1 :]
+            if len(payload) != n_text_bytes + ids.itemsize * (n_ids + n_grid):
+                return None, "truncated or oversized payload"
+            if hashlib.sha1(payload).hexdigest() != header.get("sha1"):
+                return None, "checksum mismatch"
+            text = bytes(payload[:n_text_bytes]).decode("utf-8")
+            if len(text) != n_chars or n_chars < self._config.min_chars:
+                return None, "text length mismatch"
+            ids.frombytes(payload[n_text_bytes : n_text_bytes + ids.itemsize * n_ids])
+            grid = array("i")
+            grid.frombytes(payload[n_text_bytes + ids.itemsize * n_ids :])
+            if not (
+                0 < split_token < n_ids
+                and 0 < split_char < n_chars
+                and n_grid == (n_ids + GRID_STRIDE - 1) // GRID_STRIDE
+                and grid[0] == 0
+                and all(a <= b for a, b in zip(grid, grid[1:]))
+                and grid[-1] < n_chars
+            ):
+                return None, "inconsistent split or grid"
+            return (text, ids, split_token, split_char, grid, header.get("pid")), "ok"
+        except (OSError, ValueError, TypeError, KeyError, UnicodeDecodeError) as e:
+            return None, f"unreadable ({e!r})"
 
     @staticmethod
     def _tokenize(
@@ -504,11 +697,22 @@ def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
         return None
     config = PrefixTokenCacheConfig.from_env()
     lcp_splice, why = _lcp_splice_gate(tokenizer)
+    fingerprint = _tokenizer_fingerprint(tokenizer) if lcp_splice else None
     logger.info(
         f"Prefix token cache enabled: {config}; shared-prefix splice "
         f"{'on' if lcp_splice else 'off'} ({why})"
+        + (f"; cross-process fingerprint {fingerprint}" if fingerprint else "")
     )
-    return PrefixTokenCache(config, lcp_splice=lcp_splice)
+    return PrefixTokenCache(config, lcp_splice=lcp_splice, fingerprint=fingerprint)
+
+
+def _tokenizer_fingerprint(tokenizer: object) -> str | None:
+    """Short hash of the backend tokenizer's serialized form; None if unavailable."""
+    try:
+        spec = tokenizer.backend_tokenizer.to_str()
+        return hashlib.sha1(spec.encode("utf-8")).hexdigest()[:12]
+    except Exception:  # noqa: BLE001 - no fingerprint keeps the cache process-local
+        return None
 
 
 def _lcp_splice_gate(tokenizer: object) -> tuple[bool, str]:

@@ -586,6 +586,24 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
             f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
 
 
+def _share_prefix_token_dir(ipc_dir: str) -> None:
+    """Give every frontend's prefix token cache one directory before spawning them.
+
+    Each frontend process owns its own prefix token cache, so without sharing
+    every one of them tokenizes a shared preamble in full on its first request.
+    Set in os.environ (not the children's extra_env): the launcher's own
+    serving cache reads it too, lazily on its first miss. The directory lives
+    in the launcher's ipc dir, which the executor proxy removes at shutdown.
+    """
+    from tensorrt_llm.inputs.prefix_token_cache import SHARED_DIR_ENV
+    if os.environ.get(SHARED_DIR_ENV):
+        return
+    path = os.path.join(ipc_dir, "prefix_tokens")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.environ[SHARED_DIR_ENV] = path
+    logger.info(f"Shared {SHARED_DIR_ENV} for all frontends: {path}")
+
+
 def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
                                          port: int, grpc: bool,
                                          report_addr: Optional[str],
@@ -758,6 +776,7 @@ def launch_server(
                         llm)
                     _share_prometheus_multiproc_dir(
                         llm, os.path.dirname(launcher_uds_path))
+                    _share_prefix_token_dir(os.path.dirname(launcher_uds_path))
                     frontend_children = _spawn_attached_frontends(
                         llm,
                         multi_frontend.num_frontends,
