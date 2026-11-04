@@ -57,6 +57,7 @@ from ..modules.mhc.hyper_connection import HCState, mHC
 from ..speculative import SpecMetadata
 from ..speculative.dspark import DSparkSpecMetadata
 from ..utils import AuxStreamType
+from . import _dsv41_tail_moe_graph as _tail_moe_graph
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
@@ -74,6 +75,9 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
     from ..pyexecutor.llm_request import LlmRequest
+
+# TRTLLM_DSV4_TAIL_MOE_GRAPH=1 (read once at import; unset/0 = main's eager path).
+_TAIL_MOE_GRAPH = _tail_moe_graph.ENABLED
 
 
 def _engram_history_text_mask(request: "LlmRequest", start: int, end: int) -> list[bool] | None:
@@ -706,6 +710,19 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         if attn_join is not None:
             attn_join.join()
             attn_join = None
+        if _TAIL_MOE_GRAPH and _tail_moe_graph.eligible(
+            self, x_attn, attn_metadata, spec_metadata, image_mask
+        ):
+            # 128-row eager replay tail: replay this layer's captured MoE window.
+            graphed = _tail_moe_graph.run(
+                self, x_attn, residual, post_mix, comb_mix, attn_pre, attn_metadata, input_ids
+            )
+            if graphed is not None:
+                if self._v41_defer_post_mapping:
+                    residual, post_mix, comb_mix, x_ffn, ffn_pre = graphed
+                    return HCState.deferred(residual, post_mix, comb_mix, x_ffn, pre_mix=ffn_pre)
+                residual, ffn_pre = graphed
+                return HCState.resolved(residual, pre_mix=ffn_pre)
         # Attention's post update + FFN boundary + post_attention RMSNorm in one fused pair.
         # Split (decode): its residual/ffn_pre/post_mix/comb_mix join right after the MoE.
         (residual, ffn_pre, post_mix, comb_mix, layer_input), ffn_join = self._mhc_boundary(
