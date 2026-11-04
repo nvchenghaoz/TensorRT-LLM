@@ -257,8 +257,11 @@ def section_c(gen, replays=30):
             log(f"C {n}x{k} M={m} {json.dumps(entry)}")
             if pb:
                 fail(f"C {n}x{k} M={m}: port wrong under the cross-stream aggressor {entry}")
-            if pinfo["overlap_us"] <= 0:
-                fail(f"C {n}x{k} M={m}: aggressor did not overlap the port victims {pinfo}")
+            # Two DRAM-bound workloads sharing bandwidth add up in time even when they run concurrently, so
+            # overlap_us (logged) cannot show concurrency. The test is sensitive when the b12x control faults in the
+            # same case, under the same aggressor graph.
+            if bb == 0:
+                fail(f"C {n}x{k} M={m}: b12x control did not fault, aggressor not shown to overlap {binfo}")
             out[f"{n}x{k}_M{m}"] = entry
         del copies
         torch.cuda.empty_cache()
