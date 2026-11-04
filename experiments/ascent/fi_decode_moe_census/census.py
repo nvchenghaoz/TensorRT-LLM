@@ -153,7 +153,8 @@ def trace_graph(g, tag):
     evs.sort(key=lambda e: float(e["ts"]))
     replays, cur = [], None
     for e in evs:
-        if float(e["dur"]) > 150.0:  # the 512 MB flush
+        grid = (e.get("args", {}).get("grid") or [0])[0]
+        if "FillFunctor<int>" in e["name"] and float(e["dur"]) > 100.0 and grid > 1000:  # 512 MB flush
             if cur is not None:
                 replays.append(cur)
             cur = {"flush_end": float(e["ts"]) + float(e["dur"]), "nodes": []}
@@ -277,7 +278,10 @@ def main():
     results = []
     for m in (1, 2, 4, 8):
         x = torch.randn(m, H, dtype=torch.bfloat16, device="cuda")
-        cases = [(f"D{d}", *forced_routing(m, d, 0)) for d in (1, 2, 3, 6, 12) if d <= TOPK * m]
+        dset = tuple(range(1, 13)) if m == 4 else (1, 2, 3, 6, 12)
+        if os.environ.get("CENSUS_QUICK"):
+            dset = (1, 2, 3, 6, 12)
+        cases = [(f"D{d}", *forced_routing(m, d, 0)) for d in dset if d <= TOPK * m]
         ids_b, w_b = make_routing(m, {1: 3, 2: 2, 4: 2, 8: 2}[m], seed=m)
         cases.append(("bench537", ids_b, w_b))
         ids_u, w_u, cnt = uniform_busiest(m, 0)
