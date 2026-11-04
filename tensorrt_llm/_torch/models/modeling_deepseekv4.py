@@ -51,6 +51,7 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -1624,9 +1625,45 @@ class DeepseekV4Gate(nn.Module):
         return self.routing_method.top_k
 
 
+# Shared-expert row split. When the shared expert's TP size is smaller than the
+# MoE TP size (DSV4 TP4: gcd(2304/128, 4) = 2), several ranks hold the same
+# column shard and, on main, all compute it for every row, each scaled by
+# shared_tp_size / tp_size so the all-reduce counts it once. At M >= this
+# threshold (eager prefill), the ranks sharing a column shard instead split
+# the rows: each computes its own row range once, unscaled, and adds it into
+# routed_output in place. Every row's shared output is still computed exactly
+# once per column shard across the TP group. TRTLLM_DSV4_SHARED_ROW_SPLIT=0
+# turns it off.
+SHARED_ROW_SPLIT_MIN_TOKENS = int(os.environ.get("TRTLLM_DSV4_SHARED_ROW_SPLIT_MIN_TOKENS", "128"))
+
+
+def shared_expert_row_split_layout(tp_rank: int, tp_size: int, shared_tp_size: int):
+    """Return (parts, part_index, column_shard) of a TP rank.
+
+    GatedMLP(overridden_tp_size=shared_tp_size) builds Mapping(tp=shared_tp_size,
+    pp=tp_size // shared_tp_size, rank=r), whose tp_rank (the column shard) is
+    r % shared_tp_size (mapping.py tp_rank) and whose pp_rank is
+    r // shared_tp_size. ``parts`` ranks hold each column shard; the rank's
+    index among them is its row-part index.
+    """
+    assert tp_size % shared_tp_size == 0
+    parts = tp_size // shared_tp_size
+    return parts, tp_rank // shared_tp_size, tp_rank % shared_tp_size
+
+
+def shared_expert_row_range(num_rows: int, parts: int, part_index: int):
+    """Rows [start, end) of part ``part_index`` of ``parts`` contiguous parts."""
+    chunk = -(-num_rows // parts)
+    start = min(num_rows, part_index * chunk)
+    end = min(num_rows, start + chunk)
+    return start, end
+
+
 class DeepseekV4MoE(nn.Module):
     # Set per instance in __init__; the default covers instances built without it.
     _per_layer_dynamic_eplb_enabled = False
+    _shared_row_split_parts = 0
+    _shared_row_split_index = 0
 
     def __init__(
         self,
@@ -1783,9 +1820,63 @@ class DeepseekV4MoE(nn.Module):
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
 
+        self._setup_shared_row_split(shared_tp_size, layer_idx)
+
         # Store config values for perfect routing.
         self.model_config = model_config
         self.dtype = dtype
+
+    def _setup_shared_row_split(self, shared_tp_size: int, layer_idx: Optional[int]) -> None:
+        """Enable the shared-expert row split (see SHARED_ROW_SPLIT_MIN_TOKENS)."""
+        self._shared_row_split_parts = 0
+        self._shared_row_split_index = 0
+        if (
+            os.environ.get("TRTLLM_DSV4_SHARED_ROW_SPLIT", "1") == "0"
+            or self.shared_output_scale is None
+            or self.use_dp
+            or self.mapping.tp_size <= 1
+            or self.mapping.pp_size != 1
+            or self.mapping.cp_size != 1
+            or self._per_layer_dynamic_eplb_enabled
+            or type(self.shared_experts) is not GatedMLP
+        ):
+            return
+        parts, index, column_shard = shared_expert_row_split_layout(
+            self.mapping.tp_rank, self.mapping.tp_size, shared_tp_size
+        )
+        if parts < 2 or abs(self.shared_output_scale * parts - 1.0) > 1e-12:
+            return
+        # The column shard this rank's shared GatedMLP actually loaded must be
+        # the one the layout assumes (GatedMLP's own self.mapping is the full
+        # TP mapping, so read its Linear's overridden mapping instead).
+        assert self.shared_experts.down_proj.tp_rank == column_shard, (
+            self.shared_experts.down_proj.tp_rank,
+            column_shard,
+        )
+        assert self.shared_experts.down_proj.tp_size == shared_tp_size
+        assert 0 <= index < parts
+        self._shared_row_split_parts = parts
+        self._shared_row_split_index = index
+        logger.info_once(
+            f"DeepseekV4MoE shared-expert row split on: M >= {SHARED_ROW_SPLIT_MIN_TOKENS} "
+            f"(eager, not capturing), tp_size {self.mapping.tp_size}, shared_tp_size "
+            f"{shared_tp_size}; rank {self.mapping.rank} holds column shard {column_shard} "
+            f"and computes row part {index} of {parts} (rank r: shard r % {shared_tp_size}, "
+            f"part r // {shared_tp_size}); no {self.shared_output_scale} scale on that path",
+            key="dsv4_shared_row_split_on",
+        )
+
+    def _use_shared_row_split(self, hidden_states, hidden_states_fp4, do_finalize) -> bool:
+        return (
+            self._shared_row_split_parts > 1
+            and do_finalize
+            and hidden_states_fp4 is None
+            and hidden_states.dim() == 2
+            and hidden_states.shape[0] >= SHARED_ROW_SPLIT_MIN_TOKENS
+            and hidden_states.shape[0] > 0
+            and not torch.compiler.is_compiling()
+            and not torch.cuda.is_current_stream_capturing()
+        )
 
     def _compute_shared_expert_tp_size(
         self, intermediate_size: int, block_size: int
@@ -1959,7 +2050,24 @@ class DeepseekV4MoE(nn.Module):
         if not do_finalize:
             assert not self.use_dp
 
+        # Eager prefill (M >= SHARED_ROW_SPLIT_MIN_TOKENS, never under CUDA-graph
+        # capture): this rank computes the shared expert for its row part only,
+        # unscaled, and adds it into routed_output below. Decode keeps main's path.
+        use_row_split = self._use_shared_row_split(hidden_states, hidden_states_fp4, do_finalize)
+        shared_row_start, shared_row_end = 0, hidden_states.shape[0]
+        if use_row_split:
+            shared_row_start, shared_row_end = shared_expert_row_range(
+                hidden_states.shape[0], self._shared_row_split_parts, self._shared_row_split_index
+            )
+
         def _compute_shared_output():
+            if use_row_split:
+                if shared_row_end <= shared_row_start:
+                    return None
+                rows = hidden_states[shared_row_start:shared_row_end]
+                if not rows.is_contiguous():
+                    rows = rows.contiguous()
+                return self.shared_experts(rows)
             if hidden_states.shape[0] == 0:
                 # Shared experts have no collectives and need no empty GEMMs.
                 return torch.empty_like(hidden_states)
@@ -2017,7 +2125,21 @@ class DeepseekV4MoE(nn.Module):
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
-            if routed_output.dim() == 3:
+            if use_row_split:
+                if routed_output.dim() == 3:
+                    # Not produced by the backends this path serves; keep it correct anyway.
+                    full_shared = torch.zeros_like(hidden_states)
+                    if shared_output is not None:
+                        full_shared[shared_row_start:shared_row_end] = shared_output
+                    final_hidden_states = moe_reduce_add_shared_output(routed_output, full_shared)
+                else:
+                    assert routed_output.size() == hidden_states.size(), "unmatched tensor shape"
+                    # routed_output is a fresh tensor read only here (no attention DP,
+                    # do_finalize): add this rank's shared rows into it in place.
+                    final_hidden_states = routed_output
+                    if shared_output is not None:
+                        final_hidden_states[shared_row_start:shared_row_end] += shared_output
+            elif routed_output.dim() == 3:
                 assert shared_output.numel() * self.top_k == routed_output.numel(), (
                     "unmatched tensor shape"
                 )
