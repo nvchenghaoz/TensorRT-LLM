@@ -99,5 +99,26 @@ def pinned_bytes(layers):
     return total
 
 
+def int_ws_bytes(layers):
+    """Device bytes of the plans' int workspaces (FlashInfer default: 8 MiB each)."""
+    total = 0
+    for inst in layers:
+        for cache in (inst._plans, inst._paged_plans):
+            for plan in cache.values():
+                buf = getattr(plan.wrapper, "_int_workspace_buffer", None)
+                if buf is not None:
+                    total += buf.numel() * buf.element_size()
+    return total
+
+
+def default_buffer_instance():
+    """A CSA2FlashInfer whose plans keep FlashInfer's default 8 MiB int buffer (base)."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2FlashInfer
+
+    inst = CSA2FlashInfer()
+    inst._RIGHT_SIZE_INT_WORKSPACE = False
+    return inst
+
+
 def plan_counts(layers):
     return sum(len(inst._plans) + len(inst._paged_plans) for inst in layers)

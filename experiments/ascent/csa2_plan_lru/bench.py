@@ -109,6 +109,7 @@ def main():
         "device_reserved_bytes": torch.cuda.memory_reserved(),
         "device_max_allocated_bytes": torch.cuda.max_memory_allocated(),
         "pinned_int_workspace_max_bytes": mem["pinned"],
+        "device_int_workspace_bytes": C.int_ws_bytes(layers),
         "plans_cached": C.plan_counts(layers),
         "heads_per_rank": heads,
         "raw_ms": {"c4_3ctx": t3, "c4_1ctx": t1, "c1_1ctx": ts},

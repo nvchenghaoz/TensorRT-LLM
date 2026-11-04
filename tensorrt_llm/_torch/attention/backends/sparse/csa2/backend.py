@@ -761,6 +761,56 @@ class CSA2FlashInfer:
     # serving alternates context counts (e.g. 3-ctx and 1-ctx steps), and a
     # re-plan synchronizes the stream (mask_indptr H2D copy, packbits .item()).
     _EAGER_PLANS_PER_KEY = 2
+    # Size each wrapper's int workspace (and its pinned host mirror) from the
+    # plan's real need instead of FlashInfer's fixed 8 MiB + 8 MiB. Plans never
+    # resize, and with 40 layers x several keys the fixed buffers cost hundreds
+    # of MiB that startup memory profiling takes from the KV cache.
+    _RIGHT_SIZE_INT_WORKSPACE = True
+    _int_workspace_fallback_logged = False
+
+    @staticmethod
+    def int_workspace_bytes(count: int, heads: int, chunks: int = 1) -> int:
+        """Upper bound of FA2 PrefillPlan's int workspace for one-row queries.
+
+        PrefillPlan allocates request/qo-tile/kv-tile indices (int32 per CTA),
+        o_indptr and merge_indptr (count + 1 each) and a few scalars, each
+        16-byte aligned. CTAs <= count * ceil(heads / 16) * chunks because the
+        smallest FA2 cta_tile_q is 16 packed (row, head) entries.
+        """
+        pbs = count * -(-heads // 16) * max(chunks, 1)
+        need = 64 * pbs + 8 * (count + 1) + 4096
+        return -(-need // 4096) * 4096
+
+    def _plan_with_int_workspace(self, wrapper, device, nbytes, plan_fn) -> None:
+        """Give ``wrapper`` a right-sized private int workspace, then plan.
+
+        The float workspace stays the instance's shared one per device. Falls
+        back to FlashInfer's default 8 MiB int buffer if the bound is too small.
+        """
+        float_ws = self._workspaces[device]
+        if self._RIGHT_SIZE_INT_WORKSPACE:
+            wrapper.reset_workspace_buffer(
+                float_ws, torch.empty(nbytes, dtype=torch.uint8, device=device)
+            )
+            try:
+                plan_fn()
+                return
+            except Exception as e:  # FlashInfer's AlignedAllocator overflow
+                msg = str(e)
+                if "Buffer overflow" not in msg and "Failed to allocate" not in msg:
+                    raise
+                if not CSA2FlashInfer._int_workspace_fallback_logged:
+                    from tensorrt_llm.logger import logger
+
+                    CSA2FlashInfer._int_workspace_fallback_logged = True
+                    logger.warning(
+                        f"CSA2 FlashInfer: {nbytes}-byte int workspace too small, "
+                        f"using the default buffer ({e})"
+                    )
+            wrapper.reset_workspace_buffer(
+                float_ws, torch.empty(self._WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+            )
+        plan_fn()
 
     def split_kv_rows(self, count: int, heads: int, width: int, dim: int) -> int | None:
         """Rows per split-KV chunk for a ragged plan (0: FlashInfer's choice), or None."""
@@ -920,21 +970,32 @@ class CSA2FlashInfer:
                 backend="fa2",
                 use_cuda_graph=False,
             )
-            wrapper.plan(
-                qo_host,
-                kv_host,
-                heads,
-                1,
-                dim,
-                head_dim_vo=dim,
-                custom_mask=torch.ones(count * width, dtype=torch.bool, device=device),
-                causal=False,
-                pos_encoding_mode="NONE",
-                sm_scale=scale,
-                q_data_type=torch.bfloat16,
-                kv_data_type=torch.bfloat16,
-                disable_split_kv=split_rows is None,
-                fixed_split_size=split_rows or None,
+            # KV chunks per query: 1 unsplit; split_rows == 0 lets FlashInfer pick
+            # the chunk size, so bound by one row per chunk.
+            if split_rows is None:
+                chunks = 1
+            else:
+                chunks = -(-width // split_rows) if split_rows else width
+            self._plan_with_int_workspace(
+                wrapper,
+                device,
+                self.int_workspace_bytes(count, heads, chunks),
+                lambda: wrapper.plan(
+                    qo_host,
+                    kv_host,
+                    heads,
+                    1,
+                    dim,
+                    head_dim_vo=dim,
+                    custom_mask=torch.ones(count * width, dtype=torch.bool, device=device),
+                    causal=False,
+                    pos_encoding_mode="NONE",
+                    sm_scale=scale,
+                    q_data_type=torch.bfloat16,
+                    kv_data_type=torch.bfloat16,
+                    disable_split_kv=split_rows is None,
+                    fixed_split_size=split_rows or None,
+                ),
             )
             # plan() packs the bool mask into its own persistent byte buffer
             # (layout set by qo/kv indptr only, so split-KV does not move it).
@@ -973,23 +1034,28 @@ class CSA2FlashInfer:
             wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 self._workspaces[q.device], kv_layout="NHD", backend="fa2", use_cuda_graph=False
             )
-            wrapper.plan(
-                qo_host,
-                qo_host * width,
-                page_indices,
-                torch.ones(count, dtype=torch.int32, device="cpu"),
-                heads,
-                1,
-                dim,
-                1,
-                head_dim_vo=dim,
-                custom_mask=torch.ones(count * width, dtype=torch.bool, device=q.device),
-                causal=False,
-                pos_encoding_mode="NONE",
-                sm_scale=scale,
-                q_data_type=torch.bfloat16,
-                kv_data_type=torch.bfloat16,
-                disable_split_kv=True,
+            self._plan_with_int_workspace(
+                wrapper,
+                q.device,
+                self.int_workspace_bytes(count, heads),
+                lambda: wrapper.plan(
+                    qo_host,
+                    qo_host * width,
+                    page_indices,
+                    torch.ones(count, dtype=torch.int32, device="cpu"),
+                    heads,
+                    1,
+                    dim,
+                    1,
+                    head_dim_vo=dim,
+                    custom_mask=torch.ones(count * width, dtype=torch.bool, device=q.device),
+                    causal=False,
+                    pos_encoding_mode="NONE",
+                    sm_scale=scale,
+                    q_data_type=torch.bfloat16,
+                    kv_data_type=torch.bfloat16,
+                    disable_split_kv=True,
+                ),
             )
             plan = self._Plan(wrapper, wrapper._custom_mask_buf, wrapper._paged_kv_indices_buf)
         self._paged_plans[key] = plan
