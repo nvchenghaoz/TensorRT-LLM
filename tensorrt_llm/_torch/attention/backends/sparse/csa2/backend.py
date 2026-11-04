@@ -757,6 +757,10 @@ class CSA2FlashInfer:
     _SPLIT_KV_ROWS = 64
     _SPLIT_KV_MAX_COUNT = 16
     _WORKSPACE_BYTES = 8 * 1024 * 1024
+    # Unprotected eager plans kept per (heads, width, device, scale): mixed
+    # serving alternates context counts (e.g. 3-ctx and 1-ctx steps), and a
+    # re-plan synchronizes the stream (mask_indptr H2D copy, packbits .item()).
+    _EAGER_PLANS_PER_KEY = 2
 
     def split_kv_rows(self, count: int, heads: int, width: int, dim: int) -> int | None:
         """Rows per split-KV chunk for a ragged plan (0: FlashInfer's choice), or None."""
@@ -772,6 +776,7 @@ class CSA2FlashInfer:
 
     def __init__(self, attention=None) -> None:
         self.attention = attention
+        # Plan caches: insertion order is least- to most-recently used.
         self._plans: dict[tuple[int, int, int, torch.device, float], CSA2FlashInfer._Plan] = {}
         self._workspaces: dict[torch.device, torch.Tensor] = {}
         self._paged_plans: dict[tuple, CSA2FlashInfer._Plan] = {}
@@ -888,7 +893,8 @@ class CSA2FlashInfer:
 
         key = (count, heads, width, device, scale)
         split_rows = self.split_kv_rows(count, heads, width, dim)
-        plan = self._plans.get(key)
+        # Pop and re-insert below: the dict's order is the LRU order.
+        plan = self._plans.pop(key, None)
         # The split size is part of the plan's identity: a policy change replans.
         if plan is None or plan.split_rows != split_rows:
             with torch.cuda.device(device):
@@ -934,7 +940,7 @@ class CSA2FlashInfer:
             # (layout set by qo/kv indptr only, so split-KV does not move it).
             # Update that exact buffer on replay, not the original bool mask.
             plan = self._Plan(wrapper, wrapper._custom_mask_buf, split_rows=split_rows)
-            self._plans[key] = plan
+        self._plans[key] = plan
         return plan
 
     def run_shared(self, q, bank, indices, sink, scale, protect=False, out=None) -> torch.Tensor:
@@ -953,7 +959,8 @@ class CSA2FlashInfer:
         if width == 0:
             return torch.zeros_like(q) if out is None else out.zero_()
         key = (count, heads, width, q.device, scale)
-        plan = self._paged_plans.get(key)
+        # Pop and re-insert below: the dict's order is the LRU order.
+        plan = self._paged_plans.pop(key, None)
         if plan is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm up CSA2 FlashInfer shared rows before graph capture")
@@ -985,7 +992,7 @@ class CSA2FlashInfer:
                 disable_split_kv=True,
             )
             plan = self._Plan(wrapper, wrapper._custom_mask_buf, wrapper._paged_kv_indices_buf)
-            self._paged_plans[key] = plan
+        self._paged_plans[key] = plan
         plan.protected |= protect or torch.cuda.is_current_stream_capturing()
         pages = bank.view(-1, 1, 1, dim)
         if (
@@ -1034,11 +1041,18 @@ class CSA2FlashInfer:
     def _evict_eager_plans(self, metadata, key) -> None:
         if metadata.num_contexts > 0:
             # Whole eager phases have variable Q. Preserve plans that CUDA graphs
-            # warm up or capture, but do not retain every historical eager shape.
+            # warm up or capture, but do not retain every historical eager shape:
+            # keep the most recently used _EAGER_PLANS_PER_KEY counts per
+            # (heads, width, device, scale), ``key`` included (it is about to run).
+            keep = self._EAGER_PLANS_PER_KEY - 1
             for cache in (self._plans, self._paged_plans):
-                for previous, plan in tuple(cache.items()):
-                    if previous != key and previous[1:] == key[1:] and not plan.protected:
-                        del cache[previous]
+                others = [
+                    previous
+                    for previous, plan in cache.items()
+                    if previous != key and previous[1:] == key[1:] and not plan.protected
+                ]
+                for previous in others[: max(len(others) - keep, 0)]:
+                    del cache[previous]
 
     def _forward_selected(self, q, metadata, forward_args):
         if self.attention is None:
