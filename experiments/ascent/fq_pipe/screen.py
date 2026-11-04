@@ -42,7 +42,12 @@ ALL_ARMS = {
     "bfw_p1": (True, True, 1),
     "bfw_p2": (True, True, 2),
     "bfw_p4": (True, True, 4),
+    "w_p1": (False, True, 1),
+    "w_p2": (False, True, 2),
+    "w_p4": (False, True, 4),
 }
+# K2_FIXED=off: chains keep K2 on the pinned producer and vary only K3 (K3-only landing)
+K2_FIXED = os.environ.get("K2_FIXED", "")
 ARM_NAMES = (sys.argv[3] if len(sys.argv) > 3 else "off,bf,bfw,bfw_p2,bfw_p4").split(",")
 ARMS = {k: ALL_ARMS[k] for k in ARM_NAMES}
 assert "off" in ARMS
@@ -244,6 +249,7 @@ if WAGG:
 def wagg_run(g, n, check):
     """Replay g n times, each overlapped by 4 streams of mul_ over 256 MB; check() -> bad elems."""
     bad_reps, worst = 0, 0
+    k2_bad_reps, k3_only_bad_reps = 0, 0
     main = torch.cuda.current_stream()
     for _ in range(n):
         check(reset=True)
@@ -256,13 +262,18 @@ def wagg_run(g, n, check):
                     b.mul_(1.0000001)
         g.replay()
         torch.cuda.synchronize()
-        nb = check(reset=False)
-        if nb:
+        nb2, nb3 = check(reset=False)
+        if nb2 + nb3:
             bad_reps += 1
-            worst = max(worst, nb)
+            worst = max(worst, nb2 + nb3)
+        if nb2:
+            k2_bad_reps += 1
+        elif nb3:
+            k3_only_bad_reps += 1
     for b in agg_bufs:
         b.fill_(1.0)
-    return {"replays": n, "bad_replays": bad_reps, "max_bad_elems": worst}
+    return {"replays": n, "bad_replays": bad_reps, "max_bad_elems": worst,
+            "k2_bad_replays": k2_bad_reps, "k3_only_bad_replays": k3_only_bad_reps}
 
 
 for M in MS:
@@ -293,10 +304,11 @@ for M in MS:
     for an, arm in ARMS.items():
         def chain_fns(arm=arm):
             fns = []
+            arm2 = ARMS[K2_FIXED] if K2_FIXED else arm
             for i in range(LAYERS):
                 def f(i=i):
                     k1()
-                    k2(src, ws[i], tmps[i], M, arm)
+                    k2(src, ws[i], tmps[i], M, arm2)
                     k3(tmps[i], ws[i], outs[i], M, arm)
                 fns.append(f)
             return fns
@@ -328,7 +340,8 @@ for M in MS:
                     for o in outs:
                         o.fill_(float("nan"))
                     return 0
-                return sum(bitdiff(outs[i], refs_o[i]) + bitdiff(tmps[i], refs_t[i]) for i in range(LAYERS))
+                return (sum(bitdiff(tmps[i], refs_t[i]) for i in range(LAYERS)),
+                        sum(bitdiff(outs[i], refs_o[i]) for i in range(LAYERS)))
             wr = wagg_run(g, WAGG * (3 if M == 1 else 1), check)
             results["wagg"].setdefault(M, {})[an] = wr
             if wr["bad_replays"]:
@@ -367,7 +380,8 @@ for M in MS:
                 for o in outs:
                     o.fill_(float("nan"))
                 return 0
-            return sum(bitdiff(outs[i], v0_out[i]) + bitdiff(tmps[i], v0_tmp[i]) for i in range(LAYERS))
+            return (sum(bitdiff(tmps[i], v0_tmp[i]) for i in range(LAYERS)),
+                    sum(bitdiff(outs[i], v0_out[i]) for i in range(LAYERS)))
         wr = wagg_run(g, WAGG * (3 if M == 1 else 1), check_v0)
         del g
         results["wagg"].setdefault(M, {})["V0_tma_a_control"] = wr
@@ -382,6 +396,17 @@ for M in MS:
         g = capture([lambda i=i: old_f(i) for i in range(LAYERS)])
         tim["chain_old_tma_a"] = time_graph(g, LAYERS)
         del g
+
+        # main's chain with only K3 switched (K3-only landing): K1 -> TMA-A K2 -> K3 arm
+        for an, arm in ARMS.items():
+            def mk3(i, arm=arm):
+                k1(store=False)
+                W.wo_a_dense_gemm_mxfp8(xq, ws[i].wa_b12x, out=tmps[i], alpha=alpha, expected_m=M,
+                                        sfb_k_replicated=True)
+                k3(tmps[i], ws[i], outs[i], M, arm)
+            g = capture([lambda i=i: mk3(i) for i in range(LAYERS)])
+            tim[f"chain_mainK2_K3{an}"] = time_graph(g, LAYERS)
+            del g
         g = capture([lambda: k1() for _ in range(LAYERS)])
         tim["K1_store_bf16"] = time_graph(g, LAYERS)
         del g
