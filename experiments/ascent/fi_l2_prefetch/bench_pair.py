@@ -24,6 +24,14 @@ sys.path.insert(0, os.path.join(HERE, "..", "fi_decode_moe_census"))
 
 import torch  # noqa: E402
 
+import common as _common  # noqa: E402
+
+# BENCH_SHAPE=ep2tp2: one rank of EP2 x TP2 (192 local experts, inter 1152 per rank: fc1
+# 9 tiles/expert) instead of EP4 (96 x 2304: 18 tiles/expert).  Patch before census and the
+# names below are imported.
+if os.environ.get("BENCH_SHAPE", "ep4") == "ep2tp2":
+    _common.E, _common.I = 192, 1152
+
 from common import E, H, log, make_routing, make_weights, trtllm_layout  # noqa: E402
 
 TAG = os.environ.get("BENCH_TAG", "RUN")
