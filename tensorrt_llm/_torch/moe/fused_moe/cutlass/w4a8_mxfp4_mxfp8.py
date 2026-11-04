@@ -29,6 +29,17 @@ from .base import CutlassFusedMoEBase, FusedMoeOpFlags, quantize_input_mxfp8
 from .eligibility import HP_DTYPES, SmSupport, check_cutlass_leaf
 from .identity import cutlass_descriptor
 
+#: CUTLASS calls (more tokens than the FlashInfer decode chain takes) of at most this many host-known
+#: tokens hand the BF16 activations straight to ``fused_moe``: its row expansion (expandInputRowsKernel,
+#: need_mxfp8_quant) quantizes them to MXFP8 with the same cvt_warp_fp16_to_mxfp8 the standalone
+#: ``mxfp8_quantize`` kernel uses, so one launch per layer (and the FP8 copy's write + re-read) goes away,
+#: bitwise. Negative (the default) folds at every CUTLASS token count; 0 disables the fold.
+_MXFP8_FOLD_MAX_TOKENS = int(os.environ.get("TRTLLM_MOE_MXFP8_QUANT_FOLD_MAX_TOKENS", "-1"))
+#: ... and of at least this many: below it the fold's measured gain is within run-to-run noise
+#: (SM120 EP4 rank, M=128 paired runs read 2-4% slower cross-process), so small prefill chunks keep the
+#: standalone quant.
+_MXFP8_FOLD_MIN_TOKENS = int(os.environ.get("TRTLLM_MOE_MXFP8_QUANT_FOLD_MIN_TOKENS", "1024"))
+
 
 @register_moe_impl
 class TrtllmCutlassW4a8Mxfp4Mxfp8Impl(CutlassFusedMoEBase):
@@ -157,11 +168,27 @@ class TrtllmCutlassW4a8Mxfp4Mxfp8Impl(CutlassFusedMoEBase):
             and 0 < x.shape[0] <= self._fi_max_tokens()
         )
 
+    def _folds_quant_into_cutlass(self, x) -> bool:
+        """BF16 call above the FlashInfer decode range whose MXFP8 quant ``fused_moe`` does in-kernel."""
+        if _MXFP8_FOLD_MAX_TOKENS == 0 or not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
+            return False
+        m = x.shape[0] if x.dim() == 2 else 0
+        return (
+            m > self._fi_max_tokens()
+            and m >= _MXFP8_FOLD_MIN_TOKENS
+            and (_MXFP8_FOLD_MAX_TOKENS < 0 or m <= _MXFP8_FOLD_MAX_TOKENS)
+            and x.shape[1] == self.hidden_size
+            and x.shape[1] % self.quant_method.weight_alignment == 0
+            and self.unpadded_hidden_size in (None, self.hidden_size)
+            and x.is_contiguous()
+        )
+
     def quantize_input(self, x, post_quant_comm: bool = True, **kwargs):
         """MXFP8-quantize for CUTLASS; hand decode calls through in BF16 when they take the
-        FlashInfer chain, which quantizes them itself. Calls followed by communication
-        (``post_quant_comm``) always quantize here."""
-        if not post_quant_comm and self._takes_fi_decode(x):
+        FlashInfer chain, which quantizes them itself, and CUTLASS calls above that range in
+        BF16 too: ``fused_moe``'s row expansion quantizes them in-kernel, bitwise as here.
+        Calls followed by communication (``post_quant_comm``) always quantize here."""
+        if not post_quant_comm and (self._takes_fi_decode(x) or self._folds_quant_into_cutlass(x)):
             return x, None
         return quantize_input_mxfp8(self, x, post_quant_comm=post_quant_comm, **kwargs)
 
