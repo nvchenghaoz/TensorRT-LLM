@@ -131,7 +131,10 @@ def main():
                 res[mode] = rec
                 del g1, gc
             off, on = res["0"], res["1"]
-            s_exp = max(1, min(188 // max(T, 1), split_k.max_splits(), 10))
+            s_exp = 1  # the kernel's rule: largest c in [S_min, S_max] with c*T <= 188
+            for c in range(split_k.min_splits(), split_k.max_splits() + 1):
+                if c * T <= 188 and c <= 10:
+                    s_exp = c
             fc1_bitwise = torch.equal(off["q1"], on["q1"]) and torch.equal(off["sf1"], on["sf1"])
             q_diff = (off["q1"].float() - on["q1"].float()).abs().max().item()
             row = {"M": m, "D": d, "T": T, "S": s_exp,
