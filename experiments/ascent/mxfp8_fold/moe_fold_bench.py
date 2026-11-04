@@ -141,6 +141,11 @@ def phase(p, ms, ff):
     with autotune():
         p.run(x, sel, sc, fold=False)
     torch.cuda.synchronize()
+    # Tuned tactic per (gemm, M bucket): cross-process timing differences at small M can come from a
+    # different tactic pick here (2 GEMM_1 / 2-4 GEMM_2 tactics with close times), not from the fold.
+    picks = sorted((k[0].rsplit(":", 1)[-1], k[3][0][0], v[1]) for k, v in AutoTuner.get().profiling_cache.cache.items()
+                   if k[0].startswith("trtllm::fused_moe"))
+    log("tuned tactics (gemm, M bucket, tactic):", picks)
 
 
 def rel_err(a, b):
