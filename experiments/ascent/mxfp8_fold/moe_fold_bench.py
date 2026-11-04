@@ -38,8 +38,9 @@ try:
     from tensorrt_llm._torch.moe.fused_moe.cutlass import w4a8_mxfp4_mxfp8 as _leaf
 
     FOLD_MAX = getattr(_leaf, "_MXFP8_FOLD_MAX_TOKENS", 0)
+    FOLD_MIN = getattr(_leaf, "_MXFP8_FOLD_MIN_TOKENS", 0)
 except Exception:  # pragma: no cover
-    FOLD_MAX = 0
+    FOLD_MAX, FOLD_MIN = 0, 0
 if FOLD_MAX < 0:
     FOLD_MAX = 1 << 30  # fold at every M
 
@@ -200,7 +201,7 @@ def main():
         phase(p, ms, False)
         dets, shas = {}, {}
         for m in ms:
-            fold = m <= FOLD_MAX
+            fold = FOLD_MIN <= m <= FOLD_MAX  # what this tree's leaf runs at m
             x, sel, sc = p.inputs(m)
             det = p.run(x, sel, sc, fold).clone()
             assert torch.equal(det, p.run(x, sel, sc, fold)), f"unfused finalize not deterministic at M={m}"
@@ -216,7 +217,7 @@ def main():
         phase(p, ms, True)
         res = {}
         for m in ms:
-            fold = m <= FOLD_MAX
+            fold = FOLD_MIN <= m <= FOLD_MAX  # what this tree's leaf runs at m
             x, sel, sc = p.inputs(m)
             ref = p.run(x, sel, sc, fold).clone()
             med, noise, g, out = graph_time(lambda: p.run(x, sel, sc, fold))

@@ -40,7 +40,7 @@ import torch  # noqa: E402
 T0 = time.time()
 H, I, E, E_GLOBAL, TOPK, LIMIT = 5120, 2304, 96, 384, 6, 10.0
 WARM, REPS, REPLAYS = 3, 20, 45
-MS = [1, 2, 4, 8, 32, 33, 128, 2048, 6144]
+MS = [1, 2, 4, 8, 32, 33, 128, 1023, 1024, 2048, 6144]
 
 
 def log(*a):
@@ -249,7 +249,8 @@ def main():
     avail, why = fi_decode_available()
     log("gpu", torch.cuda.get_device_name(), "fold in tree:", has_fold, "fi avail:", avail, why,
         "FI_DECODE_MAX_TOKENS", FI_DECODE_MAX_TOKENS, "fold max", getattr(leaf_mod, "_MXFP8_FOLD_MAX_TOKENS", None))
-    res.update(fold_in_tree=has_fold, fi_available=avail, fi_max_tokens=FI_DECODE_MAX_TOKENS)
+    fold_min = getattr(leaf_mod, "_MXFP8_FOLD_MIN_TOKENS", 0)
+    res.update(fold_in_tree=has_fold, fi_available=avail, fi_max_tokens=FI_DECODE_MAX_TOKENS, fold_min_tokens=fold_min)
     if not (avail and has_fold):
         print(json.dumps({"passed": False, "error": f"fi_available={avail} ({why}) fold={has_fold}"}))
         sys.exit(1)
@@ -303,6 +304,9 @@ def main():
             route = probe.summary()
             if fi_path:
                 route_ok = route["fi_chain_calls"] == 1 and route["mxfp8_quantize_calls"] == 0 and not route["fused_moe_calls"]
+            elif m < fold_min:  # below the fold gate: main's standalone quant + fused_moe(fp8)
+                route_ok = (route["fi_chain_calls"] == 0 and route["mxfp8_quantize_calls"] == 1
+                            and route["fused_moe_calls"] == [("torch.float8_e4m3fn", False)])
             else:
                 route_ok = (route["fi_chain_calls"] == 0 and route["mxfp8_quantize_calls"] == 0
                             and route["fused_moe_calls"] == [("torch.bfloat16", True)])
