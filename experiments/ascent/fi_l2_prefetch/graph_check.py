@@ -63,11 +63,16 @@ def main():
     ok = True
     rows = []
     g_cpu = torch.Generator().manual_seed(5)
+    cases = []
     for m in range(1, 33):
         x = torch.randn(m, H, dtype=torch.bfloat16, device="cuda")
         ids = torch.stack([torch.randperm(E_GLOBAL, generator=g_cpu)[:TOPK] for _ in range(m)])
-        ids = ids.to(torch.int32).cuda()
-        w = (torch.rand(m, TOPK, generator=g_cpu) + 0.1).float().cuda()
+        cases.append((m, x, ids.to(torch.int32).cuda(),
+                      (torch.rand(m, TOPK, generator=g_cpu) + 0.1).float().cuda()))
+    # mode "0" = the unsplit kernel (main's math): its replay-vs-eager deviation is fc2's
+    # scatter-add order (main's own nondeterminism), the yardstick for mode "1".
+    for mode, (m, x, ids, w) in [(md, c) for md in ("0", "1") for c in cases]:
+        os.environ["TRTLLM_SM12X_FI_SPLITK"] = mode
         eager = st.run(x, ids, w).clone()
         torch.cuda.synchronize()
         holder = {}
@@ -87,6 +92,7 @@ def main():
         good = captured
         max_err = 0.0
         cnt_zero = True
+        amax = max(eager.float().abs().max().item(), 1e-6)
         if captured:
             for _ in range(4):
                 g.replay()
@@ -94,15 +100,17 @@ def main():
                 cnt_zero &= int(cnt.abs().sum().item()) == 0
                 o = holder["o"]
                 max_err = max(max_err, (o.float() - eager.float()).abs().max().item())
-                good &= bool(torch.allclose(o.float(), eager.float(), rtol=1.6e-2, atol=1.6e-2))
                 good &= bool(torch.isfinite(o).all().item())
             del g
+        rel = max_err / amax
+        good &= rel <= 1.6e-2
         good &= cnt_zero
         ok &= good
-        rows.append({"M": m, "captured": captured, "counters_zero": cnt_zero,
-                     "max_abs_vs_eager": max_err, "pass": good})
-        log(f"GRAPH M={m}: captured {captured} counters_zero {cnt_zero} max|replay-eager| "
-            f"{max_err:.4g} pass {good}")
+        rows.append({"mode": mode, "M": m, "captured": captured, "counters_zero": cnt_zero,
+                     "max_abs_vs_eager": max_err, "rel_to_absmax": round(rel, 5), "pass": good})
+        log(f"GRAPH split={mode} M={m}: captured {captured} counters_zero {cnt_zero} "
+            f"max|replay-eager| {max_err:.4g} (/absmax {rel:.2e}) pass {good}")
+    os.environ["TRTLLM_SM12X_FI_SPLITK"] = "1"
 
     poison = []
     for m, d in ((1, 1), (4, 1), (4, 2), (2, 2)):
