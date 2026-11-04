@@ -28,6 +28,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..deepseek_v4.module import project_sparse_attn_output
 from .compressor import CSA2Compressor
+from .low_m_gemm import low_m_mm
 from .metadata import CSA2TrtllmMetadata
 from .params import (
     CSA2BackendForwardArgs,
@@ -403,8 +404,11 @@ class DeepseekV41Attention(nn.Module):
         if not self._shared_mxfp8_active(hidden_states):
             qr = self.q_norm(self.wq_a(hidden_states))
             return qr, self.wq_b(qr), self.wkv(hidden_states), None
-        act, act_scale = torch.ops.trtllm.mxfp8_quantize(hidden_states.contiguous(), True)
-        rows = self._mxfp8_mm(act, act_scale, *self._wq_a_wkv)
+        # SM120 decode: fused activation quantization + low-M GEMM (None -> quantize + GEMM).
+        rows = low_m_mm(hidden_states, *self._wq_a_wkv)
+        if rows is None:
+            act, act_scale = torch.ops.trtllm.mxfp8_quantize(hidden_states.contiguous(), True)
+            rows = self._mxfp8_mm(act, act_scale, *self._wq_a_wkv)
         q_rank = self.wq_a.weight.shape[0]
         # Strided views for M > 1: the RMSNorm and the SWA row store take a row stride.
         qr = self.q_norm(rows[:, :q_rank])

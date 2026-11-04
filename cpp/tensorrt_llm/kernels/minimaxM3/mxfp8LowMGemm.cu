@@ -846,14 +846,28 @@ struct QoutArgs
     uint8_t* xq;    // [M, K] e4m3 bytes, or null
     uint8_t* xsf;   // 128x4-swizzled UE8M0 scales, or null
     int sf_k_tiles; // ceil(K / 128)
+    unsigned long long* ts; // debug: per-CTA %globaltimer at 5 phase points, or null
+    int flags;              // debug: bit 0 skips griddepcontrol.wait (negative control of the PDL checks only)
 };
+
+__device__ __forceinline__ void csa2_stamp(QoutArgs const& q, int point)
+{
+    if (q.ts != nullptr && threadIdx.x == 0)
+    {
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        q.ts[blockIdx.x * 5 + point] = t;
+    }
+}
 
 __device__ __forceinline__ int csa2_sf_offset(int m, int kb, int sf_k_tiles)
 {
     return (m / 128) * sf_k_tiles * 512 + (kb / 4) * 512 + (m % 32) * 16 + ((m % 128) / 32) * 4 + kb % 4;
 }
 
-template <int WARPS, int CLUSTER_K, int RT>
+// STAGES: the CTA's K slice is split into STAGES consecutive sub-slices, each bulk-copied (in order) onto its own
+// mbarrier; all warps consume stage s while later stages are still arriving.
+template <int WARPS, int CLUSTER_K, int RT, int STAGES>
 __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_bfloat16 const* __restrict__ x,
     int ldx, int M, int N, int K, uint8_t const* __restrict__ w, uint8_t const* __restrict__ wsf, int num_k_tiles,
     __nv_bfloat16* __restrict__ out, int ldo, __nv_bfloat16* __restrict__ out2, int ldo2, int n_split,
@@ -864,7 +878,7 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     constexpr int kRows = 16 * RT;
     constexpr int kTile = kRows * 8;
     extern __shared__ __align__(128) uint8_t smem[];
-    __shared__ __align__(8) uint64_t bar;
+    __shared__ __align__(8) uint64_t bar[STAGES];
     __shared__ __align__(8) uint64_t red_bar;
 
     int rank = 0;
@@ -882,6 +896,7 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     int const warp = threadIdx.x / 32;
     int const lane = threadIdx.x % 32;
     int const live = kRows * M; // live outputs of this CTA
+    csa2_stamp(qout, 0);
 
     uint8_t* w_s = smem;                               // [kRows][row_stride]
     uint8_t* sf_s = w_s + kRows * row_stride;          // [RT][kc_blocks / 4][256]
@@ -890,19 +905,29 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     float* cluster_red = reinterpret_cast<float*>(xc_s + ((M * kc_blocks + 15) / 16) * 16); // [CK-1][kRows*M]
     float* red = red_aliased ? reinterpret_cast<float*>(w_s) : cluster_red + (CLUSTER_K - 1) * live;
 
-    uint32_t const w_bytes = kRows * kc;
-    uint32_t const sf_bytes = RT * (kc_blocks / 4) * 256u;
+    int const kcs = kc / STAGES;         // columns per stage
+    int const kcbs = kc_blocks / STAGES; // 32-blocks per stage
+    int const chunks_s = kcbs / 4;       // scale chunks per stage and row tile
+    uint32_t const stage_bytes = kRows * kcs + RT * chunks_s * 256u;
     if (threadIdx.x == 0)
     {
-        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(&bar)));
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+        {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(&bar[s])));
+        }
         if (CLUSTER_K > 1 && rank == 0)
         {
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(&red_bar)));
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
-        asm volatile(
-            "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(&bar)), "r"(w_bytes + sf_bytes)
-            : "memory");
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+        {
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(&bar[s])),
+                         "r"(stage_bytes)
+                         : "memory");
+        }
         if (CLUSTER_K > 1 && rank == 0)
         {
             asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(&red_bar)),
@@ -918,21 +943,30 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     // Weight rows and scale chunks do not depend on the producer kernel: stage them before the PDL wait.
     if (warp == 0)
     {
-        for (int r = lane; r < kRows; r += 32)
-        {
-            bulk_g2s(w_s + r * row_stride, w + static_cast<int64_t>(row0 + r) * K + k_begin, kc, &bar);
-        }
         int const chunks = kc_blocks / 4;
-        for (int t = lane; t < RT * chunks; t += 32)
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
         {
-            int const rt = t / chunks;
-            int const c = t % chunks;
-            int const rr = row0 + 16 * rt;
-            int64_t const sf_base = static_cast<int64_t>(rr / 128) * num_k_tiles * 512 + (rr % 32) * 16;
-            bulk_g2s(sf_s + t * 256, wsf + sf_base + static_cast<int64_t>(kb_begin / 4 + c) * 512, 256, &bar);
+            for (int r = lane; r < kRows; r += 32)
+            {
+                bulk_g2s(w_s + r * row_stride + s * kcs, w + static_cast<int64_t>(row0 + r) * K + k_begin + s * kcs,
+                    kcs, &bar[s]);
+            }
+            for (int t = lane; t < RT * chunks_s; t += 32)
+            {
+                int const rt = t / chunks_s;
+                int const c = s * chunks_s + t % chunks_s;
+                int const rr = row0 + 16 * rt;
+                int64_t const sf_base = static_cast<int64_t>(rr / 128) * num_k_tiles * 512 + (rr % 32) * 16;
+                bulk_g2s(sf_s + (rt * chunks + c) * 256, wsf + sf_base + static_cast<int64_t>(kb_begin / 4 + c) * 512,
+                    256, &bar[s]);
+            }
         }
     }
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if ((qout.flags & 1) == 0)
+    {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
     if (preq.xq != nullptr)
     {
         int const vec_per_row = kc / 16;
@@ -1041,18 +1075,25 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
             qout.xsf[csa2_sf_offset(m, kb_begin + b, qout.sf_k_tiles)] = xc_s[m * kc_blocks + b];
         }
     }
-    mbar_wait(&bar, 0);
+    csa2_stamp(qout, 1);
 
     int const g = lane >> 2;
     int const j = lane & 3;
     int const col0 = 2 * j;
-    int const bpw = kc_blocks / WARPS;
+    int const bps = kcbs / WARPS; // blocks per warp and stage
     int const chunks = kc_blocks / 4;
     float acc[RT][4] = {};
-#pragma unroll 2
-    for (int i = 0; i < bpw; ++i)
+    for (int s = 0; s < STAGES; ++s)
     {
-        int const b = warp * bpw + i;
+    mbar_wait(&bar[s], 0);
+    if (s == 0)
+    {
+        csa2_stamp(qout, 2);
+    }
+#pragma unroll 2
+    for (int i = 0; i < bps; ++i)
+    {
+        int const b = s * kcbs + warp * bps + i;
         int const kb = kb_begin + b;
         uint2 const xb = g < M ? *reinterpret_cast<uint2 const*>(xq_s + g * kc + b * 32 + 8 * j) : make_uint2(0, 0);
         float const xs0 = col0 < M ? pow2_from_ue8m0(xc_s[col0 * kc_blocks + b]) : 0.f;
@@ -1075,6 +1116,8 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
             acc[rt][3] += d[3] * (wsb * xs1);
         }
     }
+    }
+    csa2_stamp(qout, 3);
     asm volatile("griddepcontrol.launch_dependents;");
     if (red_aliased)
     {
@@ -1157,6 +1200,8 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
                          : "memory");
         }
     }
+    __syncthreads();
+    csa2_stamp(qout, 4);
 #endif
 }
 
@@ -1173,22 +1218,22 @@ size_t csa2SmemBytes(int warps, int clusterK, int rowTiles, int m, int k)
         + (aliased ? 0 : red_bytes);
 }
 
-template <int WARPS, int CLUSTER_K, int RT>
+template <int WARPS, int CLUSTER_K, int RT, int STAGES>
 void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t const* w, uint8_t const* wsf,
     __nv_bfloat16* out, int ldo, __nv_bfloat16* out2, int ldo2, int nSplit, PreqArgs preq, QoutArgs qout, bool pdl,
     cudaStream_t stream)
 {
     int const kc = K / CLUSTER_K;
     int const kc_blocks = kc / 32;
-    TLLM_CHECK_WITH_INFO(N % (16 * RT) == 0 && K % (CLUSTER_K * 128) == 0 && kc_blocks % WARPS == 0
-            && nSplit % (16 * RT) == 0,
-        "csa2_mxfp8_low_m_gemm: unsupported shape N=%d K=%d n_split=%d for (%d, %d, %d)", N, K, nSplit, WARPS,
-        CLUSTER_K, RT);
+    TLLM_CHECK_WITH_INFO(N % (16 * RT) == 0 && K % (CLUSTER_K * 128) == 0 && kc_blocks % (WARPS * STAGES) == 0
+            && (kc_blocks / STAGES) % 4 == 0 && nSplit % (16 * RT) == 0,
+        "csa2_mxfp8_low_m_gemm: unsupported shape N=%d K=%d n_split=%d for (%d, %d, %d, %d)", N, K, nSplit, WARPS,
+        CLUSTER_K, RT, STAGES);
     size_t const w_bytes = 16 * RT * (kc + kRowPad);
     size_t const red_bytes = static_cast<size_t>(WARPS) * 16 * RT * 8 * sizeof(float);
     int const red_aliased = red_bytes <= w_bytes ? 1 : 0;
     size_t const smem = csa2SmemBytes(WARPS, CLUSTER_K, RT, M, K);
-    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT>;
+    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, STAGES>;
     static bool const configured = [&]()
     {
         int device = 0, max_optin = 0;
@@ -1245,14 +1290,17 @@ void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t co
 
 } // namespace
 
+// (warps, cluster_k, row_tiles, stages)
 #define CSA2_LOW_M_CONFIGS(X)                                                                                          \
-    X(4, 8, 1) X(4, 8, 2) X(4, 4, 1) X(4, 4, 2) X(4, 2, 1) X(4, 2, 2) X(4, 2, 4) X(4, 1, 1) X(4, 1, 2) X(4, 1, 4)      \
-        X(8, 4, 1) X(8, 4, 2) X(8, 2, 2) X(8, 2, 4) X(8, 1, 2) X(8, 1, 4)
+    X(4, 8, 1, 1) X(4, 8, 2, 1) X(4, 4, 1, 1) X(4, 4, 2, 1) X(4, 2, 1, 1) X(4, 2, 2, 1) X(4, 2, 4, 1) X(4, 1, 1, 1)    \
+        X(4, 1, 2, 1) X(4, 1, 4, 1) X(8, 4, 1, 1) X(8, 4, 2, 1) X(8, 2, 2, 1) X(8, 2, 4, 1) X(8, 1, 2, 1)              \
+            X(8, 1, 4, 1) X(8, 2, 2, 2) X(4, 2, 2, 2) X(4, 2, 2, 4) X(4, 4, 2, 2) X(4, 4, 1, 2) X(4, 1, 2, 2)          \
+                X(4, 1, 1, 2) X(4, 1, 4, 2)
 
-bool isCsa2Mxfp8LowMGemmSupported(int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m)
+bool isCsa2Mxfp8LowMGemmSupported(int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t stages)
 {
     bool built = false;
-#define CSA2_IS_BUILT(W, C, R) built = built || (warps == W && clusterK == C && rowTiles == R);
+#define CSA2_IS_BUILT(W, C, R, S) built = built || (warps == W && clusterK == C && rowTiles == R && stages == S);
     CSA2_LOW_M_CONFIGS(CSA2_IS_BUILT)
 #undef CSA2_IS_BUILT
     return built && m >= 1 && m <= 8;
@@ -1266,18 +1314,18 @@ size_t csa2Mxfp8LowMGemmSmemBytes(int32_t warps, int32_t clusterK, int32_t rowTi
 void invokeCsa2Mxfp8LowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t n, int32_t k, uint8_t const* w,
     uint8_t const* wsf, __nv_bfloat16* out, int32_t ldo, __nv_bfloat16* out2, int32_t ldo2, int32_t nSplit,
     uint8_t const* xq, uint8_t const* xsf, uint8_t* xqOut, uint8_t* xsfOut, int32_t warps, int32_t clusterK,
-    int32_t rowTiles, bool pdl, cudaStream_t stream)
+    int32_t rowTiles, bool pdl, cudaStream_t stream, unsigned long long* dbgTs, int32_t stages, int32_t debugFlags)
 {
-    TLLM_CHECK_WITH_INFO(isCsa2Mxfp8LowMGemmSupported(warps, clusterK, rowTiles, m),
-        "csa2_mxfp8_low_m_gemm: unsupported configuration (warps %d, cluster_k %d, row_tiles %d) at M=%d", warps,
-        clusterK, rowTiles, m);
+    TLLM_CHECK_WITH_INFO(isCsa2Mxfp8LowMGemmSupported(warps, clusterK, rowTiles, m, stages),
+        "csa2_mxfp8_low_m_gemm: unsupported configuration (warps %d, cluster_k %d, row_tiles %d, stages %d) at M=%d",
+        warps, clusterK, rowTiles, stages, m);
     int const sfKTiles = (k / 32 + 3) / 4;
     PreqArgs const preq{xq, xsf, sfKTiles};
-    QoutArgs const qout{xqOut, xsfOut, sfKTiles};
-#define CSA2_DISPATCH(W, C, R)                                                                                         \
-    if (warps == W && clusterK == C && rowTiles == R)                                                                  \
+    QoutArgs const qout{xqOut, xsfOut, sfKTiles, dbgTs, debugFlags};
+#define CSA2_DISPATCH(W, C, R, S)                                                                                      \
+    if (warps == W && clusterK == C && rowTiles == R && stages == S)                                                   \
     {                                                                                                                  \
-        launchCsa2<W, C, R>(x, ldx, m, n, k, w, wsf, out, ldo, out2, ldo2, nSplit, preq, qout, pdl, stream);           \
+        launchCsa2<W, C, R, S>(x, ldx, m, n, k, w, wsf, out, ldo, out2, ldo2, nSplit, preq, qout, pdl, stream);        \
         return;                                                                                                        \
     }
     CSA2_LOW_M_CONFIGS(CSA2_DISPATCH)

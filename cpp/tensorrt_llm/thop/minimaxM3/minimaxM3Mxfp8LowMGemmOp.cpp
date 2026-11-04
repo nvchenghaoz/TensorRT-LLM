@@ -79,7 +79,8 @@ torch::Tensor minimaxM3Mxfp8LowMGemm(torch::Tensor const& x, torch::Tensor const
 //! @param xqOut, xsfOut optional buffers receiving the in-kernel quantized activation in that layout.
 std::vector<torch::Tensor> csa2Mxfp8LowMGemm(torch::Tensor const& x, torch::Tensor const& w, torch::Tensor const& wsf,
     int64_t warps, int64_t clusterK, int64_t rowTiles, int64_t nSplit, bool pdl, std::optional<torch::Tensor> xq,
-    std::optional<torch::Tensor> xsf, std::optional<torch::Tensor> xqOut, std::optional<torch::Tensor> xsfOut)
+    std::optional<torch::Tensor> xsf, std::optional<torch::Tensor> xqOut, std::optional<torch::Tensor> xsfOut,
+    std::optional<torch::Tensor> dbgTs, int64_t stages, int64_t debugFlags)
 {
     int const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 120, "csa2_mxfp8_low_m_gemm requires SM120, got SM", sm);
@@ -101,9 +102,10 @@ std::vector<torch::Tensor> csa2Mxfp8LowMGemm(torch::Tensor const& x, torch::Tens
         reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(wsf.data_ptr()) % 16 == 0,
         "w and wsf must be 16-byte aligned");
     TORCH_CHECK(tensorrt_llm::kernels::isCsa2Mxfp8LowMGemmSupported(static_cast<int32_t>(warps),
-                    static_cast<int32_t>(clusterK), static_cast<int32_t>(rowTiles), static_cast<int32_t>(m)),
+                    static_cast<int32_t>(clusterK), static_cast<int32_t>(rowTiles), static_cast<int32_t>(m),
+                    static_cast<int32_t>(stages)),
         "csa2_mxfp8_low_m_gemm: unsupported configuration (warps ", warps, ", cluster_k ", clusterK, ", row_tiles ",
-        rowTiles, ") at M=", m);
+        rowTiles, ", stages ", stages, ") at M=", m);
     TORCH_CHECK(nSplit >= 0 && nSplit < n, "n_split must be in [0, N)");
     int64_t const sfActNeed = (m + 127) / 128 * 128 * ((k / 32 + 3) / 4 * 4);
     TORCH_CHECK(xq.has_value() == xsf.has_value(), "xq and xsf come together");
@@ -147,7 +149,9 @@ std::vector<torch::Tensor> csa2Mxfp8LowMGemm(torch::Tensor const& x, torch::Tens
         xqOut.has_value() ? reinterpret_cast<uint8_t*>(xqOut->data_ptr()) : nullptr,
         xsfOut.has_value() ? reinterpret_cast<uint8_t*>(xsfOut->data_ptr()) : nullptr, static_cast<int32_t>(warps),
         static_cast<int32_t>(clusterK), static_cast<int32_t>(rowTiles), pdl && tensorrt_llm::common::getEnvEnablePDL(),
-        at::cuda::getCurrentCUDAStream(x.get_device()));
+        at::cuda::getCurrentCUDAStream(x.get_device()),
+        dbgTs.has_value() ? reinterpret_cast<unsigned long long*>(dbgTs->data_ptr()) : nullptr,
+        static_cast<int32_t>(stages), static_cast<int32_t>(debugFlags));
     return outs;
 }
 
@@ -162,7 +166,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "bool pdl) -> Tensor");
     m.def(
         "csa2_mxfp8_low_m_gemm(Tensor x, Tensor w, Tensor wsf, int warps, int cluster_k, int row_tiles, int n_split, "
-        "bool pdl, Tensor? xq=None, Tensor? xsf=None, Tensor(a!)? xq_out=None, Tensor(b!)? xsf_out=None) -> Tensor[]");
+        "bool pdl, Tensor? xq=None, Tensor? xsf=None, Tensor(a!)? xq_out=None, Tensor(b!)? xsf_out=None, "
+        "Tensor(c!)? dbg_ts=None, int stages=1, int debug_flags=0) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
