@@ -39,7 +39,8 @@ import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
-_DEFAULT_NUM_WARPS = 8
+# Fastest for every P in graph replays at M=1..8 (job 793: 3.9-4.2 us; 5.1 us at P=96).
+_DEFAULT_NUM_WARPS = 4
 
 
 @triton.jit
@@ -85,6 +86,57 @@ def _lane0_butterfly(scr, w):
 
 
 @triton.jit
+def _k1_chunk(i: tl.constexpr, t, v4, h2, xbase, rbase, post_ptr, comb_ptr, pre_ptr, tok, P: tl.constexpr,
+              NCHUNK: tl.constexpr, HIDDEN: tl.constexpr, P_PAD: tl.constexpr):
+    """Chunk i of every thread t (elements 8 * (i * P + t) + [0, 8)): bf16 li [P_PAD, 4, 2]."""
+    chunk = i * P + t
+    cm = (t < P) & (chunk < NCHUNK)
+    offs = chunk[:, None, None] * 8 + v4[None, :, None] * 2 + h2[None, None, :]  # [P_PAD, 4, 2]
+    m3 = cm[:, None, None] & (v4[None, :, None] < 4) & (h2[None, None, :] < 2)
+    x = tl.load(xbase + offs, mask=m3, other=0.0).to(tl.float32)
+    r0 = tl.load(rbase + offs, mask=m3, other=0.0).to(tl.float32)
+    r1 = tl.load(rbase + HIDDEN + offs, mask=m3, other=0.0).to(tl.float32)
+    r2 = tl.load(rbase + 2 * HIDDEN + offs, mask=m3, other=0.0).to(tl.float32)
+    r3 = tl.load(rbase + 3 * HIDDEN + offs, mask=m3, other=0.0).to(tl.float32)
+    li = tl.zeros([P_PAD, 4, 2], dtype=tl.float32)
+    for j in tl.static_range(4):
+        # new_r[j] = post[j] * x, then fma(comb[k][j], r[k], .) for k = 0..3 (pmap order).
+        nr = tl.load(post_ptr + tok * 4 + j) * x
+        nr = tl.fma(tl.load(comb_ptr + tok * 16 + 0 * 4 + j), r0, nr)
+        nr = tl.fma(tl.load(comb_ptr + tok * 16 + 1 * 4 + j), r1, nr)
+        nr = tl.fma(tl.load(comb_ptr + tok * 16 + 2 * 4 + j), r2, nr)
+        nr = tl.fma(tl.load(comb_ptr + tok * 16 + 3 * 4 + j), r3, nr)
+        nr = nr.to(tl.bfloat16).to(tl.float32)
+        # Lagged collapse: fma from 0 over j = 0..3 with the previous sublayer's pre.
+        li = tl.fma(tl.load(pre_ptr + tok * 4 + j), nr, li)
+    return li.to(tl.bfloat16), offs, m3
+
+
+@triton.jit
+def _k1_sumsq(li_b, s, P_PAD: tl.constexpr):
+    """s += fma(x, x, y * y) for pairs v = 0, 1, 2, 3 of the chunk, in that order."""
+    lx, ly = tl.split(li_b.to(tl.float32))  # [P_PAD, 4]
+    term = tl.fma(lx, lx, ly * ly)
+    t_even, t_odd = tl.split(tl.reshape(term, [P_PAD, 2, 2]))  # (v0, v2), (v1, v3)
+    tv0, tv2 = tl.split(t_even)
+    tv1, tv3 = tl.split(t_odd)
+    s = s + tv0
+    s = s + tv1
+    s = s + tv2
+    s = s + tv3
+    return s
+
+
+@triton.jit
+def _k1_norm(li_b, nw_b, rstd3, DEBUG: tl.constexpr):
+    if DEBUG == 2:
+        res = li_b  # test-only: the unnormalized collapse
+    else:
+        res = ((li_b.to(tl.float32) * rstd3) * nw_b.to(tl.float32)).to(tl.bfloat16)
+    return res
+
+
+@triton.jit
 def _mhc_lagged_layer_input_kernel(
     x_ptr,
     res_ptr,
@@ -114,47 +166,35 @@ def _mhc_lagged_layer_input_kernel(
     NCHUNK: tl.constexpr = HIDDEN // 8
 
     t = tl.arange(0, P_PAD)
-    e = tl.arange(0, 8)
+    v4 = tl.arange(0, 4)
+    h2 = tl.arange(0, 2)
     obase = out_ptr + tok * HIDDEN
     xbase = x_ptr + tok * HIDDEN
     rbase = res_ptr + tok * (4 * HIDDEN)
-
-    # ---- pass 1: post update + lagged collapse -> bf16 li (staged in out) ----
-    for i in tl.static_range(NI):
-        chunk = i * P + t
-        cm = (t < P) & (chunk < NCHUNK)
-        offs = chunk[:, None] * 8 + e[None, :]  # [P_PAD, 8]
-        m2 = cm[:, None] & (e[None, :] < 8)
-        x = tl.load(xbase + offs, mask=m2, other=0.0).to(tl.float32)
-        r0 = tl.load(rbase + offs, mask=m2, other=0.0).to(tl.float32)
-        r1 = tl.load(rbase + HIDDEN + offs, mask=m2, other=0.0).to(tl.float32)
-        r2 = tl.load(rbase + 2 * HIDDEN + offs, mask=m2, other=0.0).to(tl.float32)
-        r3 = tl.load(rbase + 3 * HIDDEN + offs, mask=m2, other=0.0).to(tl.float32)
-        li = tl.zeros([P_PAD, 8], dtype=tl.float32)
-        for j in tl.static_range(4):
-            pj = tl.load(post_ptr + tok * 4 + j)
-            # new_r[j] = post[j] * x, then fma(comb[k][j], r[k], .) for k = 0..3 (pmap order).
-            nr = pj * x
-            nr = tl.fma(tl.load(comb_ptr + tok * 16 + 0 * 4 + j), r0, nr)
-            nr = tl.fma(tl.load(comb_ptr + tok * 16 + 1 * 4 + j), r1, nr)
-            nr = tl.fma(tl.load(comb_ptr + tok * 16 + 2 * 4 + j), r2, nr)
-            nr = tl.fma(tl.load(comb_ptr + tok * 16 + 3 * 4 + j), r3, nr)
-            nr = nr.to(tl.bfloat16).to(tl.float32)
-            # Lagged collapse: fma from 0 over j = 0..3 with the previous sublayer's pre.
-            li = tl.fma(tl.load(pre_ptr + tok * 4 + j), nr, li)
-        tl.store(obase + offs, li.to(tl.bfloat16), mask=m2)
-    tl.debug_barrier()
-
-    # ---- per-thread partials: chunks t, t + P, ...; pairs v = 0..3; fma(x, x, y * y) ----
+    # ---- pass 1: post update + lagged collapse -> bf16 li, and the per-thread partials
+    # (chunks t, t + P, ...; pairs v = 0..3; s += fma(x, x, y * y)) with only elementwise ops
+    # and tl.split (pure data movement). Chunks 0..2 stay in registers; any further chunk
+    # (P = 96) is staged in `out` and reloaded in pass 2. ----
     s = tl.zeros([P_PAD], dtype=tl.float32)
-    for i in tl.static_range(NI):
-        chunk = i * P + t
-        cm = (t < P) & (chunk < NCHUNK)
-        cbase = obase + chunk * 8
-        for v in tl.static_range(4):
-            lx = tl.load(cbase + 2 * v, mask=cm, other=0.0).to(tl.float32)
-            ly = tl.load(cbase + 2 * v + 1, mask=cm, other=0.0).to(tl.float32)
-            s = s + tl.fma(lx, lx, ly * ly)
+    li0, o0, m0 = _k1_chunk(0, t, v4, h2, xbase, rbase, post_ptr, comb_ptr, pre_ptr, tok, P, NCHUNK, HIDDEN, P_PAD)
+    s = _k1_sumsq(li0, s, P_PAD)
+    nw0 = tl.load(nw_ptr + o0, mask=m0, other=0.0)
+    if NI > 1:
+        li1, o1, m1 = _k1_chunk(1, t, v4, h2, xbase, rbase, post_ptr, comb_ptr, pre_ptr, tok, P, NCHUNK,
+                                HIDDEN, P_PAD)
+        s = _k1_sumsq(li1, s, P_PAD)
+        nw1 = tl.load(nw_ptr + o1, mask=m1, other=0.0)
+    if NI > 2:
+        li2, o2, m2 = _k1_chunk(2, t, v4, h2, xbase, rbase, post_ptr, comb_ptr, pre_ptr, tok, P, NCHUNK,
+                                HIDDEN, P_PAD)
+        s = _k1_sumsq(li2, s, P_PAD)
+        nw2 = tl.load(nw_ptr + o2, mask=m2, other=0.0)
+    if NI > 3:
+        for i in tl.static_range(3, NI):
+            lik, ok, mk = _k1_chunk(i, t, v4, h2, xbase, rbase, post_ptr, comb_ptr, pre_ptr, tok, P, NCHUNK,
+                                    HIDDEN, P_PAD)
+            s = _k1_sumsq(lik, s, P_PAD)
+            tl.store(obase + ok, lik, mask=mk)
     sbase = scr_ptr + tok * SCR
     tl.store(sbase + t, s)
     tl.debug_barrier()
@@ -179,17 +219,22 @@ def _mhc_lagged_layer_input_kernel(
         tl.store(dbg_ptr + tok * 2 + z, total1)
         tl.store(dbg_ptr + tok * 2 + 1 + z, rstd)
 
-    # ---- pass 2: normalize the staged li in place ----
-    if DEBUG != 2:
-        rstd2 = tl.reshape(rstd, [1, 1])
-        for i in tl.static_range(NI):
+    # ---- pass 2: out = bf16((li * rstd) * w) ----
+    rstd3 = tl.reshape(rstd, [1, 1, 1])
+    tl.store(obase + o0, _k1_norm(li0, nw0, rstd3, DEBUG), mask=m0)
+    if NI > 1:
+        tl.store(obase + o1, _k1_norm(li1, nw1, rstd3, DEBUG), mask=m1)
+    if NI > 2:
+        tl.store(obase + o2, _k1_norm(li2, nw2, rstd3, DEBUG), mask=m2)
+    if NI > 3:
+        for i in tl.static_range(3, NI):
             chunk = i * P + t
             cm = (t < P) & (chunk < NCHUNK)
-            offs = chunk[:, None] * 8 + e[None, :]
-            m2 = cm[:, None] & (e[None, :] < 8)
-            li = tl.load(obase + offs, mask=m2, other=0.0).to(tl.float32)
-            nw = tl.load(nw_ptr + offs, mask=m2, other=0.0).to(tl.float32)
-            tl.store(obase + offs, ((li * rstd2) * nw).to(tl.bfloat16), mask=m2)
+            offs = chunk[:, None, None] * 8 + v4[None, :, None] * 2 + h2[None, None, :]
+            m3 = cm[:, None, None] & (v4[None, :, None] < 4) & (h2[None, None, :] < 2)
+            lik = tl.load(obase + offs, mask=m3, other=0.0)
+            nwk = tl.load(nw_ptr + offs, mask=m3, other=0.0)
+            tl.store(obase + offs, _k1_norm(lik, nwk, rstd3, DEBUG), mask=m3)
 
 
 _SPLIT_ENV_ON = os.environ.get("TRTLLM_MHC_SPLIT_LAGGED", "1") != "0"
