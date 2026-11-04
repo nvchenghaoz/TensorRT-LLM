@@ -246,6 +246,7 @@ class PrefixTokenCache:
         self._fingerprint = fingerprint if lcp_splice else None
         self._shared_path: str | None = None
         self._shared_seen: set[str] = set()  # file names loaded, published or rejected
+        self._shared_load_lock = threading.Lock()  # one directory scan at a time
         self.shared_loads = 0
         self.shared_publishes = 0
         self.shared_skipped = 0
@@ -335,8 +336,13 @@ class PrefixTokenCache:
                 base_token, base_char = entry.split_token, entry.split_char
                 base_entry = entry
         elif self._lcp_splice:
+            loads_seen = self.shared_loads
             cand = self._lcp_lookup(text)
-            if cand is None and self._fingerprint is not None and self._load_shared():
+            if (
+                cand is None
+                and self._fingerprint is not None
+                and self._load_shared(loads_seen)
+            ):
                 # Another process may already have tokenized this preamble.
                 cand = self._lcp_lookup(text)
             if cand is not None:
@@ -479,21 +485,32 @@ class PrefixTokenCache:
             f"{(time.perf_counter() - start) * 1e3:.2f} ms"
         )
 
-    def _load_shared(self) -> bool:
-        """Insert the shared entries not seen yet; whether any was inserted."""
+    def _load_shared(self, loads_seen: int) -> bool:
+        """Insert the shared entries not seen yet.
+
+        Returns whether any entry was inserted since ``shared_loads`` was
+        ``loads_seen``, by this thread or by a concurrent one: loads are
+        serialized, so a request that misses while another thread is loading
+        waits for it and then looks again instead of tokenizing in full.
+        """
         path = self._shared_dir()
         if path is None:
             return False
+        with self._shared_load_lock:
+            self._load_shared_locked(path)
+        return self.shared_loads > loads_seen
+
+    def _load_shared_locked(self, path: str) -> None:
+        """Caller holds ``_shared_load_lock``."""
         try:
             names = sorted(
                 e.name for e in os.scandir(path) if e.name.endswith(SHARED_SUFFIX)
             )
         except OSError:
-            return False
+            return
         with self._lock:
             fresh = [n for n in names if n not in self._shared_seen]
             self._shared_seen.update(fresh)
-        loaded = False
         for name in fresh:
             start = time.perf_counter()
             entry, why = self._read_shared(os.path.join(path, name))
@@ -508,12 +525,10 @@ class PrefixTokenCache:
             with self._lock:
                 self._insert(text, ids, split_token, split_char, grid)
                 self.shared_loads += 1
-            loaded = True
             logger.info(
                 f"Prefix token cache: pid {os.getpid()} loaded shared entry {name} "
                 f"from pid {src_pid} ({len(text)} chars, {len(ids)} ids) in {elapsed_ms:.2f} ms"
             )
-        return loaded
 
     def _read_shared(self, file: str) -> tuple[tuple | None, str]:
         """Parse and validate one shared file: ((text, ids, split_token, split_char, grid, pid), why)."""

@@ -98,6 +98,27 @@ def role_main(role, args):
         res["prime_exact"] = list(ids) == list(full)
         res["n_prime_ids"] = len(ids)
         res["publishes"] = cache.shared_publishes
+    elif role == "concurrent":
+        # Cold process, K threads miss at once (c2/c4 wave start on a cold pid).
+        import threading
+        k = int(args.get("k", 4))
+        barrier = threading.Barrier(k)
+        out = [None] * k
+
+        def work(i):
+            barrier.wait()
+            out[i] = cache.encode(tok, ps[1 + i])
+
+        ths = [threading.Thread(target=work, args=(i,)) for i in range(k)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+        bad = sum(list(out[i]) != list(tok(ps[1 + i], add_special_tokens=False)["input_ids"])
+                  for i in range(k))
+        res.update(k=k, mismatches=bad, full=cache._full_count, splices=cache.splices,
+                   shared_loads=cache.shared_loads, shared_publishes=cache.shared_publishes,
+                   splice_fallbacks=cache.splice_fallbacks, summary=cache.summary())
     else:
         bad, digest, times = 0, hashlib.sha1(), []
         first_loads = first_full = None
@@ -183,6 +204,15 @@ def check(ckpt):
             repeat_digest_equal=b1["digest"] == b2["digest"], n_files=len(files), fp=a["fp"],
         )
         ok &= c1
+        # 1b. concurrent cold misses in one fresh process: one load serves all.
+        conc = []
+        for rep in range(3):
+            r = run_role(ckpt, "concurrent", d1, k=4)
+            log(f"concurrent rep {rep}: {brief(r)}")
+            conc.append(bool(r["mismatches"] == 0 and r["full"] == 0 and r["splices"] == 4
+                             and r["shared_loads"] == 1 and r["shared_publishes"] == 0))
+        results["concurrent_cold"] = dict(passed=all(conc), reps=conc)
+        ok &= all(conc)
         good = files[0]
         with open(good, "rb") as f:
             data = f.read()
