@@ -277,6 +277,146 @@ if IS_FLASHINFER_AVAILABLE:
                 tactic=_b12x_tactic(tile_n))
             return out
 
+        # M > 32 (eager prefill) host trim of the CUTLASS path. Stock
+        # mm_mxfp8 pays, per call, the @backend_requirement checks, a new
+        # TunableRunner subclass, the runner-factory dict and AutoTuner
+        # .choose_one. Their result only depends on the shapes/dtypes and on
+        # the AutoTuner's state, so the first call per exact shape runs the
+        # stock path and records choose_one's tactic; later calls launch the
+        # same TVM-FFI mxfp8_gemm with that tactic and the same workspace.
+        # The memo is bypassed while the AutoTuner can choose per call
+        # (tuning mode, skip_ops/bucket overrides, autotune_v2 contexts) and
+        # is dropped whenever its caches change.
+        _CUTLASS_MEMO_MIN_M = _B12X_MAX_M + 1
+        _CUTLASS_MEMO_MAX_ENTRIES = 4096
+        _cutlass_memo: dict = {}
+        _cutlass_memo_state: list = [None, None]  # [tuner signature, deps]
+
+        def _cutlass_memo_deps():
+            """FlashInfer internals the memo needs; False when unavailable."""
+            deps = _cutlass_memo_state[1]
+            if deps is None:
+                try:
+                    import os
+                    from flashinfer.autotuner import AutoTuner
+                    from flashinfer.gemm.gemm_base import (
+                        _MM_MXFP8_TUNING_CONFIG, DEFAULT_WORKSPACE_SIZE,
+                        _load_gemm_sm120_mxfp8_module,
+                        get_cutlass_mxfp8_gemm_module)
+                    from flashinfer.utils import _get_cache_buf
+                    tuner = AutoTuner.get()
+                    # Probe every attribute the signature reads.
+                    (tuner.is_tuning_mode, tuner._in_v2_context,
+                     tuner._skip_ops_local, tuner._override_local,
+                     tuner._dirty_seq, tuner.profiling_cache,
+                     tuner._file_configs, tuner._managed_cache,
+                     tuner._winner_partitions, tuner._managed_decoded)
+                    deps = (AutoTuner, _MM_MXFP8_TUNING_CONFIG,
+                            DEFAULT_WORKSPACE_SIZE,
+                            _load_gemm_sm120_mxfp8_module,
+                            get_cutlass_mxfp8_gemm_module, _get_cache_buf)
+                    if os.environ.get("TRTLLM_FLASHINFER_MXFP8_MEMO",
+                                      "1") == "0":
+                        deps = False
+                except Exception:  # pragma: no cover - other flashinfer
+                    deps = False
+                _cutlass_memo_state[1] = deps
+            return deps
+
+        def _cutlass_tuner_signature(tuner):
+            """The AutoTuner state choose_one depends on, or None when it may
+            pick per call (then the stock path runs)."""
+            if tuner.is_tuning_mode or tuner._in_v2_context:
+                return None
+            if getattr(tuner._skip_ops_local, "stack", None):
+                return None
+            if getattr(tuner._override_local, "stack", None):
+                return None
+            return (tuner._dirty_seq, len(tuner.profiling_cache),
+                    len(tuner._file_configs), id(tuner._managed_cache),
+                    len(tuner._winner_partitions), len(tuner._managed_decoded))
+
+        def _cutlass_memo_mm(act: torch.Tensor, act_scale: torch.Tensor,
+                             weight: torch.Tensor, weight_scale: torch.Tensor,
+                             output_dtype: torch.dtype):
+            """Memoized CUTLASS mm_mxfp8 for M > 32; None -> run stock."""
+            if (act.ndim != 2 or weight.ndim != 2 or act_scale.ndim != 1
+                    or weight_scale.ndim != 1):
+                return None
+            m, k = act.shape
+            if m < _CUTLASS_MEMO_MIN_M:
+                return None
+            if not (act.is_contiguous() and weight.is_contiguous()
+                    and act_scale.is_contiguous()
+                    and weight_scale.is_contiguous()):
+                return None
+            deps = _cutlass_memo_deps()
+            if not deps:
+                return None
+            (auto_tuner, tuning_config, workspace_size, load_module,
+             get_module, get_cache_buf) = deps
+            tuner = auto_tuner.get()
+            signature = _cutlass_tuner_signature(tuner)
+            if signature is None:
+                return None
+            if signature != _cutlass_memo_state[0]:
+                _cutlass_memo.clear()
+                _cutlass_memo_state[0] = signature
+            device = act.device
+            n = weight.shape[0]
+            key = (device, m, k, n, weight.shape[1], act_scale.shape[0],
+                   weight_scale.shape[0], act.dtype, weight.dtype,
+                   act_scale.dtype, weight_scale.dtype, output_dtype)
+            entry = _cutlass_memo.get(key)
+            if entry is None:
+                # First call for this shape: the stock path validates the
+                # inputs and computes the output; then record the tactic
+                # choose_one picks for exactly the stock inputs.
+                out = mm_mxfp8(act,
+                               weight.t(),
+                               act_scale,
+                               weight_scale,
+                               out_dtype=output_dtype,
+                               use_8x4_sf_layout=False,
+                               backend="cutlass")
+                major, _ = torch.cuda.get_device_capability(device)
+                if major == 12:
+                    workspace = get_cache_buf("mm_mxfp8_workspace",
+                                              workspace_size, device)
+                    runner = get_module(major).cutlass_mxfp8_gemm_runner()
+                    inputs = [
+                        act,
+                        weight.t(), act_scale, weight_scale, output_dtype,
+                        out, workspace
+                    ]
+                    _, tactic = tuner.choose_one(
+                        custom_op="mxfp8_gemm",
+                        runners=[runner],
+                        tuning_config=tuning_config,
+                        inputs=inputs,
+                    )
+                    entry = (load_module(), tactic)
+                else:
+                    entry = (None, None)
+                if len(_cutlass_memo) >= _CUTLASS_MEMO_MAX_ENTRIES:
+                    _cutlass_memo.clear()
+                # The lookups above may promote cache entries; re-read the
+                # signature so the next call does not drop this entry.
+                _cutlass_memo_state[0] = _cutlass_tuner_signature(tuner)
+                _cutlass_memo[key] = entry
+                return out
+            module, tactic = entry
+            if module is None:
+                return None
+            out = torch.empty((m, n), dtype=output_dtype, device=device)
+            workspace = get_cache_buf("mm_mxfp8_workspace", workspace_size,
+                                      device)
+            # Same call as CutlassMxfp8GemmRunner.forward: b.T of weight.t()
+            # is weight, and the swizzled 1D scales pass through.
+            module.mxfp8_gemm(act, weight, act_scale, weight_scale, out,
+                              workspace, tactic)
+            return out
+
         # Wrap this into a custom op so torch.compile traces one opaque node
         # instead of inlining flashinfer's Python-level tactic lookup.
         @torch.library.custom_op("trtllm::flashinfer_mm_mxfp8", mutates_args=())
@@ -287,6 +427,12 @@ if IS_FLASHINFER_AVAILABLE:
             """Run CUTLASS MXFP8 GEMM with row-major weights and swizzled scales."""
             # SM12x decode sizes: b12x small-M tiles (bitwise equal output).
             out = _b12x_try(act, act_scale, weight, weight_scale, output_dtype)
+            if out is not None:
+                return out
+            # Prefill sizes: memoized CUTLASS dispatch (same tactic, same
+            # kernel launch as the stock path below).
+            out = _cutlass_memo_mm(act, act_scale, weight, weight_scale,
+                                   output_dtype)
             if out is not None:
                 return out
             # Argument order mirrors trtllm::mxfp8_mxfp8_gemm: weight arrives as
