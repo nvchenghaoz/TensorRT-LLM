@@ -77,6 +77,24 @@ def _load_ops():
     return _OPS
 
 
+_ROUTE_FUSES_PROLOGUE = None
+
+
+def _route_fuses_prologue() -> bool:
+    """Whether FlashInfer's route takes ``expert_offset``/``zero_buf`` (global-id remap and
+    output zero-fill inside its route-assign kernel); older builds take local ids."""
+    global _ROUTE_FUSES_PROLOGUE
+    if _ROUTE_FUSES_PROLOGUE is None:
+        import inspect
+
+        params = inspect.signature(_load_ops()[0]).parameters
+        _ROUTE_FUSES_PROLOGUE = (
+            os.environ.get("TRTLLM_SM12X_W4A8_FI_FUSED_PROLOGUE", "1") == "1"
+            and "expert_offset" in params and "zero_buf" in params
+        )
+    return _ROUTE_FUSES_PROLOGUE
+
+
 def fi_decode_available(device: torch.device | None = None) -> tuple[bool, str]:
     """The SM12x runner's ``_check_support`` conditions that do not depend on the layer."""
     if os.environ.get(_ENABLE_ENV, "1") == "0":
@@ -168,26 +186,43 @@ class Sm12xW4a8DecodeState:
             token_final_scales: torch.Tensor) -> torch.Tensor:
         route, _, fc1, out_sf_shape, fc2, fi_act = _load_ops()
         m = x.shape[0]
-        local = self.local_ids(token_selected_experts)
+        # The gate already returns int32 ids and FP32 weights: no kernels here.
+        ids = token_selected_experts.to(torch.int32)
         weights = token_final_scales.to(torch.float32)
-        pairs = local.numel()
-        ws = _workspace(x, local, self.num_experts)
+        fused = _route_fuses_prologue()
+        if not fused:
+            ids = self.local_ids(ids)
+        pairs = ids.numel()
+        ws = _workspace(x, ids, self.num_experts)
         # q1, sf1 and the output all have to start at zero: FC2 reads rows of q1 that FC1
         # leaves unwritten (stale bytes there are NaN often enough to poison real rows), the
-        # padded rows of sf1 likewise, and FC2 scatter-adds into the output. One zeroed
-        # buffer, one memset.
+        # padded rows of sf1 likewise, and FC2 scatter-adds into the output. One buffer,
+        # zero-filled by the route-assign kernel itself (no memset node) when the route
+        # supports it.
         sf1_shape = out_sf_shape(pairs, self.inter, self.num_experts)
         n_q1 = pairs * self.inter
         n_sf1 = sf1_shape[0] * sf1_shape[1] * 4
         off_sf1 = _align(n_q1, 256)
         off_out = _align(off_sf1 + n_sf1, 256)
-        buf = torch.zeros(off_out + m * self.hidden * 2, dtype=torch.uint8, device=x.device)
+        nbytes = off_out + m * self.hidden * 2
+        if fused:
+            buf = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
+        else:
+            buf = torch.zeros(nbytes, dtype=torch.uint8, device=x.device)
         q1 = buf[:n_q1].view(torch.float8_e4m3fn).view(pairs, self.inter)
         sf1 = buf[off_sf1:off_sf1 + n_sf1].view(torch.int32).view(sf1_shape)
         out = buf[off_out:].view(torch.bfloat16).view(m, self.hidden)
-        offsets, token_map, route_weights, a_q, a_sf = route(
-            x, local, weights, self.num_experts, workspace=ws, enable_pdl=self.enable_pdl
-        )
+        if fused:
+            # Global ids in, rank-local mapping ([slot_start, slot_start + E) -> 0..E-1,
+            # else unrouted) and the zero-fill of buf both happen in the route-assign kernel.
+            offsets, token_map, route_weights, a_q, a_sf = route(
+                x, ids, weights, self.num_experts, workspace=ws, enable_pdl=self.enable_pdl,
+                expert_offset=self.slot_start, zero_buf=buf,
+            )
+        else:
+            offsets, token_map, route_weights, a_q, a_sf = route(
+                x, ids, weights, self.num_experts, workspace=ws, enable_pdl=self.enable_pdl
+            )
         fc1(a_q, a_sf, self.w1, self.w1_sf, offsets, tune=False, enable_pdl=self.enable_pdl,
             out_q=q1, out_sf=sf1, activation=fi_act.Swiglu, swiglu_limit=self.swiglu_limit)
         fc2(q1, sf1, self.w2, self.w2_sf, offsets, token_map, route_weights, m, tune=False,
