@@ -82,8 +82,12 @@ def trace(g):
         reps.append(cur)
     spans, f1, f2, names = [], [], [], None
     for r in reps:
-        if not r:
+        # leaf nodes only: from the first node after the flush to the end of fc2 (the
+        # next flush's own small kernels follow and are not part of the leaf)
+        last = max((i for i, e in enumerate(r) if "fc2" in e["name"].lower()), default=None)
+        if last is None:
             continue
+        r = r[: last + 1]
         st = min(float(e["ts"]) for e in r)
         en = max(float(e["ts"]) + float(e["dur"]) for e in r)
         spans.append(en - st)

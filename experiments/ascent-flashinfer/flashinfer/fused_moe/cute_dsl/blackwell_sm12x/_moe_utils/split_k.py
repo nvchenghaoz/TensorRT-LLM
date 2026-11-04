@@ -14,7 +14,7 @@ S = min(grid // T, S_max, k_cycles) slices, one CTA each:
             run-to-run deterministic), then runs the unchanged SwiGLU + MXFP8 epilogue.
 
 ``TRTLLM_SM12X_FI_SPLITK`` = 0 / 1 (default 1) turns it off / on; ``TRTLLM_SM12X_FI_SPLITK_MAX``
-(default 4) caps S and ``TRTLLM_SM12X_FI_SPLITK_MIN`` (default 3) is the smallest S used
+(default 4) caps S and ``TRTLLM_SM12X_FI_SPLITK_MIN`` (default 4) is the smallest S used
 (below it the tile stays whole).  All are read when the kernel is built and are part of its
 compile key.  The choice depends only on the live tile count, so it follows the per-rank
 shape (e.g. 18 fc1 tiles/expert at EP4 inter 2304, 9 at EP2xTP2 inter 1152).
@@ -47,7 +47,7 @@ def max_splits() -> int:
 
 
 def min_splits() -> int:
-    return max(2, int(os.environ.get(ENV_MIN, "3")))
+    return max(2, int(os.environ.get(ENV_MIN, "4")))
 
 
 def key():
@@ -186,18 +186,28 @@ def bar_red_or(flag: Int32, bar_id: int, nthreads: int, *, loc=None, ip=None) ->
 _UNROLL_WINDOWS = 4  # groups 0..127 are counted with independent loads (one round trip)
 
 
-@cute.jit
-def count_m_blocks_lane(offsets: cute.Tensor, num_groups, pm):
-    """Per-lane part of the m-block count.  Issue it before the scheduler's own lookups so
-    the loads overlap; reduce with warp_total."""
+def count_loads(offsets: cute.Tensor, num_groups):
+    """Issue the m-block count's loads (no use yet), so they are in flight together with
+    the scheduler's own first lookup.  Finish with count_m_blocks_lane(*loads, ...)."""
     lane = cute.arch.lane_idx()
     ng = Int32(num_groups)
-    total = Int32(0)
-    for w in cutlass.range_constexpr(_UNROLL_WINDOWS):
+    vals = []
+    for w in range(_UNROLL_WINDOWS):
         g = lane + Int32(32 * w)
-        lo = offsets[cute.min(g, ng)]
-        hi = offsets[cute.min(g + Int32(1), ng)]
-        total = total + (hi - lo + Int32(pm - 1)) // Int32(pm)
+        vals.append(offsets[cute.min(g, ng)])
+        vals.append(offsets[cute.min(g + Int32(1), ng)])
+    return vals
+
+
+@cute.jit
+def count_m_blocks_lane(l0, h0, l1, h1, l2, h2, l3, h3, offsets: cute.Tensor, num_groups, pm):
+    """Per-lane part of the m-block count from count_loads' values (+ any groups >= 128);
+    reduce with warp_total."""
+    lane = cute.arch.lane_idx()
+    ng = Int32(num_groups)
+    p = Int32(pm - 1)
+    total = (h0 - l0 + p) // Int32(pm) + (h1 - l1 + p) // Int32(pm)
+    total = total + (h2 - l2 + p) // Int32(pm) + (h3 - l3 + p) // Int32(pm)
     base = Int32(32 * _UNROLL_WINDOWS)
     while base < ng:
         g = base + lane
@@ -219,10 +229,6 @@ def warp_total(v):
     return cute.arch.shuffle_sync(incl, Int32(31))
 
 
-@cute.jit
-def count_tiles(offsets: cute.Tensor, num_groups, pm, num_n_blocks):
-    """Whole warp: work tiles MoeTileScheduler hands out (sum of ceil(rows_g/pm) x n-blocks)."""
-    return warp_total(count_m_blocks_lane(offsets, num_groups, pm)) * Int32(num_n_blocks)
 
 
 def splits_of(valid):

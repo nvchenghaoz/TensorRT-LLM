@@ -1126,12 +1126,17 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                 if cutlass.const_expr(self.split_k):
                     # Dynamic split-K: S from the live tile count T (no host sync).
                     prod = moe_scheduler.MoeSchedProducer.create(cfg.sched_stages)
-                    # Count loads first, then the scheduler's own lookup: they overlap.
-                    mb_lane = split_k.count_m_blocks_lane(offsets, num_groups, pm)
+                    # Count loads and the scheduler's own loads are issued back to back,
+                    # before either is used, so the count adds no round trip.
+                    cl = split_k.count_loads(offsets, num_groups)
                     sched = moe_scheduler.MoeTileScheduler.create(
                         pm, num_groups, num_n_blocks, self.grid_x, bidx, offsets
                     )
                     has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(offsets)
+                    mb_lane = split_k.count_m_blocks_lane(
+                        cl[0], cl[1], cl[2], cl[3], cl[4], cl[5], cl[6], cl[7],
+                        offsets, num_groups, pm,
+                    )
                     T_k = split_k.warp_total(mb_lane) * num_n_blocks
                     S_k = split_k.choose_splits(
                         T_k, self.grid_x, self.split_max, num_sf_cycles, self.split_min
