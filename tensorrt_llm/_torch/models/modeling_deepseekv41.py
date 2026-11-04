@@ -541,6 +541,45 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         # whose fused lagged entry (mHC.fused_hc_lagged) absorbs it. Set by
         # DeepseekV41ForCausalLM.post_load_weights once the neighbours are known.
         self._v41_defer_post_mapping = False
+        # Lagged boundary split (decode M <= 8, SM120, multi-stream): the boundary's
+        # coefficient half (unchanged mhc_fused_hc) runs on its own aux stream and joins
+        # inside this forward; see mHC.fused_hc_lagged_split.
+        aux_stream_dict = kwargs.get("aux_stream_dict", args[2] if len(args) > 2 else None)
+        self._mhc_split_stream = (aux_stream_dict or {}).get(AuxStreamType.MhcCoeffs)
+        self._mhc_split_events = (
+            [(torch.cuda.Event(), torch.cuda.Event()) for _ in range(2)]
+            if self._mhc_split_stream is not None
+            else None
+        )
+
+    def _mhc_boundary(self, mhc: mHC, which: int, x_prev, residual, post_mix, comb_mix, pre, norm):
+        """``mhc.fused_hc_lagged`` or its two-stream split; returns (outputs, join or None)."""
+        if self._mhc_split_stream is not None:
+            ev0, ev1 = self._mhc_split_events[which]
+            split = mhc.fused_hc_lagged_split(
+                x_prev,
+                residual,
+                post_mix,
+                comb_mix,
+                pre,
+                norm.weight,
+                norm.variance_epsilon,
+                self._mhc_split_stream,
+                ev0,
+                ev1,
+            )
+            if split is not None:
+                return split
+        outputs = mhc.fused_hc_lagged(
+            x_prev,
+            residual,
+            post_mix,
+            comb_mix,
+            pre,
+            norm_weight=norm.weight,
+            norm_eps=norm.variance_epsilon,
+        )
+        return outputs, None
 
     def _decoder_global_input(self, hc_state: HCState) -> torch.Tensor:
         """Use the ordinary fused boundary's collapse/norm and BF16 rounding."""
@@ -634,17 +673,21 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         # --- attention sublayer -------------------------------------------
         # C++ fused boundary (GEMM + bigfuse with the lagged pre-mix and the input RMSNorm
         # folded in); the GEMM backend (FMA / tcgen05 TF32) is the autotuner's per-M choice.
+        attn_join = None
         if deferred:
             # Previous layer's post update + this boundary in one fused pair; `residual`
             # becomes the materialized stream that this layer's post_mapping needs.
-            residual, attn_pre, post_mix, comb_mix, layer_input = self.hc_attn.fused_hc_lagged(
+            # Split (decode): residual/attn_pre/post_mix/comb_mix are valid only after
+            # attn_join, which joins right after self_attn below.
+            (residual, attn_pre, post_mix, comb_mix, layer_input), attn_join = self._mhc_boundary(
+                self.hc_attn,
+                0,
                 hc_state.x_prev,
                 residual,
                 hc_state.post_mix,
                 hc_state.comb_mix,
                 pre_mix,
-                norm_weight=self.input_layernorm.weight,
-                norm_eps=self.input_layernorm.variance_epsilon,
+                self.input_layernorm,
             )
         else:
             attn_pre, post_mix, comb_mix, layer_input = self.hc_attn.pre_mapping_lagged(
@@ -660,15 +703,20 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             all_reduce_params=AllReduceParams(enable_allreduce=not self.disable_attn_allreduce),
             **kwargs,
         )
+        if attn_join is not None:
+            attn_join.join()
+            attn_join = None
         # Attention's post update + FFN boundary + post_attention RMSNorm in one fused pair.
-        residual, ffn_pre, post_mix, comb_mix, layer_input = self.hc_ffn.fused_hc_lagged(
+        # Split (decode): its residual/ffn_pre/post_mix/comb_mix join right after the MoE.
+        (residual, ffn_pre, post_mix, comb_mix, layer_input), ffn_join = self._mhc_boundary(
+            self.hc_ffn,
+            1,
             x_attn,
             residual,
             post_mix,
             comb_mix,
             attn_pre,
-            norm_weight=self.post_attention_layernorm.weight,
-            norm_eps=self.post_attention_layernorm.variance_epsilon,
+            self.post_attention_layernorm,
         )
         x_ffn = self.forward_MoE(
             hidden_states=layer_input,
@@ -678,6 +726,10 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             hidden_states_normalized=True,
             **({"image_mask": image_mask} if image_mask is not None else {}),
         )
+        if ffn_join is not None:
+            # No HCState leaves this layer with K2 pending.
+            ffn_join.join()
+            ffn_join = None
         if self._v41_defer_post_mapping:
             # Defer hc_ffn.post_mapping into the next layer's fused entry boundary; the
             # next layer materializes it itself if it cannot absorb it (see forward entry).

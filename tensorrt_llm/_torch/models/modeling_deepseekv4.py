@@ -2813,7 +2813,7 @@ class DeepseekV4Model(DecoderModel):
         # Attention-phase and MoE-phase lanes are sequential within a layer, so the
         # Mla* roles reuse the Moe* slots. Engram keeps its own: it precomputes
         # across the layer rather than inside the MoE phase.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(5)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(6)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
@@ -2824,6 +2824,9 @@ class DeepseekV4Model(DecoderModel):
             AuxStreamType.MlaCompressor: aux_stream_list[1],
             AuxStreamType.MlaIndexer: aux_stream_list[2],
             AuxStreamType.MlaIndexerAux: aux_stream_list[3],
+            # V4.1's lagged mHC boundary split (coefficient half, decode); shared with no
+            # other role.
+            AuxStreamType.MhcCoeffs: aux_stream_list[5],
         }
 
         self.embed_tokens = Embedding(
