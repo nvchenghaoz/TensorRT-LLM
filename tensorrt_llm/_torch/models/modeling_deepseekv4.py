@@ -1633,8 +1633,10 @@ class DeepseekV4Gate(nn.Module):
 # the rows: each computes its own row range once, unscaled, and adds it into
 # routed_output in place. Every row's shared output is still computed exactly
 # once per column shard across the TP group. TRTLLM_DSV4_SHARED_ROW_SPLIT=0
-# turns it off.
-SHARED_ROW_SPLIT_MIN_TOKENS = int(os.environ.get("TRTLLM_DSV4_SHARED_ROW_SPLIT_MIN_TOKENS", "128"))
+# turns it off. The threshold is 256: at M = 128 (host-bound) the split measured
+# ~1% slower on one rank, so those layers keep main's path; decode CUDA graphs
+# (M <= 32) never reach it.
+SHARED_ROW_SPLIT_MIN_TOKENS = int(os.environ.get("TRTLLM_DSV4_SHARED_ROW_SPLIT_MIN_TOKENS", "256"))
 
 
 def shared_expert_row_split_layout(tp_rank: int, tp_size: int, shared_tp_size: int):

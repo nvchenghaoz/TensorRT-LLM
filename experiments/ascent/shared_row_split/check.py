@@ -99,7 +99,7 @@ def main():
 
     # 2. numerics per rank + simulated all-reduce.
     numer = {}
-    for M in (128, 2047, 2048, 6144, 6145):
+    for M in sorted({T, 2047, 2048, 6144, 6145}):
         hs = torch.randn(M, hidden, generator=gen).to(torch.bfloat16).cuda()
         hs0 = hs.clone()
         routed = [torch.randn(M, hidden, generator=gen).to(torch.bfloat16).cuda() for _ in range(4)]
@@ -143,8 +143,12 @@ def main():
             "base_vs_fp32ref_maxabs": (ar_base - ref32).abs().max().item(),
             "cand_vs_fp32ref_maxabs": (ar_cand - ref32).abs().max().item(),
             "ref_absmax": mag}
-        if not torch.allclose(ar_cand, ar_base, rtol=1.6e-2, atol=1.6e-2 * max(1.0, mag) / 8):
-            fail(ar=M)
+        # Reordered: the candidate's AR result must be no further from the fp32
+        # reference than main's (both differ only by bf16 rounding of partials).
+        e_c = rep["allreduce_sim"]["cand_vs_fp32ref_maxabs"]
+        e_b = rep["allreduce_sim"]["base_vs_fp32ref_maxabs"]
+        if not (e_c <= 1.25 * e_b + 1e-6 and torch.isfinite(ar_cand).all()):
+            fail(ar=M, cand_err=e_c, base_err=e_b)
         numer[M] = rep
         log("numerics M", M, json.dumps(rep))
     out["numerics"] = numer
@@ -180,7 +184,7 @@ def main():
 
     # 4a. M < T keeps main's path (decode M <= 8 among them).
     small = {}
-    for M in (1, 2, 4, 8, 32, T - 1):
+    for M in sorted({1, 2, 4, 8, 32, 128, T - 1}):
         hs = torch.randn(M, hidden, generator=gen).to(torch.bfloat16).cuda()
         routed = torch.randn(M, hidden, generator=gen).to(torch.bfloat16).cuda()
         moe, stub = moes[2]
