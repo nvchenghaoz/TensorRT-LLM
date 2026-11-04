@@ -4,8 +4,9 @@ Reference = main's Sm12xW4a8DecodeState.run path in this same process (torch loc
 torch.zeros buffer + route with local ids; FlashInfer kernels with their default arguments,
 i.e. the pinned code path), toggled by the module flag _ROUTE_FUSES_PROLOGUE.
 Checks, per slot_start in 0/96/192/288 and M in 1..32 (plus edge routings):
-  * eager: candidate output bitwise vs reference (M=1: within the reference's own
-    run-to-run spread), route workspace bitwise (offsets, token_map, token_weights, dst_rows,
+  * eager: candidate output bitwise vs reference (where main's own FC2 scatter-add is
+    order-dependent, i.e. its 12-repeat run-to-run spread is > 0 -- tokens with >= 3 local
+    experts -- within that spread, with FC1's q1/sf1 bytes bitwise), route workspace bitwise (offsets, token_map, token_weights, dst_rows,
     scale_dst_rows, routed q_out rows, scale_out), with the caching allocator poisoned (0xFF)
     before every candidate call so the zero-fill is exercised;
   * graph: capture the candidate at M=1/2/4/8 (+16/32), check no Triton JIT inside capture,
@@ -33,6 +34,7 @@ EDGE = ((4, 6), (8, 0), (2, 1), (32, 6))
 N_LOCAL = {1: 3}
 GRAPH_MS = (1, 2, 4, 8, 16, 32)
 REPLAYS = 10
+REF_REPEATS = 12
 
 
 def jit_count():
@@ -79,6 +81,12 @@ def poison_ws(ws):
     ws.q_out.view(torch.uint8).fill_(0xFF)
 
 
+def pre_bytes(out):
+    """q1 + sf1 (+ alignment padding): the leaf buffer bytes in front of the output view."""
+    t = torch.empty(0, dtype=torch.uint8, device=out.device).set_(out.untyped_storage())
+    return t[: out.storage_offset() * out.element_size()].clone()
+
+
 def bits_equal(a, b):
     return torch.equal(a.view(torch.int16), b.view(torch.int16))
 
@@ -115,39 +123,47 @@ def main():
             x = torch.randn(m, H, dtype=torch.bfloat16, device="cuda")
             ids, w = routing(m, nl, slot, seed=31 * m + nl + slot)
             mod._ROUTE_FUSES_PROLOGUE = False
-            ref = st.run(x, ids, w).clone()
+            o = st.run(x, ids, w)
+            ref = o.clone()
+            ref_pre = pre_bytes(o)
             ws = mod._workspace(x, ids, E)
             ref_ws = snapshot(ws)
             spread = 0.0
-            for _ in range(3):
+            for _ in range(REF_REPEATS):
                 spread = max(spread, maxdiff(st.run(x, ids, w), ref))
             mod._ROUTE_FUSES_PROLOGUE = True
-            row = {"bitwise_all": True, "max_abs": 0.0, "ws_bad": [], "ref_spread": spread}
+            row = {"bitwise_all": True, "max_abs": 0.0, "ws_bad": [], "ref_spread": spread,
+                   "q1_sf1_bitwise": True}
             for it in range(5):
                 poison_allocator(ref.numel() * 2 + 2 * 1024 * 1024)
                 poison_ws(ws)
                 out = st.run(x, ids, w)
                 bad = ws_equal(snapshot(ws), ref_ws)
                 row["ws_bad"] = sorted(set(row["ws_bad"]) | set(bad))
+                row["q1_sf1_bitwise"] &= torch.equal(pre_bytes(out), ref_pre)
                 row["bitwise_all"] &= bits_equal(out, ref)
                 row["max_abs"] = max(row["max_abs"], maxdiff(out, ref))
                 row["finite"] = bool(torch.isfinite(out).all().item())
-            ok = (not row["ws_bad"]) and row["finite"] and (
-                row["bitwise_all"] or (m == 1 and row["max_abs"] <= spread))
+            # Main's FC2 scatter-add is order-dependent when a token has >= 3 local
+            # contributions (its run-to-run spread is > 0): there, the deterministic part
+            # (route workspace + FC1's q1/sf1) must be bitwise and the output within main's
+            # own spread. Elsewhere the output must be bitwise.
+            ok = (not row["ws_bad"]) and row["finite"] and row["q1_sf1_bitwise"] and (
+                row["bitwise_all"] or (spread > 0 and row["max_abs"] <= spread))
             # Zero-pair rank (nl=0) must give exact zeros.
             if nl == 0:
                 ok &= bool((ref == 0).all().item())
             row["ok"] = ok
             passed &= ok
             report["eager"][f"s{slot}_M{m}_nl{nl}"] = row
-            refs[(m, nl)] = (x, ids, w, ref, ref_ws, spread)
+            refs[(m, nl)] = (x, ids, w, ref, ref_ws, spread, ref_pre)
             if not ok:
                 log("FAIL", slot, m, nl, json.dumps(row))
         log("slot", slot, "eager done, passed so far", passed)
 
         for m in GRAPH_MS:
             nl = N_LOCAL.get(m, 2)
-            x, ids, w, ref, ref_ws, spread = refs[(m, nl)]
+            x, ids, w, ref, ref_ws, spread, ref_pre = refs[(m, nl)]
             ws = mod._workspace(x, ids, E)
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
@@ -174,14 +190,17 @@ def main():
                 md = maxdiff(out, ref)
                 wb = ws_equal(snapshot(ws), ref_ws)
                 fin = bool(torch.isfinite(out).all().item())
-                okr = fin and not wb and (be or (m == 1 and md <= spread))
-                row["replays"].append({"bitwise": be, "max_abs": md, "ws_bad": wb, "ok": okr})
+                pb = torch.equal(pre_bytes(out), ref_pre)
+                okr = fin and not wb and pb and (be or (spread > 0 and md <= spread))
+                row["replays"].append({"bitwise": be, "max_abs": md, "ws_bad": wb,
+                                       "q1_sf1_bitwise": pb, "ok": okr})
                 row["ok"] &= okr
             row["ok"] &= (j1 - j0) == 0
             passed &= row["ok"]
             report["graph"][f"s{slot}_M{m}"] = {
                 "ok": row["ok"], "jit_in_capture": row["jit_in_capture"],
                 "all_bitwise": all(r["bitwise"] for r in row["replays"]),
+                "all_q1_sf1_bitwise": all(r["q1_sf1_bitwise"] for r in row["replays"]),
                 "worst_max_abs": max(r["max_abs"] for r in row["replays"]),
                 "ref_spread": spread}
             log("graph", slot, m, json.dumps(report["graph"][f"s{slot}_M{m}"]))
@@ -195,7 +214,9 @@ def main():
                       "eager_failures": {k: v for k, v in report["eager"].items()
                                          if not v["ok"]},
                       "eager_nonbitwise": {k: {"max_abs": v["max_abs"],
-                                               "ref_spread": v["ref_spread"]}
+                                               "ref_spread": v["ref_spread"],
+                                               "q1_sf1_bitwise": v["q1_sf1_bitwise"],
+                                               "ws_bitwise": not v["ws_bad"]}
                                            for k, v in report["eager"].items()
                                            if not v["bitwise_all"]}}))
 
