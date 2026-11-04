@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/common/config.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -40,6 +41,23 @@ bool isMinimaxM3Mxfp8LowMGemmSupported(int32_t warps, int32_t clusterK, int32_t 
 void invokeMinimaxM3Mxfp8LowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t n, int32_t k,
     uint8_t const* w, uint8_t const* wsf, __nv_bfloat16* out, int32_t ldo, int32_t warps, int32_t clusterK,
     int32_t rowTiles, bool pdl, cudaStream_t stream);
+
+//! SM120 port of the kernel above for the CSA2 decode input projections. Built configurations (warps, clusterK,
+//! rowTiles): see CSA2_LOW_M_CONFIGS in mxfp8LowMGemm.cu, each for 1 <= M <= 8.
+bool isCsa2Mxfp8LowMGemmSupported(int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t stages = 1);
+
+//! Dynamic shared memory one CTA of `invokeCsa2Mxfp8LowMGemm` requests.
+size_t csa2Mxfp8LowMGemmSmemBytes(int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t k);
+
+//! `out[M, :nSplit] / out2[M, :N - nSplit] = mxfp8(x)[M, K] @ w[N, K]^T` in BF16 (SM120).
+//! `xq`/`xsf` (optional): an already-quantized activation (E4M3 [M, K] + 128x4-swizzled UE8M0 scales of
+//! `mxfp8_quantize(x, True)`); then `x` is not read. `xqOut`/`xsfOut` (optional): receive the in-kernel quantized
+//! activation in that same layout.
+void invokeCsa2Mxfp8LowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t n, int32_t k, uint8_t const* w,
+    uint8_t const* wsf, __nv_bfloat16* out, int32_t ldo, __nv_bfloat16* out2, int32_t ldo2, int32_t nSplit,
+    uint8_t const* xq, uint8_t const* xsf, uint8_t* xqOut, uint8_t* xsfOut, int32_t warps, int32_t clusterK,
+    int32_t rowTiles, bool pdl, cudaStream_t stream, unsigned long long* dbgTs = nullptr, int32_t stages = 1,
+    int32_t debugFlags = 0);
 
 } // namespace kernels
 
