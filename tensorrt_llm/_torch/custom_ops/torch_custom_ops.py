@@ -145,6 +145,14 @@ class MoERunner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.activation_type = activation_type
         self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
+        # 16-bit x with MXFP4 weights and MXFP8 activation scaling quantizes x
+        # to MXFP8 inside the op's row expansion; its GEMMs (and tactic list)
+        # are those of the FP8-input runner, so it shares that runner's tuned
+        # tactics instead of keeping an untuned cache entry of its own.
+        self.tuning_x_dtype = x_dtype
+        if (use_mxfp8_act_scaling and weight_dtype == torch.int64
+                and x_dtype in (torch.bfloat16, torch.float16)):
+            self.tuning_x_dtype = torch.float8_e4m3fn
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
@@ -176,7 +184,7 @@ class MoERunner(TunableRunner):
 
     def unique_id(self):
         return (
-            self.x_dtype,
+            self.tuning_x_dtype,
             self.weight_dtype,
             self.output_dtype,
             self.top_k,
