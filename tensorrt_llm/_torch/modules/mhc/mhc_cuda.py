@@ -1095,6 +1095,92 @@ def _get_fused_hc_runner(
     return runner
 
 
+def _mhc_fused_hc_choose_tactic(
+    runner,
+    x_prev,
+    residual_prev,
+    post_mix_prev,
+    comb_mix_prev,
+    w_t_cur,
+    hc_scale_cur,
+    hc_base_cur,
+    norm_weight,
+    norm_eps,
+    pre_mix_ext,
+):
+    if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+        # This fixed FMA tactic has no cross-CTA floating-point atomics and
+        # uses the same reduction order for context and generation shapes.
+        # Bypass tuning so an existing cache cannot reintroduce atomic split-K.
+        return _FUSED_HC_FALLBACK_TACTIC_FMA
+    tuner = AutoTuner.get()
+    _, best_tactic = tuner.choose_one(
+        "trtllm::mhc_fused_hc",
+        [runner],
+        MhcFusedHcRunner.tuning_config,
+        [
+            x_prev,
+            residual_prev,
+            post_mix_prev,
+            comb_mix_prev,
+            w_t_cur,
+            hc_scale_cur,
+            hc_base_cur,
+        ],
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        pre_mix_ext=pre_mix_ext,
+    )
+    return best_tactic
+
+
+def mhc_fused_hc_tactic(
+    x_prev: torch.Tensor,
+    residual_prev: torch.Tensor,
+    post_mix_prev: torch.Tensor,
+    comb_mix_prev: torch.Tensor,
+    w_t_cur: torch.Tensor,
+    hc_scale_cur: torch.Tensor,
+    hc_base_cur: torch.Tensor,
+    n: int,
+    hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
+    pre_mix_ext: torch.Tensor | None = None,
+):
+    """The resolved tactic ``mhc_fused_hc`` runs for these inputs (fallback resolved too)."""
+    runner = _get_fused_hc_runner(
+        n=n,
+        hidden_size=hidden_size,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+    )
+    tactic = _mhc_fused_hc_choose_tactic(
+        runner,
+        x_prev,
+        residual_prev,
+        post_mix_prev,
+        comb_mix_prev,
+        w_t_cur,
+        hc_scale_cur,
+        hc_base_cur,
+        norm_weight,
+        norm_eps,
+        pre_mix_ext,
+    )
+    if tactic == -1:
+        tactic = _get_fused_hc_fallback_tactic(hidden_size)
+    return tactic
+
+
 def mhc_fused_hc(
     x_prev: torch.Tensor,
     residual_prev: torch.Tensor,
@@ -1150,31 +1236,19 @@ def mhc_fused_hc(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
     )
-
-    if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
-        # This fixed FMA tactic has no cross-CTA floating-point atomics and
-        # uses the same reduction order for context and generation shapes.
-        # Bypass tuning so an existing cache cannot reintroduce atomic split-K.
-        best_tactic = _FUSED_HC_FALLBACK_TACTIC_FMA
-    else:
-        tuner = AutoTuner.get()
-        _, best_tactic = tuner.choose_one(
-            "trtllm::mhc_fused_hc",
-            [runner],
-            MhcFusedHcRunner.tuning_config,
-            [
-                x_prev,
-                residual_prev,
-                post_mix_prev,
-                comb_mix_prev,
-                w_t_cur,
-                hc_scale_cur,
-                hc_base_cur,
-            ],
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-            pre_mix_ext=pre_mix_ext,
-        )
+    best_tactic = _mhc_fused_hc_choose_tactic(
+        runner,
+        x_prev,
+        residual_prev,
+        post_mix_prev,
+        comb_mix_prev,
+        w_t_cur,
+        hc_scale_cur,
+        hc_base_cur,
+        norm_weight,
+        norm_eps,
+        pre_mix_ext,
+    )
 
     return runner(
         inputs=[

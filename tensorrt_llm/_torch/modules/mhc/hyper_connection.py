@@ -395,6 +395,145 @@ class mHC(nn.Module):
             layer_input.view(*outer_shape, hidden),
         )
 
+    def fused_hc_lagged_split(
+        self,
+        x_prev: torch.Tensor,
+        residual_prev: torch.Tensor,
+        post_mix_prev: torch.Tensor,
+        comb_mix_prev: torch.Tensor,
+        pre_mix: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        aux_stream: torch.cuda.Stream,
+        event0: torch.cuda.Event,
+        event1: torch.cuda.Event,
+    ):
+        """:meth:`fused_hc_lagged` split over two streams (decode, small M; SM120).
+
+        K1 (main stream, Triton, PDL): post update + lagged collapse + RMSNorm ->
+        ``layer_input``, bitwise equal to the fused op's. K2 (``aux_stream``): the unchanged
+        fused op, whose residual / pre / post / comb are this boundary's other outputs and
+        whose own layer_input is discarded.
+
+        Returns ``None`` when the split does not apply (the caller runs
+        :meth:`fused_hc_lagged`), else ``(outputs, join)``: ``outputs`` is
+        :meth:`fused_hc_lagged`'s 5-tuple, ``layer_input`` usable at once and the other four
+        valid on the calling stream only after ``join.join()``.
+        """
+        from tensorrt_llm._torch.modules.mhc import mhc_lagged_split as _split
+        from tensorrt_llm._torch.modules.mhc.mhc_cuda import mhc_fused_hc_tactic
+        from tensorrt_llm._torch.modules.multi_stream_utils import (
+            maybe_execute_in_parallel_deferred_join,
+        )
+
+        n = self.mult
+        hidden = self.hidden_size
+        if (
+            not _cuda_available
+            or n != 4
+            or norm_weight is None
+            or aux_stream is None
+            or x_prev.dtype != torch.bfloat16
+            or residual_prev.dtype != torch.bfloat16
+        ):
+            return None
+        outer_shape = residual_prev.shape[:-2]
+        residual_prev_flat = residual_prev.reshape(-1, n, hidden).contiguous()
+        B = residual_prev_flat.shape[0]
+        if not _split.split_supported_here(B):
+            return None
+        x_prev_flat = x_prev.reshape(B, hidden).contiguous()
+        post_flat = post_mix_prev.reshape(B, n)
+        comb_flat = comb_mix_prev.reshape(B, n, n)
+        pre_flat = pre_mix.reshape(B, n)
+        for t in (post_flat, comb_flat, pre_flat):
+            if t.dtype != torch.float32 or not t.is_contiguous():
+                return None
+        fn = self.fn.contiguous()
+        tactic = mhc_fused_hc_tactic(
+            x_prev_flat,
+            residual_prev_flat,
+            post_flat,
+            comb_flat,
+            fn,
+            self.scale,
+            self.base,
+            n,
+            hidden,
+            self.norm_eps,
+            self.eps,
+            self.sinkhorn_eps,
+            self.post_mult_value,
+            self.sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            pre_mix_ext=pre_flat,
+        )
+        reducer_threads = _split.reducer_threads_for_tactic(tactic)
+        if reducer_threads is None:
+            return None
+        nw = norm_weight
+        if nw.dtype != torch.bfloat16 or not nw.is_contiguous():
+            return None
+
+        def k1():
+            return _split.mhc_lagged_layer_input(
+                x_prev_flat,
+                residual_prev_flat,
+                post_flat,
+                comb_flat,
+                pre_flat,
+                nw,
+                norm_eps,
+                reducer_threads,
+            )
+
+        def k2():
+            if _split.TEST_AUX_SLEEP_CYCLES > 0:
+                torch.cuda._sleep(_split.TEST_AUX_SLEEP_CYCLES)
+            return self.fused_hc_lagged(
+                x_prev_flat,
+                residual_prev_flat,
+                post_flat,
+                comb_flat,
+                pre_flat,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+
+        layer_input, k2_out, event = maybe_execute_in_parallel_deferred_join(
+            k1, k2, event0, event1, aux_stream
+        )
+        residual_cur, pre_cur, post_cur, comb_cur, k2_layer_input = k2_out
+        join = _split.MhcSplitJoin(
+            event,
+            # Every K2 input (and its originals) stays referenced until the join.
+            (
+                x_prev,
+                residual_prev,
+                post_mix_prev,
+                comb_mix_prev,
+                pre_mix,
+                x_prev_flat,
+                residual_prev_flat,
+                post_flat,
+                comb_flat,
+                pre_flat,
+                fn,
+                norm_weight,
+                k2_layer_input,
+            ),
+            k2_layer_input if _split.TEST_KEEP_K2_LAYER_INPUT else None,
+        )
+        outputs = (
+            residual_cur.view(*outer_shape, n, hidden),
+            pre_cur.view(*outer_shape, n, 1),
+            post_cur.view(*outer_shape, n, 1),
+            comb_cur.view(*outer_shape, n, n),
+            layer_input.view(*outer_shape, hidden),
+        )
+        return outputs, join
+
     def fused_hc(
         self,
         x_prev: torch.Tensor,
