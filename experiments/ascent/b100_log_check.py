@@ -12,7 +12,14 @@ PATS = {
     "fi_on": r"decode chain on[^\n]*",
     "fi_off": r"FlashInfer decode chain off[^\n]*",
     "kv_alloc": r"final_kv_cache_allocation[^\n]*",
-    "group0": r"group0[^\n]*",
+    # evaluator item 3: the KV quota and slot lines as kv_cache_manager_v2.py actually logs them
+    # (:2243 "max_gpu_total_bytes is provided. New quota is", :2257 "max_tokens ... New quota is",
+    # :2282 "KV cache manager v2 device quota set to", :2626 "IndexMapper capacity=").
+    "kv_quota": r"(device quota set to|New quota is|Allowed quota from max_tokens|host cache quota set to)[^\n]*",
+    "kv_index_cap": r"IndexMapper capacity=[^\n]*",
+    "kv_pool": r"(Memory bytes in pool|blocks_per_window|role-to-pool|[Pp]ool ?(group)? ?0\b|[Gg]roup ?0\b|group_id=0)[^\n]*",
+    "kv_tokens": r"(max_tokens \d+ is provided|[Mm]ax(imum)? (number of )?tokens[^\n]{0,40}(KV|kv|cache))[^\n]*",
+    "group0": r"group0[^\n]*|slots?[^\n]{0,40}group ?0[^\n]*",
     "jit_capture": r"(JIT|jit_compile|Compiling)[^\n]*(captur|graph)[^\n]*|captur[^\n]*(JIT|compil)[^\n]*",
     "full_tok": r"full tokenizations[^\n]*",
     "error": r"(Traceback|CUDA error|OOM|out of memory)[^\n]*",
@@ -51,4 +58,8 @@ for p in glob.glob(R + "/*/jobs/*/artifacts/proxy/server/server.log"):
 print("old server logs scanned", len(glob.glob(R + "/*/jobs/*/artifacts/proxy/server/server.log")), flush=True)
 print(json.dumps({"passed": bool(ok and cand_ok), "compared": "pair 1033/1034 server logs: moe layout, FI decode chain warm-up inter=1152 experts=192, no chain off, no JIT in capture, no errors; kv allocation lines", "stall_logs_found": hits,
                   "kv_base": out.get("base_1033", {}).get("kv_alloc", {}).get("first"), "kv_cand": c.get("kv_alloc", {}).get("first"),
-                  "fi_warm": c.get("fi_warm", {}).get("first")}))
+                  "fi_warm": c.get("fi_warm", {}).get("first"),
+                  "item3": {arm: {k: out.get(arm, {}).get(k) for k in ("kv_quota", "kv_index_cap", "kv_pool",
+                                                                       "kv_tokens", "group0")}
+                            for arm in ARMS},
+                  "item3_note": "a field with n=0 in both arms means the server does not emit that line"}))
