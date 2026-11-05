@@ -93,8 +93,9 @@ def attach_branch(probe):
     if fn is None:
         return False
     for name in ("_project_inputs", "_shared_mxfp8_active", "_mxfp8_mm",
-                 "fuse_shared_input_projections"):
-        setattr(probe, name, types.MethodType(getattr(DeepseekV41Attention, name), probe))
+                 "fuse_shared_input_projections", "_qb_fused_route"):
+        if hasattr(DeepseekV41Attention, name):
+            setattr(probe, name, types.MethodType(getattr(DeepseekV41Attention, name), probe))
     probe.fuse_shared_input_projections()
     return True
 
