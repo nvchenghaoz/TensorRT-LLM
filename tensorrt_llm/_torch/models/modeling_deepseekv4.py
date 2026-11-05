@@ -1509,12 +1509,6 @@ class DeepseekV4Attention(MLA):
 # Decode (1..8 tokens, top-k routed, no image mask): DeepseekV4Gate.fused_forward runs the router GEMV and the top-6
 # gate in one launch (bitwise dsv3_router_gemm_op + gate_forward). TRTLLM_DSV4_FUSED_ROUTER=0 turns it off.
 _DSV4_FUSED_ROUTER = os.environ.get("TRTLLM_DSV4_FUSED_ROUTER", "1") == "1"
-# ... and, when the routed experts take the SM12x FlashInfer decode chain, also its route_assign_decode + MXFP8 q0
-# (written into the chain's route workspace, so the chain skips route()). TRTLLM_DSV4_FUSED_ROUTER_ROUTE=0: off.
-_DSV4_FUSED_ROUTER_ROUTE = os.environ.get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE", "1") == "1"
-# Stage 2 runs route + q0 in the router's last CTA: it pays at 1-2 tokens; above that Stage 1 + FlashInfer's route
-# is faster (same-GPU 40-layer chain behind the real mHC K1, EP4 and EP2xTP2).
-_DSV4_FUSED_ROUTER_ROUTE_MAX_M = int(os.environ.get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE_MAX_M", "2"))
 
 
 class DeepseekV4Gate(nn.Module):
@@ -1613,9 +1607,7 @@ class DeepseekV4Gate(nn.Module):
             self._fused_router_counter = counter
         return counter
 
-    def fused_forward(
-        self, hidden_states: torch.Tensor, decode_state=None
-    ) -> Optional[torch.Tensor]:
+    def fused_forward(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         """Decode router GEMV + top-6 gate in one launch (torch.ops.trtllm.dsv4_fused_router, 1..8 tokens).
 
         Returns the logits (bitwise forward()'s) and hands their routing (bitwise gate_forward's) to the routing
@@ -1642,37 +1634,6 @@ class DeepseekV4Gate(nn.Module):
         counter = self._fused_router_counter_buffer()
         if counter is None:
             return None
-        pre = None
-        if (
-            decode_state is not None
-            and _DSV4_FUSED_ROUTER_ROUTE
-            and hidden_states.shape[0] <= _DSV4_FUSED_ROUTER_ROUTE_MAX_M
-            and hasattr(torch.ops.trtllm, "dsv4_fused_router_route")
-        ):
-            pre = decode_state.preroute_buffers(hidden_states, self.top_k)
-        if pre is not None:
-            # Stage 2: also route_assign_decode + the MXFP8 q0 quant of the FlashInfer decode MoE chain.
-            ws, buf = pre
-            indices, weights, logits = torch.ops.trtllm.dsv4_fused_router_route(
-                hidden_states,
-                self.weight,
-                self.e_score_correction_bias,
-                counter,
-                float(self.routed_scaling_factor),
-                int(decode_state.slot_start),
-                int(decode_state.num_experts),
-                ws.offsets,
-                ws.token_map,
-                ws.token_weights,
-                ws.dst_rows,
-                ws.scale_dst_rows,
-                ws.q_out,
-                ws.scale_out,
-                buf,
-            )
-            decode_state.set_prerouted(hidden_states, indices, weights, ws, buf)
-            self._routing_method.fused_routing = (logits, indices, weights)
-            return logits
         indices, weights, logits = torch.ops.trtllm.dsv4_fused_router(
             hidden_states,
             self.weight,
@@ -2080,17 +2041,6 @@ class DeepseekV4MoE(nn.Module):
             and gate_up_quant_config.group_size == 128
         )
 
-    def _fi_decode_state_for(self, x):
-        """The routed experts' SM12x FlashInfer decode chain state when this call takes it, else None."""
-        experts = self.experts
-        backend = getattr(experts, "backend", None)
-        if backend is None or getattr(experts, "comm", None) is not None:
-            return None
-        takes = getattr(backend, "_takes_fi_decode", None)
-        if takes is None or not takes(x):
-            return None
-        return getattr(backend, "_fi_decode", None)
-
     def compute_routed_output(
         self,
         hidden_states,
@@ -2122,12 +2072,7 @@ class DeepseekV4MoE(nn.Module):
         router_logits = None
         if image_mask is None and not use_dp_padding:
             # Decode (1..8 tokens): router GEMV + gate in one launch; the routing method returns its routing.
-            router_logits = self.gate.fused_forward(
-                hidden_states,
-                decode_state=self._fi_decode_state_for(hidden_states)
-                if hidden_states_fp4 is None and do_finalize
-                else None,
-            )
+            router_logits = self.gate.fused_forward(hidden_states)
         if router_logits is None:
             router_logits = self.gate(hidden_states)
 

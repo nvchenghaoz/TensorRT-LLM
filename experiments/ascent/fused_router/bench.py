@@ -1,45 +1,34 @@
-"""Paired timing for idea 67 (run_gpu_pair: BASE = main tree, CAND = branch tree), plus an in-process
-interleaved A/B mode (--both, branch tree only: main's ops are still there).
+"""Paired timing for idea 67 STAGE 1 (run_gpu_pair: BASE = main tree, CAND = branch tree, same script).
 
 One GPU, one MoE rank: 40 distinct router weights [384,5120] bf16 + fp32 biases, 40 distinct sets of real mHC K1
-inputs (x_prev, residual [M,4,5120], post, comb, pre, norm weight), the real Sm12xW4a8DecodeState.run (FlashInfer
-SM12x MoE decode chain) for the MoE arms. Per layer:
-  BASE : router_gemm_mma_kernel (main's pre-wait depth) -> gate_forward_kernel -> run() = route_assign_decode +
-         _mxfp8_q0_route_direct + fc1_act_q1 + fc2_finalize
-  CAND1: dsv4FusedRouterKernel<M,false> (Stage 1: GEMV + gate)         -> run() as BASE
-  CAND : dsv4FusedRouterKernel<M,true>  (Stage 2: + route + q0 into the route workspace) -> run() = fc1 + fc2 only
-40-layer CUDA graphs, read-only 512 MB flush before every replay, every graph of a case replayed interleaved (ABBA):
-  REAL_RUN : real K1 (_mhc_lagged_layer_input_kernel, PDL, early trigger; writes x) -> router row -> run   [JUDGED]
-  REAL     : real K1 -> router row only (BASE / CAND1)
-  K1_NULL  : real K1 -> null kernel (K1 with nothing behind it)
-  P1c1/P1c4: K1 stand-in (spin 4.9/3.3 us, trigger at start) -> router row -> run   (context)
-  P0       : router row -> run, no K1 (context)
-Cases: EP4 rank 0 (96 x 2304, slot_start 0) at M=1/2/4/8 and EP2xTP2 moe_ep_rank 1 (192 x 1152, slot_start 192)
-at M=1/2/4 (labels ep2tp2_M). kernel_ms = REAL_RUN 40-layer graph. Routing of every layer checked bitwise vs main.
+inputs, the real Sm12xW4a8DecodeState.run (FlashInfer SM12x MoE decode chain). Per layer, one 40-layer CUDA graph:
+  P1-REAL chain: real K1 (_mhc_lagged_layer_input_kernel, PDL, early trigger; writes x) -> router row -> run()
+  BASE: router_gemm_mma_kernel -> gate_forward_kernel<384,6,false,false> -> run() (route_assign_decode + q0 + fc1 + fc2)
+  CAND: dsv4FusedRouterKernel<M,false> (Stage 1: GEMV + gate, one launch) -> run() exactly as BASE
+Cold L2: read-only 512 MB flush before every replay (pitfall 1356: no zero_() flush). Each sample = sum of REPS
+individually-timed (flush, replay) pairs; events bracket the replay only.
+Checks (same job output as the timings): after the warmup replays and after the last timed replay, the graph's OWN
+output buffers (logits, ids, weights of every layer) are compared bitwise with main's dsv3_router_gemm_op +
+gate_forward recomputed eagerly on the same xs (which K1 wrote inside the graph); every layer's arrival counter is
+read and must be 0. A failed check makes the job exit non-zero.
+Targeted: EP4 rank 0 (96 x 2304, slot 0) M=1/2/4 (main's layout, c1/c2/c4). Secondary (no loss beyond noise, not
+targets): EP4 M=8, EP2xTP2 moe_ep_rank 1 (192 x 1152, slot 192) M=1/2/4, reported under "secondary".
 """
-import argparse
 import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (HIDDEN, LAYERS, SPIN_C1_NS, SPIN_C4_NS, biases, capture, fused, fused_route,  # noqa: E402
-                    gate_main, has_fused, k1_standin, log, make_decode_state, router_main, router_weights)
+from common import (HIDDEN, LAYERS, biases, capture, fused, gate_main, has_fused, log,  # noqa: E402
+                    make_decode_state, router_main, router_weights)
 
 import torch  # noqa: E402
-import triton  # noqa: E402
-import triton.language as tl  # noqa: E402
 
-WARMUP, ITERS = 5, 40
-ROUTE_MAX_M = int(os.environ.get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE_MAX_M", "2"))  # modeling_deepseekv4.py's gate
+WARMUP = 5
 K1_P = 224  # fused_half_fma bigfuse 256 tactic's phase-2 threads (4 warps per K1 program)
-CASES = [("ep4", 96, 2304, 0, m) for m in (1, 2, 4, 8)] + [("ep2tp2", 192, 1152, 192, m) for m in (1, 2, 4)]
-
-
-@triton.jit
-def _null_kernel(o_ptr, BLOCK: tl.constexpr):
-    offs = tl.arange(0, BLOCK)
-    tl.store(o_ptr + offs, offs.to(tl.float32))
+# (layout, local experts, inter, slot_start, M, samples, reps per sample, targeted)
+CASES = [("ep4", 96, 2304, 0, m, 60, 4, True) for m in (1, 2, 4)] + [("ep4", 96, 2304, 0, 8, 40, 2, False)] + \
+        [("ep2tp2", 192, 1152, 192, m, 40, 2, False) for m in (1, 2, 4)]
 
 
 def make_k1_inputs(m, gen, dev):
@@ -53,41 +42,31 @@ def make_k1_inputs(m, gen, dev):
     return x, res, post, comb, pre, nw
 
 
+def bits(t):
+    return t.contiguous().view(torch.int32)
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--both", action="store_true", help="time BASE, CAND1 and CAND in one process (branch tree)")
-    ap.add_argument("--layouts", default="ep4,ep2tp2")
-    ap.add_argument("--no-context", action="store_true")
-    args = ap.parse_args()
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.modules.mhc.mhc_lagged_split import mhc_lagged_layer_input
 
-    cand_tree = has_fused()
-    has_route = hasattr(torch.ops.trtllm, "dsv4_fused_router_route")
-    arms = ["BASE", "CAND1", "CAND2"] if args.both else (["CAND"] if cand_tree else ["BASE"])
-    assert all(a == "BASE" for a in arms) or (cand_tree and has_route)
+    arm = "CAND" if has_fused() else "BASE"
     kname = {"BASE": "router_gemm_mma_kernel+gate_forward_kernel | route: _route_assign_decode_kernel+"
-                     "_mxfp8_q0_route_direct_kernel",
-             "CAND1": "dsv4FusedRouterKernel<M,false> | route: _route_assign_decode_kernel+_mxfp8_q0_route_direct_kernel",
-             "CAND2": "dsv4FusedRouterKernel<M,true> (route+q0 fused) | route: none",
-             "CAND": f"production policy: dsv4FusedRouterKernel<M,true> at M<={ROUTE_MAX_M} (no route kernels), "
-                     f"else dsv4FusedRouterKernel<M,false> + _route_assign_decode_kernel+_mxfp8_q0_route_direct_kernel"}
-    main_arm = arms[-1]
+                     "_mxfp8_q0_route_direct_kernel | fc1_act_q1+fc2_finalize",
+             "CAND": "dsv4FusedRouterKernel<M,false> (Stage 1) | route: _route_assign_decode_kernel+"
+                     "_mxfp8_q0_route_direct_kernel | fc1_act_q1+fc2_finalize"}[arm]
     dev = "cuda"
-    log("arms", arms, "judged", main_arm, torch.cuda.get_device_name(), {a: kname[a] for a in arms})
+    log("ARM", arm, torch.cuda.get_device_name(), kname)
     gen = torch.Generator(device=dev).manual_seed(4242)
     rws = router_weights(gen, LAYERS)
     bs = biases(gen, LAYERS)
     counters = [torch.zeros(1, dtype=torch.int32, device=dev) for _ in range(LAYERS)]
     flush = torch.empty(512 * 1024 * 1024 // 4, dtype=torch.float32, device=dev).fill_(1.0)
-    null_out = torch.empty(128, dtype=torch.float32, device=dev)
 
-    out, extra = {}, {}
-    layouts = args.layouts.split(",")
+    out, secondary, extra = {}, {}, {}
+    all_ok = True
     state_key, state = None, None
-    for lay, e, inter, slot, m in CASES:
-        if lay not in layouts:
-            continue
+    for lay, e, inter, slot, m, samples, reps, targeted in CASES:
         label = str(m) if lay == "ep4" else f"{lay}_{m}"
         if state_key != (e, inter, slot):
             state = None
@@ -96,108 +75,86 @@ def main():
             state_key = (e, inter, slot)
             log(f"decode state E={state.num_experts} inter={state.inter} slot_start={state.slot_start}")
 
-        def row(arm, li, x, with_run):
-            # CAND = production policy (DeepseekV4Gate.fused_forward): Stage 2 at M <= ROUTE_MAX_M, else Stage 1
-            if (arm == "CAND2" or (arm == "CAND" and m <= ROUTE_MAX_M)) and with_run:
-                ids, wts, _ = fused_route(state, x, rws[li], bs[li], counters[li])
-            elif arm in ("CAND", "CAND1", "CAND2"):
-                ids, wts, _ = fused(x, rws[li], bs[li], counters[li])
+        def row(li, x):
+            if arm == "CAND":
+                ids, wts, lg = fused(x, rws[li], bs[li], counters[li])
             else:
-                ids, wts = gate_main(router_main(x, rws[li]), bs[li])
-            if with_run:
-                state.run(x, ids, wts)
-            return ids, wts
+                lg = router_main(x, rws[li])
+                ids, wts = gate_main(lg, bs[li])
+            state.run(x, ids, wts)
+            return lg, ids, wts
 
         k1in = [make_k1_inputs(m, gen, dev) for _ in range(LAYERS)]
         xs = [torch.empty(m, HIDDEN, dtype=torch.bfloat16, device=dev) for _ in range(LAYERS)]
-        srcs = [torch.randn((m, HIDDEN), generator=gen, device=dev).to(torch.bfloat16) for _ in range(LAYERS)]
 
         def k1(li):
             xp, res, post, comb, pre, nw = k1in[li]
             mhc_lagged_layer_input(xp, res, post, comb, pre, nw, 1e-6, K1_P, enable_pdl=True, out=xs[li])
 
-        for li in range(LAYERS):
-            k1(li)
-        torch.cuda.synchronize()
-        # Routing bitwise vs main's pair, and (CAND) the MoE output vs the plain-route run (warms the workspace).
-        nbad = 0
-        for li in range(LAYERS):
-            ri, rw = gate_main(router_main(xs[li], rws[li]), bs[li])
-            ref_out = state.run(xs[li], ri, rw).clone()
-            for arm in arms:
-                ci, cw = row(arm, li, xs[li], False)
-                ok = torch.equal(ri, ci) and torch.equal(rw.view(torch.int32), cw.view(torch.int32))
-                if arm in ("CAND", "CAND2"):
-                    fi, fw, _ = fused_route(state, xs[li], rws[li], bs[li], counters[li])
-                    assert state._prerouted is not None
-                    o = state.run(xs[li], fi, fw)
-                    ok = ok and bool(torch.isfinite(o.float()).all()) and \
-                        (o.float() - ref_out.float()).abs().max().item() <= 1e-2 * max(1.0, ref_out.float().abs().max().item())
-                nbad += int(not ok)
-        torch.cuda.synchronize()
-        log(f"{label}: routing/output mismatches {nbad}")
+        def step():
+            outs = []
+            for li in range(LAYERS):
+                k1(li)
+                outs.append(row(li, xs[li]))
+            return outs
 
-        def mk(arm, kind):
-            def fn():
-                for li in range(LAYERS):
-                    if kind in ("REAL", "REAL_RUN", "K1_NULL"):
-                        k1(li)
-                    elif kind == "P1c1":
-                        k1_standin(srcs[li], xs[li], SPIN_C1_NS)
-                    elif kind == "P1c4":
-                        k1_standin(srcs[li], xs[li], SPIN_C4_NS)
-                    if kind == "K1_NULL":
-                        _null_kernel[(m,)](null_out, BLOCK=128, num_warps=4)
-                        continue
-                    row(arm, li, xs[li], kind != "REAL")
-            return fn
+        g, gout = capture(step)
 
-        kinds = ["REAL_RUN"] + ([] if args.no_context or lay != "ep4" else ["REAL", "P1c1", "P1c4", "P0"])
-        graphs = {}
-        for arm in arms:
-            for kind in kinds:
-                if arm in ("CAND", "CAND2") and kind == "REAL":
-                    continue  # Stage 2 without its run() is not a router row; CAND1:REAL is
-                graphs[f"{arm}:{kind}"] = capture(mk(arm, kind))[0]
-        if lay == "ep4":
-            graphs["K1_NULL"] = capture(mk(arms[0], "K1_NULL"))[0]
-        names = list(graphs)
-        ts = {k: [] for k in names}
-        for it in range(WARMUP + ITERS):
-            order = names if it % 2 == 0 else names[::-1]  # ABBA
-            for name in order:
-                flush.sum()
-                a = torch.cuda.Event(enable_timing=True)
-                b = torch.cuda.Event(enable_timing=True)
-                a.record()
-                graphs[name].replay()
-                b.record()
-                torch.cuda.synchronize()
-                if it >= WARMUP:
-                    ts[name].append(a.elapsed_time(b))
-        del graphs
-        r = {}
-        for k, v in ts.items():
-            v.sort()
-            med = v[len(v) // 2]
-            p10, p90 = v[int(0.1 * (len(v) - 1))], v[int(0.9 * (len(v) - 1))]
-            r[k] = {"ms": med, "us_layer": med * 1000.0 / LAYERS, "p10_us_layer": p10 * 1000.0 / LAYERS,
-                    "p90_us_layer": p90 * 1000.0 / LAYERS, "noise": (p90 - p10) / med}
-        for arm in arms:
-            log(f"{arm} {label} E={e} inter={inter} slot={slot} kernels[{kname[arm]}; K1=_mhc_lagged_layer_input_kernel] "
-                + " ".join(f"{k.split(':')[1]}={x['us_layer']:.3f}us/layer[{x['p10_us_layer']:.3f},{x['p90_us_layer']:.3f}]"
-                           for k, x in r.items() if k.startswith(arm + ":")))
-        if "K1_NULL" in r:
-            log(f"{label} K1_NULL (K1 -> null) {r['K1_NULL']['us_layer']:.3f} us/layer")
-        if args.both:
-            for c in ("CAND1", "CAND2"):
-                d = {k: r[f"{c}:{k}"]["us_layer"] - r[f"BASE:{k}"]["us_layer"] for k in kinds if f"{c}:{k}" in r}
-                log(f"{label} {c}-BASE us/layer: " + " ".join(f"{k}={v:+.3f}" for k, v in d.items()))
-        out[label] = {"kernel_ms": r[f"{main_arm}:REAL_RUN"]["ms"], "noise_floor": r[f"{main_arm}:REAL_RUN"]["noise"]}
-        extra[label] = {k: {kk: round(vv, 4) for kk, vv in x.items()} for k, x in r.items()}
-        extra[label]["mismatches"] = nbad
-    print(json.dumps({"batch": out, "output": {"class": "exact"}, "arms": arms, "judged_arm": main_arm,
-                      "kernels": {a: kname[a] for a in arms}, "chains": extra}))
+        def check(tag):
+            torch.cuda.synchronize()
+            bad = {"logits": 0, "ids": 0, "weights": 0, "counter": 0}
+            for li in range(LAYERS):
+                lg, ids, wts = gout[li]
+                rlg = router_main(xs[li], rws[li])
+                rids, rwts = gate_main(rlg, bs[li])
+                bad["logits"] += int(not torch.equal(bits(lg), bits(rlg)))
+                bad["ids"] += int(not torch.equal(ids, rids))
+                bad["weights"] += int(not torch.equal(bits(wts), bits(rwts)))
+            torch.cuda.synchronize()
+            cnt = [int(c.item()) for c in counters]
+            bad["counter"] = sum(1 for c in cnt if c != 0)
+            ok = not any(bad.values())
+            log(f"CHECK {arm} {label} {tag}: layers={LAYERS} mismatches logits={bad['logits']} ids={bad['ids']} "
+                f"weights={bad['weights']} counters_nonzero={bad['counter']} (max counter {max(cnt)}) "
+                f"vs dsv3_router_gemm_op+gate_forward on the graph's xs -> {'OK' if ok else 'FAIL'}")
+            return ok, bad
+
+        def replay_timed():
+            flush.sum()
+            a = torch.cuda.Event(enable_timing=True)
+            b = torch.cuda.Event(enable_timing=True)
+            a.record()
+            g.replay()
+            b.record()
+            torch.cuda.synchronize()
+            return a.elapsed_time(b)
+
+        for _ in range(WARMUP):
+            replay_timed()
+        ok_w, bad_w = check(f"after {WARMUP} warmup replays")
+        ts = []
+        for _ in range(samples):
+            ts.append(sum(replay_timed() for _ in range(reps)) / reps)
+        ok_e, bad_e = check(f"after last of {samples}x{reps} timed replays")
+        all_ok = all_ok and ok_w and ok_e
+        del g, gout
+        v = sorted(ts)
+        med = v[len(v) // 2]
+        p10, p90 = v[int(0.1 * (len(v) - 1))], v[int(0.9 * (len(v) - 1))]
+        noise = (p90 - p10) / med
+        log(f"{arm} {label} E={e} inter={inter} slot={slot} {'TARGET' if targeted else 'secondary'} "
+            f"kernels[K1=_mhc_lagged_layer_input_kernel -> {kname}] P1-REAL 40-layer graph "
+            f"median {med:.4f} ms = {med * 1000.0 / LAYERS:.3f} us/layer [p10 {p10 * 1000.0 / LAYERS:.3f}, "
+            f"p90 {p90 * 1000.0 / LAYERS:.3f}] noise {noise:.4%} ({samples} samples x {reps} replays)")
+        rec = {"kernel_ms": med, "noise_floor": noise}
+        (out if targeted else secondary)[label] = rec
+        extra[label] = {"us_layer": med * 1000.0 / LAYERS, "p10_us_layer": p10 * 1000.0 / LAYERS,
+                        "p90_us_layer": p90 * 1000.0 / LAYERS, "samples": samples, "reps": reps,
+                        "check_after_warmup": bad_w, "check_after_timed": bad_e}
+    print(json.dumps({"batch": out, "secondary": secondary, "output": {"class": "exact"}, "arm": arm,
+                      "kernels": kname, "checks_passed": all_ok, "chains": extra}))
+    if not all_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
