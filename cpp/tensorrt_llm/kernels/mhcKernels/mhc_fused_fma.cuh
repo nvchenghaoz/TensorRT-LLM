@@ -1244,7 +1244,8 @@ __launch_bounds__(256, (TM * N_PER_BLOCK <= 48) ? 2 : 1) __global__
 //   - MIN_BLOCKS is explicit (1 lifts the 128-register cap that made the
 //     (12,4)/(8,4)/(24,2) builds spill).
 //   - token offsets are int32 (the launcher checks M * 4 * hidden < 2^31).
-//   - the W_T loads are not volatile, so ptxas may schedule them freely.
+//   - the W_T loads stay volatile asm, as in v1 (non-volatile let ptxas hoist
+//     them and spill more, job 1426).
 //   - RAW_SMEM stages the thread-private bf16 inputs (x and the 4 residual
 //     streams of each token) in shared memory with cp.async instead of
 //     keeping 20 * TM registers live across the j loop.  Each thread reads

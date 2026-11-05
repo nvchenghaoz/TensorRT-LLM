@@ -7,6 +7,7 @@
 #include "mhc_fused_fma.cuh"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
