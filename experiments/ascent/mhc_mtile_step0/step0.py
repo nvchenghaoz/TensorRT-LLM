@@ -156,10 +156,14 @@ from mhc_fhc_bench import make_inputs, time_op  # noqa: E402
 flush = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
 rn = mhc_cuda.MhcFusedHcRunner(*ARGS)
 chosen = {}
-for M in (2048, 4096, 8192):
+for M in (128, 2048, 4096, 8192):
+  for mode in ("v41_lagged", "v4"):
     inputs, nw = make_inputs(M)
     pre_ext = torch.rand((M, HC), device="cuda").float() + 0.5
-    kw = dict(norm_weight=nw, norm_eps=1e-6, pre_mix_ext=pre_ext)
+    kw = dict(norm_weight=nw, norm_eps=1e-6)
+    if mode == "v41_lagged":
+        kw["pre_mix_ext"] = pre_ext
+    AutoTuner.get().clear_cache() if hasattr(AutoTuner.get(), "clear_cache") else None
     with autotune(skip_dynamic_tuning_buckets=True):
         mhc_cuda.mhc_fused_hc(*inputs, *ARGS, **kw)
     torch.cuda.synchronize()
@@ -172,9 +176,9 @@ for M in (2048, 4096, 8192):
         med, nz = time_op(fn, 20, flush)
         times[str(tac)] = round(med * 1000, 1)
     best = min(times, key=times.get)
-    chosen[str(M)] = {"autotuner": list(t), "us_chosen": times.get(str(tuple(t))), "best_timed": best,
+    chosen[f"{M}_{mode}"] = {"autotuner": list(t), "us_chosen": times.get(str(tuple(t))), "best_timed": best,
                       "us_best": times[best], "all_us": dict(sorted(times.items(), key=lambda kv: kv[1]))}
-    print(f"[tactic] M={M}: {chosen[str(M)]}", flush=True)
+    print(f"[tactic] M={M} {mode}: {chosen[f'{M}_{mode}']}", flush=True)
     del inputs
     torch.cuda.empty_cache()
 summary["chosen"] = chosen
