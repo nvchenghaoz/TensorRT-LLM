@@ -407,8 +407,12 @@ class mHC(nn.Module):
         aux_stream: torch.cuda.Stream,
         event0: torch.cuda.Event,
         event1: torch.cuda.Event,
+        defer_k1: bool = False,
     ):
         """:meth:`fused_hc_lagged` split over two streams (decode, small M; SM120).
+
+        ``defer_k1`` (K1 fold, M <= 4): K1 is not launched; ``layer_input`` is an empty tensor that the
+        consumer must produce through ``join.k1_fold`` (a :class:`mhc_lagged_split.K1FoldPending`).
 
         K1 (main stream, Triton, PDL): post update + lagged collapse + RMSNorm ->
         ``layer_input``, bitwise equal to the fused op's. K2 (``aux_stream``): the unchanged
@@ -476,7 +480,18 @@ class mHC(nn.Module):
         if nw.dtype != torch.bfloat16 or not nw.is_contiguous():
             return None
 
+        k1_fold = None
+        if defer_k1 and 1 <= B <= _split.K1_FOLD_MAX_TOKENS and hidden == 5120:
+            k1_fold = _split.K1FoldPending(
+                torch.empty_like(x_prev_flat),
+                (x_prev_flat, residual_prev_flat, post_flat, comb_flat, pre_flat, nw),
+                norm_eps,
+                reducer_threads,
+            )
+
         def k1():
+            if k1_fold is not None:
+                return k1_fold.out
             return _split.mhc_lagged_layer_input(
                 x_prev_flat,
                 residual_prev_flat,
@@ -524,6 +539,7 @@ class mHC(nn.Module):
                 k2_layer_input,
             ),
             k2_layer_input if _split.TEST_KEEP_K2_LAYER_INPUT else None,
+            k1_fold,
         )
         outputs = (
             residual_cur.view(*outer_shape, n, hidden),

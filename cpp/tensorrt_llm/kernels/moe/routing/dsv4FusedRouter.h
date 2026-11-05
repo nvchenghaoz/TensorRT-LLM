@@ -69,6 +69,28 @@ struct FusedRouterParams
 
 void invokeDsv4FusedRouter(FusedRouterParams const& params, cudaStream_t stream);
 
+// K1 fold (decode M <= kMaxFoldTokens; TRTLLM_DSV4_ROUTER_K1_FOLD): the router launch also computes the hc_ffn mHC
+// lagged layer_input (_mhc_lagged_layer_input_kernel's arithmetic, mhc_lagged_split.py, bit for bit for its reducer
+// thread count P) from the boundary's inputs, after griddepcontrol.wait, redundantly in every CTA (shared memory),
+// and runs the GEMV (and the Stage 2 q0) from it. It also writes layer_input to `out` (== x, for the MoE kernels
+// that read it after this launch).
+constexpr int kMaxFoldTokens = 4;
+
+struct FusedRouterFoldParams : FusedRouterParams
+{
+    __nv_bfloat16 const* k1X;          // [M, 5120] x_prev (the attention output, all-reduced)
+    __nv_bfloat16 const* k1Residual;   // [M, 4, 5120]
+    float const* k1Post;               // [M, 4]
+    float const* k1Comb;               // [M, 4, 4]
+    float const* k1Pre;                // [M, 4] (the previous sublayer's pre)
+    __nv_bfloat16 const* k1NormWeight; // [5120] (read-only for the forward: staged before the wait)
+    __nv_bfloat16* k1Out;              // [M, 5120] layer_input (== x)
+    float k1NormEps;
+    int k1ReducerThreads;              // P in {96, 224, 256, 480}
+};
+
+void invokeDsv4FusedRouterK1Fold(FusedRouterFoldParams const& params, cudaStream_t stream);
+
 } // namespace kernels::dsv4_fused_router
 
 TRTLLM_NAMESPACE_END
