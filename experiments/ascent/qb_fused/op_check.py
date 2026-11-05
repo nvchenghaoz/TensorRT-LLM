@@ -247,6 +247,75 @@ def section_b(gen):
     results["B"] = out
 
 
+_SIDE = {}
+
+
+def _overlap_case(make_victims, agg, replays, name=""):
+    """lowm_check._overlap_case with ONE side stream s1, reused and warmed eagerly (the aggressor runs on s1 once
+    before any capture, so cuBLAS' per-stream setup never happens inside capture). Victims, NaN poisoning and replay
+    counts as in lowm_check."""
+    if "s0" not in _SIDE:
+        _SIDE["s0"] = torch.cuda.Stream()
+        _SIDE["s1"] = torch.cuda.Stream()
+    s0, s1 = _SIDE["s0"], _SIDE["s1"]
+    victims = make_victims()
+    torch.cuda.synchronize()
+    iso = [v() for v in victims]
+    torch.cuda.synchronize()
+    iso = [t.clone() for t in iso]
+    s1.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s1):
+        agg()
+    torch.cuda.synchronize()
+    s0.wait_stream(torch.cuda.current_stream())
+    graphs = {}
+    with torch.cuda.stream(s0):
+        for v in victims:
+            v()
+        for gname in ("both", "vic", "agg"):
+            log(f"   capture {name} {gname}")
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=s0):
+                outs = []
+                if gname != "vic":
+                    s1.wait_stream(s0)
+                    with torch.cuda.stream(s1):
+                        agg()
+                if gname != "agg":
+                    outs = [v() for v in victims]
+                if gname != "vic":
+                    s0.wait_stream(s1)
+            graphs[gname] = (g, outs)
+    torch.cuda.current_stream().wait_stream(s0)
+    torch.cuda.synchronize()
+    tm = {}
+    for gname, (g, _) in graphs.items():
+        ts = []
+        for _ in range(5):
+            a = torch.cuda.Event(enable_timing=True)
+            b = torch.cuda.Event(enable_timing=True)
+            a.record()
+            g.replay()
+            b.record()
+            b.synchronize()
+            ts.append(a.elapsed_time(b))
+        tm[gname] = sorted(ts)[2] * 1000
+    g, outs = graphs["both"]
+    bad = bad_elems = 0
+    for _ in range(replays):
+        for o in outs:
+            o.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        wrong = [int((o != r).sum().item()) for o, r in zip(outs, iso)]
+        bad += int(any(wrong))
+        bad_elems += sum(wrong)
+    info = {"us_both": round(tm["both"], 1), "us_victims": round(tm["vic"], 1), "us_aggressor": round(tm["agg"], 1),
+            "overlap_us": round(tm["vic"] + tm["agg"] - tm["both"], 1)}
+    del graphs
+    return bad, bad_elems, info
+
+
 def section_c(gen):
     sys.path.insert(0, os.path.join(HERE, "..", "csa2_lowm"))
     import lowm_check as lc
@@ -261,37 +330,45 @@ def section_c(gen):
     for _ in range(4):
         wa, swa, _ = lb.make_weight(A_N, HIDDEN, gen)
         wq, sq, _ = lb.make_weight(QB_N, Q_RANK, gen)
-        copies.append((wa, swa, wq, sq))
+        wi, si, _ = lb.make_weight(QB_N + IDX_N, Q_RANK, gen)
+        copies.append((wa, swa, wq, sq, wi, si))
     out = {}
     b12x_faults = 0
     for m in (1, 2, 4, 8):
         x = (torch.randn((m, HIDDEN), generator=gen, device="cuda") * 2).to(torch.bfloat16)
         ca = L._CHAIN_A_CONFIGS[(A_N, HIDDEN)][m]
-        cb = L._QNORM_CONFIGS[(QB_N, Q_RANK)][m]
         replays = 90 if m == 1 else 60
         reps = 8
+        routes = [("plain", L._QNORM_CONFIGS[(QB_N, Q_RANK)][m])]
+        if m in L._QNORM_CONFIGS[(QB_N + IDX_N, Q_RANK)]:
+            routes.append(("index", L._QNORM_CONFIGS[(QB_N + IDX_N, Q_RANK)][m]))
+        for route, cb in routes:
 
-        def chain_victims():
-            def one(c):
-                rows = lowm(x, c[0], c[1], ca, flags=2)[0]
-                return qnorm(rows[:, :Q_RANK], c[2], c[3], nw, cb)[1]
-            return [(lambda c=c: one(c)) for _ in range(reps) for c in copies]
+            def chain_victims(route=route, cb=cb):
+                def one(c):
+                    rows = lowm(x, c[0], c[1], ca, flags=2)[0]
+                    if route == "plain":
+                        return qnorm(rows[:, :Q_RANK], c[2], c[3], nw, cb)[1]
+                    _, q, idx = qnorm(rows[:, :Q_RANK], c[4], c[5], nw, cb, n_split=QB_N)
+                    return torch.cat([q, idx], 1)
+                return [(lambda c=c: one(c)) for _ in range(reps) for c in copies]
 
-        def b12x_victims():
-            qx = (torch.randn((m, Q_RANK), generator=gen, device="cuda")).to(torch.bfloat16)
-            return [(lambda c=c: lb.main_mm(qx, c[2], c[3])) for _ in range(reps) for c in copies]
+            def b12x_victims():
+                qx = (torch.randn((m, Q_RANK), generator=gen, device="cuda")).to(torch.bfloat16)
+                return [(lambda c=c: lb.main_mm(qx, c[2], c[3])) for _ in range(reps) for c in copies]
 
-        entry = {"cfg_a": ca, "cfg_b": cb, "victims_per_replay": reps * len(copies), "replays": replays}
-        for aname, agg in aggs.items():
-            pbad, pe, pinfo = lc._overlap_case(chain_victims, agg, replays)
-            bbad, be, binfo = lc._overlap_case(b12x_victims, agg, replays)
-            entry[aname] = {"chain_bad_replays": pbad, "chain_bad_elems": pe, "chain_overlap": pinfo,
-                            "b12x_control_bad_replays": bbad, "b12x_overlap": binfo}
-            b12x_faults += bbad
-            log(f"C M={m} {aname} {json.dumps(entry[aname])}")
-            if pbad:
-                fail(f"C M={m} {aname}: chain wrong under the cross-stream aggressor {entry[aname]}")
-        out[f"M{m}"] = entry
+            entry = {"cfg_a": ca, "cfg_b": cb, "victims_per_replay": reps * len(copies), "replays": replays}
+            for aname, agg in aggs.items():
+                pbad, pe, pinfo = _overlap_case(chain_victims, agg, replays, f"M{m} {route} {aname} chain")
+                entry[aname] = {"chain_bad_replays": pbad, "chain_bad_elems": pe, "chain_overlap": pinfo}
+                if route == "plain":
+                    bbad, be, binfo = _overlap_case(b12x_victims, agg, replays, f"M{m} {aname} b12x")
+                    entry[aname].update({"b12x_control_bad_replays": bbad, "b12x_overlap": binfo})
+                    b12x_faults += bbad
+                log(f"C M={m} {route} {aname} {json.dumps(entry[aname])}")
+                if pbad:
+                    fail(f"C M={m} {route} {aname}: chain wrong under the cross-stream aggressor {entry[aname]}")
+            out[f"M{m}_{route}"] = entry
     out["b12x_control_faults_total"] = b12x_faults
     if b12x_faults == 0:
         fail("C: b12x control never faulted (W-AGG not sensitive in this job)")
