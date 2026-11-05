@@ -95,10 +95,35 @@ __device__ __forceinline__ uint32_t warpMaxU32(uint32_t value)
     return result;
 }
 
-template <int kNumTokens>
+// The fp32 division of the Triton q0 kernel (amax / 448.0 and 1.0 / sf).
+__device__ __forceinline__ float kQuantDiv(float a, float b)
+{
+    return __fdiv_rn(a, b);
+}
+
+// fp32 -> e4m3 with round-to-nearest-even and saturation (cvt.rn.satfinite.e4m3x2.f32), 4 values -> 4 bytes.
+__device__ __forceinline__ uint32_t packE4m3x4(float v0, float v1, float v2, float v3)
+{
+    uint16_t lo;
+    uint16_t hi;
+    // cvt.rn.satfinite.e4m3x2.f32 d, a, b: a -> upper byte, b -> lower byte.
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(v1), "f"(v0));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(v3), "f"(v2));
+    return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+}
+
+// Stage 2 constants: FlashInfer moe_mxfp8_q0_route_triton (TILE_K 128 per ue8m0 exponent, 4 exponents per int32).
+constexpr int kQTileK = 128;
+constexpr int kQTiles = kHiddenDim / kQTileK;   // 40 exponent tiles per token
+constexpr int kSfPack = 4;                      // exponents per int32 scale word
+constexpr int kSfBlocks = kQTiles / kSfPack;     // 10 scale words per routed row
+constexpr int kMaxPairs = kMaxTokens * kTopK;   // 48
+
+template <int kNumTokens, bool kRoute>
 __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRouterParams const __grid_constant__ p)
 {
     static_assert(kNumTokens >= 1 && kNumTokens <= kMaxTokens, "1..8 tokens");
+    constexpr int kPairs = kNumTokens * kTopK;
     int const warpId = threadIdx.x / 32;
     int const lane = threadIdx.x % 32;
     int const g = lane / 4; // token row (A) / expert column (B) of this lane in the MMA fragments
@@ -110,6 +135,12 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
     __shared__ float smScores[kNumTokens][kNumExperts];
     __shared__ __align__(16) float smBias[kNumExperts];
     __shared__ int smIsLast;
+    // Stage 2: the routing of every pair and its rows, and the exponents of every 128-wide tile.
+    __shared__ int smIds[kRoute ? kPairs : 1];
+    __shared__ float smWts[kRoute ? kPairs : 1];
+    __shared__ int smDst[kRoute ? kPairs : 1];
+    __shared__ int smScaleDst[kRoute ? kPairs : 1];
+    __shared__ uint32_t smExp[kRoute ? kNumTokens : 1][kQTiles];
 
     // ---- Before the wait: the router weight slice of this lane (all 8 chunks) and, for the routing warps, the
     // gate bias. Neither is written by any kernel of the forward.
@@ -145,6 +176,23 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
         int const k = kWarp + c * kChunk + q * 8;
         a0[c] = row0Valid ? *reinterpret_cast<uint4 const*>(aRow0 + k) : zero4;
     }
+    if constexpr (kRoute)
+    {
+        // route_assign_decode's fills, grid-stride over every CTA, after the wait (the previous layer's FC1/FC2 read
+        // these buffers): the caller's q1/sf1/out buffer and every scale_out word. The last CTA writes the routed
+        // scale words only after every CTA has arrived (fence + counter below).
+        int const gtid = blockIdx.x * kBlockSize + threadIdx.x;
+        constexpr int kGridThreads = kNumCtas * kBlockSize;
+        for (int64_t i = gtid; i < p.zeroNumel; i += kGridThreads)
+        {
+            p.zeroBuf[i] = 0;
+        }
+        int const totalScale = kSfBlocks * p.paddedRows;
+        for (int i = gtid; i < totalScale; i += kGridThreads)
+        {
+            p.scaleOut[i] = 0;
+        }
+    }
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
     for (int c = 0; c < kChunksPerWarp; c++)
@@ -179,7 +227,14 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
         {
             p.logits[row * kNumExperts + col] = sum;
         }
-        __threadfence(); // the logit stores are visible device-wide before this CTA counts itself in
+        if constexpr (!kRoute)
+        {
+            __threadfence(); // the logit stores are visible device-wide before this CTA counts itself in
+        }
+    }
+    if constexpr (kRoute)
+    {
+        __threadfence(); // logits and fills
     }
     __syncthreads();
     if (threadIdx.x == 0)
@@ -262,8 +317,126 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
         float const weightSum = cg::reduce(warp, myTopkValue, cg::plus<float>{});
         if (lane < kTopK)
         {
-            p.outWeights[row * kTopK + lane] = (myTopkValue / (weightSum + kWeightEpsilon)) * p.routeScale;
+            float const weight = (myTopkValue / (weightSum + kWeightEpsilon)) * p.routeScale;
+            p.outWeights[row * kTopK + lane] = weight;
             p.outIndices[row * kTopK + lane] = myTopkIndex;
+            if constexpr (kRoute)
+            {
+                smIds[row * kTopK + lane] = myTopkIndex;
+                smWts[row * kTopK + lane] = weight;
+            }
+        }
+    }
+    if constexpr (kRoute)
+    {
+        __syncthreads();
+        // route_assign_decode_kernel (remap_ids, expert_offset = slotStart): local expert = id - slotStart when in
+        // [0, numLocal), else unrouted. Rows sorted by (expert, pair index).
+        int const numLocal = p.numLocalExperts;
+        auto localOf = [&](int pair)
+        {
+            int const e = smIds[pair] - p.slotStart;
+            return (e >= 0 && e < numLocal) ? e : -1;
+        };
+        if (threadIdx.x < kPairs)
+        {
+            int const pid = threadIdx.x;
+            int const pe = localOf(pid);
+            int expertBegin = 0;
+            int rank = 0;
+#pragma unroll
+            for (int j = 0; j < kPairs; ++j)
+            {
+                int const ej = localOf(j);
+                bool const rj = ej >= 0;
+                expertBegin += (rj && ej < pe) ? 1 : 0;
+                rank += (rj && ej == pe && j < pid) ? 1 : 0;
+            }
+            int const routedRow = expertBegin + rank;
+            constexpr int kAlign = 4; // SF_M_ALIGN
+            int const scaleBegin = (expertBegin + pe * (kAlign - 1)) & -kAlign;
+            bool const routed = pe >= 0;
+            if (routed)
+            {
+                p.tokenMap[routedRow] = pid / kTopK;
+                p.tokenWeights[routedRow] = smWts[pid];
+            }
+            int const dst = routed ? routedRow : -1;
+            int const sdst = routed ? scaleBegin + rank : -1;
+            p.dstRows[pid] = dst;
+            p.scaleDstRows[pid] = sdst;
+            smDst[pid] = dst;
+            smScaleDst[pid] = sdst;
+        }
+        else if (threadIdx.x >= 64 && threadIdx.x <= 64 + numLocal)
+        {
+            int const e = threadIdx.x - 64; // offsets[e] = routed pairs with expert < e; offsets[numLocal] = all
+            int count = 0;
+#pragma unroll
+            for (int j = 0; j < kPairs; ++j)
+            {
+                int const ej = localOf(j);
+                count += (ej >= 0 && (e == numLocal || ej < e)) ? 1 : 0;
+            }
+            p.offsets[e] = count;
+        }
+        __syncthreads();
+
+        // _mxfp8_q0_route_direct_kernel: per token and 128-wide tile, amax (floor 1e-4) -> ue8m0 exponent
+        // (amax / 448, rounded up, clamped to 1..254) -> e4m3 of x / 2^(exp-127), scattered to the token's routed rows.
+        for (int tile = warpId; tile < kNumTokens * kQTiles; tile += kNumWarps)
+        {
+            int const t = tile / kQTiles;
+            int const kt = tile % kQTiles;
+            uint2 const raw = __ldcg(reinterpret_cast<uint2 const*>(p.x + t * kHiddenDim + kt * kQTileK + lane * 4));
+            __nv_bfloat162 const h0 = *reinterpret_cast<__nv_bfloat162 const*>(&raw.x);
+            __nv_bfloat162 const h1 = *reinterpret_cast<__nv_bfloat162 const*>(&raw.y);
+            float const v0 = __low2float(h0);
+            float const v1 = __high2float(h0);
+            float const v2 = __low2float(h1);
+            float const v3 = __high2float(h1);
+            float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+            for (int off = 16; off > 0; off /= 2)
+            {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+            }
+            amax = fmaxf(amax, 1.0e-4f);
+            float const sf = kQuantDiv(amax, 448.0f);
+            uint32_t const bitsSf = __float_as_uint(sf);
+            int exp = static_cast<int>((bitsSf >> 23) & 0xFFu) + ((bitsSf & 0x7FFFFFu) != 0u ? 1 : 0);
+            exp = min(max(exp, 1), 254);
+            float const sfE8 = __uint_as_float(static_cast<uint32_t>(exp) << 23);
+            float const inv = kQuantDiv(1.0f, sfE8);
+            uint32_t const packed = packE4m3x4(v0 * inv, v1 * inv, v2 * inv, v3 * inv);
+#pragma unroll
+            for (int s = 0; s < kTopK; ++s)
+            {
+                int const r = smDst[t * kTopK + s];
+                if (r >= 0)
+                {
+                    *reinterpret_cast<uint32_t*>(p.qOut + static_cast<int64_t>(r) * kHiddenDim + kt * kQTileK + lane * 4)
+                        = packed;
+                }
+            }
+            if (lane == 0)
+            {
+                smExp[t][kt] = static_cast<uint32_t>(exp);
+            }
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < kPairs * kSfBlocks; i += kBlockSize)
+        {
+            int const pair = i / kSfBlocks;
+            int const blk = i % kSfBlocks;
+            int const sr = smScaleDst[pair];
+            if (sr >= 0)
+            {
+                int const t = pair / kTopK;
+                uint32_t const word = smExp[t][blk * 4] | (smExp[t][blk * 4 + 1] << 8) | (smExp[t][blk * 4 + 2] << 16)
+                    | (smExp[t][blk * 4 + 3] << 24);
+                p.scaleOut[blk * p.paddedRows + sr] = static_cast<int>(word);
+            }
         }
     }
     if (threadIdx.x == 0)
@@ -277,6 +450,8 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
 template <int kNumTokens>
 void launch(FusedRouterParams const& params, cudaStream_t stream)
 {
+    auto kernel = params.qOut != nullptr ? dsv4FusedRouterKernel<kNumTokens, true>
+                                         : dsv4FusedRouterKernel<kNumTokens, false>;
     cudaLaunchConfig_t config{};
     config.gridDim = kNumCtas;
     config.blockDim = kBlockSize;
@@ -287,7 +462,7 @@ void launch(FusedRouterParams const& params, cudaStream_t stream)
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, dsv4FusedRouterKernel<kNumTokens>, params));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, params));
 }
 
 } // namespace

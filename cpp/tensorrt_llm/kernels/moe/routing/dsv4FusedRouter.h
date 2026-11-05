@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -48,6 +49,22 @@ struct FusedRouterParams
     // Test only (TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT=1, read per launch): skip griddepcontrol.wait, the negative
     // control of the PDL poison check.
     int testSkipWait;
+
+    // Stage 2 (qOut != nullptr): also write what FlashInfer's mxfp8_q0_route_triton decode branch writes
+    // (route_assign_decode_kernel with remap_ids/expert_offset = slotStart and zero_buf, then
+    // _mxfp8_q0_route_direct_kernel) into its Mxfp8Q0RouteWorkspace.
+    int slotStart;
+    int numLocalExperts;
+    int* offsets;          // [numLocal + 1]
+    int* tokenMap;         // [M * 6]
+    float* tokenWeights;   // [M * 6]
+    int* dstRows;          // [M, 6]
+    int* scaleDstRows;     // [M, 6]
+    uint8_t* qOut;         // [M * 6, 5120] e4m3
+    int* scaleOut;         // [5120 / 512, paddedRows] contiguous
+    int paddedRows;
+    int64_t* zeroBuf;      // caller buffer zero-filled (int64 words)
+    int64_t zeroNumel;
 };
 
 void invokeDsv4FusedRouter(FusedRouterParams const& params, cudaStream_t stream);

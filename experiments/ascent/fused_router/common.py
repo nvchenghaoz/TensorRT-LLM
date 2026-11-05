@@ -120,8 +120,13 @@ def make_decode_state():
     """Real Sm12xW4a8DecodeState of EP4 rank 0 (96 local experts, slot_start 0) on synthetic MXFP4 weights."""
     from tensorrt_llm._torch.moe.fused_moe.cutlass import w4a8_mxfp4_mxfp8_sm12x_decode as dec
 
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "w4a8_fi_chain"))
-    from common import make_weights, trtllm_layout  # noqa: E402
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "w4a8_fi_chain", "common.py")
+    spec = importlib.util.spec_from_file_location("w4a8_fi_chain_common", path)
+    fic = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fic)
+    make_weights, trtllm_layout = fic.make_weights, fic.trtllm_layout
 
     ok, why = dec.fi_decode_available()
     assert ok, why

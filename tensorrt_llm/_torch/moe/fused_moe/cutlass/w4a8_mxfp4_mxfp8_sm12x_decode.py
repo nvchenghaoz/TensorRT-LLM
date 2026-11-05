@@ -182,10 +182,37 @@ class Sm12xW4a8DecodeState:
             (ids >= 0) & (ids < self.num_experts), ids, torch.full_like(ids, -1)
         )
 
+    def preroute_buffers(self, x: torch.Tensor, top_k: int):
+        """(workspace, buf) a fused router may fill in place of route() for this call (see ``set_prerouted``), or
+        None when the route has no warmed-up workspace of this shape (never allocated under graph capture)."""
+        if not _route_fuses_prologue() or x.shape[0] > 8:
+            return None
+        ws = _WORKSPACES.get((x.device, x.shape[0], x.shape[1], top_k, self.num_experts))
+        if ws is None:
+            return None
+        _, _, _, out_sf_shape, _, _ = _load_ops()
+        m = x.shape[0]
+        pairs = m * top_k
+        sf1_shape = out_sf_shape(pairs, self.inter, self.num_experts)
+        off_sf1 = _align(pairs * self.inter, 256)
+        off_out = _align(off_sf1 + sf1_shape[0] * sf1_shape[1] * 4, 256)
+        buf = torch.empty(off_out + m * self.hidden * 2, dtype=torch.uint8, device=x.device)
+        return ws, buf
+
+    def set_prerouted(self, x, ids, weights, ws, buf) -> None:
+        """The fused router wrote route()'s outputs for (x, ids) into ws and zero-filled buf: the next run() of
+        exactly these tensors skips route()."""
+        self._prerouted = (x, ids, weights, ws, buf)
+
     def run(self, x: torch.Tensor, token_selected_experts: torch.Tensor,
             token_final_scales: torch.Tensor) -> torch.Tensor:
         route, _, fc1, out_sf_shape, fc2, fi_act = _load_ops()
         m = x.shape[0]
+        pre = getattr(self, "_prerouted", None)
+        self._prerouted = None
+        if pre is not None and (pre[0] is not x or pre[1] is not token_selected_experts
+                                or pre[2] is not token_final_scales):
+            pre = None
         # The gate already returns int32 ids and FP32 weights: no kernels here.
         ids = token_selected_experts.to(torch.int32)
         weights = token_final_scales.to(torch.float32)
@@ -193,7 +220,7 @@ class Sm12xW4a8DecodeState:
         if not fused:
             ids = self.local_ids(ids)
         pairs = ids.numel()
-        ws = _workspace(x, ids, self.num_experts)
+        ws = _workspace(x, ids, self.num_experts) if pre is None else pre[3]
         # q1, sf1 and the output all have to start at zero: FC2 reads rows of q1 that FC1
         # leaves unwritten (stale bytes there are NaN often enough to poison real rows), the
         # padded rows of sf1 likewise, and FC2 scatter-adds into the output. One buffer,
@@ -205,14 +232,22 @@ class Sm12xW4a8DecodeState:
         off_sf1 = _align(n_q1, 256)
         off_out = _align(off_sf1 + n_sf1, 256)
         nbytes = off_out + m * self.hidden * 2
-        if fused:
+        if pre is not None:
+            buf = pre[4]  # zero-filled by the fused router
+            assert buf.numel() == nbytes
+        elif fused:
             buf = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
         else:
             buf = torch.zeros(nbytes, dtype=torch.uint8, device=x.device)
         q1 = buf[:n_q1].view(torch.float8_e4m3fn).view(pairs, self.inter)
         sf1 = buf[off_sf1:off_sf1 + n_sf1].view(torch.int32).view(sf1_shape)
         out = buf[off_out:].view(torch.bfloat16).view(m, self.hidden)
-        if fused:
+        if pre is not None:
+            # dsv4_fused_router_route wrote exactly what route() writes here (decode branch, expert_offset =
+            # slot_start, zero_buf = buf): no route launches.
+            offsets, token_map, route_weights = ws.offsets, ws.token_map, ws.token_weights
+            a_q, a_sf = ws.q_out, ws.scale_out
+        elif fused:
             # Global ids in, rank-local mapping ([slot_start, slot_start + E) -> 0..E-1,
             # else unrouted) and the zero-fill of buf both happen in the route-assign kernel.
             offsets, token_map, route_weights, a_q, a_sf = route(
