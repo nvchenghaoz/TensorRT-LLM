@@ -34,6 +34,18 @@ def main():
     import torch
     import tensorrt_llm  # noqa: F401
     has_fold = hasattr(torch.ops.trtllm, "dsv4_fused_router_k1fold")
+    only = sys.argv[1] if len(sys.argv) > 1 else "all"  # all | timing (sass + bench) | checks
+    if only == "checks":
+        rc_k, ck = run("check_kernel.py", 1800)
+        rc_m, cm = run("check_module.py", 2400)
+        ok = bool(ck and ck.get("passed")) and bool(cm and cm.get("passed"))
+        print(json.dumps({"passed": ok, "compared": "fold vs main K1 -> router (kernel sweep) and module plumbing "
+                          "vs eager mHC.fused_hc_lagged + dsv4_fused_router",
+                          "kernel": {"rc": rc_k, "passed": bool(ck and ck.get("passed"))},
+                          "module": cm}))
+        return 0 if ok else 1
+    if only == "timing":
+        has_fold = False  # the gates run in their own job
     rc_s, sass = run("sass.py", 1200)
     rc_b, bench = run("bench.py", 1800)
     out = dict(bench or {"batch": {}, "output": {"class": "exact"}})

@@ -262,7 +262,7 @@ class K1FoldPending:
     the current stream) when the consumer cannot fold it. :meth:`run_copy` runs K1 into a fresh buffer on the
     current stream (the shared expert's input on its aux stream)."""
 
-    __slots__ = ("out", "args", "reducer_threads", "norm_eps", "done")
+    __slots__ = ("out", "args", "reducer_threads", "norm_eps", "done", "folded")
 
     def __init__(self, out, args, norm_eps, reducer_threads):
         self.out = out
@@ -270,11 +270,13 @@ class K1FoldPending:
         self.norm_eps = float(norm_eps)
         self.reducer_threads = int(reducer_threads)
         self.done = False
+        self.folded = False  # True when the router launch produced ``out`` (not materialize)
 
     def fold_args(self):
         """(x_prev, residual, post, comb, pre, norm_weight, norm_eps, reducer_threads) for the fold op; marks
         ``out`` as produced by that launch."""
         self.done = True
+        self.folded = True
         return (*self.args, self.norm_eps, self.reducer_threads)
 
     def materialize(self):

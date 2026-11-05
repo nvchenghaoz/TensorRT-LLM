@@ -168,7 +168,8 @@ def run_arm(arm):
             join.join()
             lg, ids, wts = gate._routing_method.fused_routing
             state.update(li=li, y=y, routed_in=moe.experts.last, shared_in=moe.shared_experts.last, lg=lg,
-                         ids=ids, wts=wts, folded=fold is not None)
+                         ids=ids, wts=wts, folded=fold is not None and fold.folded,
+                         deferred=fold is not None)
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())

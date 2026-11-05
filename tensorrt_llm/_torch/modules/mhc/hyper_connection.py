@@ -548,6 +548,9 @@ class mHC(nn.Module):
             comb_cur.view(*outer_shape, n, n),
             layer_input.view(*outer_shape, hidden),
         )
+        if k1_fold is not None:
+            # The consumer matches the deferred K1 by tensor identity: hand it the object it receives.
+            k1_fold.out = outputs[4]
         return outputs, join
 
     def fused_hc(
