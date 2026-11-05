@@ -453,6 +453,17 @@ def run_time(only_counts):
                 if label in ("dual:default_f32", "single:default_f32"):
                     row["chain_graph_nopdl"] = time_graph(lambda: (prep(), arm(False)))
                     row["prep_only_graph"] = time_graph(prep)
+                    # drop-one: the same chain with prep removed (indices already prepared and
+                    # unchanged), so exposed prep = chain_graph_pdl - body_merge_graph_pdl.
+                    prep()
+                    torch.cuda.synchronize()
+                    row["body_merge_graph_pdl"] = time_graph(lambda: arm(True))
+                    row["exposed_prep_us"] = round(
+                        row["chain_graph_pdl"]["median_us"]
+                        - row["body_merge_graph_pdl"]["median_us"], 3)
+                    o3 = arm(False).clone()
+                    torch.cuda.synchronize()
+                    row["repeat_after_graphs_bitwise"] = bool(torch.equal(o3, o1))
                 row["clock"] = clock.stop()
                 body = k.get("body", {}) or {}
                 merge = k.get("merge", {}) or {}
@@ -508,6 +519,9 @@ def run_time(only_counts):
                 base_chain=bch,
                 base_kernels=base.get("kernels"),
                 base_kernel_sum_us=round(kern_sum(base), 3),
+                base_body_merge_graph=base.get("body_merge_graph_pdl"),
+                base_exposed_prep_us=base.get("exposed_prep_us"),
+                base_repeat_after_graphs_bitwise=base.get("repeat_after_graphs_bitwise"),
                 base_err_vs_ref=base["err_vs_ref"]["max_abs"],
                 best=best,
                 recoverable_ms_per_step=(
@@ -521,6 +535,9 @@ def run_time(only_counts):
     log("[full] " + json.dumps(results))
     compact = {c: {k: dict(base_chain_median_us=v["base_chain"]["median_us"],
                            base_kernel_sum_us=v["base_kernel_sum_us"],
+                           base_exposed_prep_us=v["base_exposed_prep_us"],
+                           base_kernels={c: (v["base_kernels"] or {}).get(c)
+                                         for c in ("prep", "body", "merge")},
                            best=v["best"], recoverable_ms_per_step=v["recoverable_ms_per_step"])
                    for k, v in s.items()} for c, s in summary.items()}
     print(json.dumps(dict(passed=True, mode="time", q2=q2, summary=compact)))
