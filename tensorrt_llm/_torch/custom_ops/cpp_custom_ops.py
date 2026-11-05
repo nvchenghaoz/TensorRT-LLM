@@ -610,6 +610,27 @@ def _register_fake():
         # In-place operation, no return value.
         pass
 
+    if hasattr(torch.ops.trtllm, "dsv4_fused_router"):
+
+        @torch.library.register_fake("trtllm::dsv4_fused_router")
+        def _(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+              counter: torch.Tensor, route_scale: float):
+            m = x.shape[0]
+            return (x.new_empty((m, 6), dtype=torch.int32),
+                    x.new_empty((m, 6), dtype=torch.float32),
+                    x.new_empty((m, weight.shape[0]), dtype=torch.float32))
+
+    if hasattr(torch.ops.trtllm, "dsv4_fused_router_route"):
+
+        @torch.library.register_fake("trtllm::dsv4_fused_router_route")
+        def _(x, weight, bias, counter, route_scale, slot_start, num_local,
+              offsets, token_map, token_weights, dst_rows, scale_dst_rows,
+              q_out, scale_out, zero_buf):
+            m = x.shape[0]
+            return (x.new_empty((m, 6), dtype=torch.int32),
+                    x.new_empty((m, 6), dtype=torch.float32),
+                    x.new_empty((m, weight.shape[0]), dtype=torch.float32))
+
     @torch.library.register_fake("tensorrt_llm::quantize_e4m3_per_tensor")
     def _(input: torch.Tensor):
         scale_shape = [1] * input.dim()

@@ -28,7 +28,8 @@ add_subdirectory(loadBalance/dynamicEplb) # moe_dynamic_eplb_src
 # ../CMakeLists.txt excludes all of moe/ from its glob and takes these back into
 # kernels_src, so the backend directories are named here, next to the
 # add_subdirectory() calls they correspond to, and nowhere else.
-file(GLOB_RECURSE MOE_SRC *.cpp *.cu)
+# CONFIGURE_DEPENDS: a new routing/ or utils/ TU (e.g. routing/dsv4FusedRouter.cu) joins an existing build tree.
+file(GLOB_RECURSE MOE_SRC CONFIGURE_DEPENDS *.cpp *.cu)
 list(FILTER MOE_SRC EXCLUDE REGEX
      "/kernels/moe/(cutlass|trtllmGen|cuteDsl|loadBalance/dynamicEplb)/.*")
 list(APPEND MOE_SRC $<TARGET_OBJECTS:moe_dynamic_eplb_src>)

@@ -1506,6 +1506,11 @@ class DeepseekV4Attention(MLA):
         )
 
 
+# Decode (1..8 tokens, top-k routed, no image mask): DeepseekV4Gate.fused_forward runs the router GEMV and the top-6
+# gate in one launch (bitwise dsv3_router_gemm_op + gate_forward). TRTLLM_DSV4_FUSED_ROUTER=0 turns it off.
+_DSV4_FUSED_ROUTER = os.environ.get("TRTLLM_DSV4_FUSED_ROUTER", "1") == "1"
+
+
 class DeepseekV4Gate(nn.Module):
     def __init__(
         self,
@@ -1592,6 +1597,52 @@ class DeepseekV4Gate(nn.Module):
         return torch.ops.trtllm.dsv3_router_gemm_op(
             hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
         )
+
+    def _fused_router_counter_buffer(self) -> Optional[torch.Tensor]:
+        counter = getattr(self, "_fused_router_counter", None)
+        if counter is None or counter.device != self.weight.device:
+            if torch.cuda.is_current_stream_capturing() or self.weight.device.type != "cuda":
+                return None
+            counter = torch.zeros(1, dtype=torch.int32, device=self.weight.device)
+            self._fused_router_counter = counter
+        return counter
+
+    def fused_forward(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        """Decode router GEMV + top-6 gate in one launch (torch.ops.trtllm.dsv4_fused_router, 1..8 tokens).
+
+        Returns the logits (bitwise forward()'s) and hands their routing (bitwise gate_forward's) to the routing
+        method, whose next apply() of exactly this tensor returns it without a gate launch. None when the call
+        does not qualify (hashed gate, other shapes, more than 8 tokens); the caller then uses forward().
+        """
+        if (
+            not _DSV4_FUSED_ROUTER
+            or self.is_hashed
+            or self.top_k != 6
+            or not hasattr(torch.ops.trtllm, "dsv4_fused_router")
+            or hidden_states.dim() != 2
+            or not 1 <= hidden_states.shape[0] <= 8
+            or hidden_states.shape[1] != 5120
+            or hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_cuda
+            or not hidden_states.is_contiguous()
+            or tuple(self.weight.shape) != (384, 5120)
+            or self.weight.dtype != torch.bfloat16
+            or self.e_score_correction_bias is None
+            or self.e_score_correction_bias.dtype != torch.float32
+        ):
+            return None
+        counter = self._fused_router_counter_buffer()
+        if counter is None:
+            return None
+        indices, weights, logits = torch.ops.trtllm.dsv4_fused_router(
+            hidden_states,
+            self.weight,
+            self.e_score_correction_bias,
+            counter,
+            float(self.routed_scaling_factor),
+        )
+        self._routing_method.fused_routing = (logits, indices, weights)
+        return logits
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
@@ -2155,7 +2206,12 @@ class DeepseekV4MoE(nn.Module):
                     image_mask, (0, max(all_rank_num_tokens) - image_mask.shape[0]), value=False
                 )
 
-        router_logits = self.gate(hidden_states)
+        router_logits = None
+        if image_mask is None and not use_dp_padding:
+            # Decode (1..8 tokens): router GEMV + gate in one launch; the routing method returns its routing.
+            router_logits = self.gate.fused_forward(hidden_states)
+        if router_logits is None:
+            router_logits = self.gate(hidden_states)
 
         # When ENABLE_PERFECT_ROUTER=1, the FusedMoE backend swaps router_logits
         # for cached ideal logits inside its own forward (interface.py:
