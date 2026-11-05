@@ -45,7 +45,11 @@ class LayersF(s0.Layers):
         self.tabs, self.rngs, self.sh_b = tabs, rngs, sh_b
 
     def new_shared(self, key, layer):
-        from tensorrt_llm._torch.modules.fp8_shared_decode import shared_decode_mlp
+        if os.environ.get("FSD_IMPL", "tree") == "v2":
+            sys.path.insert(0, HERE)
+            from fsd_v2 import shared_decode_mlp
+        else:
+            from tensorrt_llm._torch.modules.fp8_shared_decode import shared_decode_mlp
         mlp = self.sh_b[layer]
         s1, s2 = self.tabs[layer]
         return shared_decode_mlp(self.xs[layer], mlp.gate_up_proj.weight, s1,

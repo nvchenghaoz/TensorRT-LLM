@@ -32,7 +32,10 @@ def pct(v, q):
 
 def main():
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch.modules import fp8_shared_decode as fsd
+    if os.environ.get("FSD_IMPL", "tree") == "v2":
+        import fsd_v2 as fsd
+    else:
+        from tensorrt_llm._torch.modules import fp8_shared_decode as fsd
     from check_kernel import errs, ref_mlp
 
     H, I = 5120, 1152
@@ -48,9 +51,16 @@ def main():
     limit = 10.0
     rows = []
     for cfg in CFGS.split(";"):
-        gbn, gbk, gw, gs, dbn, dw, ds = (int(v) for v in cfg.split(","))
-        fsd._GU_BN, fsd._GU_BK, fsd._GU_WARPS, fsd._GU_STAGES = gbn, gbk, gw, gs
-        fsd._DN_BN, fsd._DN_WARPS, fsd._DN_STAGES = dbn, dw, ds
+        if cfg.startswith("v2"):
+            # v2: 'v2,GU_BN,SUB,GU_WARPS,GU_STAGES,DN_BN,DN_WARPS,DN_STAGES,FP8_DOT'
+            vals = [int(v) for v in cfg.split(",")[1:]]
+            (fsd._GU_BN, fsd._GU_SUB, fsd._GU_WARPS, fsd._GU_STAGES, fsd._DN_BN, fsd._DN_WARPS,
+             fsd._DN_STAGES, fp8) = vals
+            fsd._FP8_DOT = bool(fp8)
+        else:
+            gbn, gbk, gw, gs, dbn, dw, ds = (int(v) for v in cfg.split(","))
+            fsd._GU_BN, fsd._GU_BK, fsd._GU_WARPS, fsd._GU_STAGES = gbn, gbk, gw, gs
+            fsd._DN_BN, fsd._DN_WARPS, fsd._DN_STAGES = dbn, dw, ds
         # correctness (one layer)
         ok = True
         worst = 0.0
