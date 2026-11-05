@@ -46,7 +46,7 @@ struct FusedRouterParams
     int* counter;                // [1] arrival counter, 0 between launches (reset in-kernel)
     float routeScale;
     int numTokens;
-    // Test only (TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT=1, read per launch): skip griddepcontrol.wait, the negative
+    // Test only (TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT=1, read once per process): skip griddepcontrol.wait, the negative
     // control of the PDL poison check.
     int testSkipWait;
 
