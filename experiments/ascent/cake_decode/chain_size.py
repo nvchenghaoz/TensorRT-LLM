@@ -543,14 +543,91 @@ def run_time(only_counts):
     print(json.dumps(dict(passed=True, mode="time", q2=q2, summary=compact)))
 
 
+def run_err(only_counts):
+    """Untimed accuracy of every variant on NON-stress pools (unit-scale values, no x1024 rows).
+
+    The timing pools (large=True) make the softmax one-hot, so BF16 and FP32 partials agree
+    bitwise there; here the attention spreads over many keys and the partial precision shows.
+    Each config runs 3 times (prep before each) and every run is compared with run 1.
+    """
+    from flashinfer.mla._sparse_mla_sm120 import cake_dsv41_mixed as cdm
+
+    cdm.get_cake_sparse_mla_sm120_dsv41_mixed_module()
+    swa_pool, main_pool = C.build_pools(7, large=False)
+    d = cdm.kernel_dispatch()
+    h16 = [n for n, v in d.variants.items()
+           if (16, True, v.decode) in d.decode_bodies and (16, v.merge) in d.merge_bodies]
+    h8 = [n for n, v in d.variants.items()
+          if (8, True, v.decode) in d.decode_bodies and (8, v.merge) in d.merge_bodies]
+    h16s = [n for n, v in d.variants.items()
+            if (16, False, v.decode) in d.decode_bodies and (16, v.merge) in d.merge_bodies]
+    out = {}
+    ok_all = True
+    for count in only_counts:
+        sel, q, sink, swa_i, main_i, swa_s, prep_dual, prep_single, prep_ok = count_inputs(
+            count, swa_pool, main_pool)
+        ref_d = C.reference(q, sink, swa_pool, main_pool, sel)
+        ref_s = C.reference(q, sink, swa_pool, main_pool, dict(sel, width=C.SWA_W))
+        cfgs = [("dual:default_f32", Arm(cdm, q, sink, swa_pool, swa_i, main_pool, main_i,
+                                          variant="default", f32=True), prep_dual, ref_d)]
+        cfgs += [(f"dual:{n}_bf16", Arm(cdm, q, sink, swa_pool, swa_i, main_pool, main_i,
+                                        variant=n, f32=False), prep_dual, ref_d) for n in h16]
+        cfgs += [(f"dual:h8x2:{n}", H8x2(cdm, q, sink, swa_pool, swa_i, main_pool, main_i,
+                                         variant=n), prep_dual, ref_d) for n in h8]
+        cfgs += [("single:default_f32", Arm(cdm, q, sink, swa_pool, swa_s, None, None,
+                                            variant="default", f32=True), prep_single, ref_s)]
+        cfgs += [(f"single:{n}_bf16", Arm(cdm, q, sink, swa_pool, swa_s, None, None,
+                                          variant=n, f32=False), prep_single, ref_s) for n in h16s]
+        base = {}
+        rows = {}
+        for label, arm, prep, ref in cfgs:
+            outs = []
+            for _ in range(3):
+                prep()
+                outs.append(arm(False).clone())
+            torch.cuda.synchronize()
+            key = label.split(":")[0]
+            if label.endswith("default_f32"):
+                base[key] = outs[0]
+            r = dict(
+                deterministic=all(torch.equal(o, outs[0]) for o in outs[1:]),
+                finite=bool(torch.isfinite(outs[0]).all()),
+                ref_absmax=ref.abs().max().item(),
+                err_vs_ref=errs(outs[0], ref),
+                err_vs_default_f32=errs(outs[0], base[key]),
+                bitwise_vs_default_f32=bool(torch.equal(outs[0], base[key])),
+            )
+            ok_all &= r["deterministic"] and r["finite"]
+            rows[label] = r
+            log(f"[err count {count}] {label:48s} |ref|max={r['ref_absmax']:.3g} "
+                f"vs_def abs={r['err_vs_default_f32']['max_abs']:.3g} "
+                f"rel_norm={r['err_vs_default_f32']['max_rel_norm']:.3g} "
+                f"vs_ref abs={r['err_vs_ref']['max_abs']:.3g} "
+                f"rel_norm={r['err_vs_ref']['max_rel_norm']:.3g} "
+                f"bitwise={r['bitwise_vs_default_f32']} det={r['deterministic']}")
+        out[str(count)] = dict(prep_ok=prep_ok, rows=rows)
+    log("[err full] " + json.dumps(out))
+    compact = {c: {lab: dict(vs_def_abs=r["err_vs_default_f32"]["max_abs"],
+                             vs_def_rel=r["err_vs_default_f32"]["max_rel_norm"],
+                             vs_ref_rel=r["err_vs_ref"]["max_rel_norm"],
+                             bitwise=r["bitwise_vs_default_f32"])
+                   for lab, r in v["rows"].items()
+                   if lab.endswith("default_f32") or lab.endswith("default_bf16")
+                   or "sa+pw+lq+el+mo2" in lab}
+               for c, v in out.items()}
+    print(json.dumps(dict(passed=bool(ok_all), mode="err", subset=compact)))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["time", "ncu"], default="time")
+    ap.add_argument("--mode", choices=["time", "ncu", "err"], default="time")
     ap.add_argument("--counts", default="1,2,4,8")
     a = ap.parse_args()
     torch.manual_seed(0)
     if a.mode == "ncu":
         run_ncu()
+    elif a.mode == "err":
+        run_err(tuple(int(x) for x in a.counts.split(",")))
     else:
         run_time(tuple(int(x) for x in a.counts.split(",")))
 
