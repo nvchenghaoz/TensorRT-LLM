@@ -1,6 +1,12 @@
-# Idea 196 Stage 0 — status (branch 112, 11-04 session)
+# Idea 196 Stage 0 — status
 
-Harness written, NOT run. The binding top-lead ruling (~12:58 PST, coach notes 5798/5858)
+UPDATE (branch 131, idea 215, 11-04 evening): RUN. Final job 1138 (commit 058bbe52); results and
+verdict (BUILD SKEW) in RESULTS.md. Harness changes since 77bb689a: spans by CUDA events after a
+warm-up (Kineto spans carry ~27 us/layer of CUPTI overhead), per-node split with grid/block,
+replay output checks, NVML by UUID, pre-warm + auto re-run on >3% block dispersion, row key `nD`,
+expmax REAL calibrated to fact 822.
+
+(Original branch 112 note follows.) Harness written, NOT run. The binding top-lead ruling (~12:58 PST, coach notes 5798/5858)
 says a non-focus branch started after 12:35 does CPU-only work this session and queues no GPU job;
 plan 1970 (3) defers idea 196 to next session. So no table and no verdict exist yet.
 
