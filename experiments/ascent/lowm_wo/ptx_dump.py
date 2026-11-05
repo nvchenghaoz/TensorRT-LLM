@@ -48,6 +48,11 @@ def main():
     for i, line in enumerate(lines):
         if re.search(r"\b(div|lg2|ex2|cvt\.rpi|cvt\.rn\.satfinite|cvt\.rn\.bf16|max\.f32|min\.f32)", line):
             print("PTX", i, line.strip(), flush=True)
+    # Verbatim body from the RoPE math through the e4m3 convert (the log2 is a libdevice routine).
+    first = next(i for i, l in enumerate(lines) if "fma.rn" in l or "mul.f32" in l)
+    last = max(i for i, l in enumerate(lines) if "cvt.rn.satfinite.e4m3x2" in l)
+    for i in range(max(0, first - 30), last + 2):
+        print("RAW %4d %s" % (i, lines[i].rstrip()), flush=True)
     print(json.dumps({"passed": True, "n_ptx_lines": len(lines)}))
 
 
