@@ -153,3 +153,16 @@ c4 TPOT +2.1% needs a look; decode ARs are unchanged.
 - trace.py already deep-merges engine.json over the protocol settings (tensor_parallel_size 4), so it traces EP2xTP2.
   Added a per-rank AR census (prefill LP/NCCL/other AR counts + median durations, decode counts) for acceptance item 2.
 - Next: own trace_graph.py (4 GPU), then own run_serving_pair, then submit serving_latency mode_switch.
+
+## Branch 158, session 9 (node smc521ge-0072)
+- sync_main -> ba74f05c (landings 1-52; 52 = branch 164 decode fsd_v2, no AR file/call site). The allreduceOp.cpp
+  whole-message LP threshold (:1439) and ops.py <2 MiB -> AUTO routing still apply; kPcieCustomAllReduceDefaultMaxBytes :1529.
+- Job 1549 (4 GPU, austin:4 = GPUs 4-7, NUMA 1, commit 1e4f902d, rc 0, ~720 s), run_lp_trace.sh:
+  STEP 0 receipt + 12-pair peer assert OK; STEP 1 lp_check.py (kill-bounded 300 s, peer-READ gate) passed;
+  STEP 2 trace_graph.py --with-check PASSED: rank 0 EXTEND lp_calls 40 + NCCL AR 40, 0 lamport; DECODE 0 LP / 0 NCCL AR /
+  400 lamport (lamport only) on all 4 ranks; tail graph captured 80/80 (L20-39 x 4 ranks), 0 capture failed.
+  Under moe_tp2 x moe_ep2 the per-rank census is unchanged: every rank 40 LP + 40 NCCL AR per EXTEND step (+3 AllGather).
+  bench.py sweep: LP 2048 rel_rms 0.0373 / heavy 0.0204, e 0.120, deterministic; NCCL 0.0027;
+  1000-call robust run 0 nonfinite, max rel_rms 0.0373, IPC flags OK before every reset, 0 re-run bitwise mismatches;
+  routing M=1..16 (graph) and 128 rows LP == AUTO bitwise (2048 differs by design).
+- Serving pair 1575 (base ba74f05c) / 1576 (cand 1e4f902d): queued at ~13:5x PST.
