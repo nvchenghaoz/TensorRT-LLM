@@ -14,7 +14,10 @@ SUITE = "tests/unittest/_torch/attention/sparse/csa2/test_module.py"
 def run(extra_env):
     env = dict(os.environ)
     env.update(extra_env)
-    cmd = [sys.executable, "-m", "pytest", "-q", "-rA", "-p", "no:cacheprovider", SUITE]
+    # Pre-existing failures on unmodified main (top lead rulings 19:5x / 20:10 PST 11-04, knowledge 2200):
+    # module.py _shared_mxfp8_active reads wq_a.quant_method on the test's nn.Identity stubs.
+    cmd = [sys.executable, "-m", "pytest", "-q", "-rA", "-p", "no:cacheprovider", "-k",
+           "not test_module_sends_whole_context_and_generation_phases", SUITE]
     print(" ".join(cmd), extra_env, flush=True)
     proc = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
     lines = proc.stdout.strip().splitlines()
