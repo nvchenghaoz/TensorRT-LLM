@@ -1433,13 +1433,14 @@ private:
         // For ONESHOT, TWOSHOT, LOWPRECISION, fallback is allowed.
         auto const message_size = seq_len * hidden_size;
 
-        // Check if LOWPRECISION is supported.
-        if (isUsingLowPrecision(hidden_size))
+        auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(mType);
+
+        // Check if LOWPRECISION is supported. The threshold is on the whole message, not on one row.
+        if (isUsingLowPrecision(message_size_bytes))
         {
             return AllReduceStrategyType::LOWPRECISION;
         }
 
-        auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(mType);
         auto const max_workspace_size
             = tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(mGroup.size());
 
@@ -1451,7 +1452,8 @@ private:
         // This rule based heuristic only chooses between NCCL_SYMMETRIC and MIN_LATENCY strategies.
         // From this point, all fusion patterns are supported by all these strategies: NCCL_SYMMETRIC, ONESHOT, TWOSHOT
         // and MIN_LATENCY.
-        if (mStrategy != AllReduceStrategyType::AUTO)
+        // LOWPRECISION below its size threshold takes the same path as AUTO.
+        if (mStrategy != AllReduceStrategyType::AUTO && mStrategy != AllReduceStrategyType::LOWPRECISION)
         {
             // Check TWOSHOT constraint: seq_len >= tp_size
             if (mStrategy == AllReduceStrategyType::TWOSHOT && seq_len < mGroup.size())
