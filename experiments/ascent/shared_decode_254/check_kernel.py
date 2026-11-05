@@ -9,7 +9,8 @@ Checks, for M = 1..8 and ranges empty / 1 / 4 / 5 / 9 blocks (several positions)
  (b) kernel vs a torch fp64 reference of the same block math (same quantized operands),
      BF16 tolerance rtol/atol 1.6e-2 plus max abs/rel error;
  (c) kernel [0,9) vs main's GatedMLP forward (the original op), and [0,5) + [5,9) (the
-     SHARD pair sum) vs main's full half;
+     SHARD pair sum) vs main's full half, bounded by the parts' magnitude (two bf16
+     partials rounded on their own, as a row-parallel all-reduce sums them);
  (d) repeated replays of one CUDA graph (the range tensor rewritten between replays,
      as the reset point) bitwise equal to the eager call, every replay, NREP replays.
 Last line: {"passed": ..., ...}.
@@ -73,11 +74,15 @@ def ref_mlp(x, w1, s1, w2, s2, b0, b1, limit):
     return out.to(torch.bfloat16), h
 
 
-def errs(a, b):
+def errs(a, b, mag=None):
+    """BF16 tolerance. mag: magnitude of the summed terms when a is a sum of bf16
+    partials (each rounded on its own, as an all-reduce of row-parallel partials is);
+    the rounding error of such a sum scales with the parts, not with the result."""
     a, b = a.float(), b.float()
     d = (a - b).abs()
     rel = d / b.abs().clamp_min(1e-6)
-    ok = bool(torch.all(d <= TOL + TOL * b.abs()).item())
+    bound = b.abs() if mag is None else torch.maximum(b.abs(), mag.float())
+    ok = bool(torch.all(d <= TOL + TOL * bound).item())
     return {"max_abs": float(d.max().item()), "max_rel_where_abs_gt_0.1":
             float(rel[b.abs() > 0.1].max().item()) if bool((b.abs() > 0.1).any()) else 0.0,
             "ok": ok}
@@ -145,7 +150,8 @@ def main():
         full = outs[(0, nb)]
         half = (outs[(0, 5)] + outs[(5, nb)])
         row["full_vs_main"] = errs(full, main_full)
-        row["pair_sum_vs_main"] = errs(half, main_full)
+        row["pair_sum_vs_main"] = errs(half, main_full,
+                                       mag=outs[(0, 5)].float().abs() + outs[(5, nb)].float().abs())
         ok_m = ok_m and row["full_vs_main"]["ok"] and row["pair_sum_vs_main"]["ok"]
         # (d) graph replays with the range tensor rewritten between replays
         rng_g = torch.zeros(2, dtype=torch.int32, device="cuda")
@@ -175,7 +181,28 @@ def main():
         passed = passed and ok_m
         log(json.dumps(row))
         results.append(row)
-    print(json.dumps({"passed": passed, "compared": "shared_decode_mlp vs torch fp64 block-math "
+    # (e) layout: the SHARD ranges under EP4 (moe_ep 4, moe_tp 1) and EP2xTP2 (moe_ep 2,
+    # moe_tp 2). The gate reads only tp_rank/tp_size (+ pp/cp/ADP), never moe_ep/moe_tp.
+    from tensorrt_llm._torch.models.modeling_deepseekv4 import (shared_expert_row_range,
+                                                                 shared_expert_row_split_layout)
+    from tensorrt_llm.mapping import Mapping
+    layout = {}
+    for name, mtp, mep in (("ep4", 1, 4), ("ep2tp2", 2, 2)):
+        per_shard = {}
+        for r in range(4):
+            mp = Mapping(world_size=4, rank=r, tp_size=4, moe_tp_size=mtp, moe_ep_size=mep)
+            parts, index, shard = shared_expert_row_split_layout(mp.tp_rank, mp.tp_size, 2)
+            b0, b1 = shared_expert_row_range(nb, parts, index)
+            per_shard.setdefault(shard, []).append((b0, b1))
+            layout[f"{name}_r{r}"] = {"moe_ep_rank": mp.moe_ep_rank, "moe_tp_rank": mp.moe_tp_rank,
+                                      "shard": shard, "part": index, "range": [b0, b1]}
+        for shard, rs in per_shard.items():
+            covered = sorted(b for r0, r1 in rs for b in range(r0, r1))
+            ok_l = covered == list(range(nb))
+            layout[f"{name}_shard{shard}_partition_ok"] = ok_l
+            passed = passed and ok_l
+    log("layout", json.dumps(layout))
+    print(json.dumps({"passed": passed, "layout": layout, "compared": "shared_decode_mlp vs torch fp64 block-math "
                       "reference (same quantized operands) and vs main GatedMLP forward; quant "
                       "byte-equal vs per_token_quant_and_transform; CUDA graph replays bitwise",
                       "M": list(range(1, 9)), "ranges": [list(r) for r in ranges],
