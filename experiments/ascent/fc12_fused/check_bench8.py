@@ -12,7 +12,7 @@ seed=li) per layer), M2 D 0/1/6/12, and the uniform busiest-rank M1/M2/M4 mixes
 Here the same 8-layer graph is built twice per case: BASE = every layer's st._force_chain=True
 (main's fc1_act_q1 + fc2_finalize, the protected FI ops), CAND = the fused kernel.  Each graph
 runs the 3 warmup + 30 replays (same flush before each).  After EVERY replay (sync, then read
-the graph's own buffers, recovered from st.run's returned output: out._base is the one buffer
+the graph's own buffers, recovered from st.run's returned output: its storage is the one buffer
 st.run allocates, q1/sf1 live at the offsets st.run uses):
   * every layer's q1/sf1 bitwise == BASE replay 0's;
   * every layer's output inside main's band: |cand - base_0| <= max(main's replay-to-replay
@@ -61,8 +61,9 @@ def make_layer(seed):
 
 def views(leaf, st, out, m):
     """q1 / sf1 views of the buffer st.run allocated (out is its tail)."""
-    buf = out._base
-    assert buf is not None and buf.dtype == torch.uint8
+    stor = out.untyped_storage()
+    buf = torch.empty(0, dtype=torch.uint8, device=out.device)
+    buf.set_(stor, 0, (stor.nbytes(),))
     out_sf_shape = leaf._load_ops()[3]
     pairs = m * TOPK
     sf1_shape = out_sf_shape(pairs, st.inter, st.num_experts)
@@ -70,7 +71,8 @@ def views(leaf, st, out, m):
     n_sf1 = sf1_shape[0] * sf1_shape[1] * 4
     off_sf1 = leaf._align(n_q1, 256)
     off_out = leaf._align(off_sf1 + n_sf1, 256)
-    assert out.data_ptr() == buf.data_ptr() + off_out
+    assert out.data_ptr() == buf.data_ptr() + off_out, (out.storage_offset(), off_out)
+    assert buf.numel() >= off_out + m * st.hidden * 2
     q1 = buf[:n_q1]
     sf1 = buf[off_sf1:off_sf1 + n_sf1]
     return q1, sf1
