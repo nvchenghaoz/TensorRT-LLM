@@ -88,6 +88,9 @@ class Chain:
         wa, sa = self.A[l]
         wb, sb = self.B[l]
         n_split = QB_N if self.index[l] else 0
+        if n_split and L.qnorm_config_for(QB_N + IDX_N, Q_RANK, m) is None:
+            # no fused wq_b||index_wq_b config at this M (module takes the unfused route there): plain wq_b slice
+            wb, sb, n_split = wb[:QB_N], sb[: QB_N * (Q_RANK // 32)], 0
         if dbg is not None:
             # stamp run: same launch as low_m_mm with dbg_ts (A per-CTA residency)
             cfg = L.chain_a_config_for(A_N, HIDDEN, m)
@@ -127,9 +130,12 @@ class Chain:
 
 def arm_list():
     arms = [("base", "0")]
-    for pos in (0, 1, 2):
-        for frac in (256, 154, 102):
-            for last in (0, 1):
+    poss = [int(v) for v in os.environ.get("L2PF_POS", "0,1,2").split(",")]
+    fracs = [int(v) for v in os.environ.get("L2PF_FRACS", "256,154,102").split(",")]
+    pols = [int(v) for v in os.environ.get("L2PF_POLS", "0,1").split(",")]
+    for pos in poss:
+        for frac in fracs:
+            for last in pols:
                 arms.append((f"PF{pos}_f{frac}_{'el' if last else 'pl'}", f"{pos},{last},{frac}"))
     sel = os.environ.get("L2PF_ARMS")
     if sel:
