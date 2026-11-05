@@ -788,7 +788,9 @@ class CSA2FlashInfer:
         back to FlashInfer's default 8 MiB int buffer if the bound is too small.
         """
         float_ws = self._workspaces[device]
-        if self._RIGHT_SIZE_INT_WORKSPACE:
+        # Every FlashInfer wrapper has reset_workspace_buffer; a planner without it
+        # (a stand-in) plans on the buffers it was constructed with.
+        if self._RIGHT_SIZE_INT_WORKSPACE and hasattr(wrapper, "reset_workspace_buffer"):
             wrapper.reset_workspace_buffer(
                 float_ws, torch.empty(nbytes, dtype=torch.uint8, device=device)
             )
