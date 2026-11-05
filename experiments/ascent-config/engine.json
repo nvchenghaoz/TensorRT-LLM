@@ -1,1 +1,1 @@
-{"enable_tokenization_cache": true, "moe_tensor_parallel_size": 2, "moe_expert_parallel_size": 2}
+{"enable_tokenization_cache": true, "moe_tensor_parallel_size": 2, "moe_expert_parallel_size": 2, "allreduce_strategy": "LOWPRECISION"}
