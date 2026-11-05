@@ -183,7 +183,7 @@ def _check(torch, run, m, rank, dev, heavy):
     return agg
 
 
-def _lp_flag_state(torch, mapping):
+def _lp_flag_state(torch, mapping, expect_blocks=None):
     """IPC flag state of the LOWPRECISION workspace (ops.allocate_low_presicion_allreduce_workspace):
     host counter workspace[4*tp+1] (incremented once per call in LowPrecisionAllReduceParams::deserialize, the
     barrier_flag of that call) and this rank's barrier_in IPC buffer (uint64): slots [0, tp) are written by
@@ -199,7 +199,11 @@ def _lp_flag_state(torch, mapping):
     bufs, wst = ws[mapping] if mapping in ws else next(iter(ws.values()))
     tp = mapping.tp_size
     counter = int(wst[4 * tp + 1].item())
-    nbytes = IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * tp * 2
+    try:
+        from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
+        nbytes = CustomAllReduceHelper.lowprecision_barrier_bytes(tp)
+    except AttributeError:  # base tree without the sized barrier buffer
+        nbytes = IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * tp * 2
     host = torch.zeros(nbytes // 8, dtype=torch.int64)
     torch.cuda.synchronize()
     err = cudart.cudaMemcpy(host.data_ptr(), bufs[2].local_ptr, nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
@@ -207,24 +211,33 @@ def _lp_flag_state(torch, mapping):
     slots = host.tolist()
     entry = slots[:tp]
     block = slots[tp:]
-    used_blocks = [b for b in range(len(block) // tp) if any(block[b * tp + r] for r in range(tp))]
+    nblk = len(block) // tp
+    # Blocks of the last call hold its flag (= counter) from every peer; they must form a prefix [0, k). Blocks past k
+    # may hold an older flag (a wider grid run earlier in the same process) but never counter or more.
+    k = 0
+    while k < nblk and all(block[k * tp + r] == counter for r in range(tp)):
+        k += 1
+    used_blocks = list(range(k))
     counters = MPI.COMM_WORLD.allgather(counter)
     ok = (all(v == counter for v in entry)  # every peer signalled this rank with the last call's flag
-          and all(block[b * tp + r] == counter for b in used_blocks for r in range(tp))
+          and k > 0
+          and all(block[b * tp + r] < counter for b in range(k, nblk) for r in range(tp))
+          and (expect_blocks is None or k == expect_blocks)
           and max(slots) <= counter        # nothing already holds counter+1, the next call's flag
           and len(set(counters)) == 1)     # every rank's next call uses the same flag
     return {"counter": counter, "counters_all_ranks": counters, "entry_slots": entry, "blocks_used": len(used_blocks),
+            "flag_slots_read": len(slots), "expect_blocks": expect_blocks,
             "max_slot": max(slots), "min_used_slot": min([v for v in slots if v] or [0]), "ok": bool(ok),
             "memcpy_err": str(err)}
 
 
-def _robust(torch, mapping, strategy, m, rank, dev):
+def _robust(torch, mapping, strategy, m, rank, dev, expect_blocks=None):
     run = Runner(torch, mapping, strategy, m, graph=False)
     worst = {"e": 0.0, "rel_rms": 0.0}
     nonfinite, done, chunks = 0, 0, []
     torch.cuda.synchronize()
     _barrier()
-    flag0 = _lp_flag_state(torch, mapping)
+    flag0 = _lp_flag_state(torch, mapping, expect_blocks)
     flags = [flag0]
     flags_ok = flag0["ok"]
     bitwise_mismatch = 0
@@ -241,7 +254,7 @@ def _robust(torch, mapping, strategy, m, rank, dev):
         torch.cuda.synchronize()
         _barrier()
         # before the next reset barrier: the IPC flags must hold the values the next call expects
-        fs = _lp_flag_state(torch, mapping)
+        fs = _lp_flag_state(torch, mapping, expect_blocks)
         fs["advanced_by"] = fs["counter"] - flags[-1]["counter"]
         fs["ok"] = fs["ok"] and fs["advanced_by"] == n
         flags.append(fs)
@@ -262,7 +275,7 @@ def _robust(torch, mapping, strategy, m, rank, dev):
             torch.cuda.synchronize()
             mism += int(not torch.equal(o, outs[i]))
         _barrier()
-        fs2 = _lp_flag_state(torch, mapping)
+        fs2 = _lp_flag_state(torch, mapping, expect_blocks)
         fs2["advanced_by"] = fs2["counter"] - fs["counter"]
         fs2["ok"] = fs2["ok"] and fs2["advanced_by"] == len(range(0, n, 25))
         flags.append(fs2)

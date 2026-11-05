@@ -1,3 +1,19 @@
+# Branch 181 / idea 226 (build_on 158): LP FP8 two-shot prefill AR + wider two-shot grid: STATUS
+
+Synced (three-way merge, no conflicts) onto main 8e291e60. Files the merge touched beyond 158's own: none (158's
+10 files merged cleanly; engine.json keeps main's keys verbatim + allreduce_strategy LOWPRECISION).
+Kernel change (bitwise vs LP-16CTA): lowPrecisionTwoShotAllReduceKernel grid = LP_TWOSHOT_DEFAULT_CTAS (64, committed
+before the first GPU job; capped at LP_TWOSHOT_MAX_CTAS 128 and at one block pass per block), env
+TRTLLM_LP_AR_TWOSHOT_CTAS for the sweep only. LP ipc_barriers_in/out sized (1 + 128) * tp * 8 bytes
+(allreduce_helper.py lowprecision_barrier_bytes); IpcMemory.IPC_BARRIERS_SIZE_PER_GPU unchanged.
+
+## DECLARED TARGET (fixed before the pair; top-lead ruling 15:0x 11-05, plan 2913 5o-1)
+- Measure: TTFT-specific. TARGETS: c1 TTFT mean and c4 TTFT mean, each judged alone (lower is better).
+- GUARDS: c2 TTFT not slower beyond the gate floor; c1/c2/c4 TPOT not slower beyond max(gate floor, 2.9%), valid
+  only with this branch's own trace showing DECODE unchanged (0 LP, lamport only).
+- Numerics: mode_switch (LP FP8 payload vs NCCL bf16); the grid change is bitwise vs LP-16CTA.
+- Pair: ONE run_serving_pair, base = current main 8e291e60, candidate = this head, back to back on one half.
+
 # Idea 94 (branch 94): LOWPRECISION FP8-payload two-shot AR for prefill-size messages: status
 
 Base ab62f1d6 (landings 30-32 included; TRTLLM_B12X_WO_B_WIDE_ROWS, TRTLLM_MHC_SPLIT_LAGGED and

@@ -150,6 +150,8 @@ def reduce_rank(path):
         c["kernels"] = len(lst)
         c["nccl_ar_us"] = [round(e["dur"], 1) for e in lst if NCCL_AR_RE.search(e["name"])][:100]
         c["lp_twoshot_us"] = [round(e["dur"], 1) for e in lst if LP_RE.search(e["name"]) and "TwoShot" in e["name"]][:100]
+        c["lp_twoshot_grid"] = sorted({str((e.get("args") or {}).get("grid")) for e in lst
+                                       if LP_RE.search(e["name"]) and "TwoShot" in e["name"]})
         steps.append(c)
     ext = [s for s in steps if s["label"].startswith("step[EXTEND")]
     dec = [s for s in steps if s["label"].startswith("step[DECODE")]
@@ -255,6 +257,7 @@ def main():
         census[r] = {"prefill_lp_calls": pwr.get("lp_calls"), "prefill_nccl_ar": pwr.get("ncclDevKernel_AllReduce"),
                      "prefill_lamport": pwr.get("oneshot_lamport"), "prefill_other_ar": pwr.get("other_ar"),
                      "prefill_lp_us_median": ln[len(ln) // 2] if ln else None,
+                     "prefill_lp_twoshot_grid": pwr.get("lp_twoshot_grid"),
                      "prefill_nccl_us_median": nn[len(nn) // 2] if nn else None,
                      "decode": dwr,
                      "decode_other_ar": [s.get("other_ar") for s in d.get("steps", [])
