@@ -35,6 +35,9 @@ A_DEFAULT = {1: (8, 2, 2), 2: (8, 2, 2), 3: (8, 4, 1), 4: (8, 4, 1), 5: (8, 4, 1
 B_CFGS = [(4, 1, 2), (4, 1, 1), (4, 2, 1), (4, 2, 2), (8, 1, 2), (4, 1, 4), (8, 1, 4)]
 A_ALTS = [(8, 2, 2), (8, 4, 1), (4, 4, 1), (4, 4, 2), (4, 8, 1), (4, 8, 2), (4, 2, 2)]
 ORDER = int(os.environ.get("QB_ORDER", "0"))
+CHAIN_MS = tuple(int(v) for v in os.environ.get("QB_MS", "1,2,4,8").split(","))
+K1_ALTS = os.environ.get("QB_K1_ALTS", "0") == "1"
+LIVE_SPIN_NS = int(os.environ.get("QB_LIVE_SPIN_NS", "50000"))
 
 
 def log(*a):
@@ -236,7 +239,7 @@ def gemm_check(ext, eps, order):
             for it in range(20):
                 dst.zero_()
                 q = torch.full((m, QB_N), float("nan"), dtype=torch.bfloat16, device="cuda")
-                ext.poison_producer(src, dst, 5000)
+                ext.poison_producer(src, dst, LIVE_SPIN_NS)
                 ext.gemm(dst[:, :Q_RANK], wq, sq, q, None, 0, 4, 1, 2, True, gamma, eps, None, order, 0, flags, True)
                 torch.cuda.synchronize()
                 bad += 0 if torch.equal(q, ref) else 1
@@ -387,6 +390,9 @@ def chain(ext, eps, order, ms=(1, 2, 4, 8), kinds=("plain", "indexer"), rounds=3
                 for cb in bcfgs[:3]:
                     tag = ",".join(map(str, cb))
                     arms[f"A{ca}s>B{tag}e"] = (lambda ca_, cb_: lambda l: proto_fn(l, ca_, 1, cb_, 0))(ca, cb)
+                    if K1_ALTS:
+                        arms[f"k1:A{ca}s>B{tag}e"] = (
+                            lambda ca_, cb_: lambda l: proto_fn(l, ca_, 1, cb_, 0, "k1"))(ca, cb)
             graphs = {}
             for n, fn in arms.items():
                 try:
@@ -441,7 +447,7 @@ def main():
         result["check"] = {"passed": ck["passed"], "live_overlap": ck["live_overlap"]}
         passed &= ck["passed"]
     if mode in ("chain", "all"):
-        tb = chain(ext, eps, order)
+        tb = chain(ext, eps, order, ms=CHAIN_MS)
         result["chain"] = {k: {"best": v["best"], "main": v["arms"]["main"], "best_arm": v["arms"][v["best"]],
                                "sm_clock": v["sm_clock"]} for k, v in tb.items()}
         os.makedirs("/tmp/qb_out", exist_ok=True)
