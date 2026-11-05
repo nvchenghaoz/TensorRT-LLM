@@ -109,6 +109,8 @@ def fused_greedy_argmax_scatter(
     if (
         max_beam_width != 1
         or not logits.is_cuda
+        # Never JIT/load the Triton module inside an open CUDA-graph capture.
+        or torch.cuda.is_current_stream_capturing()
         or logits.dim() != 2
         or logits.dtype not in _SUPPORTED_DTYPES
         or logits.stride(1) != 1
