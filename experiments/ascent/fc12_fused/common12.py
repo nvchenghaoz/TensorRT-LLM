@@ -44,7 +44,7 @@ def routing(m, d, seed=0):
         ids.append(row)
     w = torch.rand(m, TOPK, generator=torch.Generator().manual_seed(d + 100 * m)) + 0.1
     w = (w / w.sum(-1, keepdim=True) * 1.5).float()
-    return torch.tensor(ids, dtype=torch.int32).cuda(), w.cuda()
+    return to_global(torch.tensor(ids, dtype=torch.int32).cuda()), w.cuda()
 
 
 def uniform_routing(m, seed):
@@ -57,7 +57,15 @@ def uniform_routing(m, seed):
     ids = [[((e // E - r0) % ranks) * E + e % E for e in row] for row in ids]
     w = torch.rand(m, TOPK, generator=torch.Generator().manual_seed(seed)) + 0.1
     w = (w / w.sum(-1, keepdim=True) * 1.5).float()
-    return torch.tensor(ids, dtype=torch.int32).cuda(), w.cuda(), cnt[r0]
+    return to_global(torch.tensor(ids, dtype=torch.int32).cuda()), w.cuda(), cnt[r0]
+
+
+SLOT = int(os.environ.get("CHECK_SLOT", "0"))  # this rank's slot_start (EP2xTP2 rank 1: 192)
+
+
+def to_global(ids):
+    """Rank-local routing ids (local experts in [0, E)) -> global ids for slot_start SLOT."""
+    return ((ids + SLOT) % E_GLOBAL).to(torch.int32)
 
 
 def make_state(enable_pdl=True, seed=0):
@@ -69,7 +77,7 @@ def make_state(enable_pdl=True, seed=0):
     del w1, s1, w2, s2
     st = leaf.Sm12xW4a8DecodeState(
         w3_w1_weight=w31, w3_w1_weight_scale=s31, w2_weight=w2v, w2_weight_scale=s2s,
-        num_local_experts=E, slot_start=0, swiglu_limit=10.0, enable_pdl=enable_pdl)
+        num_local_experts=E, slot_start=SLOT, swiglu_limit=10.0, enable_pdl=enable_pdl)
     return leaf, st
 
 
