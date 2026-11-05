@@ -141,7 +141,7 @@ def main():
         hits.clear()
         g, gout = capture(step)
         handoff = {"calls": len(hits), "taken": sum(hits)}
-        assert state._prerouted is None
+        assert getattr(state, "_prerouted", None) is None
         ref_ws = make_mxfp8_q0_route_workspace(xs[0], torch.empty(m, TOPK, dtype=torch.int32, device=dev), 96)
 
         def check(tag):
