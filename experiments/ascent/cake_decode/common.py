@@ -278,7 +278,8 @@ class CakeNoPrepArm:
             SWA_W, MAIN_W if width > SWA_W else 0
         )
         self.lse = torch.empty((count, HEADS), dtype=torch.float32, device=device)
-        self.mid_out = torch.empty((count, HEADS, splits, DIM), dtype=torch.bfloat16, device=device)
+        # fp32 split partials + variant 'default', as cake_decode.CakeDecode runs them
+        self.mid_out = torch.empty((count, HEADS, splits, DIM), dtype=torch.float32, device=device)
         self.mid_lse = torch.empty((count, HEADS, splits), dtype=torch.float32, device=device)
         self.plan = None
 
@@ -292,7 +293,7 @@ class CakeNoPrepArm:
             q, swa_pool, self.swa, out, self.lse, SCALE, attn_sink=sink,
             extra_kv_cache=main_pool if has_main else None,
             extra_indices=self.main if has_main else None,
-            mid_out=self.mid_out, mid_lse=self.mid_lse,
+            mid_out=self.mid_out, mid_lse=self.mid_lse, variant="default",
         )
         return out
 

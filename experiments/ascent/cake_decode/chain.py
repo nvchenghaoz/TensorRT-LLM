@@ -198,6 +198,21 @@ def stats_ms(t):
     return med, (p90 - p10) / med, p10, p90
 
 
+def control_alloc_delta():
+    """Allocation count of capturing a graph with one in-place op (capture's own overhead)."""
+    x = torch.zeros(16, device="cuda")
+    x.add_(1)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats().get("allocation.all.allocated", 0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        x.add_(1)
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats().get("allocation.all.allocated", 0)
+    del graph
+    return after - before
+
+
 def capture(chain):
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -218,9 +233,11 @@ def capture(chain):
 def mode_time(args):
     flush = torch.empty(C.FLUSH_BYTES, dtype=torch.uint8, device="cuda")
     batch = {}
+    control = control_alloc_delta()
     for count in COUNTS:
         chain = Chain(count, seed=count)
-        graph, _ = capture(chain)
+        graph, alloc_delta = capture(chain)
+        C.log(f"count {count}: capture alloc delta {alloc_delta} (control {control})")
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
         ends = [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
         for _ in range(WARMUP):
@@ -279,6 +296,9 @@ def mode_check(args):
     assert NEW, "check runs in the candidate tree"
     ok = True
     report = {}
+    control = control_alloc_delta()
+    report["capture_alloc_delta_control"] = control
+    C.log("control capture alloc delta", control)
     for realistic in (True, False):
         for count in COUNTS:
             tag = f"{'real' if realistic else 'wide'}/c{count}"
@@ -319,7 +339,9 @@ def mode_check(args):
                 max_abs_diff_cake_vs_main=max((o.float() - m.float()).abs().max().item()
                                               for o, m in zip(last, mains)),
             )
-            good = iter_ok and det and alloc_delta == 0
+            rep["strict_le_main_all_layers_last_iter"] = all(
+                errs(o, r)[0] <= m[0] for o, r, m in zip(last, refs, e_main))
+            good = iter_ok and det and alloc_delta <= control
             rep["passed"] = good
             ok &= good
             report[f"repeated/{tag}"] = rep
@@ -350,7 +372,8 @@ def advancing(chain, graph, report, count, steps=8):
     for step in range(steps):
         new_swa_slot = torch.full((count,), 0, dtype=torch.int64)
         for li, L in enumerate(chain.layers):
-            slots = torch.randint(0, C.SWA_ROWS, (count,), generator=gen).cuda()
+            # distinct slots: duplicate slots in one scatter would race (pool vs mirror)
+            slots = torch.randperm(C.SWA_ROWS, generator=gen)[:count].cuda()
             vals = gpu_values(count, 9000 + step * 100 + li)
             store_rows(chain.swa_pools[li], slots, vals, "swa")
             store_rows(mirror_swa[li], slots, vals, "swa")
@@ -358,7 +381,7 @@ def advancing(chain, graph, report, count, steps=8):
             # ring: newest slot replaces column step % 128
             sel["swa"][:, step % C.SWA_W] = slots
         for g, mp in chain.main_pools.items():
-            slots = torch.randint(0, C.MAIN_ROWS, (count,), generator=gen).cuda()
+            slots = torch.randperm(C.MAIN_ROWS, generator=gen)[:count].cuda()
             vals = gpu_values(count, 9500 + step * 10 + g)
             store_rows(mp, slots, vals, "main")
             store_rows(mirror_main[g], slots, vals, "main")

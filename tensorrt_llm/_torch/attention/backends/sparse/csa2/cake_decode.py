@@ -217,10 +217,19 @@ def supported(q, swa_pool, swa_slots, main_pool, main_slots) -> bool:
 
 
 class CakeDecode:
-    """Per-shape scratch (int32 indices, split partials, LSE) and the Cake launch."""
+    """Per-shape scratch (int32 indices, split partials, LSE) and the Cake launch.
 
-    def __init__(self) -> None:
+    ``f32_partials`` (default on) keeps the split-K partials in fp32: the 16-head
+    ``default`` Cake bodies write them and the binding's fp32 merge combines them
+    (FlashInfer overlay), so the only BF16 rounding is the output's, as in the
+    split sink path. Off, the stock BF16 partials and dispatched variant run.
+    """
+
+    def __init__(self, f32_partials: bool | None = None) -> None:
         self._buffers: dict[tuple, dict[str, torch.Tensor]] = {}
+        if f32_partials is None:
+            f32_partials = os.environ.get("TRTLLM_CSA2_CAKE_F32_PARTIALS", "1") != "0"
+        self.f32_partials = bool(f32_partials)
 
     def _scratch(self, count, heads, swa_width, main_width, device):
         key = (count, heads, swa_width, main_width, device)
@@ -240,12 +249,17 @@ class CakeDecode:
                 "main": torch.full((count, max(main_width, 1)), -1, dtype=torch.int32, device=device),
                 "lse": torch.empty((count, heads), dtype=torch.float32, device=device),
                 "mid_out": torch.empty(
-                    (count, heads, splits, _HEAD_DIM), dtype=torch.bfloat16, device=device
+                    (count, heads, splits, _HEAD_DIM),
+                    dtype=torch.float32 if self._use_f32(heads) else torch.bfloat16,
+                    device=device,
                 ),
                 "mid_lse": torch.empty((count, heads, splits), dtype=torch.float32, device=device),
             }
             self._buffers[key] = buffers
         return buffers
+
+    def _use_f32(self, heads: int) -> bool:
+        return self.f32_partials and heads == 16
 
     def __call__(
         self,
@@ -292,6 +306,7 @@ class CakeDecode:
             extra_indices=buffers["main"] if has_main else None,
             mid_out=buffers["mid_out"],
             mid_lse=buffers["mid_lse"],
+            variant="default" if self._use_f32(heads) else None,
         )
         return out
 
