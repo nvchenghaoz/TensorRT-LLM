@@ -160,26 +160,44 @@ __global__ __launch_bounds__(64, 1) void CakeMergeF32Kernel(const float* __restr
   const int row = token * heads + h;
   const int lse_base = row * scratch_split_stride;
   asm volatile("griddepcontrol.wait;" ::: "memory");
-  float gmax = -1e+30f;
-  for (int s = 0; s < num_splits; ++s) gmax = fmaxf(gmax, mid_lse[lse_base + s]);
+  // Up to kMaxChunksPerBlock (16) splits: all LSEs, then all partial loads in flight, then the
+  // split-order accumulation (the stock merge's schedule, so no dependent load chain per split).
+  constexpr int kMaxSplits = 16;
+  float lse[kMaxSplits];
+#pragma unroll
+  for (int s = 0; s < kMaxSplits; ++s) lse[s] = s < num_splits ? mid_lse[lse_base + s] : -1e+30f;
+  float gmax = lse[0];
+#pragma unroll
+  for (int s = 1; s < kMaxSplits; ++s) gmax = fmaxf(gmax, lse[s]);
+  float4 va[kMaxSplits];
+  float4 vb[kMaxSplits];
+  const float* base = mid_out + (static_cast<long long>(lse_base) * 512 + lane * 8);
+#pragma unroll
+  for (int s = 0; s < kMaxSplits; ++s) {
+    if (s < num_splits) {
+      const float4* p = reinterpret_cast<const float4*>(base + static_cast<long long>(s) * 512);
+      va[s] = p[0];
+      vb[s] = p[1];
+    } else {
+      va[s] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      vb[s] = va[s];
+    }
+  }
   float total = 0.0f;
   float o[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  for (int s = 0; s < num_splits; ++s) {
-    const float l = mid_lse[lse_base + s];
-    if (l > -1e+29f) {
-      const float w = CakeF32ApproxExp2(l - gmax);
+#pragma unroll
+  for (int s = 0; s < kMaxSplits; ++s) {
+    if (lse[s] > -1e+29f) {
+      const float w = CakeF32ApproxExp2(lse[s] - gmax);
       total = total + w;
-      const float4* p = reinterpret_cast<const float4*>(mid_out + (static_cast<long long>(lse_base + s) * 512 + lane * 8));
-      const float4 a = p[0];
-      const float4 b = p[1];
-      o[0] = o[0] + a.x * w;
-      o[1] = o[1] + a.y * w;
-      o[2] = o[2] + a.z * w;
-      o[3] = o[3] + a.w * w;
-      o[4] = o[4] + b.x * w;
-      o[5] = o[5] + b.y * w;
-      o[6] = o[6] + b.z * w;
-      o[7] = o[7] + b.w * w;
+      o[0] = o[0] + va[s].x * w;
+      o[1] = o[1] + va[s].y * w;
+      o[2] = o[2] + va[s].z * w;
+      o[3] = o[3] + va[s].w * w;
+      o[4] = o[4] + vb[s].x * w;
+      o[5] = o[5] + vb[s].y * w;
+      o[6] = o[6] + vb[s].z * w;
+      o[7] = o[7] + vb[s].w * w;
     }
   }
   float lse_out = __int_as_float(0xff800000);  // -inf
