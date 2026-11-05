@@ -51,7 +51,7 @@ K3_RE = re.compile(r"csa2_mxfp8_low_m_gemm")
 BODY_RE = re.compile(r"decode_body|kernel_sm120_dsv41_mixed_sparse_mla")
 PREP_RE = re.compile(r"_cake_index_prep")
 AR_RE = re.compile(r"allreduce|all_reduce|lamport|oneshot|twoshot|nccl", re.I)
-ARMS = {
+ALL_ARMS = {
     "W": {},
     "A1": {},
     "A1b": {},
@@ -60,6 +60,11 @@ ARMS = {
     "A4": {"TRTLLM_CSA2_CAKE_DECODE": "0"},
     "A5": {"TRTLLM_CSA2_CAKE_DECODE": "0", "TRTLLM_CSA2_ATTN_PDL": "0"},
 }
+# Model loads take ~17-20 min each on node smc521ge-0109. Default: W (writes the cache, records the traces), then
+# A1, A1b, A2, A3, which all LOAD the cache (acceptance item 1: the load line on all 4 ranks in every compared arm).
+# AUDIT_ARMS=W,A1,A1b,A2,A3,A4,A5 runs the full set.
+ARMS = {n: ALL_ARMS[n] for n in os.environ.get("AUDIT_ARMS", "W,A1,A1b,A2,A3").split(",")}
+WRITER = next(iter(ARMS))
 # main's experiments/ascent-config/engine.json since landing 51 (branch 147); this branch's base predates it.
 MAIN_LAYOUT = {"moe_tensor_parallel_size": 2, "moe_expert_parallel_size": 2}
 PROTOCOL = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, pipeline_parallel_size=1,
@@ -132,7 +137,7 @@ def run_phase(ckpt, name):
         res[f"c{c}"] = rows
         print(f"[{name}] c{c}: tokens[:6]={[r['tokens'][:6] for r in rows]} lp0={[r['logprobs'][:1] for r in rows]}",
               flush=True)
-    if name == "W":
+    if name == WRITER:
         rng = random.Random(245)
         root = ART / "traces"
         for c in (1, 4):
@@ -338,7 +343,7 @@ def main():
     rc = {}
     for name, env in ARMS.items():
         rc[name] = run_arm(ckpt, name, env)
-        if name == "W" and not CACHE.exists():
+        if name == WRITER and not CACHE.exists():
             print("WARNING: writer arm did not create the autotuner cache file", flush=True)
     phases = {n: (json.loads((ART / f"phase_{n}.json").read_text()) if (ART / f"phase_{n}.json").exists() else None)
               for n in ARMS}
@@ -347,7 +352,7 @@ def main():
                "cache_path": str(CACHE), "arms_rc": rc, "logs": logs}
     all_rc = all(v["rc"] == 0 for v in rc.values()) and all(phases.values())
     # G1: cache-load line on all 4 ranks in every loading arm.
-    g1 = {n: logs[n]["cache_load_ranks"] for n in ARMS if n != "W"}
+    g1 = {n: logs[n]["cache_load_ranks"] for n in ARMS if n != WRITER}
     # Lines without a [RANK n] tag (logger rank unset) count as -1; then require >= 4 occurrences instead.
     g1_ok = all(set(v) >= {0, 1, 2, 3} or (v == [-1] and logs[n]["cache_load_lines"] >= 4) for n, v in g1.items())
     # G2: prefill first-token logprob (and first token) equal across arms.

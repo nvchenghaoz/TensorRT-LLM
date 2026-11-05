@@ -1,3 +1,10 @@
+# Branch 157 (idea 296, build_on 145) session 8, 11:2x PST 11-05, node smc521ge-0109
+- Job 1486 (4-GPU audit) was cancelled while queued; it never ran (no slot, empty log). Not evidence.
+- Resubmitted server_audit.py with arms W,A1,A1b,A2,A3 (W writes the shared TLLM_AUTOTUNER_CACHE_PATH and records
+  the route traces; A1/A1b/A2/A3 all load it). timeout_s sized for 5 model loads (~20 min each) + a cold slot build.
+- Measured code commit 1c78969e unchanged; only experiments/ (server_audit.py, STATUS) changed after it.
+- If the job stalls after the first warmup forward on austin:0, it is a NODE SUSPECT (top-lead rule 11:1x).
+
 # Branch 145 (idea 245 Q1) STATUS, 05:2x PST 11-05 (end of run)
 
 Measured commit: 1c78969e (unchanged; only this STATUS file was added after it).
