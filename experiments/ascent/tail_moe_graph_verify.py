@@ -27,6 +27,29 @@ import sys
 import time
 
 
+def _layout():
+    """MoE layout: env TAIL_VERIFY_MOE_TP / TAIL_VERIFY_MOE_EP (default: main's EP4, moe_tp unset)."""
+    moe_tp = os.environ.get("TAIL_VERIFY_MOE_TP")
+    moe_ep = int(os.environ.get("TAIL_VERIFY_MOE_EP", "4"))
+    return (int(moe_tp) if moe_tp else None), moe_ep
+
+
+def _mapping_receipt(llm, moe_tp, moe_ep):
+    from tensorrt_llm.mapping import Mapping
+
+    for key in ("moe_tensor_parallel_size", "moe_expert_parallel_size", "tensor_parallel_size"):
+        print(f"[verify] llm.args.{key} = {getattr(llm.args, key, '?')}", flush=True)
+    for r in range(4):
+        m = Mapping(world_size=4, rank=r, tp_size=4, moe_tp_size=moe_tp if moe_tp else 1,
+                    moe_ep_size=moe_ep)
+        experts_per_rank = 384 // m.moe_ep_size
+        print(f"[verify] MAPPING rank {r}: tp_rank={m.tp_rank} moe_tp_size={m.moe_tp_size} "
+              f"moe_ep_size={m.moe_ep_size} moe_tp_rank={m.moe_tp_rank} "
+              f"moe_ep_rank={m.moe_ep_rank} slot_start={experts_per_rank * m.moe_ep_rank} "
+              f"local_experts={experts_per_rank} inter_per_rank={2304 // m.moe_tp_size}",
+              flush=True)
+
+
 def run_one(ckpt, steps, verify, mode):
     env = {"TRTLLM_DSV4_TAIL_MOE_GRAPH": "1", "TRTLLM_DSV4_TAIL_MOE_GRAPH_VERIFY": str(verify)}
     os.environ.update(env)
@@ -34,9 +57,13 @@ def run_one(ckpt, steps, verify, mode):
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
 
-    print(f"[verify] mode={mode} steps={steps} verify={verify}", flush=True)
+    moe_tp, moe_ep = _layout()
+    print(f"[verify] mode={mode} steps={steps} verify={verify} "
+          f"moe_tensor_parallel_size={moe_tp} moe_expert_parallel_size={moe_ep}", flush=True)
     t0 = time.time()
     extra = {}
+    if moe_tp is not None:
+        extra["moe_tensor_parallel_size"] = moe_tp
     if mode == "determ":
         extra["moe_config"] = MoeConfig(disable_finalize_fusion=True)
     # The frozen protocol's server settings (harness.server), so memory sizing matches serving.
@@ -45,7 +72,7 @@ def run_one(ckpt, steps, verify, mode):
         tensor_parallel_size=4,
         pipeline_parallel_size=1,
         context_parallel_size=1,
-        moe_expert_parallel_size=4,
+        moe_expert_parallel_size=moe_ep,
         enable_attention_dp=False,
         enable_chunked_prefill=True,
         trust_remote_code=True,
@@ -59,6 +86,7 @@ def run_one(ckpt, steps, verify, mode):
         **extra,
     )
     print(f"[verify] mode={mode} LLM ready in {time.time() - t0:.0f}s", flush=True)
+    _mapping_receipt(llm, moe_tp, moe_ep)
     rng = random.Random(0)
     vocab = 100000  # tokenizer.vocab_size raises NotImplementedError here; ids < 100000 are valid
     sp = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
