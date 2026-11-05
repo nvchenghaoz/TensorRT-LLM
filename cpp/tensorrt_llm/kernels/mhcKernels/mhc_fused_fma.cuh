@@ -1233,4 +1233,294 @@ __launch_bounds__(256, (TM * N_PER_BLOCK <= 48) ? 2 : 1) __global__
 #endif
 }
 
+// ===================================================================
+// fused_pmap_gemm_fma_mtile_v2<N_PER_BLOCK, TM, RAW_SMEM, MIN_BLOCKS>
+// -------------------------------------------------------------------
+// Spill-free rebuild of fused_pmap_gemm_fma_mtile<N_PER_BLOCK, TM>.  BITWISE
+// EQUAL to it (and so to the ks = 1 ksplit kernel): every thread owns the same
+// h positions, and every fmaf chain (new_r, sqr, acc) and the shuffle / 8-warp
+// epilogue are the same operations in the same order.  Only register
+// allocation and data movement change:
+//   - MIN_BLOCKS is explicit (1 lifts the 128-register cap that made the
+//     (12,4)/(8,4)/(24,2) builds spill).
+//   - token offsets are int32 (the launcher checks M * 4 * hidden < 2^31).
+//   - the W_T loads are not volatile, so ptxas may schedule them freely.
+//   - RAW_SMEM stages the thread-private bf16 inputs (x and the 4 residual
+//     streams of each token) in shared memory with cp.async instead of
+//     keeping 20 * TM registers live across the j loop.  Each thread reads
+//     only the slots it wrote, so no barrier is needed.  The next h-step's
+//     copies are issued once j = 3 has consumed the current ones.
+//     Dynamic smem: TM * 5 * 256 * 16 bytes.
+// Grid: (ceil(M / TM), N / N_PER_BLOCK, 1).  Block: 256 threads.
+// ===================================================================
+template <int N_PER_BLOCK, int TM, bool RAW_SMEM, int MIN_BLOCKS>
+__launch_bounds__(256, MIN_BLOCKS) __global__
+    void fused_pmap_gemm_fma_mtile_v2(__nv_bfloat16 const* __restrict__ residual_in,
+        __nv_bfloat16 const* __restrict__ x_in, float const* __restrict__ post_mix,
+        float const* __restrict__ comb_mix, float const* __restrict__ W_T, float* __restrict__ Yp,
+        float* __restrict__ Rp, int M, int hidden_size, int N, int K, __nv_bfloat16* __restrict__ residual_out)
+{
+    constexpr int HC_MULT = 4;
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+    constexpr int BF16_VEC = 8;
+    constexpr int RAW_SLOTS = HC_MULT + 1; // slot k < 4: residual stream k; slot 4: x
+
+    int const tok0 = blockIdx.x * TM;
+    int const n_start = blockIdx.y * N_PER_BLOCK;
+    int const tid = threadIdx.x;
+    int const warp_id = tid / WARP_SIZE;
+    int const lane = tid % WARP_SIZE;
+    bool const do_sqr = (n_start == 0);
+
+    extern __shared__ uint4 s_raw_dyn[];
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
+    __shared__ float s_post[TM][HC_MULT];
+    __shared__ float s_comb[TM][HC_MULT][HC_MULT];
+
+    if (tid < TM * HC_MULT)
+    {
+        int const t = tid / HC_MULT;
+        int const c = tid % HC_MULT;
+        int const tok = min(tok0 + t, M - 1);
+        s_post[t][c] = post_mix[tok * HC_MULT + c];
+    }
+    if (tid < TM * HC_MULT * HC_MULT)
+    {
+        int const t = tid / (HC_MULT * HC_MULT);
+        int const rc = tid % (HC_MULT * HC_MULT);
+        int const tok = min(tok0 + t, M - 1);
+        s_comb[t][rc / HC_MULT][rc % HC_MULT] = comb_mix[tok * HC_MULT * HC_MULT + rc];
+    }
+
+    // Tokens past M (last CTA) recompute token M-1 and never write.
+    int tok_res[TM];
+    int tok_x[TM];
+    bool tok_ok[TM];
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        int const tok = min(tok0 + t, M - 1);
+        tok_ok[t] = (tok0 + t) < M;
+        tok_res[t] = tok * HC_MULT * hidden_size;
+        tok_x[t] = tok * hidden_size;
+    }
+
+    auto issue_raw = [&](int hh)
+    {
+#pragma unroll
+        for (int t = 0; t < TM; t++)
+        {
+#pragma unroll
+            for (int k = 0; k < RAW_SLOTS; k++)
+            {
+                __nv_bfloat16 const* src
+                    = (k < HC_MULT) ? &residual_in[tok_res[t] + k * hidden_size + hh] : &x_in[tok_x[t] + hh];
+                uint32_t const dst = static_cast<uint32_t>(
+                    __cvta_generic_to_shared(&s_raw_dyn[(t * RAW_SLOTS + k) * BLOCK_SIZE + tid]));
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    };
+
+    if constexpr (RAW_SMEM)
+    {
+        if (tid * BF16_VEC < hidden_size)
+            issue_raw(tid * BF16_VEC);
+    }
+    __syncthreads();
+
+    float acc[TM][N_PER_BLOCK];
+    float sqr[TM];
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        sqr[t] = 0.0f;
+#pragma unroll
+        for (int n = 0; n < N_PER_BLOCK; n++)
+            acc[t][n] = 0.0f;
+    }
+
+    for (int h = tid * BF16_VEC; h < hidden_size; h += BLOCK_SIZE * BF16_VEC)
+    {
+        uint4 x_raw[RAW_SMEM ? 1 : TM];
+        uint4 r_raw[RAW_SMEM ? 1 : TM][HC_MULT];
+        if constexpr (RAW_SMEM)
+        {
+            asm volatile("cp.async.wait_all;\n" ::: "memory");
+        }
+        else
+        {
+#pragma unroll
+            for (int t = 0; t < TM; t++)
+            {
+                x_raw[t] = *reinterpret_cast<uint4 const*>(&x_in[tok_x[t] + h]);
+#pragma unroll
+                for (int k = 0; k < HC_MULT; k++)
+                    r_raw[t][k] = *reinterpret_cast<uint4 const*>(&residual_in[tok_res[t] + k * hidden_size + h]);
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < HC_MULT; j++)
+        {
+            float new_r[TM][BF16_VEC];
+#pragma unroll
+            for (int t = 0; t < TM; t++)
+            {
+                float const pmj = s_post[t][j];
+                uint4 xr;
+                if constexpr (RAW_SMEM)
+                    xr = s_raw_dyn[(t * RAW_SLOTS + HC_MULT) * BLOCK_SIZE + tid];
+                else
+                    xr = x_raw[t];
+                __nv_bfloat162 const* xp = reinterpret_cast<__nv_bfloat162 const*>(&xr);
+#pragma unroll
+                for (int v = 0; v < 4; v++)
+                {
+                    float2 f = __bfloat1622float2(xp[v]);
+                    new_r[t][2 * v + 0] = pmj * f.x;
+                    new_r[t][2 * v + 1] = pmj * f.y;
+                }
+#pragma unroll
+                for (int k = 0; k < HC_MULT; k++)
+                {
+                    float const ckj = s_comb[t][k][j];
+                    uint4 rr;
+                    if constexpr (RAW_SMEM)
+                        rr = s_raw_dyn[(t * RAW_SLOTS + k) * BLOCK_SIZE + tid];
+                    else
+                        rr = r_raw[t][k];
+                    __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&rr);
+#pragma unroll
+                    for (int v = 0; v < 4; v++)
+                    {
+                        float2 f = __bfloat1622float2(rp[v]);
+                        new_r[t][2 * v + 0] = fmaf(ckj, f.x, new_r[t][2 * v + 0]);
+                        new_r[t][2 * v + 1] = fmaf(ckj, f.y, new_r[t][2 * v + 1]);
+                    }
+                }
+            }
+
+            if constexpr (RAW_SMEM)
+            {
+                // All of this step's slots are consumed: prefetch the next step.
+                if (j == HC_MULT - 1 && h + BLOCK_SIZE * BF16_VEC < hidden_size)
+                    issue_raw(h + BLOCK_SIZE * BF16_VEC);
+            }
+
+            if (do_sqr)
+            {
+#pragma unroll
+                for (int t = 0; t < TM; t++)
+                {
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+                        sqr[t] = fmaf(new_r[t][v], new_r[t][v], sqr[t]);
+                    if (tok_ok[t])
+                    {
+                        uint4 packed;
+                        __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
+#pragma unroll
+                        for (int v = 0; v < 4; v++)
+                            pairs[v] = __float22bfloat162_rn(make_float2(new_r[t][2 * v], new_r[t][2 * v + 1]));
+                        *reinterpret_cast<uint4*>(residual_out + tok_res[t] + j * hidden_size + h) = packed;
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int n = 0; n < N_PER_BLOCK; n++)
+            {
+                float const* wp = W_T + (n_start + n) * K + j * hidden_size + h;
+                float w[BF16_VEC];
+                asm("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                    : "=f"(w[0]), "=f"(w[1]), "=f"(w[2]), "=f"(w[3])
+                    : "l"(wp));
+                asm("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                    : "=f"(w[4]), "=f"(w[5]), "=f"(w[6]), "=f"(w[7])
+                    : "l"(wp + 4));
+#pragma unroll
+                for (int t = 0; t < TM; t++)
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+                        acc[t][n] = fmaf(new_r[t][v], w[v], acc[t][n]);
+            }
+        }
+    }
+
+    constexpr int COLS_PER_GROUP = NUM_WARPS;
+    constexpr int SQRSUM_SLOT = COLS_PER_GROUP;
+    constexpr int N_GROUPS = (N_PER_BLOCK + COLS_PER_GROUP - 1) / COLS_PER_GROUP;
+    constexpr unsigned FULL_WARP_MASK = 0xffffffff;
+
+    __shared__ float s_warp[NUM_WARPS][COLS_PER_GROUP + 1];
+
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        int const token = tok0 + t;
+#pragma unroll
+        for (int g = 0; g < N_GROUPS; g++)
+        {
+            constexpr int LAST_COLS = N_PER_BLOCK - (N_GROUPS - 1) * COLS_PER_GROUP;
+            int const n_cols = (g == N_GROUPS - 1) ? LAST_COLS : COLS_PER_GROUP;
+#pragma unroll
+            for (int n = 0; n < COLS_PER_GROUP; n++)
+            {
+                if (n < n_cols)
+                {
+#pragma unroll
+                    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+                        acc[t][g * COLS_PER_GROUP + n]
+                            += __shfl_xor_sync(FULL_WARP_MASK, acc[t][g * COLS_PER_GROUP + n], off);
+                }
+            }
+            if (g == 0 && do_sqr)
+            {
+#pragma unroll
+                for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+                    sqr[t] += __shfl_xor_sync(FULL_WARP_MASK, sqr[t], off);
+            }
+            if (lane == 0)
+            {
+#pragma unroll
+                for (int n = 0; n < COLS_PER_GROUP; n++)
+                    if (n < n_cols)
+                        s_warp[warp_id][n] = acc[t][g * COLS_PER_GROUP + n];
+                if (g == 0 && do_sqr)
+                    s_warp[warp_id][SQRSUM_SLOT] = sqr[t];
+            }
+            __syncthreads();
+            if (tok_ok[t] && lane == 0 && warp_id < n_cols)
+            {
+                float val = 0.0f;
+#pragma unroll
+                for (int w = 0; w < NUM_WARPS; w++)
+                    val += s_warp[w][warp_id];
+                int const n_global = n_start + g * COLS_PER_GROUP + warp_id;
+                Yp[static_cast<long long>(token) * N + n_global] = val;
+            }
+            if (tok_ok[t] && g == 0 && do_sqr && lane == 0 && warp_id == 0)
+            {
+                float sq = 0.0f;
+#pragma unroll
+                for (int w = 0; w < NUM_WARPS; w++)
+                    sq += s_warp[w][SQRSUM_SLOT];
+                Rp[token] = sq;
+            }
+            __syncthreads();
+        }
+    }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 } // namespace fused_fma_kernels
