@@ -94,9 +94,14 @@ def step_info(seg):
     for a in ars:
         inside = [e for e in non if e["ts"] >= prev_end - 1 and e["ts"] < a["ts"]]
         is_moe = any(MOE_RE.search(e.get("name", "")) for e in inside)
+        names = []
+        for e in inside:
+            b = base_name(e.get("name", ""))[-40:]
+            if b not in names:
+                names.append(b)
         ivs.append({"compute": a["ts"] - prev_end, "ar_dur": a["dur"], "moe": is_moe,
                     "busy": union([(e["ts"], e["ts"] + e["dur"]) for e in inside]),
-                    "ar_name": base_name(a.get("name", ""))})
+                    "ar_name": base_name(a.get("name", "")), "names": names[:4], "nk": len(inside)})
         prev_end = a["ts"] + a["dur"]
     tail = t1 - prev_end
     return {"span": t1 - t0, "n": len(seg), "n_ar": len(ars), "ar_sum": sum(a["dur"] for a in ars),
@@ -200,6 +205,43 @@ def main():
                                         "kernels": st[0]["n"], "n_ar": st[0]["n_ar"]}
                                     for r, st in wins[arm].items()}}
             log(json.dumps(rr[arm]["decomp_ms"]))
+        # per-interval view: mean over steps of crit, per-rank compute and gap (compute - busy)
+        per_iv = {}
+        for arm in ("ep4", "ep2tp2"):
+            ranks = sorted(wins[arm])
+            ns = min(len(wins[arm][r]) for r in ranks)
+            n_iv = min(len(wins[arm][r][s]["ivs"]) for r in ranks for s in range(ns))
+            rows = []
+            for i in range(n_iv):
+                comp = [sum(wins[arm][r][s]["ivs"][i]["compute"] for s in range(ns)) / ns for r in ranks]
+                gap = [sum(wins[arm][r][s]["ivs"][i]["compute"] - wins[arm][r][s]["ivs"][i]["busy"]
+                           for s in range(ns)) / ns for r in ranks]
+                crit = sum(max(wins[arm][r][s]["ivs"][i]["compute"] for r in ranks) for s in range(ns)) / ns
+                iv0 = wins[arm][0][0]["ivs"][i]
+                rows.append({"crit": crit, "comp": comp, "gap": gap, "moe": iv0["moe"], "names": iv0["names"],
+                             "nk": iv0["nk"], "ar": iv0["ar_name"][:30]})
+            per_iv[arm] = rows
+        n_iv = min(len(per_iv["ep4"]), len(per_iv["ep2tp2"]))
+        ivd = []
+        for i in range(n_iv):
+            a, b = per_iv["ep4"][i], per_iv["ep2tp2"][i]
+            ivd.append({"i": i, "moe": a["moe"], "nk": [a["nk"], b["nk"]], "names": a["names"],
+                        "crit_ep4": round(a["crit"], 1), "crit_ep2tp2": round(b["crit"], 1),
+                        "d_crit": round(b["crit"] - a["crit"], 1),
+                        "comp_ep4": [round(x, 1) for x in a["comp"]], "comp_ep2tp2": [round(x, 1) for x in b["comp"]],
+                        "gap_ep4": [round(x, 1) for x in a["gap"]], "gap_ep2tp2": [round(x, 1) for x in b["gap"]]})
+        rr["intervals"] = ivd
+        for typ in (True, False):
+            sel = [x for x in ivd if x["moe"] == typ]
+            for half, lo, hi in (("first", 0, n_iv // 2), ("second", n_iv // 2, n_iv)):
+                s2 = [x for x in sel if lo <= x["i"] < hi]
+                log(f"run {run} {'moe' if typ else 'attn'} intervals {half} half (n={len(s2)}): d_crit "
+                    f"{sum(x['d_crit'] for x in s2) / 1e3:.3f} ms; gap sum per rank ep4 "
+                    f"{[round(sum(x['gap_ep4'][r] for x in s2) / 1e3, 3) for r in range(4)]} ep2tp2 "
+                    f"{[round(sum(x['gap_ep2tp2'][r] for x in s2) / 1e3, 3) for r in range(4)]}")
+        log(f"run {run} top intervals by d_crit:")
+        for x in sorted(ivd, key=lambda x: -abs(x["d_crit"]))[:14]:
+            log("   ", json.dumps(x))
         dd = {k: round(rr["ep2tp2"]["decomp_ms"][k] - rr["ep4"]["decomp_ms"][k], 3)
               for k in rr["ep4"]["decomp_ms"] if isinstance(rr["ep4"]["decomp_ms"][k], float)}
         rr["decomp_delta_ms"] = dd
