@@ -252,6 +252,9 @@ def section_c(gen):
     import lowm_check as lc
 
     aggs = lc._aggressors(gen)
+    for agg in aggs.values():  # initialize cuBLAS handles/workspaces eagerly, never inside capture
+        agg()
+    torch.cuda.synchronize()
     L = lg()
     nw = (1.0 + 0.2 * torch.randn(Q_RANK, generator=gen, device="cuda")).to(torch.bfloat16)
     copies = []
