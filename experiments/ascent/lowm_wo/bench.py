@@ -219,7 +219,9 @@ def check(env):
             qok = torch.equal(xq, ref_q) and torch.equal(xs, ref_s)
             e = C.err(outs[0], ref_lora)
             em = C.err(outs[0], main_lora)
-            ok = det and qok and bool(torch.isfinite(outs[0]).all()) and e["max_rel"] < 1.6e-2
+            # Reordered class: within main's own (b12x) error vs FP64 (1.25x), and close to main's output.
+            ok = (det and qok and bool(torch.isfinite(outs[0]).all())
+                  and e["max_rel"] <= 1.25 * row["main_lora_err"]["max_rel"] and em["max_rel"] < 1.6e-2)
             res["passed"] &= ok
             k2r["%d,%d,%d" % cfg] = {"ok": ok, "det": det, "quant_bytes_equal": qok, "vs_fp64": e, "vs_main": em}
         row["k2"] = k2r
@@ -490,8 +492,9 @@ def main():
             best = {M: parse_best(v["best"]) for M, v in s.items()}
         result["table"] = table(env, best)
     result["passed"] = bool(passed)
-    os.makedirs("artifacts", exist_ok=True)
-    with open(os.path.join("artifacts", f"lowm_wo_{mode}.json"), "w") as f:
+    art = os.environ.get("AUTO_DEV_ARTIFACTS", tempfile.gettempdir())
+    os.makedirs(art, exist_ok=True)
+    with open(os.path.join(art, f"lowm_wo_{mode}.json"), "w") as f:
         json.dump(result, f, indent=1, default=str)
     summ = {"passed": bool(passed), "mode": mode}
     if "table" in result:

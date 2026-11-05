@@ -20,6 +20,18 @@ For decode row counts this module runs
    NCCL window output, locality-domain shards) it runs ``o_b_proj(o_lora)``.
 
 Every stage is byte-identical to main's (checked bitwise at M=1..8).
+
+With ``TRTLLM_CSA2_LOWM_WO`` (default on) the decode rows M=1..8 instead run the SM120 low-M MXFP8 kernel family
+(``LowMWOProjection``), with no b12x kernel on the route:
+
+1. ``trtllm::csa2_lowm_wo_a`` (cpp/tensorrt_llm/kernels/minimaxM3/csa2LowMWo.cu): the same BF16 inverse RoPE and
+   1x128 UE8M0 quantization as step 1 above (byte-equal, same instruction sequence) fused with the grouped wo_a
+   GEMM, writing ``o_lora`` [M, groups * rank]. It stages its weights before ``griddepcontrol.wait`` and triggers its
+   dependents at start, so the wo_b kernel's weight staging overlaps it.
+2. ``trtllm::csa2_mxfp8_low_m_gemm`` on wo_b (in-kernel MXFP8 quantization byte-equal to ``mxfp8_quantize``), then
+   ``o_b_proj.all_reduce`` as above.
+
+The GEMM products are summed in another order than b12x's (reordered output class).
 """
 
 import os
@@ -40,6 +52,11 @@ _ENV_WO_B = "TRTLLM_B12X_WO_B_FUSED"
 _ENV_WO_B_WIDE_ROWS = "TRTLLM_B12X_WO_B_WIDE_ROWS"
 _WO_B_WIDE_ROWS_DEFAULT = "2,3,4"
 MAX_DECODE_ROWS = 8
+_ENV_LOWM = "TRTLLM_CSA2_LOWM_WO"
+# (warps, cluster_k, row_tiles) per decode row count. RTX PRO 6000 (SM120, 188 SMs), 40-layer cold-L2 PDL graph
+# chain sweep at the TP4 rank shapes (experiments/ascent/lowm_wo/bench.py, job 1104).
+_LOWM_WO_A_CONFIGS = {m: ((4, 2, 2) if m <= 2 else (8, 4, 2)) for m in range(1, MAX_DECODE_ROWS + 1)}
+_LOWM_WO_B_CONFIGS = {m: ((4, 1, 1) if m <= 2 else (8, 1, 2)) for m in range(1, MAX_DECODE_ROWS + 1)}
 
 
 def _env_on(name: str) -> bool:
@@ -55,6 +72,10 @@ def _wo_b_wide_rows() -> frozenset:
 
 def b12x_wo_projection_enabled() -> bool:
     return _env_on(_ENV)
+
+
+def lowm_wo_projection_enabled() -> bool:
+    return _env_on(_ENV_LOWM)
 
 
 @triton.jit
@@ -372,15 +393,150 @@ class B12xWOProjection:
         torch.cuda.current_stream(device).synchronize()
 
 
-def build_b12x_wo_projection(module, prewarm: bool = True) -> Optional[B12xWOProjection]:
-    """Build the packed projection for an SM120 grouped-128 FP8 CSA2 module, or None."""
-    if not b12x_wo_projection_enabled() or get_sm_version() != 120:
+class LowMWOProjection:
+    """SM120 decode WO projection on the low-M MXFP8 kernels: csa2_lowm_wo_a + csa2_mxfp8_low_m_gemm (wo_b).
+
+    Covers every decode row count 1..MAX_DECODE_ROWS (both config tables are complete); weights are the live
+    parameters (o_a_proj E4M3, o_b_proj E4M3 + its 1D swizzled UE8M0 scales). Only the wo_a block scales are
+    re-encoded once as UE8M0 bytes ([G, rank/128, group_width/128]).
+    """
+
+    def __init__(self, module) -> None:
+        ops = torch.ops.trtllm
+        if not (hasattr(ops, "csa2_lowm_wo_a") and hasattr(ops, "csa2_mxfp8_low_m_gemm")):
+            raise RuntimeError("csa2_lowm_wo_a / csa2_mxfp8_low_m_gemm are not built")
+        weight = module.o_a_proj
+        if weight.dim() != 3 or not weight.is_contiguous() or weight.dtype != torch.float8_e4m3fn:
+            raise ValueError("low-M WO projection needs a contiguous E4M3 [G, rank, group_width] o_a_proj")
+        groups, rank, group_width = weight.shape
+        block = module._o_a_proj_block_scale  # fp32 powers of two [G, rank/128, gw/128]
+        exps = torch.log2(block.float())
+        if not bool((exps == exps.round()).all()) or tuple(block.shape) != (groups, rank // 128, group_width // 128):
+            raise ValueError("low-M WO projection needs UE8M0 (power-of-two) 128x128 wo_a block scales")
+        self.wa = weight
+        self.wsc = (exps.round() + 127).to(torch.uint8).contiguous()
+        self.groups = groups
+        self.rank = rank
+        self.group_width = group_width
+        self.heads = module.num_heads_tp
+        self.head_dim = module.qk_head_dim
+        self.nope_dim = module.qk_nope_head_dim
+        if self.heads * self.head_dim != groups * group_width:
+            raise ValueError("low-M WO projection: heads * head_dim != groups * group_width")
+        cos_sin = module.inverse_rotary_emb.rotary_cos_sin
+        if cos_sin.dtype != torch.float32 or cos_sin.stride(-1) != 1:
+            raise ValueError("low-M WO projection needs an fp32 inverse-RoPE cos/sin table")
+        self.cos_sin = cos_sin
+        self.o_b_proj = module.o_b_proj
+        self.wo_b = None
+        lin = self.o_b_proj
+        if _direct_wo_b_supported(lin) and lin.weight_scale.dim() == 1 and lin.weight.is_contiguous():
+            n, k = lin.weight.shape
+            if k == groups * rank:
+                self.wo_b = (lin.weight, lin.weight_scale)
+        self._warm_rows = set()
+
+    def accepts(self, output: torch.Tensor) -> bool:
+        m = output.shape[0]
+        if not (1 <= m <= MAX_DECODE_ROWS) or output.dtype != torch.bfloat16:
+            return False
+        if not output.is_contiguous():
+            return False
+        if torch.cuda.is_current_stream_capturing() and m not in self._warm_rows:
+            return False
+        return True
+
+    def o_lora(self, output: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """wo_a only: o_lora [M, groups * rank] BF16 (inverse RoPE + 1x128 quant fused in)."""
+        m = output.shape[0]
+        warps, cluster_k, row_tiles = _LOWM_WO_A_CONFIGS[m]
+        return torch.ops.trtllm.csa2_lowm_wo_a(
+            output.view(m, -1),
+            positions.reshape(-1),
+            self.cos_sin,
+            self.wa,
+            self.wsc,
+            self.groups,
+            self.head_dim,
+            self.nope_dim,
+            warps,
+            cluster_k,
+            row_tiles,
+            True,
+        )
+
+    def _use_direct_wo_b(self) -> bool:
+        if self.wo_b is None:
+            return False
+        lin = self.o_b_proj
+        return not (
+            lin.reduce_output
+            and lin.quant_method.supports_nccl_symmetric_memory_window_output
+            and lin.all_reduce.uses_nccl_symmetric_memory_window()
+        )
+
+    def _wo_b_mm(self, o_lora: torch.Tensor) -> torch.Tensor:
+        warps, cluster_k, row_tiles = _LOWM_WO_B_CONFIGS[o_lora.shape[0]]
+        return torch.ops.trtllm.csa2_mxfp8_low_m_gemm(
+            o_lora, self.wo_b[0], self.wo_b[1], warps, cluster_k, row_tiles, 0, True
+        )[0]
+
+    def __call__(self, output: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Return o_b_proj(o_a_proj(inverse_rope(output))) as [M, hidden]."""
+        o_lora = self.o_lora(output, positions)
+        if self._use_direct_wo_b():
+            result = self._wo_b_mm(o_lora)
+            if self.o_b_proj.reduce_output:
+                result = self.o_b_proj.all_reduce(result, all_reduce_params=None)
+        else:
+            result = self.o_b_proj(o_lora)
+        if not torch.cuda.is_current_stream_capturing():
+            self._warm_rows.add(output.shape[0])
+        return result
+
+    def prewarm(self, device: torch.device) -> None:
+        """Launch every configuration once eagerly (sets each kernel's smem attributes) before graph capture."""
+        for m in range(1, MAX_DECODE_ROWS + 1):
+            dummy = torch.zeros((m, self.heads * self.head_dim), dtype=torch.bfloat16, device=device)
+            positions = torch.zeros((m,), dtype=torch.int32, device=device)
+            o_lora = self.o_lora(dummy, positions)
+            if self.wo_b is not None:
+                self._wo_b_mm(o_lora)
+            self._warm_rows.add(m)
+        torch.cuda.current_stream(device).synchronize()
+
+
+if hasattr(torch.ops.trtllm, "csa2_lowm_wo_a"):
+
+    @torch.library.register_fake("trtllm::csa2_lowm_wo_a")
+    def _(o, positions, cos_sin, w, wsc, groups, head_dim, nope_dim, warps, cluster_k, row_tiles, pdl,
+          xq_dbg=None, xs_dbg=None, debug_flags=0):
+        rank = w.numel() // o.shape[1]
+        return o.new_empty((o.shape[0], groups * rank))
+
+
+def build_b12x_wo_projection(module, prewarm: bool = True):
+    """Build the SM120 decode WO projection for a grouped-128 FP8 CSA2 module (low-M or b12x), or None."""
+    if get_sm_version() != 120:
         return None
     if not getattr(module, "_o_a_fp8_block128", False):
         return None
     if getattr(module, "_o_a_proj_block_scale", None) is None:
         return None
     if module.inverse_rotary_emb.is_neox or module.o_a_proj.dtype != torch.float8_e4m3fn:
+        return None
+    if lowm_wo_projection_enabled():
+        try:
+            projection = LowMWOProjection(module)
+            if prewarm:
+                projection.prewarm(module.o_a_proj.device)
+            return projection
+        except Exception as error:  # pragma: no cover - optional kernels
+            logger.warning_once(
+                f"low-M WO projection unavailable ({error!r}); trying the b12x WO projection.",
+                key="csa2_lowm_wo_unavailable",
+            )
+    if not b12x_wo_projection_enabled():
         return None
     try:
         projection = B12xWOProjection(module)
