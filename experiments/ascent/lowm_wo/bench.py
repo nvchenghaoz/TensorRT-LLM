@@ -42,8 +42,8 @@ def ext():
         t = time.time()
         bdir = tempfile.mkdtemp(prefix="lowm_wo_ext_")
         _EXT = load(name="lowm_wo_ext", sources=[os.path.join(HERE, "lowm_wo_ext.cu")],
-                    extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_120a,code=sm_120a", "-lineinfo"],
-                    extra_cflags=["-O2", "-std=c++17"], build_directory=bdir, verbose=False)
+                    extra_cuda_cflags=["-O3", "-std=c++20", "-gencode=arch=compute_120a,code=sm_120a", "-lineinfo"],
+                    extra_cflags=["-O2", "-std=c++20"], build_directory=bdir, verbose=False)
         log(f"ext built in {time.time() - t:.1f}s")
     return _EXT
 
