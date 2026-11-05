@@ -127,6 +127,7 @@ int main(int argc, char** argv)
     std::vector<__nv_bfloat16> h_ro((size_t) Mmax * HC * HID), h_ro_ref((size_t) Mmax * HC * HID);
     std::vector<float> h_yp(Mmax * N), h_yp_ref(Mmax * N), h_rp(Mmax), h_rp_ref(Mmax);
     bool all_ok = true;
+    int HID_v = HID, N_v = N, K_v = K;
 
     for (int M : Ms)
     {
@@ -153,7 +154,9 @@ int main(int argc, char** argv)
                 CK(cudaMemset(dro, 0xFF, (size_t) M * HC * HID * 2));
                 CK(cudaMemsetAsync(flush, it & 0xFF, flush_bytes));
                 CK(cudaEventRecord(e0));
-                kn.fn<<<grid, 256, kn.smem>>>(dr, dx, dpm, dcm, dw, dyp, drp, M, HID, N, K, dro);
+                void* args[] = {&dr, &dx, &dpm, &dcm, &dw, &dyp, &drp, (void*) &M, (void*) &HID_v, (void*) &N_v,
+                    (void*) &K_v, &dro};
+                CK(cudaLaunchKernel(reinterpret_cast<void const*>(kn.fn), grid, dim3(256), args, kn.smem, 0));
                 CK(cudaEventRecord(e1));
                 CK(cudaGetLastError());
                 CK(cudaEventSynchronize(e1));
