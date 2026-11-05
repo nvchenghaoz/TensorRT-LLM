@@ -46,6 +46,8 @@ __device__ __forceinline__ uint4 ldv(const void* p) {
     return v;
 }
 
+extern __shared__ uint4 dyn_smem[];
+
 template <int M, int V>
 __global__ __launch_bounds__(640, 1) void rk(float* out, __nv_bfloat16 const* A, __nv_bfloat16 const* B) {
     constexpr int H = 5120, E = 384, NW = 20, CH = 32, CPW = 8;
@@ -66,13 +68,20 @@ __global__ __launch_bounds__(640, 1) void rk(float* out, __nv_bfloat16 const* A,
     } else if constexpr (V == 2) {
 #pragma unroll
         for (int c = 0; c < CPW; c++) b[c] = ldv(bp + c * CH);
-    } else if constexpr (V == 4) {
+    } else if constexpr (V == 4 || V == 5) {
         // one 128 B line per lane: row lane/4 of the CTA's 8 rows, line lane%4 of the warp's 512 B K-slice
         __nv_bfloat16 const* pp = B + static_cast<int64_t>(n_base + lane / 4) * H + k_warp + (lane % 4) * 64;
         asm volatile("prefetch.global.L2 [%0];" ::"l"(pp));
+    } else if constexpr (V == 6) {
+#pragma unroll
+        for (int c = 0; c < CPW; c++) {
+            uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(&dyn_smem[c * 640 + threadIdx.x]));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(bp + c * CH));
+        }
+        asm volatile("cp.async.commit_group;");
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    if constexpr (V == 0) {
+    if constexpr (V == 0 || V == 5) {
 #pragma unroll
         for (int c = 0; c < CPW; c++) {
             a0[c] = row0_valid ? *reinterpret_cast<uint4 const*>(ap + c * CH) : zero4;
@@ -81,6 +90,12 @@ __global__ __launch_bounds__(640, 1) void rk(float* out, __nv_bfloat16 const* A,
     } else if constexpr (V == 1) {
 #pragma unroll
         for (int c = 0; c < CPW; c++) a0[c] = row0_valid ? *reinterpret_cast<uint4 const*>(ap + c * CH) : zero4;
+    } else if constexpr (V == 6) {
+#pragma unroll
+        for (int c = 0; c < CPW; c++) a0[c] = row0_valid ? *reinterpret_cast<uint4 const*>(ap + c * CH) : zero4;
+        asm volatile("cp.async.wait_all;" ::: "memory");
+#pragma unroll
+        for (int c = 0; c < CPW; c++) b[c] = dyn_smem[c * 640 + threadIdx.x];
     } else if constexpr (V == 2) {
 #pragma unroll
         for (int c = 0; c < CPW; c++) a0[c] = zero4;
@@ -132,6 +147,14 @@ static void launch(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
     cfg.gridDim = dim3(48);
     cfg.blockDim = dim3(640);
     cfg.stream = at::cuda::getCurrentCUDAStream();
+    if constexpr (V == 6) {
+        static bool once = false;
+        if (!once) {
+            cudaFuncSetAttribute(rk<M, V>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 640 * 16);
+            once = true;
+        }
+        cfg.dynamicSmemBytes = 8 * 640 * 16;
+    }
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
@@ -149,6 +172,8 @@ static void by_v(int64_t v, torch::Tensor x, torch::Tensor w, torch::Tensor out)
         case 2: launch<M, 2>(x, w, out); break;
         case 3: launch<M, 3>(x, w, out); break;
         case 4: launch<M, 4>(x, w, out); break;
+        case 5: launch<M, 5>(x, w, out); break;
+        case 6: launch<M, 6>(x, w, out); break;
         default: TORCH_CHECK(false, "variant");
     }
 }
@@ -167,7 +192,7 @@ void router_variant(int64_t variant, torch::Tensor x, torch::Tensor w, torch::Te
 
 HIDDEN, EXPERTS, LAYERS, TOPK, SCALE = 5120, 384, 40, 6, 1.5
 MS = (1, 2, 4, 8)
-VARIANTS = (0, 1, 2, 3, 4)
+VARIANTS = tuple(int(v) for v in os.environ.get("VARIANTS", "0,1,5,6").split(","))
 WARMUP, ITERS = 10, 50
 SEED = 22301
 
