@@ -36,19 +36,60 @@ ITL = {1: 6.86, 2: 7.88, 4: 9.44}  # window 910 ITL ms, c1 / c2 / c4
 TARGET_M4 = (1.5, 82.8, 15.7)
 
 
-def draw(gen, m, rng):
-    """(STEPS, m, 6) expert ids."""
-    out = np.empty((STEPS, m, TOPK), dtype=np.int64)
-    for s in range(STEPS):
+REAL_PARAMS = [0.5, 2.0]  # (Dirichlet weight w, alpha); replaced by calibrate()
+
+
+def draw(gen, m, rng, steps=None, params=None):
+    """(steps, m, 6) expert ids."""
+    steps = steps or STEPS
+    w, alpha = params or REAL_PARAMS
+    out = np.empty((steps, m, TOPK), dtype=np.int64)
+    for s in range(steps):
         if gen == "UNIFORM":
             for t in range(m):
                 out[s, t] = rng.choice(NE, TOPK, replace=False)
         else:
-            p = 0.5 / NE + 0.5 * rng.dirichlet(np.full(NE, 2.0))
+            p = (1.0 - w) / NE + w * rng.dirichlet(np.full(NE, alpha))
             p = p / p.sum()
             for t in range(m):
                 out[s, t] = rng.choice(NE, TOPK, replace=False, p=p)
     return out
+
+
+def m4_hist(params, rng, steps=1500):
+    dr = local_counts(draw("REAL", 4, rng, steps=steps, params=params), 4)
+    h0 = 100.0 * (dr == 0).mean()
+    h6 = 100.0 * (dr >= 6).mean()
+    return (h0, 100.0 - h0 - h6, h6)
+
+
+def calibrate(rng):
+    """Fit REAL's (w, alpha) so its M=4 EP4 per-rank histogram matches fact 822."""
+    orig = m4_hist((0.5, 2.0), rng)
+    best = None
+    for w in (0.5, 0.7, 0.8, 0.9, 0.95, 1.0):
+        for alpha in (0.02, 0.03, 0.05, 0.08, 0.12, 0.2, 0.3, 0.5):
+            h = m4_hist((w, alpha), rng, steps=600)
+            off = max(abs(a - b) for a, b in zip(h, TARGET_M4))
+            if best is None or off < best[0]:
+                best = (off, w, alpha, h)
+    # refine around the best point with more steps
+    _, w0, a0, _ = best
+    best = None
+    for w in sorted({max(0.3, min(1.0, w0 + dw)) for dw in (-0.05, 0.0, 0.05)}):
+        for alpha in sorted({a0 * f for f in (0.7, 0.85, 1.0, 1.2, 1.4)}):
+            h = m4_hist((w, alpha), rng, steps=2000)
+            off = max(abs(a - b) for a, b in zip(h, TARGET_M4))
+            if best is None or off < best[0]:
+                best = (off, w, alpha, h)
+    print(f"REAL calibration: original (w 0.5, alpha 2.0) M4 hist "
+          f"{tuple(round(x, 2) for x in orig)}; calibrated w {best[1]:.3f} alpha {best[2]:.4f} "
+          f"hist {tuple(round(x, 2) for x in best[3])} (max off {best[0]:.2f} pp) vs fact 822 "
+          f"{TARGET_M4}", flush=True)
+    REAL_PARAMS[:] = [best[1], best[2]]
+    return {"original_params": [0.5, 2.0], "original_hist": [round(x, 2) for x in orig],
+            "params": [best[1], best[2]], "hist": [round(x, 2) for x in best[3]],
+            "max_off_pp": round(best[0], 2)}
 
 
 def local_counts(ids, ngroups):
@@ -64,8 +105,8 @@ def local_counts(ids, ngroups):
 
 def table_fns(table, m, arms, perturb=None):
     """Per arm, an interpolator D -> us at token count m (rows with that M)."""
-    rows = sorted((r for r in table if r["M"] == m), key=lambda r: r["D"])
-    ds = np.array([r["D"] for r in rows], dtype=float)
+    rows = sorted((r for r in table if r["M"] == m), key=lambda r: r["nD"])
+    ds = np.array([r["nD"] for r in rows], dtype=float)
     fns = {}
     for a in arms:
         us = np.array([r[a]["us"] for r in rows], dtype=float)
@@ -137,8 +178,10 @@ def analyse(res, layout, rng):
                 print(f"[{layout}] REAL M4 histogram {hist} vs fact 822 {TARGET_M4}: max off "
                       f"{off:.2f} pp -> {'OK (within 2 pp)' if off <= 2.0 else 'OFF (> 2 pp)'}",
                       flush=True)
-                report["REAL_M4_hist_check"] = {"hist": hist, "target": TARGET_M4,
-                                                "max_off_pp": round(off, 2), "ok": off <= 2.0}
+                report["REAL_M4_hist_check"] = {"hist": [float(x) for x in hist],
+                                                "target": TARGET_M4, "params": list(REAL_PARAMS),
+                                                "max_off_pp": round(float(off), 2),
+                                                "ok": bool(off <= 2.0)}
     return report
 
 
@@ -163,7 +206,7 @@ def verdict(rep):
 
 def main():
     rng = np.random.default_rng(141)
-    out = {}
+    out = {"calibration": calibrate(rng)}
     for path in sys.argv[1:]:
         with open(path) as f:
             res = json.load(f)

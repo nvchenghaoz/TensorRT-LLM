@@ -177,9 +177,37 @@ def capture(fn):
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            fn()
+            outs = fn()
     torch.cuda.synchronize()
-    return g
+    return g, outs
+
+
+def max_diff(outs, ref):
+    return max(float((o.float() - r.float()).abs().max().item()) for o, r in zip(outs, ref))
+
+
+def node_split(reps, names):
+    """Per in-layer position of the nodes whose name is in `names` (a serial stream, so
+    position = index % k): name, median over replays of the mean-over-layers us, grid, block."""
+    per_pos = None
+    for r in reps:
+        sel = sorted((e for e in r if e["name"] in names), key=lambda e: float(e["ts"]))
+        if not sel or len(sel) % NL:
+            continue
+        k = len(sel) // NL
+        if per_pos is None:
+            per_pos = [{"name": sel[p]["name"], "grid": sel[p].get("args", {}).get("grid"),
+                        "block": sel[p].get("args", {}).get("block"), "us": []}
+                       for p in range(k)]
+        if len(per_pos) != k:
+            continue
+        for p in range(k):
+            per_pos[p]["us"].append(sum(float(sel[l * k + p]["dur"]) for l in range(NL)) / NL)
+    out = []
+    for p in per_pos or []:
+        out.append({"name": p["name"][:110], "grid": p["grid"], "block": p["block"],
+                    "us": round(pct(p["us"], 0.5), 3) if p["us"] else None})
+    return out
 
 
 def pct(v, q):
@@ -187,11 +215,35 @@ def pct(v, q):
     return v[min(len(v) - 1, int(q * len(v)))]
 
 
-def kineto(g):
-    from torch.profiler import ProfilerActivity, profile
-    for _ in range(3):
+WARM = int(os.environ.get("S0_WARM", "30"))
+
+
+def warm(g, n=WARM):
+    for _ in range(n):
         FLUSH.sum()
         g.replay()
+
+
+def time_events(g, n, clk=None):
+    """CUDA-event span per replay (us per layer), flush before each replay, after a warm-up
+    so the SM clock is up; the NVML clock is sampled while the GPU is busy."""
+    warm(g)
+    evs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+           for _ in range(n)]
+    for a, b in evs:
+        FLUSH.sum()
+        a.record()
+        g.replay()
+        b.record()
+    if clk is not None:
+        clk()
+    torch.cuda.synchronize()
+    return [a.elapsed_time(b) * 1000.0 / NL for a, b in evs]
+
+
+def kineto(g):
+    from torch.profiler import ProfilerActivity, profile
+    warm(g)
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for _ in range(REPLAYS):
@@ -241,7 +293,13 @@ def nvml():
     try:
         import pynvml
         pynvml.nvmlInit()
-        h = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+        # NVML indexes physical GPUs (CUDA_VISIBLE_DEVICES does not remap it): go by UUID.
+        u = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
+        u = u if u.startswith("GPU-") else "GPU-" + u
+        try:
+            h = pynvml.nvmlDeviceGetHandleByUUID(u)
+        except Exception:  # noqa: BLE001
+            h = pynvml.nvmlDeviceGetHandleByUUID(u.encode())
         uuid = pynvml.nvmlDeviceGetUUID(h)
         return h, (uuid.decode() if isinstance(uuid, bytes) else uuid), pynvml
     except Exception:  # noqa: BLE001
@@ -285,19 +343,82 @@ def main():
     arms = ["A", "B", "C", "D", "E"]
     for (m, d) in parse_cases():
         lay = Layers(states, sh_b, sh_c, scale, m, d)
-        graphs = {a: capture(lambda a=a: lay.run(a)) for a in arms}
+        caps = {a: capture(lambda a=a: lay.run(a)) for a in arms}
+        graphs = {a: caps[a][0] for a in arms}
+        outs = {a: caps[a][1] for a in arms}
+        # reference snapshot: first replay of each arm after capture
+        refs = {}
+        for a in arms:
+            FLUSH.sum()
+            graphs[a].replay()
+            torch.cuda.synchronize()
+            refs[a] = [o.clone() for o in outs[a]]
+        # B = routed + shared(1152): compare with A's routed + D's shared from their graphs
+        b_vs_ad = max(float((b.float() - (r.float() + s.float())).abs().max().item())
+                      for b, r, s in zip(refs["B"], refs["A"], refs["D"]))
+        c_vs_ae = max(float((c.float() - (r.float() + s.float())).abs().max().item())
+                      for c, r, s in zip(refs["C"], refs["A"], refs["E"]))
+        finite = all(bool(torch.isfinite(o.float()).all().item()) for a in arms for o in refs[a])
         # node classification from one trace per arm: shared nodes = names seen in the
         # shared-alone graphs and never in the routed-only graph
         names = {a: {e["name"] for r in kineto(graphs[a]) for e in r} for a in ("A", "D", "E")}
         routed_names = names["A"]
         shared_names = names["D"] | names["E"]
+        sh_only = shared_names - routed_names
         blocks = {a: [] for a in arms}
+        splits = {k: [] for k in ("D_sh", "B_sh", "E_sh", "C_sh", "A_rt", "B_rt", "C_rt")}
+        rep_diff = {a: 0.0 for a in arms}
         for _b in range(NB):
-            for a in arms:
-                blocks[a].append(summarize(kineto(graphs[a]), shared_names, routed_names))
-            if h is not None:
-                clocks.append(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
-        row = {"M": m, "D": d}
+            blk_clk = []
+
+            def clk():
+                if h is not None:
+                    blk_clk.append(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
+
+            for a in arms[_b % len(arms):] + arms[:_b % len(arms)]:  # rotate arm order
+                ev = time_events(graphs[a], REPLAYS, clk)
+                reps = kineto(graphs[a])
+                sm = summarize(reps, shared_names, routed_names)
+                sm["kspan"] = sm["span"]
+                sm["span"] = pct(ev, 0.5)
+                sm["span_rnoise"] = (pct(ev, 0.9) - pct(ev, 0.1)) / max(pct(ev, 0.5), 1e-9)
+                blocks[a].append(sm)
+                torch.cuda.synchronize()
+                rep_diff[a] = max(rep_diff[a], max_diff(outs[a], refs[a]))
+                if a in ("B", "C", "D", "E"):
+                    splits[f"{a}_sh"].append(node_split(reps, sh_only))
+                if a in ("A", "B", "C"):
+                    splits[f"{a}_rt"].append(node_split(reps, routed_names))
+            if blk_clk:
+                clocks.append(min(blk_clk))
+        row = {"M": m, "nD": d,
+               "check": {"B_vs_A_plus_D": b_vs_ad, "C_vs_A_plus_E": c_vs_ae, "finite": finite,
+                         "replay_maxdiff_vs_first": rep_diff}}
+        nodes_out = {}
+        for k, lst in splits.items():
+            lst = [x for x in lst if x]
+            if not lst:
+                nodes_out[k] = []
+                continue
+            npos = min(len(x) for x in lst)
+            nodes_out[k] = [{**lst[0][p], "us": round(pct([x[p]["us"] for x in lst
+                                                             if x[p]["us"] is not None], 0.5), 3)}
+                            for p in range(npos)]
+        row["nodes_split"] = nodes_out
+        gu_n, dn_n = sh_b[0].gate_up_proj.weight.shape[0], sh_b[0].down_proj.weight.shape[0]
+        row["tiles_main"] = {"gate_up_N": int(gu_n), "gate_up_tiles": -(-m // 32) * -(-int(gu_n) // 128),
+                             "down_N": int(dn_n), "down_tiles": -(-m // 32) * -(-int(dn_n) // 128)}
+        dsh, bsh = nodes_out.get("D_sh", []), nodes_out.get("B_sh", [])
+        log(f"{TAG} M{m}_D{d} shared per-node D vs B: " + "; ".join(
+            f"[{p}] {x['name'][:60]} grid {x['grid']} block {x['block']} D {x['us']} / B "
+            f"{bsh[p]['us'] if p < len(bsh) else None} us" for p, x in enumerate(dsh))
+            + f" | tiles {row['tiles_main']}")
+        art, brt = nodes_out.get("A_rt", []), nodes_out.get("B_rt", [])
+        log(f"{TAG} M{m}_D{d} routed per-node A vs B: " + "; ".join(
+            f"[{p}] {x['name'][:50]} A {x['us']} / B {brt[p]['us'] if p < len(brt) else None} us"
+            for p, x in enumerate(art)))
+        log(f"{TAG} M{m}_D{d} check: B-(A+D) {b_vs_ad:.3g} C-(A+E) {c_vs_ae:.3g} finite {finite} "
+            f"replay maxdiff {rep_diff}")
         for a in arms:
             sp = [x["span"] for x in blocks[a]]
             med = pct(sp, 0.5)
@@ -306,6 +427,7 @@ def main():
                 "disp": round((max(sp) - min(sp)) / max(med, 1e-9), 4),
                 "blk_std": round(float(torch.tensor(sp).std().item()) if len(sp) > 1 else 0.0, 3),
                 "rnoise": round(pct([x["span_rnoise"] for x in blocks[a]], 0.5), 4),
+                "kspan": round(pct([x["kspan"] for x in blocks[a]], 0.5), 3),
                 "fc1": round(pct([x["fc1"] for x in blocks[a]], 0.5), 3),
                 "fc2": round(pct([x["fc2"] for x in blocks[a]], 0.5), 3),
                 "shared": round(pct([x["shared"] for x in blocks[a]], 0.5), 3),
@@ -316,12 +438,13 @@ def main():
         table.append(row)
         clk = clocks[-NB:] if clocks else []
         log(f"{TAG} M{m}_D{d}: " + " | ".join(
-            f"{a} {row[a]['us']}us (disp {row[a]['disp']}, rn {row[a]['rnoise']}, fc1 "
+            f"{a} {row[a]['us']}us (kineto {row[a]['kspan']}, disp {row[a]['disp']}, rn "
+            f"{row[a]['rnoise']}, fc1 "
             f"{row[a]['fc1']} fc2 {row[a]['fc2']} sh {row[a]['shared']} n{row[a]['nodes']})"
             for a in arms) + f" || B-A {row['B_minus_A']} B-C {row['B_minus_C']} "
             f"C-A {row['C_minus_A']} | SM MHz {min(clk) if clk else None}-"
             f"{max(clk) if clk else None} | t {time.time() - t0:.0f}s")
-        del graphs, lay
+        del graphs, lay, caps, outs, refs
         torch.cuda.empty_cache()
     out_dir = os.environ.get("AUTO_DEV_ARTIFACTS", tempfile.gettempdir())
     res = {"tag": TAG, "shape": SHAPE, "E": E, "I": _common.I, "NL": NL, "NB": NB,
@@ -331,9 +454,14 @@ def main():
     with open(os.path.join(out_dir, f"stage0_{SHAPE}.json"), "w") as f:
         json.dump(res, f, indent=1)
     worst = max((row[a]["disp"] for row in table for a in ("A", "B", "C")), default=0.0)
+    rep_ok = all(v == 0.0 for r in table for v in r["check"]["replay_maxdiff_vs_first"].values())
+    fin_ok = all(r["check"]["finite"] for r in table)
     print(json.dumps({"tag": TAG, "worst_block_dispersion": worst,
+                      "replays_bitwise_vs_first": rep_ok, "finite": fin_ok,
+                      "max_B_vs_A_plus_D": max((r["check"]["B_vs_A_plus_D"] for r in table),
+                                               default=None),
                       "sm_mhz_min": res["sm_mhz_min"],
-                      "table": [[f"M{r['M']}_D{r['D']}", r["A"]["us"], r["B"]["us"], r["C"]["us"],
+                      "table": [[f"M{r['M']}_D{r['nD']}", r["A"]["us"], r["B"]["us"], r["C"]["us"],
                                  r["D"]["us"], r["B_minus_A"], r["B_minus_C"]] for r in table]}))
 
 
