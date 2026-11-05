@@ -9,10 +9,12 @@ range can change without re-capturing a CUDA graph.
 Math (same as main's chain, in a different summation order):
 * x is quantized per token and 128-column group exactly as
   per_token_quant_and_transform does (UE8M0 scale = 2^ceil(log2(amax/448))).
-* gate/up: per 128-K block, a tensor-core fp32 sum of exact e4m3 x e4m3 products
-  (operands widened to fp16, which holds every e4m3 value exactly), scaled by the
-  activation and weight UE8M0 block scales (powers of two, so the scaling is
-  exact), summed over K blocks in fp32 and rounded to bf16 like the GEMM output.
+* gate/up: a tensor-core fp32 sum over K of exact products of the e4m3 values
+  times their UE8M0 block scales (powers of two folded into bf16 operands, which
+  is exact: e4m3 has 4 significant bits), rounded to bf16 like the GEMM output.
+  The weight scales must be powers of two (block_scale_table checks it).
+* down: per 128-K block, a tensor-core fp32 sum of exact e4m3 x e4m3 products
+  (operands widened to fp16), scaled by both block scales, summed in fp32.
 * SwiGLU exactly as silu_and_mul_kernel (gate upper clamp, symmetric up clamp),
   rounded to bf16; then the same per-token 1x128 requantization.
 * down: in-range K blocks only, fp32, rounded to bf16. An empty range writes zeros.
@@ -41,8 +43,9 @@ _FP8_MIN = -_FP8_MAX
 
 # Launch configuration (tunable by env for microbenchmarks).
 _GU_BN = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_BN", "16"))
+_GU_BK = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_BK", "512"))
 _GU_WARPS = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_WARPS", "4"))
-_GU_STAGES = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_STAGES", "6"))
+_GU_STAGES = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_STAGES", "2"))
 _DN_BN = int(os.environ.get("TRTLLM_SHARED_DECODE_DN_BN", "32"))
 _DN_WARPS = int(os.environ.get("TRTLLM_SHARED_DECODE_DN_WARPS", "4"))
 _DN_STAGES = int(os.environ.get("TRTLLM_SHARED_DECODE_DN_STAGES", "3"))
@@ -78,6 +81,7 @@ def _shared_gate_up_kernel(
     I: tl.constexpr,
     TM: tl.constexpr,
     BN: tl.constexpr,
+    BK: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
@@ -97,17 +101,28 @@ def _shared_gate_up_kernel(
         offs_n = row0 + tl.arange(0, BN)
         offs_k = tl.arange(0, 128)
         offs_m = tl.arange(0, TM)
-        w_ptrs = w_ptr + offs_n.to(tl.int64)[:, None] * stride_wn + offs_k[None, :]
-        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :]
+        NKB: tl.constexpr = BK // 128
+        offs_bk = tl.arange(0, BK)
+        offs_kb = tl.arange(0, NKB)
+        w_ptrs = w_ptr + offs_n.to(tl.int64)[:, None] * stride_wn + offs_bk[None, :]
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_bk[None, :]
         xmask = offs_m[:, None] < M
         acc = tl.zeros([BN, TM], dtype=tl.float32)
-        for kb in tl.range(0, K // 128, num_stages=NUM_STAGES):
-            w = tl.load(w_ptrs + kb * 128)
-            xv = tl.load(x_ptrs + kb * 128, mask=xmask, other=0.0).to(tl.float32)
-            q, s = _quant_rows_128(xv, fp8_max, fp8_min)
-            sw = tl.load(ws_ptr + sblk * stride_wsn + kb)
-            p = tl.dot(w.to(tl.float16), tl.trans(q.to(tl.float16)))
-            acc += p * (s * sw)[None, :]
+        for k0 in tl.range(0, K, BK, num_stages=NUM_STAGES):
+            w = tl.load(w_ptrs + k0)
+            xv = tl.load(x_ptrs + k0, mask=xmask, other=0.0).to(tl.float32)
+            x3 = tl.reshape(xv, [TM, NKB, 128])
+            amax = tl.maximum(tl.max(tl.abs(x3), axis=2), 1e-10)
+            s = amax / fp8_max
+            s = tl.exp2(tl.ceil(tl.log2(tl.abs(s))))
+            q = tl.clamp(x3 / s[:, :, None], fp8_min, fp8_max).to(tl.float8e4nv).to(tl.float32)
+            # Power-of-two block scales folded into the operands: exact in bf16
+            # (e4m3 has 4 significant bits), so each product is exact in fp32.
+            qs = tl.reshape(q * s[:, :, None], [TM, BK]).to(tl.bfloat16)
+            sw = tl.load(ws_ptr + sblk * stride_wsn + k0 // 128 + offs_kb)
+            ww = tl.reshape(tl.reshape(w.to(tl.float32), [BN, NKB, 128]) * sw[None, :, None],
+                            [BN, BK]).to(tl.bfloat16)
+            acc += tl.dot(ww, tl.trans(qs))
         tl.store(g_ptr + offs_m[None, :] * stride_gm + offs_n[:, None],
                  acc.to(tl.bfloat16),
                  mask=offs_m[None, :] < M)
@@ -171,18 +186,25 @@ def block_scale_table(weight_scale: torch.Tensor, mn: int, k: int) -> torch.Tens
     from either the raw FP32 grid or SM100f/SM120's packed UE8M0 int32 layout."""
     if weight_scale.dtype == torch.float32 and weight_scale.dim() == 2 and tuple(
             weight_scale.shape) == ((mn + 127) // 128, (k + 127) // 128):
-        return weight_scale.contiguous()
-    if weight_scale.dtype == torch.int32:
+        table = weight_scale.contiguous()
+    elif weight_scale.dtype == torch.int32:
         from tensorrt_llm.quantization.utils.fp8_utils import inverse_transform_sf
-        return inverse_transform_sf(weight_scale, mn, k).contiguous()
-    raise NotImplementedError(
-        f"unsupported FP8 block-scale layout {weight_scale.dtype} {tuple(weight_scale.shape)}")
+        table = inverse_transform_sf(weight_scale, mn, k).contiguous()
+    else:
+        raise NotImplementedError(
+            f"unsupported FP8 block-scale layout {weight_scale.dtype} {tuple(weight_scale.shape)}")
+    # The kernels fold the scales into bf16 operands, exact only for powers of two
+    # (always true of SM120's UE8M0 layout).
+    if not bool((table > 0).all().item()) or not bool(
+            (torch.frexp(table).mantissa == 0.5).all().item()):
+        raise NotImplementedError("FP8 block scales are not all positive powers of two")
+    return table
 
 
 def supported_shapes(hidden: int, inter: int) -> bool:
     """Shapes the two kernels tile exactly (128-blocks in K and in the intermediate)."""
-    return (hidden % 128 == 0 and inter % 128 == 0 and hidden % _DN_BN == 0
-            and 128 % _GU_BN == 0 and 128 % _DN_BN == 0)
+    return (hidden % _GU_BK == 0 and inter % 128 == 0 and hidden % _DN_BN == 0
+            and _GU_BK % 128 == 0 and 128 % _GU_BN == 0 and 128 % _DN_BN == 0)
 
 
 def shared_decode_mlp(
@@ -235,6 +257,7 @@ def shared_decode_mlp(
         I=i,
         TM=_TM,
         BN=_GU_BN,
+        BK=_GU_BK,
         NUM_STAGES=_GU_STAGES,
         USE_PDL=pdl,
         num_warps=_GU_WARPS,

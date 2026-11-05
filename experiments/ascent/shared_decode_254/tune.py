@@ -2,7 +2,7 @@
 shared half (gate_up [2304, 5120], down [5120, 1152], fp32 block-scale tables), 40
 distinct layer copies in one CUDA graph, read-only 512 MB flush per replay, CUDA events.
 Also a quick fp64 block-math reference check per config (one layer, M=1..8 set).
-Env CFGS: ';'-separated 'GU_BN,GU_WARPS,GU_STAGES,DN_BN,DN_WARPS,DN_STAGES'.
+Env CFGS: ';'-separated 'GU_BN,GU_BK,GU_WARPS,GU_STAGES,DN_BN,DN_WARPS,DN_STAGES'.
 """
 
 import json
@@ -18,7 +18,7 @@ NL = 40
 REPS = int(os.environ.get("REPS", "20"))
 MS = [int(v) for v in os.environ.get("MS", "1,2,4,8").split(",")]
 RANGES = [tuple(int(t) for t in r.split("-")) for r in os.environ.get("RANGES", "0-5,0-9").split(",")]
-CFGS = os.environ.get("CFGS", "16,4,6,32,4,3")
+CFGS = os.environ.get("CFGS", "16,512,4,2,32,4,3")
 
 
 def log(*a):
@@ -48,8 +48,8 @@ def main():
     limit = 10.0
     rows = []
     for cfg in CFGS.split(";"):
-        gbn, gw, gs, dbn, dw, ds = (int(v) for v in cfg.split(","))
-        fsd._GU_BN, fsd._GU_WARPS, fsd._GU_STAGES = gbn, gw, gs
+        gbn, gbk, gw, gs, dbn, dw, ds = (int(v) for v in cfg.split(","))
+        fsd._GU_BN, fsd._GU_BK, fsd._GU_WARPS, fsd._GU_STAGES = gbn, gbk, gw, gs
         fsd._DN_BN, fsd._DN_WARPS, fsd._DN_STAGES = dbn, dw, ds
         # correctness (one layer)
         ok = True
