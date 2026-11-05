@@ -1661,11 +1661,26 @@ def shared_expert_row_range(num_rows: int, parts: int, part_index: int):
     return start, end
 
 
+# Decode shared-expert block split (SM120, FP8 block scales). Under the same
+# layout as the row split (``parts`` ranks hold each column shard, main scales
+# each copy by 1/parts), a decode step (M <= 8, eager or CUDA graph) instead
+# has the ranks of a shard split its 128-column intermediate blocks: part p
+# computes blocks shared_expert_row_range(n_blocks, parts, p) of its half
+# (DSV4 TP4: 9 blocks -> [0,5) and [5,9)) with a low-M GEMV kernel
+# (modules/fp8_shared_decode.py), unscaled; the MoE all-reduce sums the parts,
+# so every block is computed once per shard. TRTLLM_DSV4_SHARED_DECODE_SPLIT=0
+# turns it off.
+SHARED_DECODE_SPLIT_MAX_TOKENS = 8
+
+
 class DeepseekV4MoE(nn.Module):
     # Set per instance in __init__; the default covers instances built without it.
     _per_layer_dynamic_eplb_enabled = False
     _shared_row_split_parts = 0
     _shared_row_split_index = 0
+    # Decode block split: None = not decided yet (needs loaded weights), False = off,
+    # else a dict with the kernel operands.
+    _shared_decode_split = False
 
     def __init__(
         self,
@@ -1823,6 +1838,7 @@ class DeepseekV4MoE(nn.Module):
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
 
         self._setup_shared_row_split(shared_tp_size, layer_idx)
+        self._setup_shared_decode_split()
 
         # Store config values for perfect routing.
         self.model_config = model_config
@@ -1878,6 +1894,127 @@ class DeepseekV4MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and not torch.compiler.is_compiling()
             and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _setup_shared_decode_split(self) -> None:
+        """Gate the decode shared-expert block split (see SHARED_DECODE_SPLIT_MAX_TOKENS).
+
+        Leaves None when the layout qualifies; the weight checks and kernel operands
+        are settled by _prepare_shared_decode_split on the first eager call."""
+        self._shared_decode_split = False
+        se = self.shared_experts
+        if (
+            os.environ.get("TRTLLM_DSV4_SHARED_DECODE_SPLIT", "1") == "0"
+            or not is_sm_120f()
+            or self.shared_output_scale is None
+            or self.use_dp
+            or self.mapping.tp_size <= 1
+            or self.mapping.pp_size != 1
+            or self.mapping.cp_size != 1
+            or self._per_layer_dynamic_eplb_enabled
+            or type(se) is not GatedMLP
+            or se.split_gate_up
+            or se.activation is not torch.nn.functional.silu
+            or not se._is_plain_swiglu()
+        ):
+            return
+        parts, _index, _shard = shared_expert_row_split_layout(
+            self.mapping.tp_rank, self.mapping.tp_size, se.down_proj.tp_size
+        )
+        if parts != 2 or abs(self.shared_output_scale * parts - 1.0) > 1e-12:
+            return
+        self._shared_decode_split = None
+
+    def _prepare_shared_decode_split(self) -> bool:
+        """Settle the block split once the weights are loaded (eager, not capturing)."""
+        from ..modules import fp8_shared_decode
+
+        se = self.shared_experts
+        gu, dn = se.gate_up_proj, se.down_proj
+        state = False
+        try:
+            ok = (
+                gu.has_fp8_block_scales
+                and dn.has_fp8_block_scales
+                and gu.bias is None
+                and dn.bias is None
+                and gu.weight.dtype == torch.float8_e4m3fn
+                and dn.weight.dtype == torch.float8_e4m3fn
+                and gu.weight.is_contiguous()
+                and dn.weight.is_contiguous()
+            )
+            if ok:
+                two_i, hidden = gu.weight.shape
+                n_out, inter = dn.weight.shape
+                ok = (
+                    two_i == 2 * inter
+                    and n_out == hidden
+                    and fp8_shared_decode.supported_shapes(hidden, inter)
+                )
+            if ok:
+                parts, index, column_shard = shared_expert_row_split_layout(
+                    self.mapping.tp_rank, self.mapping.tp_size, dn.tp_size
+                )
+                assert dn.tp_rank == column_shard, (dn.tp_rank, column_shard)
+                b0, b1 = shared_expert_row_range(inter // 128, parts, index)
+                state = {
+                    "w1": gu.weight,
+                    "s1": fp8_shared_decode.block_scale_table(gu.weight_scale, two_i, hidden),
+                    "w2": dn.weight,
+                    "s2": fp8_shared_decode.block_scale_table(dn.weight_scale, n_out, inter),
+                    "range": torch.tensor([b0, b1], dtype=torch.int32, device=gu.weight.device),
+                    "limit": se.swiglu_limit,
+                }
+                # Compile now, outside any CUDA-graph capture (M is not a
+                # specialization key: one variant serves every M <= MAX_TOKENS).
+                for m in (1, 2, SHARED_DECODE_SPLIT_MAX_TOKENS):
+                    fp8_shared_decode.shared_decode_mlp(
+                        torch.zeros(m, hidden, dtype=torch.bfloat16, device=gu.weight.device),
+                        state["w1"],
+                        state["s1"],
+                        state["w2"],
+                        state["s2"],
+                        state["range"],
+                        state["limit"],
+                    )
+                logger.info_once(
+                    f"DeepseekV4MoE decode shared-expert block split on: M <= "
+                    f"{SHARED_DECODE_SPLIT_MAX_TOKENS}, rank {self.mapping.rank} computes "
+                    f"intermediate blocks [{b0}, {b1}) of column shard {column_shard} "
+                    f"({inter // 128} blocks, part {index} of {parts}), unscaled",
+                    key="dsv4_shared_decode_split_on",
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"DeepseekV4MoE decode shared-expert block split off: {e!r}")
+            state = False
+        self._shared_decode_split = state
+        return state is not False
+
+    def _use_shared_decode_split(self, hidden_states, hidden_states_fp4, do_finalize) -> bool:
+        if self._shared_decode_split is False:
+            return False
+        if not (
+            do_finalize
+            and hidden_states_fp4 is None
+            and hidden_states.dim() == 2
+            and 0 < hidden_states.shape[0] <= SHARED_DECODE_SPLIT_MAX_TOKENS
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.stride(-1) == 1
+            and not torch.compiler.is_compiling()
+        ):
+            return False
+        if self._shared_decode_split is None:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            return self._prepare_shared_decode_split()
+        return True
+
+    def _shared_decode_split_output(self, hidden_states):
+        from ..modules.fp8_shared_decode import shared_decode_mlp
+
+        st = self._shared_decode_split
+        return shared_decode_mlp(
+            hidden_states, st["w1"], st["s1"], st["w2"], st["s2"], st["range"], st["limit"]
         )
 
     def _compute_shared_expert_tp_size(
@@ -2061,8 +2198,15 @@ class DeepseekV4MoE(nn.Module):
             shared_row_start, shared_row_end = shared_expert_row_range(
                 hidden_states.shape[0], self._shared_row_split_parts, self._shared_row_split_index
             )
+        # Decode (M <= 8): this rank computes its blocks of the column shard,
+        # unscaled; the all-reduce below sums the shard's parts.
+        use_decode_split = not use_row_split and self._use_shared_decode_split(
+            hidden_states, hidden_states_fp4, do_finalize
+        )
 
         def _compute_shared_output():
+            if use_decode_split:
+                return self._shared_decode_split_output(hidden_states)
             if use_row_split:
                 if shared_row_end <= shared_row_start:
                     return None
