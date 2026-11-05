@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import functools
+import os
 from typing import Literal
 
 import torch
@@ -38,6 +40,13 @@ from .params import (
     CSA2Params,
     RowTransform,
 )
+
+
+@functools.lru_cache(maxsize=None)
+def _attn_pdl_enabled() -> bool:
+    """TRTLLM_CSA2_ATTN_PDL (default on): the last decode attention kernel triggers the output
+    projection's PDL waiter first. Off restores the end-of-grid hand-off (launch attributes only)."""
+    return os.environ.get("TRTLLM_CSA2_ATTN_PDL", "1") != "0"
 
 
 def concat_mxfp8_linears(first: Linear, second: Linear):
@@ -623,6 +632,22 @@ class DeepseekV41Attention(nn.Module):
         query = self.index_wq_b(qr).reshape(-1, self.index_heads, self.index_head_dim)
         return self._rope(query, positions, self.index_heads), None
 
+    def _lowm_wo_follows(self, output, inverse_rope_applied: bool = False) -> bool:
+        """Whether _project_output(output) will start with csa2_lowm_wo_a (LowMWOProjection).
+
+        That kernel stages only its weights/scales before griddepcontrol.wait and reads the
+        attention output after it, so the last attention kernel (the Cake fp32 split merge) may
+        call griddepcontrol.launch_dependents first. TRTLLM_CSA2_ATTN_PDL=0 turns this off.
+        """
+        if not _attn_pdl_enabled():
+            return False
+        if self.projection_quantization == "bf16" or not self._o_a_fp8_block128 or inverse_rope_applied:
+            return False
+        wo = getattr(self, "_b12x_wo", None)
+        if wo is None or type(wo).__name__ != "LowMWOProjection":
+            return False
+        return bool(wo.accepts(output))
+
     def _project_output(self, output, positions, *, inverse_rope_applied: bool = False):
         if self._o_a_fp8_block128 and inverse_rope_applied:
             raise ValueError("Grouped 128-block FP8 owns its fused inverse-RoPE/quantization")
@@ -799,6 +824,7 @@ class DeepseekV41Attention(nn.Module):
             else None,
         )
         output = torch.empty_like(q, memory_format=torch.contiguous_format)
+        state.output_pdl_consumer = self._lowm_wo_follows(output, inverse_rope_applied)
         # One complete call per real phase; shared KV staging removes the
         # per-query expansion that previously imposed an artificial chunk cap.
         for start, end in (

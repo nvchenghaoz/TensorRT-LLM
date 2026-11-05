@@ -151,12 +151,18 @@ __device__ __forceinline__ float CakeF32ApproxLog2(float x) {
 // The partials are written by the decode grid this merge is a programmatic dependent of: they must be
 // plain (coherent) loads issued after griddepcontrol.wait, so they are deliberately not `const __restrict__`
 // (that lets nvcc emit non-coherent loads and hoist them above the wait), exactly like the stock merge.
+// kTriggerFirst (TRT-LLM CSA2 overlay): call griddepcontrol.launch_dependents on entry, before the wait, so the
+// next PDL kernel (csa2_lowm_wo_a, which stages only its weights/scales before its own griddepcontrol.wait) can
+// launch while this merge waits for the decode grid. Every partial load and every store stays after the wait; the
+// dependent's wait still covers this whole grid's completion. The <false> instance is the unchanged merge.
+template <bool kTriggerFirst>
 __global__ __launch_bounds__(64, 1) void CakeMergeF32Kernel(float* mid_out,
                                                             float* mid_lse,
                                                             const float* __restrict__ attn_sink,
                                                             __nv_bfloat16* __restrict__ output,
                                                             float* __restrict__ out_lse, int heads, int num_splits,
                                                             int scratch_split_stride, float lse_scale, int hb_major) {
+  if constexpr (kTriggerFirst) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   const int lane = threadIdx.x;
   const int token = hb_major != 0 ? blockIdx.y : blockIdx.x;
   const int h = hb_major != 0 ? blockIdx.x : blockIdx.y;
@@ -268,7 +274,11 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
              TensorView out_lse, Optional<TensorView> mid_out, Optional<TensorView> mid_lse, int64_t page_size,
              int64_t page_stride_bytes, int64_t extra_page_size, int64_t extra_page_stride_bytes,
              int64_t chunks_per_block, int64_t decode_body, int64_t merge_body, bool hb_major, double sm_scale,
-             double lse_scale, bool enable_pdl) {
+             double lse_scale, int64_t enable_pdl) {
+  // enable_pdl bit 0: launch the split merge with the PDL attribute. Bit 1 (TRT-LLM CSA2 overlay): the fp32 merge
+  // triggers its dependents first (CakeMergeF32Kernel<true>); set only when a PDL waiter is the next launch.
+  const bool pdl = (enable_pdl & 1) != 0;
+  const bool trigger_first = (enable_pdl & 2) != 0;
   TVM_FFI_CHECK(q.ndim() == 3, ValueError) << "q must be [tokens, heads, " << kHeadDim << "]";
   const int64_t tokens = q.size(0);
   const int64_t heads = q.size(1);
@@ -412,16 +422,24 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
       config.stream = stream;
       cudaLaunchAttribute attribute[1];
       attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+      attribute[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
       config.attrs = attribute;
       config.numAttrs = 1;
-      status = cudaLaunchKernelEx(&config, CakeMergeF32Kernel, mid_out_f32_ptr, mid_lse_ptr,
-                                  static_cast<const float*>(sink),
-                                  args.output, args.out_lse, static_cast<int>(heads), static_cast<int>(num_splits),
-                                  static_cast<int>(scratch_split_stride), static_cast<float>(lse_scale),
-                                  static_cast<int>(args.hb_major));
+      if (trigger_first) {
+        status = cudaLaunchKernelEx(&config, CakeMergeF32Kernel<true>, mid_out_f32_ptr, mid_lse_ptr,
+                                    static_cast<const float*>(sink),
+                                    args.output, args.out_lse, static_cast<int>(heads), static_cast<int>(num_splits),
+                                    static_cast<int>(scratch_split_stride), static_cast<float>(lse_scale),
+                                    static_cast<int>(args.hb_major));
+      } else {
+        status = cudaLaunchKernelEx(&config, CakeMergeF32Kernel<false>, mid_out_f32_ptr, mid_lse_ptr,
+                                    static_cast<const float*>(sink),
+                                    args.output, args.out_lse, static_cast<int>(heads), static_cast<int>(num_splits),
+                                    static_cast<int>(scratch_split_stride), static_cast<float>(lse_scale),
+                                    static_cast<int>(args.hb_major));
+      }
     } else {
-      status = merge_kernel.launch(merge, merge_grid, enable_pdl, stream);
+      status = merge_kernel.launch(merge, merge_grid, pdl, stream);
     }
     TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
         << "Cake SM120 DSV4.1 mixed-cache sparse MLA merge launch failed: " << cudaGetErrorString(status);

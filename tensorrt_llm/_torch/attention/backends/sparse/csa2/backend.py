@@ -1160,6 +1160,7 @@ class CSA2FlashInfer:
                     scale,
                     out,
                     mapping=inputs.main_mapping,
+                    pdl_consumer=bool(getattr(inputs.state, "output_pdl_consumer", False)),
                 )
             return output if output is not None else out.flatten(1)
         # Staged fallback: the same tail as prepare_selected_pools + _forward_pools_decode.
