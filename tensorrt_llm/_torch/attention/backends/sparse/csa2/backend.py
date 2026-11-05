@@ -835,6 +835,9 @@ class CSA2FlashInfer:
         # Generation-only rows: two-launch Triton split-KV sink attention.
         self.split_sink_decode = os.environ.get("TRTLLM_CSA2_SPLIT_SINK_DECODE", "1") != "0"
         self._decode_workspaces: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Generation-only rows on SM120/SM121: FlashInfer's Cake DeepSeek-V4.1
+        # mixed-cache decode reads the packed SWA/main pools in place (no staging).
+        self._cake = None
 
     def __call__(
         self,
@@ -1120,9 +1123,79 @@ class CSA2FlashInfer:
                 for previous in others[: max(len(others) - keep, 0)]:
                     del cache[previous]
 
+    def _forward_cake_decode(self, q, metadata, forward_args):
+        """Generation-only rows through the Cake mixed-cache decode, reading the packed pools.
+
+        Replaces StageCompact/StageDequant + the split sink kernels; falls back to the
+        staged split sink path when Cake cannot serve these inputs.
+        """
+        from . import cake_decode
+
+        attention = self.attention
+        attention._validate_helper_output(q, forward_args)
+        inputs = attention.prepare_sparse_inputs(q, metadata, forward_args)
+        count, heads = metadata.num_tokens, attention.num_heads
+        query = q.view(count, heads, _HEAD_DIM)
+        scale = 1.0 / (attention.q_scaling * math.sqrt(_HEAD_DIM))
+        sink = forward_args.attention_sinks
+        output = forward_args.output
+        out = None if output is None else output.view_as(query)
+        if cake_decode.supported(
+            query, inputs.swa_pool, inputs.swa_indices, inputs.main_pool, inputs.topk_indices
+        ):
+            if self._cake is None:
+                self._cake = cake_decode.CakeDecode()
+            if out is None:
+                out = torch.empty_like(query)
+            with torch.cuda.device(q.device):
+                self._cake(
+                    query,
+                    inputs.swa_pool,
+                    inputs.swa_indices,
+                    inputs.main_pool,
+                    inputs.topk_indices,
+                    sink,
+                    scale,
+                    out,
+                    mapping=inputs.main_mapping,
+                )
+            return output if output is not None else out.flatten(1)
+        # Staged fallback: the same tail as prepare_selected_pools + _forward_pools_decode.
+        metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices)
+        extra = metadata.extra_pool if metadata.num_sparse_topk > _SWA_TILE else None
+        width = metadata.swa_pool.shape[1] + (0 if extra is None else extra.shape[1])
+        self._evict_eager_plans(metadata, (count, heads, width, q.device, scale))
+        with torch.cuda.device(q.device):
+            result = self._forward_pools_decode(
+                query,
+                metadata.swa_pool,
+                extra,
+                metadata.prepared_lens[:count],
+                sink,
+                scale,
+                protect=metadata._csa2_graph_reserved,
+                out=out,
+            )
+        return output if output is not None else result.flatten(1)
+
+    def _use_cake_decode(self, q, metadata, forward_args) -> bool:
+        if forward_args.attention_input_type != AttentionInputType.generation_only:
+            return False
+        if metadata.shared_plan is not None or not self.fused_glue or not self.split_sink_decode:
+            return False
+        if self.attention is None or self.attention.sparse_params.use_packed_sparse_attention:
+            return False
+        if not q.is_cuda:
+            return False
+        from .cake_decode import cake_available
+
+        return cake_available(q.device.index)
+
     def _forward_selected(self, q, metadata, forward_args):
         if self.attention is None:
             raise ValueError("CSA2 helper requires its attention backend")
+        if self._use_cake_decode(q, metadata, forward_args):
+            return self._forward_cake_decode(q, metadata, forward_args)
         shared = metadata.shared_plan is not None
         if not shared and self.fused_glue:
             query, swa, extra, lengths, sink, scale = self.attention.prepare_selected_pools(
