@@ -61,7 +61,9 @@ for k, v in ptxas.items():
     if "mtile" in k or "ksplit" in k:
         print(f"[ptxas] {k}: {v}", flush=True)
 if r.returncode != 0:
-    print(log[-6000:], flush=True)
+    errs = [l for l in log.splitlines() if "error" in l]
+    print("\n".join(errs[:15]), flush=True)
+    print(log[:5000], flush=True)
     print(json.dumps({"passed": False, "error": "nvcc failed"}))
     sys.exit(0)
 
