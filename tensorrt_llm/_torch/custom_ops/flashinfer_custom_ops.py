@@ -159,9 +159,16 @@ if IS_FLASHINFER_AVAILABLE:
                     None)
 
         def _b12x_cache_key(tile_n: int, output_dtype: torch.dtype):
-            # Mirrors the cache_key built in B12xMxfp8GemmRunner.forward.
-            return (32, (_B12X_TILE_M, tile_n), (1, 1), False, False, "sm120",
-                    None, True, output_dtype)
+            # Mirrors the cache_key built in B12xMxfp8GemmRunner.forward,
+            # including the compile-time core-fence flag when it has one.
+            key = (32, (_B12X_TILE_M, tile_n), (1, 1), False, False, "sm120",
+                   None, True, output_dtype)
+            try:
+                from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import \
+                    b12x_core_fence_enabled
+            except ImportError:  # pinned FlashInfer without the fence
+                return key
+            return key + (b12x_core_fence_enabled(), )
 
         def _b12x_get_runner(device: torch.device, output_dtype: torch.dtype):
             """Return (runner, sm_count) or None when b12x is unusable here."""
