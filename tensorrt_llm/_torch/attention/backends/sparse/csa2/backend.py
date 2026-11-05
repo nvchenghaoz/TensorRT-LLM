@@ -1068,6 +1068,7 @@ class CSA2FlashInfer:
         pages = bank.view(-1, 1, 1, dim)
         if (
             self.fused_glue
+            and q.is_cuda  # Triton staging; host tensors take the bitwise-equal ATen glue
             and indices.shape[0] == count
             and indices.dtype == torch.int32
             and indices.stride(1) == 1
