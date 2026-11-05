@@ -1509,6 +1509,15 @@ class DeepseekV4Attention(MLA):
 # Decode (1..8 tokens, top-k routed, no image mask): DeepseekV4Gate.fused_forward runs the router GEMV and the top-6
 # gate in one launch (bitwise dsv3_router_gemm_op + gate_forward). TRTLLM_DSV4_FUSED_ROUTER=0 turns it off.
 _DSV4_FUSED_ROUTER = os.environ.get("TRTLLM_DSV4_FUSED_ROUTER", "1") == "1"
+# Stage 2 at M <= this many tokens: the same launch's last CTA also writes the SM12x FlashInfer decode chain's route
+# (route_assign_decode + MXFP8 q0, torch.ops.trtllm.dsv4_fused_router_route) and Sm12xW4a8DecodeState.run skips
+# its two route kernels. Above it the per-token q_out scatter from one SM costs more than the route kernels
+# (+0.5 us/layer at M8). TRTLLM_DSV4_FUSED_ROUTER_ROUTE=0 turns Stage 2 off (Stage 1 only).
+_DSV4_FUSED_ROUTER_ROUTE_MAX_M = (
+    int(os.environ.get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE_MAX_M", "2"))
+    if os.environ.get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE", "1") == "1"
+    else 0
+)
 
 
 class DeepseekV4Gate(nn.Module):
@@ -1607,12 +1616,17 @@ class DeepseekV4Gate(nn.Module):
             self._fused_router_counter = counter
         return counter
 
-    def fused_forward(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def fused_forward(
+        self, hidden_states: torch.Tensor, decode_state=None
+    ) -> Optional[torch.Tensor]:
         """Decode router GEMV + top-6 gate in one launch (torch.ops.trtllm.dsv4_fused_router, 1..8 tokens).
 
         Returns the logits (bitwise forward()'s) and hands their routing (bitwise gate_forward's) to the routing
         method, whose next apply() of exactly this tensor returns it without a gate launch. None when the call
         does not qualify (hashed gate, other shapes, more than 8 tokens); the caller then uses forward().
+        ``decode_state``: the Sm12xW4a8DecodeState whose run() takes these tokens next. At M <=
+        _DSV4_FUSED_ROUTER_ROUTE_MAX_M the launch also writes its route (dsv4_fused_router_route) and stashes it
+        on the state, whose next run() of exactly (hidden_states, ids, weights) skips route().
         """
         if (
             not _DSV4_FUSED_ROUTER
@@ -1634,6 +1648,35 @@ class DeepseekV4Gate(nn.Module):
         counter = self._fused_router_counter_buffer()
         if counter is None:
             return None
+        pre = None
+        if (
+            decode_state is not None
+            and hidden_states.shape[0] <= _DSV4_FUSED_ROUTER_ROUTE_MAX_M
+            and hasattr(torch.ops.trtllm, "dsv4_fused_router_route")
+        ):
+            pre = decode_state.preroute_buffers(hidden_states, self.top_k)
+        if pre is not None:
+            ws, buf = pre
+            indices, weights, logits = torch.ops.trtllm.dsv4_fused_router_route(
+                hidden_states,
+                self.weight,
+                self.e_score_correction_bias,
+                counter,
+                float(self.routed_scaling_factor),
+                int(decode_state.slot_start),
+                int(decode_state.num_experts),
+                ws.offsets,
+                ws.token_map,
+                ws.token_weights,
+                ws.dst_rows,
+                ws.scale_dst_rows,
+                ws.q_out,
+                ws.scale_out,
+                buf,
+            )
+            decode_state.set_prerouted(hidden_states, indices, weights, ws, buf)
+            self._routing_method.fused_routing = (logits, indices, weights)
+            return logits
         indices, weights, logits = torch.ops.trtllm.dsv4_fused_router(
             hidden_states,
             self.weight,
@@ -2178,6 +2221,28 @@ class DeepseekV4MoE(nn.Module):
             and gate_up_quant_config.group_size == 128
         )
 
+    def _fi_decode_state_for(self, hidden_states, hidden_states_fp4, do_finalize):
+        """The experts' SM12x FlashInfer decode state when its run() takes exactly ``hidden_states`` next (BF16
+        decode, finalized, no communication, at most _DSV4_FUSED_ROUTER_ROUTE_MAX_M tokens), else None. A state
+        whose stash is then not consumed (any other path) drops it at its next run(): the stash only matches
+        the exact tensors it was made for."""
+        if (
+            _DSV4_FUSED_ROUTER_ROUTE_MAX_M <= 0
+            or hidden_states_fp4 is not None
+            or not do_finalize
+            or hidden_states.dim() != 2
+            or hidden_states.shape[0] > _DSV4_FUSED_ROUTER_ROUTE_MAX_M
+        ):
+            return None
+        experts = self.experts
+        if getattr(experts, "comm", None) is not None:
+            return None
+        backend = getattr(experts, "backend", None)
+        takes = getattr(backend, "_takes_fi_decode", None)
+        if takes is None or not takes(hidden_states):
+            return None
+        return getattr(backend, "_fi_decode", None)
+
     def compute_routed_output(
         self,
         hidden_states,
@@ -2209,7 +2274,13 @@ class DeepseekV4MoE(nn.Module):
         router_logits = None
         if image_mask is None and not use_dp_padding:
             # Decode (1..8 tokens): router GEMV + gate in one launch; the routing method returns its routing.
-            router_logits = self.gate.fused_forward(hidden_states)
+            # At M <= _DSV4_FUSED_ROUTER_ROUTE_MAX_M it also writes the SM12x decode chain's route.
+            router_logits = self.gate.fused_forward(
+                hidden_states,
+                decode_state=self._fi_decode_state_for(
+                    hidden_states, hidden_states_fp4, do_finalize
+                ),
+            )
         if router_logits is None:
             router_logits = self.gate(hidden_states)
 

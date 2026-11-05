@@ -499,8 +499,13 @@ void launch(FusedRouterParams const& params, cudaStream_t stream)
 void invokeDsv4FusedRouter(FusedRouterParams const& paramsIn, cudaStream_t stream)
 {
     FusedRouterParams params = paramsIn;
-    char const* skipWait = std::getenv("TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT");
-    params.testSkipWait = skipWait != nullptr && skipWait[0] == '1';
+    // Test only: read once per process (set it before the first launch, e.g. in a dedicated subprocess).
+    static bool const kTestSkipWait = []
+    {
+        char const* skipWait = std::getenv("TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT");
+        return skipWait != nullptr && skipWait[0] == '1';
+    }();
+    params.testSkipWait = kTestSkipWait ? 1 : 0;
     switch (params.numTokens)
     {
     case 1: launch<1>(params, stream); break;

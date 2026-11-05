@@ -199,6 +199,49 @@ class Sm12xW4a8DecodeState:
         self.w2 = w2_weight.view(torch.uint8).reshape(e, n2, k2 // 2)
         self.w1_sf = swizzled_sf_to_fi(w3_w1_weight_scale, e, n1, k1)
         self.w2_sf = swizzled_sf_to_fi(w2_weight_scale, e, n2, k2)
+        # (x, ids, weights, route workspace, q1/sf1/out buffer) of a route the router kernel already wrote
+        # (DeepseekV4Gate.fused_forward -> torch.ops.trtllm.dsv4_fused_router_route); consumed by the next run().
+        self._prerouted = None
+
+    def _buf_layout(self, m: int, pairs: int):
+        """(sf1 shape, q1 bytes, sf1 bytes, sf1 offset, out offset, total bytes) of run()'s one q1/sf1/out buffer."""
+        out_sf_shape = _load_ops()[3]
+        sf1_shape = out_sf_shape(pairs, self.inter, self.num_experts)
+        n_q1 = pairs * self.inter
+        n_sf1 = sf1_shape[0] * sf1_shape[1] * 4
+        off_sf1 = _align(n_q1, 256)
+        off_out = _align(off_sf1 + n_sf1, 256)
+        return sf1_shape, n_q1, n_sf1, off_sf1, off_out, off_out + m * self.hidden * 2
+
+    def preroute_buffers(self, x: torch.Tensor, top_k: int):
+        """(route workspace, q1/sf1/out buffer) that run(x, ...) would use, for a router kernel that writes the
+        route (route_assign_decode with expert_offset/zero_buf + MXFP8 q0) itself; None when run() routes another
+        way (older FlashInfer route) or this shape's shared workspace does not exist yet (warmup creates it
+        for 1..FI_DECODE_MAX_TOKENS; it is never allocated here, so never inside a capture)."""
+        if not _route_fuses_prologue() or x.dim() != 2 or not 0 < x.shape[0] <= FI_DECODE_MAX_TOKENS:
+            return None
+        ws = _WORKSPACES.get((x.device, x.shape[0], x.shape[1], top_k, self.num_experts))
+        if ws is None:
+            return None
+        nbytes = self._buf_layout(x.shape[0], x.shape[0] * top_k)[-1]
+        return ws, torch.empty(nbytes, dtype=torch.uint8, device=x.device)
+
+    def set_prerouted(self, x, ids, weights, ws, buf) -> None:
+        """The route of (x, ids, weights) is in ws and buf is zero-filled: the next run() of exactly these
+        tensors skips route()."""
+        self._prerouted = (x, ids, weights, ws, buf)
+
+    def _take_prerouted(self, x, ids, weights):
+        """Pop the stash; return (ws, buf) only for exactly the tensors it was made for (the identity check
+        of the gate's fused_routing stash), so a stale stash is never trusted."""
+        pre = self._prerouted
+        if pre is None:
+            return None
+        self._prerouted = None
+        px, pids, pw, ws, buf = pre
+        if px is not x or pids is not ids or pw is not weights:
+            return None
+        return ws, buf
 
     def _shape_key(self):
         return (self.hidden, self.inter, self.num_experts, self.enable_pdl, self.swiglu_limit)
@@ -223,33 +266,41 @@ class Sm12xW4a8DecodeState:
             token_final_scales: torch.Tensor) -> torch.Tensor:
         route, _, fc1, out_sf_shape, fc2, fi_act = _load_ops()
         m = x.shape[0]
+        fused = _route_fuses_prologue()
+        pre = self._take_prerouted(x, token_selected_experts, token_final_scales)
         # The gate already returns int32 ids and FP32 weights: no kernels here.
         ids = token_selected_experts.to(torch.int32)
         weights = token_final_scales.to(torch.float32)
-        fused = _route_fuses_prologue()
         if not fused:
             ids = self.local_ids(ids)
+            pre = None
         pairs = ids.numel()
-        ws = _workspace(x, ids, self.num_experts)
         # q1, sf1 and the output all have to start at zero: FC2 reads rows of q1 that FC1
         # leaves unwritten (stale bytes there are NaN often enough to poison real rows), the
         # padded rows of sf1 likewise, and FC2 scatter-adds into the output. One buffer,
         # zero-filled by the route-assign kernel itself (no memset node) when the route
         # supports it.
-        sf1_shape = out_sf_shape(pairs, self.inter, self.num_experts)
-        n_q1 = pairs * self.inter
-        n_sf1 = sf1_shape[0] * sf1_shape[1] * 4
-        off_sf1 = _align(n_q1, 256)
-        off_out = _align(off_sf1 + n_sf1, 256)
-        nbytes = off_out + m * self.hidden * 2
-        if fused:
-            buf = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
+        sf1_shape, n_q1, n_sf1, off_sf1, off_out, nbytes = self._buf_layout(m, pairs)
+        if pre is not None and pre[1].numel() != nbytes:
+            pre = None
+        if pre is not None:
+            ws, buf = pre
         else:
-            buf = torch.zeros(nbytes, dtype=torch.uint8, device=x.device)
+            ws = _workspace(x, ids, self.num_experts)
+            if fused:
+                buf = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
+            else:
+                buf = torch.zeros(nbytes, dtype=torch.uint8, device=x.device)
         q1 = buf[:n_q1].view(torch.float8_e4m3fn).view(pairs, self.inter)
         sf1 = buf[off_sf1:off_sf1 + n_sf1].view(torch.int32).view(sf1_shape)
         out = buf[off_out:].view(torch.bfloat16).view(m, self.hidden)
-        if fused:
+        if pre is not None:
+            # The router kernel's last CTA (dsv4_fused_router_route) already wrote exactly what the route
+            # below writes (route_assign_decode with expert_offset = slot_start and zero_buf = buf, then the
+            # MXFP8 q0 of x) into this shape's shared workspace: no route kernels.
+            offsets, token_map, route_weights, a_q, a_sf = (
+                ws.offsets, ws.token_map, ws.token_weights, ws.q_out, ws.scale_out)
+        elif fused:
             # Global ids in, rank-local mapping ([slot_start, slot_start + E) -> 0..E-1,
             # else unrouted) and the zero-fill of buf both happen in the route-assign kernel.
             offsets, token_map, route_weights, a_q, a_sf = route(
