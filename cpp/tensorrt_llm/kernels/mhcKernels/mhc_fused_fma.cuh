@@ -1258,16 +1258,18 @@ __launch_bounds__(256, (TM * N_PER_BLOCK <= 48) ? 2 : 1) __global__
 // into slots [(t * 5 + k) * 256 + tid] of the dynamic smem buffer.
 template <int TM>
 __device__ __forceinline__ void mtile_v2_issue_raw(uint4* s_raw, __nv_bfloat16 const* __restrict__ residual_in,
-    __nv_bfloat16 const* __restrict__ x_in, int const (&tok_res)[TM], int const (&tok_x)[TM], int hidden_size, int hh,
-    int tid)
+    __nv_bfloat16 const* __restrict__ x_in, int const (&tok_res)[TM], int hidden_size, int hh, int tid)
 {
 #pragma unroll
     for (int t = 0; t < TM; t++)
     {
+        // x offset = tok * hidden = tok_res / 4 (tok_res = tok * 4 * hidden >= 0): no separate
+        // tok_x registers live across the h loop.
+        int const tok_x = tok_res[t] >> 2;
 #pragma unroll
         for (int k = 0; k < 5; k++)
         {
-            __nv_bfloat16 const* src = (k < 4) ? &residual_in[tok_res[t] + k * hidden_size + hh] : &x_in[tok_x[t] + hh];
+            __nv_bfloat16 const* src = (k < 4) ? &residual_in[tok_res[t] + k * hidden_size + hh] : &x_in[tok_x + hh];
             unsigned const dst = static_cast<unsigned>(__cvta_generic_to_shared(&s_raw[(t * 5 + k) * 256 + tid]));
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
         }
@@ -1336,7 +1338,7 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
     if constexpr (RAW_SMEM)
     {
         if (tid * BF16_VEC < hidden_size)
-            mtile_v2_issue_raw<TM>(s_raw_dyn, residual_in, x_in, tok_res, tok_x, hidden_size, tid * BF16_VEC, tid);
+            mtile_v2_issue_raw<TM>(s_raw_dyn, residual_in, x_in, tok_res, hidden_size, tid * BF16_VEC, tid);
     }
     __syncthreads();
 
@@ -1420,7 +1422,7 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
                 // All of this step's slots are consumed: prefetch the next step.
                 if (j == HC_MULT - 1 && h + BLOCK_SIZE * BF16_VEC < hidden_size)
                     mtile_v2_issue_raw<TM>(
-                        s_raw_dyn, residual_in, x_in, tok_res, tok_x, hidden_size, h + BLOCK_SIZE * BF16_VEC, tid);
+                        s_raw_dyn, residual_in, x_in, tok_res, hidden_size, h + BLOCK_SIZE * BF16_VEC, tid);
             }
 
             if (do_sqr)

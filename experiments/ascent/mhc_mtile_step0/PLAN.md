@@ -1,3 +1,49 @@
+# S0 TABLE (branch 163 / idea 285), job 1489, node smc521ge-0109 austin:7, commit 0642890c
+
+Standalone nvcc -O3 sm_120 -Xptxas -v build of proto.cu (experiments/ascent/mhc_mtile_v2/sweep.py),
+kernel-only cold-L2 (256 MB memset between calls) median of 10 timed after 3 warmup, us.
+Bitwise vs fused_pmap_gemm_fma_ksplit<24,1,0,true> on Yp, Rp and residual_out, outputs NaN-poisoned
+before every one of the 13 calls: 0 bad iterations for EVERY variant at EVERY M (33,128,2047,2048,4096,8192).
+v2 args = <TN,TM,RAW_SMEM,MIN_BLOCKS,J_ROLLED>; all v2 have volatile W_T asm loads.
+
+| kernel | regs | stack B | spill st/ld B | M=33 | M=128 | M=2047 | M=2048 | M=4096 | M=8192 |
+|---|---|---|---|---|---|---|---|---|---|
+| v1<24,4> | 255 | 408 | 832/1300 | 105.5 | 115.7 | 361.5 | 363.5 | 605.2 | 1058.8 |
+| v1<24,3> | 255 | 176 | 528/524 | 92.2 | 101.3 | 363.5 | 365.6 | 642.0 | 1143.8 |
+| v1<12,2> | 128 | 248 | 432/500 | 52.2 | 68.6 | 410.6 | 411.6 | 707.6 | 1287.2 |
+| v2<24,4,reg,1,unrolled> | 255 | 672 | 1252/1820 | 105.5 | 115.7 | 391.2 | 398.3 | 666.6 | 1170.5 |
+| v2<24,3,reg,1,unrolled> | 255 | 352 | 832/848 | 87.0 | 95.2 | 373.8 | 379.9 | 666.7 | 1199.1 |
+| v2<12,4,reg,1,unrolled> | 255 | 328 | 428/756 | 57.3 | 68.6 | 375.8 | 379.9 | 662.5 | 1205.3 |
+| v2<8,4,reg,1,unrolled> | 255 | 192 | 316/432 | 44.0 | 56.3 | 388.1 | 386.0 | 707.6 | 1305.6 |
+| v2<6,4,reg,1,unrolled> | 255 | 168 | 300/312 | 37.9 | 50.2 | 404.5 | 403.5 | 812.0 | 1508.4 |
+| v2<4,4,reg,1,unrolled> | 255 | 56 | 112/108 | 31.7 | 54.3 | 446.5 | 447.5 | 1060.9 | 2019.3 |
+| v2<12,2,reg,1,unrolled> | 255 | 168 | 168/168 | 48.1 | 62.4 | 459.8 | 462.8 | 846.8 | 1623.0 |
+| v2<12,2,reg,2,unrolled> | 128 | 456 | 612/920 | 58.3 | 76.8 | 543.7 | 543.7 | 969.7 | 1993.8 |
+| v2<12,6,reg,1,unrolled> | 255 | 1072 | 1292/2724 | 89.1 | 93.2 | 541.7 | 543.7 | 1000.4 | 1853.4 |
+| v2<8,6,reg,1,unrolled> | 255 | 864 | 1052/2116 | 68.6 | 80.9 | 533.5 | 537.6 | 994.3 | 1881.1 |
+| v2<24,4,reg,1,JROLLED> | 255 | 472 | 472/472 | 118.2 | 124.9 | 382.0 | 382.0 | 652.3 | 1158.1 |
+| v2<24,3,reg,1,JROLLED> | 255 | 144 | 144/144 | 103.4 | 111.6 | 373.8 | 375.8 | 644.1 | 1150.0 |
+| v2<12,4,reg,1,JROLLED> | 255 | 144 | 144/144 | 64.5 | 73.7 | 365.6 | 365.6 | 627.7 | 1125.4 |
+| v2<8,4,reg,1,JROLLED> | 255 | 8 | 4/4 | 64.5 | 72.7 | 451.6 | 451.6 | 803.8 | 1434.6 |
+| v2<12,6,reg,1,JROLLED> | 255 | 712 | 712/712 | 97.3 | 103.4 | 463.9 | 463.9 | 875.5 | 1643.5 |
+| v2<8,6,reg,1,JROLLED> | 255 | 504 | 500/500 | 70.7 | 78.8 | 476.2 | 478.2 | 859.1 | 1588.2 |
+| v2<4,4,reg,1,JROLLED> | 255 | **0** | 0/0 | 31.7 | 54.3 | 484.4 | 482.3 | 1059.8 | 2017.3 |
+| **v2<24,4,SMEM,1,JROLLED>** | 255 | 16 | 16/16 | 78.9 | 91.1 | **291.8** | **289.8** | **499.7** | **853.0** |
+| v2<24,4,SMEM,1,unrolled> | 255 | 848 | 1048/2240 | 103.4 | 113.7 | 447.5 | 451.6 | 816.1 | 1489.9 |
+| v2<12,4,SMEM,1,unrolled> | 255 | 640 | 676/1596 | 70.7 | 87.0 | 506.9 | 508.9 | 896.0 | 1662.0 |
+| v2<24,3,SMEM,1,unrolled> | 255 | 672 | 684/1724 | 103.4 | 113.7 | 529.4 | 529.4 | 990.2 | 1850.4 |
+| v2<8,4,SMEM,1,unrolled> | 255 | 456 | 512/1132 | 52.2 | 70.7 | 527.4 | 527.4 | 951.3 | 1787.9 |
+| v2<24,2,SMEM,2,unrolled> | 128 | 992 | 1516/2512 | 103.4 | 121.8 | 803.8 | 801.8 | 1451.0 | 2707.5 |
+| v2<12,2,SMEM,2,unrolled> | 128 | 616 | 784/1484 | 70.7 | 95.2 | 848.9 | 855.0 | 1596.4 | 3098.6 |
+
+Readings: (1) only the RAW_SMEM + J_ROLLED combination wins: <24,4> is -20% at M=2048 vs v1<24,4>
+(289.8 vs 363.5), -17% at 4096, -19% at 8192, still bitwise. Either knob alone makes things worse:
+an unrolled j loop with smem inputs spills 848 B, because ptxas hoists all four j-steps' smem loads.
+(2) J_ROLLED alone with register-held inputs gives at best -2..-6% (<12,4>). (3) The only build with
+STACK=0 is <4,4,reg,JROLLED>, which is slow. NEXT: <24,4,SMEM,JROLLED> keeps a 16 B stack. Derive
+tok_x = tok_res >> 2 in the cp.async issue (frees TM regs), then sweep the SMEM+JROLLED family
+(TN 24/12/8/6, TM 2/3/4) for a STACK=0 build. Land exactly one tactic id.
+
 # STATUS branch 148 (idea 212), 04:4x PST 11-05 -- WIP, NOT SUBMITTED
 
 DONE (measured, synced to main 31878478):
