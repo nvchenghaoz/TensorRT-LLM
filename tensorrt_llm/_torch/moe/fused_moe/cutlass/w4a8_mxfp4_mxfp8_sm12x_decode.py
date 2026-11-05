@@ -53,6 +53,11 @@ FC12_FUSED = os.environ.get("TRTLLM_SM12X_FI_FC12_FUSED", "1") == "1"
 _LOCK = threading.Lock()
 _OPS = None  # (route, make_ws, fc1, out_sf_shape, fc2, FiActivation) once imported
 _FUSED_OP = None  # the fused fc1+fc2 entry point, or False when unavailable
+#: Layer shapes (hidden, inter, E, pdl, limit) whose fused fc1+fc2 build failed at warmup:
+#: those layers keep the two-kernel chain. The fused kernel takes every size from the
+#: tensors (EP4 96 x 2304 and EP2xTP2 192 x 1152 both build), so this gate is never
+#: stricter than _fi_decode_layer_reason (hidden % 128, inter % 128).
+_FC12_BAD: set = set()
 _WARMED: set = set()
 _WORKSPACES: dict = {}
 
@@ -195,6 +200,15 @@ class Sm12xW4a8DecodeState:
         self.w1_sf = swizzled_sf_to_fi(w3_w1_weight_scale, e, n1, k1)
         self.w2_sf = swizzled_sf_to_fi(w2_weight_scale, e, n2, k2)
 
+    def _shape_key(self):
+        return (self.hidden, self.inter, self.num_experts, self.enable_pdl, self.swiglu_limit)
+
+    def _fc12_op(self):
+        """The fused fc1+fc2 op for this layer, or False for the two-kernel chain."""
+        if getattr(self, "_force_chain", False) or self._shape_key() in _FC12_BAD:
+            return False
+        return _fused_op()
+
     @property
     def extra_bytes(self) -> int:
         return self.w1_sf.numel() + self.w2_sf.numel()
@@ -246,7 +260,7 @@ class Sm12xW4a8DecodeState:
             offsets, token_map, route_weights, a_q, a_sf = route(
                 x, ids, weights, self.num_experts, workspace=ws, enable_pdl=self.enable_pdl
             )
-        fused_fc12 = _fused_op() if fused else False
+        fused_fc12 = self._fc12_op() if fused else False
         if fused_fc12:
             # q1/sf1 bitwise those of fc1_act_q1; out differs only by the scatter atomics'
             # order, as main's own fc2_finalize does from replay to replay.
@@ -273,13 +287,32 @@ class Sm12xW4a8DecodeState:
             if key in _WARMED:
                 return
             dev = self.w1.device
+            cases = []
             for m in range(1, FI_DECODE_MAX_TOKENS + 1):
                 x = torch.zeros(m, self.hidden, dtype=torch.bfloat16, device=dev)
                 ids = (torch.arange(m * top_k, device=dev, dtype=torch.int32)
                        % self.num_experts + self.slot_start).view(m, top_k)
                 w = torch.full((m, top_k), 1.0 / top_k, dtype=torch.float32, device=dev)
-                self.run(x, ids, w)
+                cases.append((x, ids, w))
+            # Both variants, outside any capture: the two-kernel chain (taken whenever the
+            # fused kernel is off or fails to build for this shape) and the fused kernel.
+            self._force_chain = True
+            try:
+                for x, ids, w in cases:
+                    self.run(x, ids, w)
+            finally:
+                self._force_chain = False
             torch.cuda.synchronize(dev)
+            if _route_fuses_prologue() and self._fc12_op():
+                try:
+                    for x, ids, w in cases:
+                        self.run(x, ids, w)
+                    torch.cuda.synchronize(dev)
+                except Exception as e:  # build/compile refusal: keep the chain for this shape
+                    _FC12_BAD.add(self._shape_key())
+                    logger.warning(
+                        f"SM12x fused fc1+fc2 decode kernel off for hidden={self.hidden} "
+                        f"inter={self.inter} experts={self.num_experts}: {e!r}")
             _WARMED.add(key)
             logger.info(
                 f"SM12x W4A8 MXFP4xMXFP8 FlashInfer decode chain warmed up for 1..{FI_DECODE_MAX_TOKENS} "
