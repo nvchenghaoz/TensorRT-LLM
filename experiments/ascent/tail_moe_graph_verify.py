@@ -27,16 +27,26 @@ def main():
     os.environ.update(env)
     os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
     from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
     t0 = time.time()
+    # The frozen protocol's server settings (harness.server), so memory sizing matches serving.
     llm = LLM(
         model=ckpt,
         tensor_parallel_size=4,
+        pipeline_parallel_size=1,
+        context_parallel_size=1,
         moe_expert_parallel_size=4,
         enable_attention_dp=False,
+        enable_chunked_prefill=True,
+        trust_remote_code=True,
         env_overrides=env,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.5,
+                                      tokens_per_block=128),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8], enable_padding=True),
+        max_batch_size=8,
         max_num_tokens=8192,
-        max_seq_len=40960,
+        max_seq_len=36864,
     )
     print(f"[verify] LLM ready in {time.time() - t0:.0f}s", flush=True)
     tok = llm.tokenizer
