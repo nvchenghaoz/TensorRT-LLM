@@ -28,7 +28,7 @@ PREFIX, SUFFIX = 32768, 2048
 MODEL = "dsv41-flash"
 N_TTFT = int(os.environ.get("B123_N_TTFT", "12"))
 N_PROF = int(os.environ.get("B123_N_PROF", "3"))
-GAP_US = 4000.0
+GAP_US = float(os.environ.get("B123_GAP_US", "60000"))  # requests are >=300 ms apart; one segment = one request
 ART = Path(os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp/b123"))
 T0 = time.time()
 
@@ -397,6 +397,10 @@ def main():
                "mean_delta_rank": {r: v["mean_delta"] for r, v in (summary.get("diff") or {}).get("ranks", {}).items()},
                "summary": "b123_summary.json"}
     print(json.dumps(compact))
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
