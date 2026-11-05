@@ -631,8 +631,31 @@ static FmaMtileFn pickFhcFmaMtile(int tile_n, int tile_m)
     FHCFMA_MT_CASE(12, 4);
     FHCFMA_MT_CASE(8, 4);
 #undef FHCFMA_MT_CASE
+
+    // tile_m >= 16 selects fused_pmap_gemm_fma_mtile_v2 (spill-free build, same
+    // math): tile_m = 16 * variant + TM.  Variant 1: register-held inputs,
+    // __launch_bounds__(256, 1).  Must stay in sync with the Python
+    // _FUSED_HC_HALF_FMA_MT2_TN_TM table.
+#define FHCFMA_MT2_CASE(TN, TM)                                                                                        \
+    if (tile_n == (TN) && tile_m == (16 + (TM)))                                                                       \
+    return &fused_fma_kernels::fused_pmap_gemm_fma_mtile_v2<TN, TM, false, 1>
+
+    FHCFMA_MT2_CASE(24, 3);
+    FHCFMA_MT2_CASE(24, 4);
+    FHCFMA_MT2_CASE(12, 4);
+    FHCFMA_MT2_CASE(8, 4);
+    FHCFMA_MT2_CASE(6, 4);
+    FHCFMA_MT2_CASE(4, 4);
+    FHCFMA_MT2_CASE(12, 2);
+#undef FHCFMA_MT2_CASE
     TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaMtileLaunch: unsupported (tile_n=%d, tile_m=%d)", tile_n, tile_m);
     return nullptr;
+}
+
+// Tokens per CTA of an mtile tactic id (tile_m = 16 * variant + TM for the v2 builds).
+static int fhcFmaMtileTokens(int tile_m)
+{
+    return tile_m >= 16 ? (tile_m % 16) : tile_m;
 }
 
 void mhcFusedHcFmaMtileLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
@@ -657,7 +680,15 @@ void mhcFusedHcFmaMtileLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
     int const N = static_cast<int>(FHC_SHAPE_N);
 
     FmaMtileFn fn = pickFhcFmaMtile(tile_n, tile_m);
-    dim3 const grid(static_cast<unsigned>((M + tile_m - 1) / tile_m), static_cast<unsigned>(N / tile_n), 1u);
+    int const tokens_per_cta = fhcFmaMtileTokens(tile_m);
+    if (tile_m >= 16)
+    {
+        // v2 builds index tokens with int32 offsets.
+        TLLM_CHECK_WITH_INFO(static_cast<long long>(M) * hc_mult * hidden_size < (1LL << 31),
+            "mhcFusedHcFmaMtileLaunch: M=%d too large for the int32-offset mtile_v2 tactic", M);
+    }
+    dim3 const grid(
+        static_cast<unsigned>((M + tokens_per_cta - 1) / tokens_per_cta), static_cast<unsigned>(N / tile_n), 1u);
     dim3 const block(256);
     tensorrt_llm::common::launchWithPdlWhenEnabled("fused_pmap_gemm_fma_mtile", fn, grid, block, 0, stream,
         residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, y_acc_workspace, r_acc_workspace, M, hidden_size, N,

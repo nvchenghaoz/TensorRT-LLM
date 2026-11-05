@@ -1253,6 +1253,27 @@ __launch_bounds__(256, (TM * N_PER_BLOCK <= 48) ? 2 : 1) __global__
 //     Dynamic smem: TM * 5 * 256 * 16 bytes.
 // Grid: (ceil(M / TM), N / N_PER_BLOCK, 1).  Block: 256 threads.
 // ===================================================================
+// Thread-private cp.async of one h-step's bf16 inputs (4 residual streams + x per token)
+// into slots [(t * 5 + k) * 256 + tid] of the dynamic smem buffer.
+template <int TM>
+__device__ __forceinline__ void mtile_v2_issue_raw(uint4* s_raw, __nv_bfloat16 const* __restrict__ residual_in,
+    __nv_bfloat16 const* __restrict__ x_in, int const (&tok_res)[TM], int const (&tok_x)[TM], int hidden_size, int hh,
+    int tid)
+{
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+#pragma unroll
+        for (int k = 0; k < 5; k++)
+        {
+            __nv_bfloat16 const* src = (k < 4) ? &residual_in[tok_res[t] + k * hidden_size + hh] : &x_in[tok_x[t] + hh];
+            unsigned const dst = static_cast<unsigned>(__cvta_generic_to_shared(&s_raw[(t * 5 + k) * 256 + tid]));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+        }
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
 template <int N_PER_BLOCK, int TM, bool RAW_SMEM, int MIN_BLOCKS>
 __launch_bounds__(256, MIN_BLOCKS) __global__
     void fused_pmap_gemm_fma_mtile_v2(__nv_bfloat16 const* __restrict__ residual_in,
@@ -1311,28 +1332,10 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
         tok_x[t] = tok * hidden_size;
     }
 
-    auto issue_raw = [&](int hh)
-    {
-#pragma unroll
-        for (int t = 0; t < TM; t++)
-        {
-#pragma unroll
-            for (int k = 0; k < RAW_SLOTS; k++)
-            {
-                __nv_bfloat16 const* src
-                    = (k < HC_MULT) ? &residual_in[tok_res[t] + k * hidden_size + hh] : &x_in[tok_x[t] + hh];
-                uint32_t const dst = static_cast<uint32_t>(
-                    __cvta_generic_to_shared(&s_raw_dyn[(t * RAW_SLOTS + k) * BLOCK_SIZE + tid]));
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
-            }
-        }
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
-    };
-
     if constexpr (RAW_SMEM)
     {
         if (tid * BF16_VEC < hidden_size)
-            issue_raw(tid * BF16_VEC);
+            mtile_v2_issue_raw<TM>(s_raw_dyn, residual_in, x_in, tok_res, tok_x, hidden_size, tid * BF16_VEC, tid);
     }
     __syncthreads();
 
@@ -1412,7 +1415,8 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
             {
                 // All of this step's slots are consumed: prefetch the next step.
                 if (j == HC_MULT - 1 && h + BLOCK_SIZE * BF16_VEC < hidden_size)
-                    issue_raw(h + BLOCK_SIZE * BF16_VEC);
+                    mtile_v2_issue_raw<TM>(
+                        s_raw_dyn, residual_in, x_in, tok_res, tok_x, hidden_size, h + BLOCK_SIZE * BF16_VEC, tid);
             }
 
             if (do_sqr)
