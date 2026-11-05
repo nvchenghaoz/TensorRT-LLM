@@ -228,7 +228,7 @@ class Patch:
             def _wo_b_mm(proj, o_lora):
                 warps, cluster_k, row_tiles = BW._LOWM_WO_B_CONFIGS[o_lora.shape[0]]
                 return torch.ops.trtllm.csa2_mxfp8_low_m_gemm(
-                    o_lora, proj.wo_b[0], proj.wo_b[1], warps, cluster_k, row_tiles, 2, True)[0]
+                    o_lora, proj.wo_b[0], proj.wo_b[1], warps, cluster_k, row_tiles, 0, True, debug_flags=2)[0]
             BW.LowMWOProjection._wo_b_mm = _wo_b_mm
         if self.k2_skip_wait:
             def o_lora(proj, output, positions):
