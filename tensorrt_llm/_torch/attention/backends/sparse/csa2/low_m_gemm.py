@@ -34,6 +34,27 @@ _CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int, int]]] = {
                    7: (8, 4, 1), 8: (8, 4, 1)},
 }
 
+# Attention-input chain (TRTLLM_CSA2_QB_FUSED, idea 232): wq_a||wkv is launched with its dependents triggered at
+# start so the fused q_norm + MXFP8 quant + wq_b(||index_wq_b) kernel (``torch.ops.trtllm.csa2_qnorm_low_m_gemm``)
+# stages its weight slice while wq_a||wkv streams. Measured in a 40-layer cold-L2 PDL CUDA-graph chain on RTX PRO 6000
+# (experiments/ascent/qb_fused/bench.py, jobs 1087/1097), us/layer main -> chain:
+#   wq_b [8192, 1280]: 24.2 -> 19.5 (M=1), 22.7 -> 21.1 (2), 24.5 -> 21.5 (3), 24.6 -> 21.6 (4), 24.7 -> 21.9 (5),
+#                      24.8 -> 24.1 (6), 25.8 -> 24.8 (7), 25.8 -> 24.9 (8);
+#   wq_b||index_wq_b [12288, 1280] (n_split 8192): 26.4 -> 24.0 (1), 28.2 -> 23.9 (2), 29.7 -> 27.0 (3), 30.0 -> 27.0 (4);
+#   at M >= 5 it is within noise or slower, so those row counts keep the unfused route.
+# wq_a||wkv configuration when the fused kernel follows it (the co-resident pair differs from the standalone best).
+_CHAIN_A_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int, int]]] = {
+    (1792, 5120): {1: (4, 4, 2), 2: (8, 2, 2), 3: (8, 4, 1), 4: (8, 4, 1), 5: (8, 4, 1), 6: (8, 4, 1),
+                   7: (8, 4, 1), 8: (8, 4, 1)},
+}
+# (N, K) -> fused q_norm + quant + GEMM configuration per M: (warps, cluster_k, row_tiles).
+_QNORM_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int, int]]] = {
+    (8192, 1280): {1: (4, 1, 2), 2: (4, 1, 4), 3: (8, 1, 4), 4: (8, 1, 4), 5: (8, 1, 4), 6: (8, 1, 2),
+                   7: (8, 1, 2), 8: (8, 1, 2)},
+    (12288, 1280): {1: (4, 1, 2), 2: (8, 1, 2), 3: (4, 1, 1), 4: (4, 1, 1)},
+}
+_TRIGGER_AT_START = 2  # csa2_mxfp8_low_m_gemm debug_flags bit 1: trigger dependents at start
+
 _state: dict = {}
 
 
@@ -69,20 +90,108 @@ def _warmup(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor) -
 _warmed: set = set()
 
 
-def low_m_mm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor):
-    """``mxfp8(x) @ weight^T`` in BF16 through the fused kernel, or ``None`` when it does not apply."""
+def low_m_mm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, trigger_at_start: bool = False):
+    """``mxfp8(x) @ weight^T`` in BF16 through the fused kernel, or ``None`` when it does not apply.
+
+    ``trigger_at_start`` launches the attention-input chain's configuration, which triggers its PDL dependents at
+    start (its consumer must be ``qnorm_mm``, whose kernel reads nothing of this output before its PDL wait).
+    """
     if x.dim() != 2 or x.dtype != torch.bfloat16 or weight.dtype != torch.float8_e4m3fn:
         return None
     m, k = x.shape
     if m == 0 or m > MAX_M or weight.dim() != 2 or weight.shape[1] != k or weight_scale.dim() != 1:
         return None
-    cfg = config_for(weight.shape[0], k, m)
+    cfg = chain_a_config_for(weight.shape[0], k, m) if trigger_at_start else config_for(weight.shape[0], k, m)
     if cfg is None or not _available(x.device):
         return None
     _warmup(x, weight, weight_scale)
     if x.stride(1) != 1 or x.stride(0) % 8 != 0 or x.data_ptr() % 16 != 0:
         x = x.contiguous()
-    return torch.ops.trtllm.csa2_mxfp8_low_m_gemm(x, weight, weight_scale, cfg[0], cfg[1], cfg[2], 0, True)[0]
+    flags = _TRIGGER_AT_START if trigger_at_start else 0
+    return torch.ops.trtllm.csa2_mxfp8_low_m_gemm(x, weight, weight_scale, cfg[0], cfg[1], cfg[2], 0, True,
+                                                 debug_flags=flags)[0]
+
+
+def chain_a_config_for(n: int, k: int, m: int):
+    table = _CHAIN_A_CONFIGS.get((n, k))
+    return None if table is None else table.get(m)
+
+
+def qnorm_config_for(n: int, k: int, m: int):
+    table = _QNORM_CONFIGS.get((n, k))
+    return None if table is None else table.get(m)
+
+
+def _qnorm_available(device: torch.device) -> bool:
+    key = ("qnorm", device.index)
+    ok = _state.get(key)
+    if ok is None:
+        ok = (
+            os.environ.get("TRTLLM_CSA2_QB_FUSED", "1") != "0"
+            and _available(device)
+            and hasattr(torch.ops.trtllm, "csa2_qnorm_low_m_gemm")
+        )
+        _state[key] = ok
+    return ok
+
+
+def qnorm_chain_applies(m: int, a_weight: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+                        norm_weight: torch.Tensor) -> bool:
+    """Whether the attention-input chain (A trigger-at-start -> fused q_norm + quant + GEMM) serves ``m`` rows."""
+    if not 1 <= m <= MAX_M or weight.dtype != torch.float8_e4m3fn or weight.dim() != 2 or weight_scale.dim() != 1:
+        return False
+    if norm_weight.dtype != torch.bfloat16 or norm_weight.numel() != weight.shape[1] or not norm_weight.is_contiguous():
+        return False
+    if a_weight.dim() != 2 or chain_a_config_for(a_weight.shape[0], a_weight.shape[1], m) is None:
+        return False
+    return qnorm_config_for(weight.shape[0], weight.shape[1], m) is not None and _qnorm_available(weight.device)
+
+
+def _qnorm_warmup(weight: torch.Tensor, weight_scale: torch.Tensor, norm_weight: torch.Tensor, eps: float,
+                  n_split: int) -> None:
+    """Launch every fused q_norm configuration of this (N, K) table once, eagerly, before any graph capture."""
+    n, k = weight.shape
+    key = ("qnorm", weight.device.index, n, k, n_split)
+    if key in _warmed or torch.cuda.is_current_stream_capturing():
+        return
+    for m, cfg in sorted(_QNORM_CONFIGS[(n, k)].items()):
+        xw = torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device)
+        torch.ops.trtllm.csa2_qnorm_low_m_gemm(xw, weight, weight_scale, norm_weight, eps, cfg[0], cfg[1], cfg[2],
+                                               n_split, True)
+    _warmed.add(key)
+
+
+def _chain_a_warmup(weight: torch.Tensor, weight_scale: torch.Tensor) -> None:
+    n, k = weight.shape
+    key = ("chain_a", weight.device.index, n, k)
+    if key in _warmed or torch.cuda.is_current_stream_capturing():
+        return
+    for m, cfg in sorted(_CHAIN_A_CONFIGS[(n, k)].items()):
+        xw = torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device)
+        torch.ops.trtllm.csa2_mxfp8_low_m_gemm(xw, weight, weight_scale, cfg[0], cfg[1], cfg[2], 0, True,
+                                             debug_flags=_TRIGGER_AT_START)
+    _warmed.add(key)
+
+
+def qnorm_chain_warmup(a_weight, a_weight_scale, weight, weight_scale, norm_weight, eps, n_split=0) -> None:
+    """Eager warmup of both chain kernels (run before capture; a no-op once done or while capturing)."""
+    _chain_a_warmup(a_weight, a_weight_scale)
+    _qnorm_warmup(weight, weight_scale, norm_weight, eps, n_split)
+
+
+def qnorm_mm(rows: torch.Tensor, norm_weight: torch.Tensor, eps: float, weight: torch.Tensor,
+             weight_scale: torch.Tensor, n_split: int = 0):
+    """``qr = rmsnorm(rows)`` (bit for bit as FlashInfer rmsnorm_cute) and ``mxfp8(qr) @ weight^T`` in one launch.
+
+    ``rows`` is the raw [M, K] row view (unit column stride, 16-byte aligned rows). Returns ``[qr, out]`` or, with
+    ``n_split``, ``[qr, out[:, :n_split], out[:, n_split:]]``. Only call it when ``qnorm_chain_applies``.
+    """
+    m, k = rows.shape
+    cfg = qnorm_config_for(weight.shape[0], k, m)
+    if rows.stride(1) != 1 or rows.stride(0) % 8 != 0 or rows.data_ptr() % 16 != 0:
+        rows = rows.contiguous()
+    return torch.ops.trtllm.csa2_qnorm_low_m_gemm(rows, weight, weight_scale, norm_weight, eps, cfg[0], cfg[1],
+                                                  cfg[2], n_split, True)
 
 
 if hasattr(torch.ops.trtllm, "csa2_mxfp8_low_m_gemm"):
@@ -94,3 +203,15 @@ if hasattr(torch.ops.trtllm, "csa2_mxfp8_low_m_gemm"):
         if n_split == 0:
             return [x.new_empty((x.shape[0], n))]
         return [x.new_empty((x.shape[0], n_split)), x.new_empty((x.shape[0], n - n_split))]
+
+
+if hasattr(torch.ops.trtllm, "csa2_qnorm_low_m_gemm"):
+
+    @torch.library.register_fake("trtllm::csa2_qnorm_low_m_gemm")
+    def _(x, w, wsf, norm_w, eps, warps, cluster_k, row_tiles, n_split, pdl, debug_flags=0, xq_out=None,
+          xsf_out=None):
+        n = w.shape[0]
+        qr = x.new_empty((x.shape[0], x.shape[1]))
+        if n_split == 0:
+            return [qr, x.new_empty((x.shape[0], n))]
+        return [qr, x.new_empty((x.shape[0], n_split)), x.new_empty((x.shape[0], n - n_split))]

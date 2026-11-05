@@ -848,7 +848,118 @@ struct QoutArgs
     int sf_k_tiles; // ceil(K / 128)
     unsigned long long* ts; // debug: per-CTA %globaltimer at 5 phase points, or null
     int flags;              // debug: bit 0 skips griddepcontrol.wait (negative control of the PDL checks only)
+                            // bit 1: trigger dependents at start
 };
+
+// Fused q_norm prologue (NORM instances): the activation is the raw [M, K] row view, normalized in-kernel exactly
+// as FlashInfer rmsnorm_cute (H = K = 1280) before the MXFP8 quantization; tile 0 writes the normalized rows.
+struct NormArgs
+{
+    __nv_bfloat16 const* norm_w; // [K] RMSNorm weight
+    float eps;
+    __nv_bfloat16* qr_out; // [M, K] normalized rows (row stride ld_qr), or null
+    int ld_qr;
+};
+
+constexpr int kQnormK = 1280;
+constexpr int kQnormVecBlocks = kQnormK / 256;
+
+// One warp normalizes one K = 1280 row bit for bit as FlashInfer's CuTe-DSL RMSNormKernel at H = 1280
+// (flashinfer/norm/kernels/rmsnorm.py: 32 threads per row, vec 8, lane t holds columns 8t + v + 256b): a sequential
+// per-thread FMA sum of squares in (b, v) order, an xor butterfly over the warp, mean = sum / 1280 as a true
+// division, rstd = rsqrt.approx(mean + eps), y = (x * rstd) * (w + 0), BF16 RN. The BF16-rounded y is then quantized
+// exactly as trtllm::mxfp8_quantize(qr, True) (4 adjacent lanes form one 1x32 group). Quantized columns
+// [k_begin, k_begin + kc) go to xq_row / xc_row relative to k_begin; qr_row (or null) receives the same columns of y.
+__device__ __forceinline__ void csa2_qnorm_quant_row(__nv_bfloat16 const* __restrict__ xrow,
+    uint4 const (&g)[kQnormVecBlocks], float eps, int lane, __nv_bfloat16* qr_row, uint8_t* xq_row, uint8_t* xc_row,
+    int k_begin, int kc)
+{
+#if CSA2_SM120_LOW_M_GEMM_ENABLED
+    float v[kQnormVecBlocks * 8];
+#pragma unroll
+    for (int b = 0; b < kQnormVecBlocks; ++b)
+    {
+        uint4 const raw = __ldcg(reinterpret_cast<uint4 const*>(xrow + 8 * lane + 256 * b));
+        __nv_bfloat162 const* h = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+#pragma unroll
+        for (int t = 0; t < 4; ++t)
+        {
+            float2 const f = __bfloat1622float2(h[t]);
+            v[b * 8 + 2 * t] = f.x;
+            v[b * 8 + 2 * t + 1] = f.y;
+        }
+    }
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < kQnormVecBlocks * 8; ++i)
+    {
+        s = __fmaf_rn(v[i], v[i], s);
+    }
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1)
+    {
+        s = __fadd_rn(s, __shfl_xor_sync(0xffffffffu, s, o));
+    }
+    float const mean = __fdiv_rn(s, static_cast<float>(kQnormK));
+    float rstd;
+    asm("rsqrt.approx.f32 %0, %1;\n" : "=f"(rstd) : "f"(__fadd_rn(mean, eps)));
+#pragma unroll
+    for (int b = 0; b < kQnormVecBlocks; ++b)
+    {
+        __nv_bfloat162 const* gh = reinterpret_cast<__nv_bfloat162 const*>(&g[b]);
+        float y[8];
+        uint32_t yb[4];
+#pragma unroll
+        for (int e2 = 0; e2 < 4; ++e2)
+        {
+            float2 const gf = __bfloat1622float2(gh[e2]);
+            __nv_bfloat16 const lo
+                = __float2bfloat16_rn(__fmul_rn(__fmul_rn(v[b * 8 + 2 * e2], rstd), __fadd_rn(gf.x, 0.f)));
+            __nv_bfloat16 const hi
+                = __float2bfloat16_rn(__fmul_rn(__fmul_rn(v[b * 8 + 2 * e2 + 1], rstd), __fadd_rn(gf.y, 0.f)));
+            y[2 * e2] = __bfloat162float(lo);
+            y[2 * e2 + 1] = __bfloat162float(hi);
+            yb[e2] = static_cast<uint32_t>(__bfloat16_as_ushort(lo))
+                | (static_cast<uint32_t>(__bfloat16_as_ushort(hi)) << 16);
+        }
+        float amax = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+        {
+            amax = fmaxf(amax, fabsf(y[e]));
+        }
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        float const sf = amax * rcp_approx_ftz(448.0f);
+        __nv_fp8_e8m0 code;
+        code.__x = __nv_cvt_float_to_e8m0(sf, __NV_SATFINITE, cudaRoundPosInf);
+        // quantization.cuh exp2f_rcp: exact reciprocal of the UE8M0 scale, no subnormal flush.
+        float const out_scale
+            = amax != 0.f ? (code.__x == 0 ? 1.0f : exp2f(127.0f - static_cast<float>(code.__x))) : 0.0f;
+        uint32_t packed[2];
+#pragma unroll
+        for (int t2 = 0; t2 < 2; ++t2)
+        {
+            __nv_fp8x2_e4m3 const lo(make_float2(y[4 * t2] * out_scale, y[4 * t2 + 1] * out_scale));
+            __nv_fp8x2_e4m3 const hi(make_float2(y[4 * t2 + 2] * out_scale, y[4 * t2 + 3] * out_scale));
+            packed[t2] = static_cast<uint32_t>(lo.__x) | (static_cast<uint32_t>(hi.__x) << 16);
+        }
+        int const col = 8 * lane + 256 * b;
+        if (col >= k_begin && col < k_begin + kc)
+        {
+            if (qr_row != nullptr)
+            {
+                *reinterpret_cast<uint4*>(qr_row + col) = make_uint4(yb[0], yb[1], yb[2], yb[3]);
+            }
+            *reinterpret_cast<uint2*>(xq_row + (col - k_begin)) = make_uint2(packed[0], packed[1]);
+            if ((lane & 3) == 0)
+            {
+                xc_row[(col - k_begin) / 32] = code.__x;
+            }
+        }
+    }
+#endif
+}
 
 __device__ __forceinline__ void csa2_stamp(QoutArgs const& q, int point)
 {
@@ -867,11 +978,12 @@ __device__ __forceinline__ int csa2_sf_offset(int m, int kb, int sf_k_tiles)
 
 // STAGES: the CTA's K slice is split into STAGES consecutive sub-slices, each bulk-copied (in order) onto its own
 // mbarrier; all warps consume stage s while later stages are still arriving.
-template <int WARPS, int CLUSTER_K, int RT, int STAGES>
+// NORM: x is the raw (un-normalized) K = 1280 row view; the CTA applies q_norm in-kernel (csa2_qnorm_quant_row).
+template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false>
 __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_bfloat16 const* __restrict__ x,
     int ldx, int M, int N, int K, uint8_t const* __restrict__ w, uint8_t const* __restrict__ wsf, int num_k_tiles,
     __nv_bfloat16* __restrict__ out, int ldo, __nv_bfloat16* __restrict__ out2, int ldo2, int n_split,
-    int red_aliased, PreqArgs preq, QoutArgs qout)
+    int red_aliased, PreqArgs preq, QoutArgs qout, NormArgs nrm)
 {
 #if CSA2_SM120_LOW_M_GEMM_ENABLED
     constexpr int kThreads = WARPS * 32;
@@ -963,11 +1075,35 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
             }
         }
     }
+    if (qout.flags & 2)
+    {
+        asm volatile("griddepcontrol.launch_dependents;");
+    }
+    [[maybe_unused]] uint4 norm_w[kQnormVecBlocks];
+    if constexpr (NORM)
+    {
+        // The RMSNorm weight is a constant: load it before the PDL wait.
+#pragma unroll
+        for (int b = 0; b < kQnormVecBlocks; ++b)
+        {
+            norm_w[b] = __ldg(reinterpret_cast<uint4 const*>(nrm.norm_w + 8 * lane + 256 * b));
+        }
+    }
     if ((qout.flags & 1) == 0)
     {
         asm volatile("griddepcontrol.wait;" ::: "memory");
     }
-    if (preq.xq != nullptr)
+    if constexpr (NORM)
+    {
+        for (int m = warp; m < M; m += WARPS)
+        {
+            __nv_bfloat16* qr_row
+                = (tile == 0 && nrm.qr_out != nullptr) ? nrm.qr_out + static_cast<int64_t>(m) * nrm.ld_qr : nullptr;
+            csa2_qnorm_quant_row(x + static_cast<int64_t>(m) * ldx, norm_w, nrm.eps, lane, qr_row, xq_s + m * kc,
+                xc_s + m * kc_blocks, k_begin, kc);
+        }
+    }
+    else if (preq.xq != nullptr)
     {
         int const vec_per_row = kc / 16;
         int const vecs = M * vec_per_row;
@@ -1218,22 +1354,22 @@ size_t csa2SmemBytes(int warps, int clusterK, int rowTiles, int m, int k)
         + (aliased ? 0 : red_bytes);
 }
 
-template <int WARPS, int CLUSTER_K, int RT, int STAGES>
+template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false>
 void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t const* w, uint8_t const* wsf,
     __nv_bfloat16* out, int ldo, __nv_bfloat16* out2, int ldo2, int nSplit, PreqArgs preq, QoutArgs qout, bool pdl,
-    cudaStream_t stream)
+    cudaStream_t stream, NormArgs nrm = NormArgs{})
 {
     int const kc = K / CLUSTER_K;
     int const kc_blocks = kc / 32;
     TLLM_CHECK_WITH_INFO(N % (16 * RT) == 0 && K % (CLUSTER_K * 128) == 0 && kc_blocks % (WARPS * STAGES) == 0
-            && (kc_blocks / STAGES) % 4 == 0 && nSplit % (16 * RT) == 0,
+            && (kc_blocks / STAGES) % 4 == 0 && nSplit % (16 * RT) == 0 && (!NORM || K == kQnormK),
         "csa2_mxfp8_low_m_gemm: unsupported shape N=%d K=%d n_split=%d for (%d, %d, %d, %d)", N, K, nSplit, WARPS,
         CLUSTER_K, RT, STAGES);
     size_t const w_bytes = 16 * RT * (kc + kRowPad);
     size_t const red_bytes = static_cast<size_t>(WARPS) * 16 * RT * 8 * sizeof(float);
     int const red_aliased = red_bytes <= w_bytes ? 1 : 0;
     size_t const smem = csa2SmemBytes(WARPS, CLUSTER_K, RT, M, K);
-    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, STAGES>;
+    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, STAGES, NORM>;
     static bool const configured = [&]()
     {
         int device = 0, max_optin = 0;
@@ -1280,7 +1416,7 @@ void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t co
     cfg.attrs = attr;
     cfg.numAttrs = 2;
     cudaError_t const err = cudaLaunchKernelEx(&cfg, kernel, x, ldx, M, N, K, w, wsf, (K / 32 + 3) / 4, out, ldo,
-        out2, ldo2, nSplit, red_aliased, preq, qout);
+        out2, ldo2, nSplit, red_aliased, preq, qout, nrm);
     if (err != cudaSuccess)
     {
         cudaGetLastError();
@@ -1330,6 +1466,41 @@ void invokeCsa2Mxfp8LowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int
     }
     CSA2_LOW_M_CONFIGS(CSA2_DISPATCH)
 #undef CSA2_DISPATCH
+}
+
+// (warps, cluster_k, row_tiles) of the fused q_norm instances (K = 1280, one stage).
+#define CSA2_QNORM_CONFIGS(X) X(4, 1, 1) X(4, 1, 2) X(4, 1, 4) X(8, 1, 2) X(8, 1, 4)
+
+bool isCsa2QnormLowMGemmSupported(int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t k)
+{
+    bool built = false;
+#define CSA2_QNORM_IS_BUILT(W, C, R) built = built || (warps == W && clusterK == C && rowTiles == R);
+    CSA2_QNORM_CONFIGS(CSA2_QNORM_IS_BUILT)
+#undef CSA2_QNORM_IS_BUILT
+    return built && m >= 1 && m <= 8 && k == kQnormK;
+}
+
+void invokeCsa2QnormLowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t n, int32_t k, uint8_t const* w,
+    uint8_t const* wsf, __nv_bfloat16 const* normW, float eps, __nv_bfloat16* qrOut, int32_t ldqr, __nv_bfloat16* out,
+    int32_t ldo, __nv_bfloat16* out2, int32_t ldo2, int32_t nSplit, int32_t warps, int32_t clusterK, int32_t rowTiles,
+    bool pdl, cudaStream_t stream, int32_t debugFlags, uint8_t* xqOut, uint8_t* xsfOut)
+{
+    TLLM_CHECK_WITH_INFO(isCsa2QnormLowMGemmSupported(warps, clusterK, rowTiles, m, k),
+        "csa2_qnorm_low_m_gemm: unsupported configuration (warps %d, cluster_k %d, row_tiles %d) at M=%d K=%d", warps,
+        clusterK, rowTiles, m, k);
+    int const sfKTiles = (k / 32 + 3) / 4;
+    PreqArgs const preq{nullptr, nullptr, sfKTiles};
+    QoutArgs const qout{xqOut, xsfOut, sfKTiles, nullptr, debugFlags};
+    NormArgs const nrm{normW, eps, qrOut, ldqr};
+#define CSA2_QNORM_DISPATCH(W, C, R)                                                                                   \
+    if (warps == W && clusterK == C && rowTiles == R)                                                                  \
+    {                                                                                                                  \
+        launchCsa2<W, C, R, 1, true>(                                                                                  \
+            x, ldx, m, n, k, w, wsf, out, ldo, out2, ldo2, nSplit, preq, qout, pdl, stream, nrm);                      \
+        return;                                                                                                        \
+    }
+    CSA2_QNORM_CONFIGS(CSA2_QNORM_DISPATCH)
+#undef CSA2_QNORM_DISPATCH
 }
 
 } // namespace kernels

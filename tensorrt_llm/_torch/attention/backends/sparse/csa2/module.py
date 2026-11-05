@@ -28,7 +28,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..deepseek_v4.module import project_sparse_attn_output
 from .compressor import CSA2Compressor
-from .low_m_gemm import low_m_mm
+from .low_m_gemm import low_m_mm, qnorm_chain_applies, qnorm_chain_warmup, qnorm_mm
 from .metadata import CSA2TrtllmMetadata
 from .params import (
     CSA2BackendForwardArgs,
@@ -395,6 +395,36 @@ class DeepseekV41Attention(nn.Module):
     def _mxfp8_mm(self, act, act_scale, weight, weight_scale):
         return torch.ops.trtllm.flashinfer_mm_mxfp8(act, act_scale, weight, weight_scale, self.dtype)
 
+    def _qb_fused_route(self, hidden_states: torch.Tensor):
+        """``(weight, weight_scale, n_split)`` of the fused q_norm + quant + wq_b(||index_wq_b) kernel, or ``None``.
+
+        SM120 decode only (1..8 rows, TRTLLM_CSA2_QB_FUSED != 0, low-M port on). The fused norm reproduces the
+        FlashInfer RMSNorm the q_norm module runs here, so it requires that module path (plain, non-Gemma, BF16).
+        """
+        m = hidden_states.shape[0]
+        if hidden_states.dtype != torch.bfloat16 or not 1 <= m <= 8 or self._wq_a_wkv is None:
+            return None
+        norm = self.q_norm
+        if norm.use_gemma or norm.use_cuda_tile or norm.nvfp4_scale is not None or norm.return_hp_output:
+            return None
+        from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+        if not IS_FLASHINFER_AVAILABLE:
+            return None
+        if hasattr(self, "index_wq_b") and not (self._fuse_index_q and m <= 16):
+            if self._wq_b_index is None:
+                return None
+            weight, weight_scale = self._wq_b_index
+            n_split = self.wq_b.weight.shape[0]
+        else:
+            weight, weight_scale, n_split = self.wq_b.weight, self.wq_b.weight_scale, 0
+        if not qnorm_chain_applies(m, self._wq_a_wkv[0], weight, weight_scale, norm.weight):
+            return None
+        qnorm_chain_warmup(
+            *self._wq_a_wkv, weight, weight_scale, norm.weight, norm.variance_epsilon, n_split
+        )
+        return weight, weight_scale, n_split
+
     def _project_inputs(self, hidden_states: torch.Tensor):
         """Return ``(qr, q [tokens, heads*dim], swa, index_query or None)``.
 
@@ -404,12 +434,30 @@ class DeepseekV41Attention(nn.Module):
         if not self._shared_mxfp8_active(hidden_states):
             qr = self.q_norm(self.wq_a(hidden_states))
             return qr, self.wq_b(qr), self.wkv(hidden_states), None
+        q_rank = self.wq_a.weight.shape[0]
+        chain = self._qb_fused_route(hidden_states)
+        rows = None
+        if chain is not None:
+            # SM120 decode attention-input chain: wq_a||wkv triggers its dependents at start, so the fused
+            # q_norm + MXFP8 quant + wq_b(||index_wq_b) kernel, launched right after it, stages its weights while
+            # wq_a||wkv streams. It reads the rows only after its PDL wait.
+            rows = low_m_mm(hidden_states, *self._wq_a_wkv, trigger_at_start=True)
+        if rows is not None:
+            weight, weight_scale, n_split = chain
+            outs = qnorm_mm(
+                rows[:, :q_rank],
+                self.q_norm.weight,
+                self.q_norm.variance_epsilon,
+                weight,
+                weight_scale,
+                n_split,
+            )
+            return outs[0], outs[1], rows[:, q_rank:], outs[2] if n_split else None
         # SM120 decode: fused activation quantization + low-M GEMM (None -> quantize + GEMM).
         rows = low_m_mm(hidden_states, *self._wq_a_wkv)
         if rows is None:
             act, act_scale = torch.ops.trtllm.mxfp8_quantize(hidden_states.contiguous(), True)
             rows = self._mxfp8_mm(act, act_scale, *self._wq_a_wkv)
-        q_rank = self.wq_a.weight.shape[0]
         # Strided views for M > 1: the RMSNorm and the SWA row store take a row stride.
         qr = self.q_norm(rows[:, :q_rank])
         swa = rows[:, q_rank:]

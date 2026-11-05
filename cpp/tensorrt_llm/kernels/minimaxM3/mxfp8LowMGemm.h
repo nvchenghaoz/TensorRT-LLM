@@ -59,6 +59,19 @@ void invokeCsa2Mxfp8LowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int
     int32_t rowTiles, bool pdl, cudaStream_t stream, unsigned long long* dbgTs = nullptr, int32_t stages = 1,
     int32_t debugFlags = 0);
 
+//! Whether `invokeCsa2QnormLowMGemm` is built for (warps, clusterK, rowTiles) at M rows and K columns (K = 1280).
+bool isCsa2QnormLowMGemmSupported(int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t k);
+
+//! Fused CSA2 q_norm + MXFP8 quantization + low-M GEMM (SM120 decode attention-input chain):
+//! `qr = rmsnorm(x, normW, eps)` bit for bit as FlashInfer rmsnorm_cute (written to `qrOut`, row stride `ldqr`, when
+//! non-null), then `out[M, :nSplit] / out2[M, :N - nSplit] = mxfp8(qr) @ w[N, K]^T` in BF16, with mxfp8(qr) byte-equal
+//! to `mxfp8_quantize(qr, True)`. `x` is the raw [M, K] row view (row stride `ldx`). `debugFlags` as in
+//! `invokeCsa2Mxfp8LowMGemm` (bit 0 skips the PDL wait: negative control only; bit 1 triggers dependents at start).
+void invokeCsa2QnormLowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t n, int32_t k, uint8_t const* w,
+    uint8_t const* wsf, __nv_bfloat16 const* normW, float eps, __nv_bfloat16* qrOut, int32_t ldqr, __nv_bfloat16* out,
+    int32_t ldo, __nv_bfloat16* out2, int32_t ldo2, int32_t nSplit, int32_t warps, int32_t clusterK, int32_t rowTiles,
+    bool pdl, cudaStream_t stream, int32_t debugFlags = 0, uint8_t* xqOut = nullptr, uint8_t* xsfOut = nullptr);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
