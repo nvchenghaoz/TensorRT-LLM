@@ -341,7 +341,32 @@ def main():
     table, clocks = [], []
     t0 = time.time()
     arms = ["A", "B", "C", "D", "E"]
-    for (m, d) in parse_cases():
+    # pre-warm: keep the GPU busy until the SM clock settles (it steps 2295 -> 2422 MHz)
+    prev = None
+    for i in range(60):
+        for _ in range(100):
+            FLUSH.sum()
+        c = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM) if h is not None else None
+        torch.cuda.synchronize()
+        if i >= 10 and c is not None and c == prev:
+            break
+        prev = c
+    log(f"{TAG}: pre-warm done after {i + 1} rounds, SM {prev} MHz")
+
+    def case_iter():
+        """Re-run a case (up to 2 more times) when any arm's block dispersion is > 3%."""
+        for c in parse_cases():
+            for att in range(3):
+                yield c
+                r = table[-1]
+                worst_d = max(r[a]["disp"] for a in arms)
+                r["attempt"] = att + 1
+                if worst_d <= 0.03 or att == 2:
+                    break
+                log(f"{TAG} M{c[0]}_D{c[1]}: block dispersion {worst_d:.4f} > 3%, re-running")
+                table.pop()
+
+    for (m, d) in case_iter():
         lay = Layers(states, sh_b, sh_c, scale, m, d)
         caps = {a: capture(lambda a=a: lay.run(a)) for a in arms}
         graphs = {a: caps[a][0] for a in arms}
