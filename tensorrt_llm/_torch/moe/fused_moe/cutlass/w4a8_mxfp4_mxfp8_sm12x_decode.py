@@ -132,6 +132,21 @@ def _align(n: int, a: int) -> int:
     return (n + a - 1) // a * a
 
 
+_PREROUTE_MISS_LOGGED = False
+
+
+def _same_tensor(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """b is a (the stash keeps a alive, so equal storage, shape, stride and dtype means the same values)."""
+    return a is b or (
+        isinstance(b, torch.Tensor)
+        and a.data_ptr() == b.data_ptr()
+        and a.dtype == b.dtype
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.device == b.device
+    )
+
+
 def _workspace(x: torch.Tensor, local_ids: torch.Tensor, num_experts: int):
     """Route workspace shared by every layer: layers run one after another on one stream."""
     key = (x.device, x.shape[0], x.shape[1], local_ids.shape[1], num_experts)
@@ -210,8 +225,13 @@ class Sm12xW4a8DecodeState:
         m = x.shape[0]
         pre = getattr(self, "_prerouted", None)
         self._prerouted = None
-        if pre is not None and (pre[0] is not x or pre[1] is not token_selected_experts
-                                or pre[2] is not token_final_scales):
+        if pre is not None and not (_same_tensor(pre[0], x) and _same_tensor(pre[1], token_selected_experts)
+                                    and _same_tensor(pre[2], token_final_scales)):
+            global _PREROUTE_MISS_LOGGED
+            if not _PREROUTE_MISS_LOGGED:
+                _PREROUTE_MISS_LOGGED = True
+                logger.warning("SM12x W4A8 decode: fused-router routing was not handed to this run(); "
+                               "routing it again (correct, but the fused route is wasted)")
             pre = None
         # The gate already returns int32 ids and FP32 weights: no kernels here.
         ids = token_selected_experts.to(torch.int32)

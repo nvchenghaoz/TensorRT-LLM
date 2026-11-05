@@ -95,10 +95,13 @@ __device__ __forceinline__ uint32_t warpMaxU32(uint32_t value)
     return result;
 }
 
-// The fp32 division of the Triton q0 kernel (amax / 448.0 and 1.0 / sf).
+// The fp32 division of the Triton q0 kernel (amax / 448.0 and 1.0 / sf): its PTX uses div.full.f32 for both
+// (experiments/ascent/fused_router/ptx_probe.py).
 __device__ __forceinline__ float kQuantDiv(float a, float b)
 {
-    return __fdiv_rn(a, b);
+    float r;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
 }
 
 // fp32 -> e4m3 with round-to-nearest-even and saturation (cvt.rn.satfinite.e4m3x2.f32), 4 values -> 4 bytes.
@@ -368,17 +371,21 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
             smDst[pid] = dst;
             smScaleDst[pid] = sdst;
         }
-        else if (threadIdx.x >= 64 && threadIdx.x <= 64 + numLocal)
+        else if (threadIdx.x >= 64)
         {
-            int const e = threadIdx.x - 64; // offsets[e] = routed pairs with expert < e; offsets[numLocal] = all
-            int count = 0;
-#pragma unroll
-            for (int j = 0; j < kPairs; ++j)
+            // offsets[e] = routed pairs with expert < e; offsets[numLocal] = all. Strided, so any numLocal works
+            // (EP4: 96, EP2xTP2: 192, EP1: 384).
+            for (int e = threadIdx.x - 64; e <= numLocal; e += kBlockSize - 64)
             {
-                int const ej = localOf(j);
-                count += (ej >= 0 && (e == numLocal || ej < e)) ? 1 : 0;
+                int count = 0;
+#pragma unroll
+                for (int j = 0; j < kPairs; ++j)
+                {
+                    int const ej = localOf(j);
+                    count += (ej >= 0 && (e == numLocal || ej < e)) ? 1 : 0;
+                }
+                p.offsets[e] = count;
             }
-            p.offsets[e] = count;
         }
         __syncthreads();
 

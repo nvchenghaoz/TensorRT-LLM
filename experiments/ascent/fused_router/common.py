@@ -116,28 +116,55 @@ def fused(x, w, bias, counter):
     return ids, wts, logits
 
 
-def make_decode_state():
-    """Real Sm12xW4a8DecodeState of EP4 rank 0 (96 local experts, slot_start 0) on synthetic MXFP4 weights."""
+# Per-rank MoE layouts (mapping.py:269-281): (local experts, intermediate, slot_start).
+LAYOUT_EP4 = {"EP4_r0": (96, 2304, 0), "EP4_r3": (96, 2304, 288)}
+LAYOUT_EP2TP2 = {"EP2TP2_ep0": (192, 1152, 0), "EP2TP2_ep1": (192, 1152, 192)}
+
+
+def _make_weights(e, inter, seed=0, device="cuda"):
+    """Synthetic MXFP4 experts (random e2m1 codes, ue8m0 exponents 119..122), as w4a8_fi_chain/common.py, any shape."""
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
+    w1 = torch.randint(0, 256, (e, 2 * inter, HIDDEN // 2), dtype=torch.uint8, device=device, generator=g)
+    w2 = torch.randint(0, 256, (e, HIDDEN, inter // 2), dtype=torch.uint8, device=device, generator=g)
+    s1 = torch.randint(119, 123, (e, 2 * inter, HIDDEN // 32), dtype=torch.uint8, device=device, generator=g)
+    s2 = torch.randint(119, 123, (e, HIDDEN, inter // 32), dtype=torch.uint8, device=device, generator=g)
+    w31 = w1.view(torch.int64)
+    w2v = w2.view(torch.int64)
+    s31 = torch.ops.trtllm.block_scale_interleave(s1.contiguous()).view(torch.int32).reshape(
+        e, 2 * inter, HIDDEN // 128)
+    s2s = torch.ops.trtllm.block_scale_interleave(s2.contiguous()).view(torch.int32).reshape(
+        e, HIDDEN, inter // 128)
+    return w31, s31, w2v, s2s
+
+
+def make_decode_state(e=E_LOCAL, inter=INTER, slot_start=0):
+    """Real Sm12xW4a8DecodeState of one rank (default EP4 rank 0: 96 local experts x 2304, slot_start 0; EP2xTP2:
+    192 x 1152, slot_start 0 / 192) on synthetic MXFP4 weights."""
     from tensorrt_llm._torch.moe.fused_moe.cutlass import w4a8_mxfp4_mxfp8_sm12x_decode as dec
-
-    import importlib.util
-
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "w4a8_fi_chain", "common.py")
-    spec = importlib.util.spec_from_file_location("w4a8_fi_chain_common", path)
-    fic = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(fic)
-    make_weights, trtllm_layout = fic.make_weights, fic.trtllm_layout
 
     ok, why = dec.fi_decode_available()
     assert ok, why
-    w1, s1, w2, s2 = make_weights(seed=0)
-    w31, s31, w2v, s2s = trtllm_layout(w1, s1, w2, s2)
-    del w1, w2
+    w31, s31, w2v, s2s = _make_weights(e, inter, seed=0)
     state = dec.Sm12xW4a8DecodeState(w3_w1_weight=w31, w3_w1_weight_scale=s31, w2_weight=w2v,
-                                     w2_weight_scale=s2s, num_local_experts=E_LOCAL, slot_start=0,
+                                     w2_weight_scale=s2s, num_local_experts=e, slot_start=slot_start,
                                      swiglu_limit=10.0, enable_pdl=True)
+    assert (state.num_experts, state.inter, state.hidden) == (e, inter, HIDDEN)
     assert dec._route_fuses_prologue()
     return state, dec
+
+
+def fused_route(state, x, w, bias, counter):
+    """Stage 2 as DeepseekV4Gate.fused_forward runs it: router + gate + route_assign_decode + q0 into the decode
+    state's shared route workspace, then the hand-off so the next state.run(x, ids, wts) skips route()."""
+    pre = state.preroute_buffers(x, TOPK)
+    assert pre is not None, "route workspace not warmed for this shape"
+    ws, buf = pre
+    ids, wts, logits = torch.ops.trtllm.dsv4_fused_router_route(
+        x, w, bias, counter, SCALE, int(state.slot_start), int(state.num_experts), ws.offsets, ws.token_map,
+        ws.token_weights, ws.dst_rows, ws.scale_dst_rows, ws.q_out, ws.scale_out, buf)
+    state.set_prerouted(x, ids, wts, ws, buf)
+    return ids, wts, logits
 
 
 def router_weights(gen, n):
