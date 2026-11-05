@@ -45,8 +45,8 @@ _FP8_MIN = -_FP8_MAX
 _GU_BN = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_BN", "16"))
 _GU_BK = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_BK", "512"))
 _GU_WARPS = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_WARPS", "4"))
-_GU_STAGES = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_STAGES", "2"))
-_DN_BN = int(os.environ.get("TRTLLM_SHARED_DECODE_DN_BN", "32"))
+_GU_STAGES = int(os.environ.get("TRTLLM_SHARED_DECODE_GU_STAGES", "3"))
+_DN_BN = int(os.environ.get("TRTLLM_SHARED_DECODE_DN_BN", "64"))
 _DN_WARPS = int(os.environ.get("TRTLLM_SHARED_DECODE_DN_WARPS", "4"))
 _DN_STAGES = int(os.environ.get("TRTLLM_SHARED_DECODE_DN_STAGES", "3"))
 _USE_PDL = os.environ.get("TRTLLM_SHARED_DECODE_PDL", "1") == "1"
