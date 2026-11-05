@@ -62,9 +62,13 @@ __global__ __launch_bounds__(640, 1) void rk(float* out, __nv_bfloat16 const* A,
     __nv_bfloat16 const* ap = A + g * H + k_warp + q * 8;
     bool const row0_valid = g < M;
     uint4 const zero4 = make_uint4(0u, 0u, 0u, 0u);
+    constexpr int PRE = V == 10 ? 6 : V == 11 ? 4 : V == 12 ? 2 : 0;
     if constexpr (V == 1) {
 #pragma unroll
         for (int c = 0; c < CPW; c++) b[c] = *reinterpret_cast<uint4 const*>(bp + c * CH);
+    } else if constexpr (PRE > 0) {
+#pragma unroll
+        for (int c = 0; c < PRE; c++) b[c] = *reinterpret_cast<uint4 const*>(bp + c * CH);
     } else if constexpr (V == 2) {
 #pragma unroll
         for (int c = 0; c < CPW; c++) b[c] = ldv(bp + c * CH);
@@ -90,6 +94,12 @@ __global__ __launch_bounds__(640, 1) void rk(float* out, __nv_bfloat16 const* A,
     } else if constexpr (V == 1) {
 #pragma unroll
         for (int c = 0; c < CPW; c++) a0[c] = row0_valid ? *reinterpret_cast<uint4 const*>(ap + c * CH) : zero4;
+    } else if constexpr (PRE > 0) {
+#pragma unroll
+        for (int c = 0; c < CPW; c++) {
+            a0[c] = row0_valid ? *reinterpret_cast<uint4 const*>(ap + c * CH) : zero4;
+            if (c >= PRE) b[c] = *reinterpret_cast<uint4 const*>(bp + c * CH);
+        }
     } else if constexpr (V == 6) {
 #pragma unroll
         for (int c = 0; c < CPW; c++) a0[c] = row0_valid ? *reinterpret_cast<uint4 const*>(ap + c * CH) : zero4;
@@ -257,6 +267,9 @@ static void by_v(int64_t v, torch::Tensor x, torch::Tensor w, torch::Tensor out)
         case 5: launch<M, 5>(x, w, out); break;
         case 6: launch<M, 6>(x, w, out); break;
         case 9: launch9<M>(x, w, out); break;
+        case 10: launch<M, 10>(x, w, out); break;
+        case 11: launch<M, 11>(x, w, out); break;
+        case 12: launch<M, 12>(x, w, out); break;
         default: TORCH_CHECK(false, "variant");
     }
 }
@@ -275,7 +288,7 @@ void router_variant(int64_t variant, torch::Tensor x, torch::Tensor w, torch::Te
 
 HIDDEN, EXPERTS, LAYERS, TOPK, SCALE = 5120, 384, 40, 6, 1.5
 MS = (1, 2, 4, 8)
-VARIANTS = tuple(int(v) for v in os.environ.get("VARIANTS", "0,1,9").split(","))
+VARIANTS = tuple(int(v) for v in os.environ.get("VARIANTS", "0,1,10,11,12").split(","))
 WARMUP, ITERS = 10, 50
 SEED = 22301
 
