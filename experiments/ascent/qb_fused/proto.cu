@@ -538,12 +538,25 @@ __global__ void norm_test_kernel(__nv_bfloat16 const* x, int ldx, int rows, Norm
 }
 
 // Stand-in for the rest of the layer: waits for its producer, reads one output value, triggers at its end.
-__global__ void glue_kernel(__nv_bfloat16 const* q, float* sink)
+// trig_first: K1-like producer stand-in that triggers its dependents at once, then waits and spins ~spin_ns.
+__global__ void glue_kernel(__nv_bfloat16 const* q, float* sink, long long spin_ns, int trig_first)
 {
+    if (trig_first)
+        asm volatile("griddepcontrol.launch_dependents;");
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    if (threadIdx.x == 0)
+    if (spin_ns > 0)
+    {
+        long long t0, t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+        do
+        {
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        } while (t - t0 < spin_ns);
+    }
+    if (threadIdx.x == 0 && blockIdx.x == 0)
         sink[0] += __bfloat162float(q[0]);
-    asm volatile("griddepcontrol.launch_dependents;");
+    if (!trig_first)
+        asm volatile("griddepcontrol.launch_dependents;");
 }
 
 // Live-overlap PDL producer: triggers at once, NaN-poisons dst, spins ~spin_ns, then writes src -> dst.
@@ -701,11 +714,11 @@ void norm_test(torch::Tensor x, torch::Tensor gamma, double eps, int64_t order, 
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
-void glue(torch::Tensor q, torch::Tensor sink)
+void glue(torch::Tensor q, torch::Tensor sink, int64_t spin_ns, int64_t trig_first, int64_t ctas)
 {
     auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
     cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = dim3(1);
+    cfg.gridDim = dim3(ctas);
     cfg.blockDim = dim3(32);
     cfg.stream = stream;
     cudaLaunchAttribute attr[1];
@@ -714,7 +727,8 @@ void glue(torch::Tensor q, torch::Tensor sink)
     cfg.attrs = attr;
     cfg.numAttrs = 1;
     cudaError_t const err = cudaLaunchKernelEx(&cfg, glue_kernel,
-        reinterpret_cast<__nv_bfloat16 const*>(q.data_ptr()), reinterpret_cast<float*>(sink.data_ptr()));
+        reinterpret_cast<__nv_bfloat16 const*>(q.data_ptr()), reinterpret_cast<float*>(sink.data_ptr()),
+        static_cast<long long>(spin_ns), static_cast<int>(trig_first));
     TORCH_CHECK(err == cudaSuccess, cudaGetErrorString(err));
 }
 

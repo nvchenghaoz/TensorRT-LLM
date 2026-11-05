@@ -49,7 +49,7 @@ def load_ext():
     os.makedirs(bd, exist_ok=True)
     t = time.time()
     ext = load(name="qb_proto", sources=[os.path.join(HERE, "proto.cu")], build_directory=bd,
-               extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr"], verbose=False)
+               extra_cuda_cflags=["-O3", "-std=c++20", "--expt-relaxed-constexpr"], verbose=False)
     log(f"built ext in {time.time() - t:.1f}s")
     return ext
 
@@ -329,24 +329,34 @@ def chain(ext, eps, order, ms=(1, 2, 4, 8), kinds=("plain", "indexer"), rounds=3
             qr = torch.empty((m, Q_RANK), dtype=torch.bfloat16, device="cuda")
             cfg_a = A_DEFAULT[m]
 
-            def main_fn(l, proto_a=False):
+            def post(o, ctx):
+                ext.glue(o, sink, 0, 0, 1)  # rest of the layer: wait first, trigger at end
+                if ctx == "k1":
+                    ext.glue(o, sink, 4000, 1, 4)  # K1-like producer of A: triggers at start, ~4 us
+
+            def main_fn(l, ctx="glue", proto_a=False, stop=4):
                 wa, sa = A[l]
                 if proto_a:
                     ext.gemm(x, wa, sa, rows, None, 0, *cfg_a, False, None, 0.0, None, 0, 0, 0, True)
                     r = rows
                 else:
                     r = torch.ops.trtllm.csa2_mxfp8_low_m_gemm(x, wa, sa, *cfg_a, 0, True)[0]
-                qn = rmsnorm_ref(r[:, :Q_RANK], gamma, eps)
-                a_, s_ = torch.ops.trtllm.mxfp8_quantize(qn, True)
-                wb, sb = B[l]
-                if kind == "plain" or m == 1:
-                    o = torch.ops.trtllm.flashinfer_mm_mxfp8(a_, s_, wb, sb, torch.bfloat16)
-                else:
-                    o = torch.ops.trtllm.flashinfer_mm_mxfp8(a_, s_, wb[:QB_N], sb[: QB_N * 40], torch.bfloat16)
-                    torch.ops.trtllm.flashinfer_mm_mxfp8(a_, s_, wb[QB_N:], sb[QB_N * 40:], torch.bfloat16)
-                ext.glue(o, sink)
+                o = r
+                if stop >= 2:
+                    o = qn = rmsnorm_ref(r[:, :Q_RANK], gamma, eps)
+                if stop >= 3:
+                    a_, s_ = torch.ops.trtllm.mxfp8_quantize(qn, True)
+                    o = qn
+                if stop >= 4:
+                    wb, sb = B[l]
+                    if kind == "plain" or m == 1:
+                        o = torch.ops.trtllm.flashinfer_mm_mxfp8(a_, s_, wb, sb, torch.bfloat16)
+                    else:
+                        o = torch.ops.trtllm.flashinfer_mm_mxfp8(a_, s_, wb[:QB_N], sb[: QB_N * 40], torch.bfloat16)
+                        torch.ops.trtllm.flashinfer_mm_mxfp8(a_, s_, wb[QB_N:], sb[QB_N * 40:], torch.bfloat16)
+                post(o, ctx)
 
-            def proto_fn(l, ca, ta, cb, tb):
+            def proto_fn(l, ca, ta, cb, tb, ctx="glue"):
                 wa, sa = A[l]
                 wb, sb = B[l]
                 ext.gemm(x, wa, sa, rows, None, 0, *ca, False, None, 0.0, None, 0, ta, 0, True)
@@ -354,18 +364,23 @@ def chain(ext, eps, order, ms=(1, 2, 4, 8), kinds=("plain", "indexer"), rounds=3
                     ext.gemm(rows[:, :Q_RANK], wb, sb, q, None, 0, *cb, True, gamma, eps, qr, order, tb, 0, True)
                 else:
                     ext.gemm(rows[:, :Q_RANK], wb, sb, q, idx, QB_N, *cb, True, gamma, eps, qr, order, tb, 0, True)
-                ext.glue(q, sink)
+                post(q, ctx)
 
-            arms = {"main": lambda l: main_fn(l), "main_protoA": lambda l: main_fn(l, True)}
+            arms = {"main": lambda l: main_fn(l), "main_protoA": lambda l: main_fn(l, proto_a=True),
+                    "bd:A": lambda l: main_fn(l, stop=1), "bd:A+norm": lambda l: main_fn(l, stop=2),
+                    "bd:A+norm+quant": lambda l: main_fn(l, stop=3),
+                    "k1:main": lambda l: main_fn(l, ctx="k1"), "k1:bd:A": lambda l: main_fn(l, ctx="k1", stop=1)}
             bcfgs = [cb for cb in B_CFGS if valid(cb, nb, Q_RANK, m, norm=True)]
             for cb in bcfgs:
                 tag = ",".join(map(str, cb))
                 arms[f"A{cfg_a}e>B{tag}e"] = (lambda cb_: lambda l: proto_fn(l, cfg_a, 0, cb_, 0))(cb)
                 arms[f"A{cfg_a}s>B{tag}e"] = (lambda cb_: lambda l: proto_fn(l, cfg_a, 1, cb_, 0))(cb)
+                arms[f"k1:A{cfg_a}s>B{tag}e"] = (lambda cb_: lambda l: proto_fn(l, cfg_a, 1, cb_, 0, "k1"))(cb)
             for cb in bcfgs[:3]:
                 tag = ",".join(map(str, cb))
                 arms[f"A{cfg_a}s>B{tag}s"] = (lambda cb_: lambda l: proto_fn(l, cfg_a, 1, cb_, 1))(cb)
                 arms[f"A{cfg_a}w>B{tag}e"] = (lambda cb_: lambda l: proto_fn(l, cfg_a, 2, cb_, 0))(cb)
+                arms[f"k1:A{cfg_a}e>B{tag}e"] = (lambda cb_: lambda l: proto_fn(l, cfg_a, 0, cb_, 0, "k1"))(cb)
             for ca in A_ALTS:
                 if ca == cfg_a or not valid(ca, A_N, HIDDEN, m):
                     continue
@@ -382,9 +397,15 @@ def chain(ext, eps, order, ms=(1, 2, 4, 8), kinds=("plain", "indexer"), rounds=3
             res = time_arms(graphs, layers, rounds)
             clk1 = sm_clock()
             base = res["main"]["us"]
-            best = min((v["us"], n) for n, v in res.items() if n not in ("main", "main_protoA"))
+            best = min((v["us"], n) for n, v in res.items() if n.startswith("A"))
             log(f"== {kind} M={m} main {base:.2f} us/layer (noise {res['main']['noise']}) best {best[1]} {best[0]:.2f} "
                 f"({(base - best[0]):.2f} us saved) sm_clock {clk0}/{clk1}")
+            k1b = min((v["us"], n) for n, v in res.items() if n.startswith("k1:A"))
+            log(f"== {kind} M={m} K1-ctx main {res['k1:main']['us']:.2f} best {k1b[1]} {k1b[0]:.2f} "
+                f"({res['k1:main']['us'] - k1b[0]:.2f} us saved)")
+            bd = {n: res[n]["us"] for n in ("bd:A", "bd:A+norm", "bd:A+norm+quant", "main")}
+            log(f"== {kind} M={m} BREAKDOWN A {bd['bd:A']:.2f} | +q_norm {bd['bd:A+norm'] - bd['bd:A']:.2f} | "
+                f"+quant {bd['bd:A+norm+quant'] - bd['bd:A+norm']:.2f} | +wq_b {bd['main'] - bd['bd:A+norm+quant']:.2f}")
             for n, v in sorted(res.items(), key=lambda kv: kv[1]["us"]):
                 log(f"   {kind} M={m} {n:32s} {v['us']:7.2f} [{v['p10']:.2f}, {v['p90']:.2f}] noise {v['noise']}")
             table[f"{kind}/M{m}"] = {"arms": res, "sm_clock": [clk0, clk1], "best": best[1]}
