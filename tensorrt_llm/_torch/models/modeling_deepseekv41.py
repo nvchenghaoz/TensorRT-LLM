@@ -332,6 +332,82 @@ class DeepseekV41Engram(Engram):
     def _make_kv_projection(self, in_features: int, out_features: int) -> nn.Module:
         return EngramFp8Projection(in_features, out_features, self.config.dtype)
 
+    # Decode token counts at which the replicated WKV is N-sharded over TP.
+    _KV_SHARD_MAX_TOKENS = 4
+
+    def _kv_shard_ready(self, num_tokens: int) -> bool:
+        """Whether this call computes 1/TP of the WKV columns and all-gathers.
+
+        Every TP rank sees the same token count and settings, so all ranks take
+        the same branch and the collective stays matched.
+        """
+        if not 0 < num_tokens <= self._KV_SHARD_MAX_TOKENS:
+            return False
+        ready = getattr(self, "_kv_shard_state", None)
+        if ready is None:
+            ready = self._resolve_kv_shard()
+            self._kv_shard_state = ready
+        return ready
+
+    def _resolve_kv_shard(self) -> bool:
+        proj = getattr(self, "kv_proj", None)
+        method = getattr(proj, "quant_method", None)
+        if (
+            os.environ.get("TRTLLM_ENGRAM_KV_SHARD", "1") == "0"
+            or self.mapping is None
+            or self.tp_size <= 1
+            or self.enable_attention_dp
+            or not isinstance(proj, EngramFp8Projection)
+            or getattr(method, "_flashinfer_mxfp8", None) is None
+            or method.backend != "flashinfer"
+            or not method.use_cutlass
+            or not proj.weight.is_cuda
+            or proj.weight_scale.ndim != 1
+            or proj.out_features % (self.tp_size * method._SF_ROW_PAD)
+        ):
+            return False
+        sf_cols = -(-(proj.in_features // method.BLOCK_SIZE) // method._SF_COL_PAD)
+        sf_cols *= method._SF_COL_PAD
+        if proj.weight_scale.numel() != proj.out_features * sf_cols:
+            return False
+        logger.info(
+            f"Engram layer {self.layer_id}: WKV [{proj.out_features}, {proj.in_features}] "
+            f"N-sharded over TP{self.tp_size} for decode T<={self._KV_SHARD_MAX_TOKENS} "
+            f"({proj.out_features // self.tp_size} columns per rank, then all-gather); "
+            "TRTLLM_ENGRAM_KV_SHARD=0 disables."
+        )
+        return True
+
+    def _sharded_kv_proj(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """``kv_proj`` as this rank's contiguous output rows plus a TP all-gather.
+
+        The weight rows and their 128x4-swizzled scale tiles of rank ``r`` are
+        contiguous views (shard rows are a multiple of 128 and the swizzle is
+        row-tile major), so no weight is copied. The same activation quantize
+        and per-column GEMM run on fewer columns, and the gather restores the
+        replicated column order.
+        """
+        proj = self.kv_proj
+        method = proj.quant_method
+        tp, rank = self.tp_size, self.tp_rank
+        rows = proj.out_features // tp
+        sf_row_bytes = proj.weight_scale.numel() // proj.out_features
+        weight = proj.weight.narrow(0, rank * rows, rows)
+        weight_scale = proj.weight_scale.narrow(0, rank * rows * sf_row_bytes, rows * sf_row_bytes)
+        tokens = embeddings.shape[0]
+        act = embeddings.reshape(tokens, proj.in_features).contiguous()
+        act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(act, True)
+        local = method._flashinfer_mxfp8(act_e4m3, act_sf, weight, weight_scale, proj.dtype)
+        gathered = allgather(local, self.mapping, dim=0)  # [tp * T, rows], rank-major
+        if tokens == 1:
+            return gathered.view(1, tp * rows)
+        return gathered.view(tp, tokens, rows).transpose(0, 1).reshape(tokens, tp * rows)
+
+    def _project_kv(self, embeddings: torch.Tensor) -> torch.Tensor:
+        if self._kv_shard_ready(embeddings.shape[0]):
+            return self._sharded_kv_proj(embeddings)
+        return self.kv_proj(embeddings)
+
     def _combine_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
         """Reassemble per-rank contributions into ``[T, H * D]``.
 
@@ -466,7 +542,7 @@ class DeepseekV41Engram(Engram):
                 embeddings = self._combine_embeddings(embeddings)
             if hidden_states.shape[0] == 0:
                 return hidden_states if add_residual else torch.zeros_like(hidden_states)
-            kv = self.kv_proj(embeddings)
+            kv = self._project_kv(embeddings)
         else:
             kv = precomputed_kv
         output = engram_gate(
