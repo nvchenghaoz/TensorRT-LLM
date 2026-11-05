@@ -77,44 +77,84 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity)
         : "memory");
 }
 
-// ---- Triton K1 arithmetic (QV selects PTX variants; QV = 0 is the form read from K1's PTX) ----
+// ---- Triton K1 arithmetic, transcribed from the PTX of b12x_wo._inv_rope_quant128_kernel (job 1084) ----
+// sc = exp2(ceil(log2(|amax / 448|))): div.full.f32, libdevice __nv_log2f (subnormal pre-scale + fma.rn.ftz
+// polynomial), cvt.rpi.ftz, ex2.approx.ftz. QV = 1 is a diagnostic variant (lg2.approx.ftz) only.
 template <int QV>
-__device__ __forceinline__ float q_div(float a, float b)
+__device__ __forceinline__ float k1_scale(float amax, float fp8_max)
 {
     float r;
-    if constexpr ((QV & 1) == 0)
-        asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    if constexpr (QV == 0)
+    {
+        asm("{\n"
+            ".reg .pred p2, p3, p5;\n"
+            ".reg .b32 q, a, s, xs, e0, i100, i101, i102, f103, f105, f106, k, t, u, v, w, z;\n"
+            "div.full.f32 q, %1, %2;\n"
+            "abs.f32 a, q;\n"
+            "setp.lt.f32 p2, a, 0f00800000;\n"
+            "mul.f32 s, a, 0f4B000000;\n"
+            "selp.f32 xs, s, a, p2;\n"
+            "selp.f32 e0, 0fC1B80000, 0f00000000, p2;\n"
+            "add.s32 i100, xs, -1060439283;\n"
+            "and.b32 i101, i100, -8388608;\n"
+            "sub.s32 i102, xs, i101;\n"
+            "cvt.rn.f32.s32 f103, i101;\n"
+            "mov.b32 k, 0f34000000;\n"
+            "fma.rn.ftz.f32 f105, f103, k, e0;\n"
+            "add.f32 f106, i102, 0fBF800000;\n"
+            "mov.b32 k, 0fBE2C7F30;\n"
+            "mov.b32 t, 0f3DC6B27F;\n"
+            "fma.rn.ftz.f32 t, t, f106, k;\n"
+            "mov.b32 k, 0f3E2FCF2A;\n"
+            "fma.rn.ftz.f32 t, t, f106, k;\n"
+            "mov.b32 k, 0fBE374E43;\n"
+            "fma.rn.ftz.f32 t, t, f106, k;\n"
+            "mov.b32 k, 0f3E520BF4;\n"
+            "fma.rn.ftz.f32 t, t, f106, k;\n"
+            "mov.b32 k, 0fBE763C8B;\n"
+            "fma.rn.ftz.f32 t, t, f106, k;\n"
+            "mov.b32 k, 0f3E93BF99;\n"
+            "fma.rn.ftz.f32 t, t, f106, k;\n"
+            "mov.b32 k, 0fBEB8AA49;\n"
+            "fma.rn.ftz.f32 t, t, f106, k;\n"
+            "mov.b32 k, 0f3EF6384A;\n"
+            "fma.rn.ftz.f32 t, t, f106, k;\n"
+            "mov.b32 k, 0fBF38AA3B;\n"
+            "fma.rn.ftz.f32 t, t, f106, k;\n"
+            "mul.f32 u, f106, t;\n"
+            "mul.f32 v, f106, u;\n"
+            "mov.b32 k, 0f3FB8AA3B;\n"
+            "fma.rn.ftz.f32 w, f106, k, v;\n"
+            "add.f32 z, f105, w;\n"
+            "setp.lt.u32 p3, xs, 2139095040;\n"
+            "@!p3 mov.b32 k, 0f7F800000;\n"
+            "@!p3 fma.rn.ftz.f32 z, xs, k, k;\n"
+            "setp.eq.f32 p5, xs, 0f00000000;\n"
+            "selp.f32 z, 0fFF800000, z, p5;\n"
+            "cvt.rpi.ftz.f32.f32 z, z;\n"
+            "ex2.approx.ftz.f32 %0, z;\n"
+            "}\n"
+            : "=f"(r)
+            : "f"(amax), "f"(fp8_max));
+    }
     else
-        asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    {
+        asm("{\n.reg .b32 q, z;\n"
+            "div.full.f32 q, %1, %2;\n"
+            "abs.f32 q, q;\n"
+            "lg2.approx.ftz.f32 z, q;\n"
+            "cvt.rpi.ftz.f32.f32 z, z;\n"
+            "ex2.approx.ftz.f32 %0, z;\n}\n"
+            : "=f"(r)
+            : "f"(amax), "f"(fp8_max));
+    }
     return r;
 }
 
-template <int QV>
-__device__ __forceinline__ float q_lg2(float a)
+__device__ __forceinline__ float k1_div(float a, float b)
 {
     float r;
-    if constexpr ((QV & 2) == 0)
-        asm("lg2.approx.f32 %0, %1;" : "=f"(r) : "f"(a));
-    else
-        asm("lg2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
-    return r;
-}
-
-template <int QV>
-__device__ __forceinline__ float q_ex2(float a)
-{
-    float r;
-    if constexpr ((QV & 4) == 0)
-        asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(a));
-    else
-        asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
-    return r;
-}
-
-__device__ __forceinline__ float q_ceil(float a)
-{
-    float r;
-    asm("cvt.rpi.f32.f32 %0, %1;" : "=f"(r) : "f"(a));
+    asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
     return r;
 }
 
@@ -141,6 +181,7 @@ struct WoaArgs
     long long pf_bytes;   //
     int flags;            // bit 0: skip griddepcontrol.wait (negative control); bit 1: trigger at start
     unsigned long long* ts; // debug %globaltimer per CTA [grid][4] or null
+    float fp8_max;          // 448 (a runtime operand, as in K1)
 };
 
 __device__ __forceinline__ void stamp(unsigned long long* ts, int point)
@@ -335,8 +376,7 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_lowm_wo_a_kernel(WoaArgs a, i
                 continue;
             }
             amax = fmaxf(amax, 1e-10f);
-            float sc = q_div<QV>(amax, 448.0f);
-            sc = q_ex2<QV>(q_ceil(q_lg2<QV>(fabsf(sc))));
+            float const sc = k1_scale<QV>(amax, a.fp8_max);
             uint32_t packed[8];
 #pragma unroll
             for (int t = 0; t < 8; ++t)
@@ -345,7 +385,7 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_lowm_wo_a_kernel(WoaArgs a, i
 #pragma unroll
                 for (int u = 0; u < 4; ++u)
                 {
-                    f[u] = fminf(fmaxf(q_div<QV>(v[4 * t + u], sc), -448.0f), 448.0f);
+                    f[u] = fminf(fmaxf(k1_div(v[4 * t + u], sc), -a.fp8_max), a.fp8_max);
                 }
                 __nv_fp8x2_e4m3 const lo(make_float2(f[0], f[1]));
                 __nv_fp8x2_e4m3 const hi(make_float2(f[2], f[3]));
@@ -591,6 +631,7 @@ void wo_a(torch::Tensor o, torch::Tensor pos, torch::Tensor cs, torch::Tensor w,
     a.pf_bytes = pf.has_value() ? pf->numel() * pf->element_size() : 0;
     a.flags = static_cast<int>(flags);
     a.ts = ts.has_value() ? reinterpret_cast<unsigned long long*>(ts->data_ptr()) : nullptr;
+    a.fp8_max = 448.0f;
     TORCH_CHECK(a.M >= 1 && a.M <= 8);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(o.get_device());
 #define WOA_DISPATCH(W, C, R)                                                                                          \
@@ -598,14 +639,8 @@ void wo_a(torch::Tensor o, torch::Tensor pos, torch::Tensor cs, torch::Tensor w,
     {                                                                                                                  \
         if (qv == 0)                                                                                                   \
             launchWoa<W, C, R, 0>(a, G, stream, pdl);                                                                  \
-        else if (qv == 1)                                                                                              \
-            launchWoa<W, C, R, 1>(a, G, stream, pdl);                                                                  \
-        else if (qv == 2)                                                                                              \
-            launchWoa<W, C, R, 2>(a, G, stream, pdl);                                                                  \
-        else if (qv == 4)                                                                                              \
-            launchWoa<W, C, R, 4>(a, G, stream, pdl);                                                                  \
         else                                                                                                           \
-            launchWoa<W, C, R, 6>(a, G, stream, pdl);                                                                  \
+            launchWoa<W, C, R, 1>(a, G, stream, pdl);                                                                  \
         return;                                                                                                        \
     }
     WOA_CONFIGS(WOA_DISPATCH)
