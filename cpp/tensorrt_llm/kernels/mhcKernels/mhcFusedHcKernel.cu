@@ -631,8 +631,32 @@ static FmaMtileFn pickFhcFmaMtile(int tile_n, int tile_m)
     FHCFMA_MT_CASE(12, 4);
     FHCFMA_MT_CASE(8, 4);
 #undef FHCFMA_MT_CASE
+
+    // tile_m = 16 + TM selects fused_pmap_gemm_fma_mtile_v2<TN, TM, RAW_SMEM=true,
+    // MIN_BLOCKS=1, J_ROLLED=true> (same math, bitwise equal): bf16 inputs staged in
+    // dynamic shared memory (fhcFmaMtileSmem bytes) by cp.async, j loop rolled.
+    // Must stay in sync with the Python _FUSED_HC_HALF_FMA_MT2_TN_TM table.
+#define FHCFMA_MT2_CASE(TN, TM)                                                                                        \
+    if (tile_n == (TN) && tile_m == (16 + (TM)))                                                                       \
+    return &fused_fma_kernels::fused_pmap_gemm_fma_mtile_v2<TN, TM, true, 1, true>
+
+    FHCFMA_MT2_CASE(24, 4);
+#undef FHCFMA_MT2_CASE
     TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaMtileLaunch: unsupported (tile_n=%d, tile_m=%d)", tile_n, tile_m);
     return nullptr;
+}
+
+// Tokens per CTA of an mtile tactic id (tile_m = 16 + TM for the v2 build).
+static int fhcFmaMtileTokens(int tile_m)
+{
+    return tile_m >= 16 ? (tile_m - 16) : tile_m;
+}
+
+// Dynamic shared memory of an mtile tactic: the v2 build stages TM tokens x 5 bf16
+// streams x 256 threads x 16 bytes; v1 uses none.
+static int fhcFmaMtileSmem(int tile_m)
+{
+    return tile_m >= 16 ? fhcFmaMtileTokens(tile_m) * 5 * 256 * 16 : 0;
 }
 
 void mhcFusedHcFmaMtileLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
@@ -657,11 +681,24 @@ void mhcFusedHcFmaMtileLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
     int const N = static_cast<int>(FHC_SHAPE_N);
 
     FmaMtileFn fn = pickFhcFmaMtile(tile_n, tile_m);
-    dim3 const grid(static_cast<unsigned>((M + tile_m - 1) / tile_m), static_cast<unsigned>(N / tile_n), 1u);
+    int const tokens_per_cta = fhcFmaMtileTokens(tile_m);
+    if (tile_m >= 16)
+    {
+        // v2 builds index tokens with int32 offsets.
+        TLLM_CHECK_WITH_INFO(static_cast<long long>(M) * hc_mult * hidden_size < (1LL << 31),
+            "mhcFusedHcFmaMtileLaunch: M=%d too large for the int32-offset mtile_v2 tactic", M);
+    }
+    dim3 const grid(
+        static_cast<unsigned>((M + tokens_per_cta - 1) / tokens_per_cta), static_cast<unsigned>(N / tile_n), 1u);
     dim3 const block(256);
-    tensorrt_llm::common::launchWithPdlWhenEnabled("fused_pmap_gemm_fma_mtile", fn, grid, block, 0, stream,
-        residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, y_acc_workspace, r_acc_workspace, M, hidden_size, N,
-        K, residual_cur);
+    int const smem = fhcFmaMtileSmem(tile_m);
+    if (smem > 48 * 1024)
+    {
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    }
+    tensorrt_llm::common::launchWithPdlWhenEnabled("fused_pmap_gemm_fma_mtile", fn, grid, block,
+        static_cast<size_t>(smem), stream, residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, y_acc_workspace,
+        r_acc_workspace, M, hidden_size, N, K, residual_cur);
 
     mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
         layer_input_cur, M, /*K=*/K, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
