@@ -35,8 +35,13 @@ def main():
             ref = C.reference(q, sink, *pools, sel)
             dec = CakeDecode()
             outs = []
-            for i in range(3):
-                o = torch.empty_like(q)
+            for i in range(10):
+                # Poison every scratch buffer the merge reads (a load hoisted above
+                # griddepcontrol.wait would read NaN / stale values here).
+                for buf in dec._buffers.values():
+                    buf["mid_out"].fill_(float("nan"))
+                    buf["mid_lse"].fill_(float("nan"))
+                o = torch.full_like(q, float("nan"))
                 dec(q, pools[0], sel["swa"], pools[1] if has_main else None,
                     sel["logical"] if has_main else None, sink, C.SCALE, o,
                     mapping=sel["mapping"] if has_main else None)

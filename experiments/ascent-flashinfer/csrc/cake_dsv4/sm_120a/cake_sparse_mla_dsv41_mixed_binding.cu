@@ -148,8 +148,11 @@ __device__ __forceinline__ float CakeF32ApproxLog2(float x) {
   return y;
 }
 
-__global__ __launch_bounds__(64, 1) void CakeMergeF32Kernel(const float* __restrict__ mid_out,
-                                                            const float* __restrict__ mid_lse,
+// The partials are written by the decode grid this merge is a programmatic dependent of: they must be
+// plain (coherent) loads issued after griddepcontrol.wait, so they are deliberately not `const __restrict__`
+// (that lets nvcc emit non-coherent loads and hoist them above the wait), exactly like the stock merge.
+__global__ __launch_bounds__(64, 1) void CakeMergeF32Kernel(float* mid_out,
+                                                            float* mid_lse,
                                                             const float* __restrict__ attn_sink,
                                                             __nv_bfloat16* __restrict__ output,
                                                             float* __restrict__ out_lse, int heads, int num_splits,
@@ -165,7 +168,11 @@ __global__ __launch_bounds__(64, 1) void CakeMergeF32Kernel(const float* __restr
   constexpr int kMaxSplits = 16;
   float lse[kMaxSplits];
 #pragma unroll
-  for (int s = 0; s < kMaxSplits; ++s) lse[s] = s < num_splits ? mid_lse[lse_base + s] : -1e+30f;
+  for (int s = 0; s < kMaxSplits; ++s) {
+    float v = -1e+30f;
+    if (s < num_splits) asm volatile("ld.global.f32 %0, [%1];" : "=f"(v) : "l"(mid_lse + lse_base + s) : "memory");
+    lse[s] = v;
+  }
   float gmax = lse[0];
 #pragma unroll
   for (int s = 1; s < kMaxSplits; ++s) gmax = fmaxf(gmax, lse[s]);
@@ -175,9 +182,16 @@ __global__ __launch_bounds__(64, 1) void CakeMergeF32Kernel(const float* __restr
 #pragma unroll
   for (int s = 0; s < kMaxSplits; ++s) {
     if (s < num_splits) {
-      const float4* p = reinterpret_cast<const float4*>(base + static_cast<long long>(s) * 512);
-      va[s] = p[0];
-      vb[s] = p[1];
+      // Coherent (ld.global, not .nc) vector loads, ordered after griddepcontrol.wait by the clobber.
+      const float* p = base + static_cast<long long>(s) * 512;
+      asm volatile("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                   : "=f"(va[s].x), "=f"(va[s].y), "=f"(va[s].z), "=f"(va[s].w)
+                   : "l"(p)
+                   : "memory");
+      asm volatile("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                   : "=f"(vb[s].x), "=f"(vb[s].y), "=f"(vb[s].z), "=f"(vb[s].w)
+                   : "l"(p + 4)
+                   : "memory");
     } else {
       va[s] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
       vb[s] = va[s];
@@ -401,8 +415,8 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
       attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
       config.attrs = attribute;
       config.numAttrs = 1;
-      status = cudaLaunchKernelEx(&config, CakeMergeF32Kernel, static_cast<const float*>(mid_out_f32_ptr),
-                                  static_cast<const float*>(mid_lse_ptr), static_cast<const float*>(sink),
+      status = cudaLaunchKernelEx(&config, CakeMergeF32Kernel, mid_out_f32_ptr, mid_lse_ptr,
+                                  static_cast<const float*>(sink),
                                   args.output, args.out_lse, static_cast<int>(heads), static_cast<int>(num_splits),
                                   static_cast<int>(scratch_split_stride), static_cast<float>(lse_scale),
                                   static_cast<int>(args.hb_major));
