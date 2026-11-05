@@ -18,12 +18,15 @@ def trio(logits, new_tokens, dest, mbw=1):
 
 
 def make_dummy():
-    # ~6 ms busy kernel captured in a graph to hide host launch cost
-    a = torch.randn(4096, 4096, device=dev)
+    # ~6 ms of elementwise work captured in a graph (no cuBLAS) to hide host launch cost
+    a = torch.ones(16 * 1024 * 1024, device=dev)
+    a.mul_(1.0)
+    torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        for _ in range(12):
-            a = a @ a.T * 1e-3
+        for _ in range(68):
+            a.mul_(1.0)
+    g._buf = a
     return g
 
 

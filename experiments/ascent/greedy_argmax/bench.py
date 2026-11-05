@@ -31,11 +31,15 @@ def ref_trio(logits, new_tokens, dest, mbw=1):
 
 
 def make_dummy():
-    a = torch.randn(4096, 4096, device=DEV)
+    # ~6 ms of elementwise work captured in a graph (no cuBLAS) to hide host launch cost
+    a = torch.ones(16 * 1024 * 1024, device=DEV)
+    a.mul_(1.0)
+    torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        for _ in range(12):
-            a = a @ a.T * 1e-3
+        for _ in range(68):
+            a.mul_(1.0)
+    g._buf = a
     return g
 
 
@@ -50,8 +54,17 @@ def setup(B, seed):
 
 
 def run_time():
+    if "--stage0" in sys.argv:
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import stage0
+        stage0.main()
     dummy = make_dummy()
     torch.cuda.synchronize()
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record(); dummy.replay(); e.record(); e.synchronize()
+    print("dummy graph ms", s.elapsed_time(e), flush=True)
     out = {}
     fused = getattr(sf, "fused_greedy_argmax_enabled", lambda: False)()
     print("fused path available+enabled:", fused, flush=True)
