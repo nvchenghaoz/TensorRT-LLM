@@ -70,6 +70,8 @@ def main():
         "rank0_prefill": pw,
         "rank0_decode": dw,
         "rank0_steps": trace.get("rank0_steps"),
+        "layout": trace.get("layout"),
+        "per_rank_census": trace.get("per_rank_census"),
         "profiled_request": trace.get("profiled_request"),
         "trace_error": trace.get("error"),
         "trace_rc": p.returncode,

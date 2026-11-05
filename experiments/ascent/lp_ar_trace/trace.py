@@ -243,6 +243,23 @@ def main():
     dw = r0.get("decode_window", {})
     summary["rank0_decode"] = dw
     summary["rank0_steps"] = [s["label"] for s in r0.get("steps", [])]
+    # Per-rank AR census (landing 51 / EP2xTP2 re-check): any reduce-scatter / all-gather / other AR kernel shows
+    # up in other_ar; LP two-shot and NCCL AR durations show whether the [2048,5120] / tail shapes changed.
+    summary["layout"] = {k: settings.get(k) for k in ("tensor_parallel_size", "moe_tensor_parallel_size",
+                                                      "moe_expert_parallel_size", "allreduce_strategy")}
+    census = {}
+    for r, d in per_rank.items():
+        pwr, dwr = d.get("prefill_window", {}) or {}, d.get("decode_window", {}) or {}
+        ln = sorted(pwr.get("lp_twoshot_us", []))
+        nn = sorted(pwr.get("nccl_ar_us", []))
+        census[r] = {"prefill_lp_calls": pwr.get("lp_calls"), "prefill_nccl_ar": pwr.get("ncclDevKernel_AllReduce"),
+                     "prefill_lamport": pwr.get("oneshot_lamport"), "prefill_other_ar": pwr.get("other_ar"),
+                     "prefill_lp_us_median": ln[len(ln) // 2] if ln else None,
+                     "prefill_nccl_us_median": nn[len(nn) // 2] if nn else None,
+                     "decode": dwr,
+                     "decode_other_ar": [s.get("other_ar") for s in d.get("steps", [])
+                                         if str(s.get("label", "")).startswith("step[DECODE") and s.get("other_ar")][:4]}
+    summary["per_rank_census"] = census
     summary["passed"] = (bool(pw) and pw.get("lp_calls") == 40 and pw.get("ncclDevKernel_AllReduce") == 40
                          and dw.get("lowPrecision", 1) == 0)
     (art / "lp_trace_summary.json").write_text(json.dumps(summary, indent=1))

@@ -146,3 +146,10 @@ c4 TPOT +2.1% needs a look; decode ARs are unchanged.
   TRTLLM_ENABLE_PDL env), then submit serving_latency mode_switch, target label 4 (c4 TTFT), guards per plan 2588(b)
   (c1/c2 TTFT: gate floor; c1/c2/c4 TPOT: max(gate floor, 2.9%)), checks [1442] (or a re-trace if a sync touches
   ops.py / allreduceOp.cpp / an AR call site / engine.json's AR key), acceptance item 1 -> 1442, item 2 -> the new pair.
+
+## Branch 158 (idea 293), session 7 (11-05, node smc521ge-0109)
+- Base 893870d3 = main with landings 1-51 (51 = EP2xTP2 MoE layout). engine.json keeps main's keys verbatim
+  {enable_tokenization_cache, moe_tensor_parallel_size 2, moe_expert_parallel_size 2} + allreduce_strategy LOWPRECISION.
+- trace.py already deep-merges engine.json over the protocol settings (tensor_parallel_size 4), so it traces EP2xTP2.
+  Added a per-rank AR census (prefill LP/NCCL/other AR counts + median durations, decode counts) for acceptance item 2.
+- Next: own trace_graph.py (4 GPU), then own run_serving_pair, then submit serving_latency mode_switch.
