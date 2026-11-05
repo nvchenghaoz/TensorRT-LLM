@@ -14,9 +14,10 @@ The math is the eager math: the same Python code runs inside the capture, with
 the same kernels, with the same tactics (autotuner cache / FlashInfer memo lookups
 resolve on the host at capture), and the same all-reduce.
 
-Kill switch: ``TRTLLM_DSV4_TAIL_MOE_GRAPH`` read ONCE at import. Unset or ``0``
-(the default) keeps the decoder-layer forward exactly main's: the only change in
-``modeling_deepseekv41.py`` is a branch on the module bool ``ENABLED``.
+Kill switch: ``TRTLLM_DSV4_TAIL_MOE_GRAPH`` read ONCE at import. Unset (the
+default) or ``1`` engages the graph; ``0`` keeps the decoder-layer forward exactly
+main's: the only change in ``modeling_deepseekv41.py`` is a branch on the module
+bool ``ENABLED``.
 
 ``TRTLLM_DSV4_TAIL_MOE_GRAPH_VERIFY=N``: for the first N replays of each layer's
 graph, also run the eager window on the same inputs and compare outputs with
@@ -48,7 +49,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-ENABLED = os.environ.get("TRTLLM_DSV4_TAIL_MOE_GRAPH", "0") == "1"
+ENABLED = os.environ.get("TRTLLM_DSV4_TAIL_MOE_GRAPH", "1") == "1"
 VERIFY = int(os.environ.get("TRTLLM_DSV4_TAIL_MOE_GRAPH_VERIFY", "0") or "0") if ENABLED else 0
 TAIL_ROWS = 128
 WARM_CALLS = 1
@@ -192,8 +193,68 @@ def _capture(layer, state: _LayerGraph, inputs, attn_metadata, key) -> bool:
     return True
 
 
-def _verify(layer, state: _LayerGraph, inputs, attn_metadata) -> None:
-    eager = moe_window(layer, *inputs[:5], attn_metadata, inputs[5])
+_RECEIPT_LAYERS = (20, 39)
+
+
+def _kernel_names(fn):
+    """Run fn under the torch profiler (VERIFY only); return (result, ordered GPU op names)."""
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity, profile
+
+    # fn runs exactly once on every rank (it holds a collective); only the profiler's
+    # own bookkeeping may fail, and then the names are None.
+    torch.cuda.synchronize()
+    prof = None
+    try:
+        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+        prof.__enter__()
+    except Exception as error:
+        logger.info(f"[TAIL_MOE_GRAPH KERNELS] profiler start failed: {error!r}")
+        prof = None
+    out = fn()
+    torch.cuda.synchronize()
+    if prof is None:
+        return out, None
+    try:
+        prof.__exit__(None, None, None)
+        evs = [e for e in prof.events() if e.device_type == DeviceType.CUDA]
+        evs.sort(key=lambda e: e.time_range.start)
+        return out, [e.name for e in evs]
+    except Exception as error:
+        logger.info(f"[TAIL_MOE_GRAPH KERNELS] profiler read failed: {error!r}")
+        return out, None
+
+
+def _is_ar(name: str) -> bool:
+    low = name.lower()
+    return "nccl" in low or "allreduce" in low or "all_reduce" in low
+
+
+def _kernel_receipt(layer, graph_names, eager_names) -> None:
+    g_ar = [n for n in graph_names if _is_ar(n)]
+    e_ar = [n for n in eager_names if _is_ar(n)]
+    logger.info(
+        f"[TAIL_MOE_GRAPH KERNELS] rank {layer.mapping.rank} layer {layer.layer_idx}: "
+        f"graph {len(graph_names)} GPU ops, eager {len(eager_names)} GPU ops, "
+        f"sequence identical={graph_names == eager_names}, AR identical={g_ar == e_ar}; "
+        f"graph AR={g_ar}; eager AR={e_ar}"
+    )
+    if graph_names != eager_names:
+        logger.info(
+            f"[TAIL_MOE_GRAPH KERNELS] rank {layer.mapping.rank} layer {layer.layer_idx}: "
+            f"graph seq={graph_names}; eager seq={eager_names}"
+        )
+
+
+def _verify(layer, state: _LayerGraph, inputs, attn_metadata, graph_names=None) -> None:
+    if graph_names is not None:
+        eager, eager_names = _kernel_names(
+            lambda: moe_window(layer, *inputs[:5], attn_metadata, inputs[5])
+        )
+        if eager_names is not None:
+            _kernel_receipt(layer, graph_names, eager_names)
+    else:
+        eager = moe_window(layer, *inputs[:5], attn_metadata, inputs[5])
     names = (
         ("residual", "post_mix", "comb_mix", "x_ffn", "ffn_pre")
         if len(eager) == 5
@@ -256,8 +317,13 @@ def run(
         for s, t in zip(state.static_in, inputs):
             if s is not None:
                 s.copy_(t)
-    state.graph.replay()
+    graph_names = None
+    if VERIFY and state.verified == 0 and layer.layer_idx in _RECEIPT_LAYERS:
+        # One kernel-sequence receipt per receipt layer: graph replay vs eager window.
+        _, graph_names = _kernel_names(state.graph.replay)
+    else:
+        state.graph.replay()
     state.replays += 1
     if VERIFY and state.verified < VERIFY:
-        _verify(layer, state, inputs, attn_metadata)
+        _verify(layer, state, inputs, attn_metadata, graph_names)
     return state.static_out

@@ -61,8 +61,8 @@ def import_receipts():
         out[name] = rec
         log(f"[A] env={name}: {rec} ({time.time() - t0:.0f}s)")
     ok = (
-        out["unset"].get("ENABLED") is False
-        and out["unset"].get("m41") is False
+        out["unset"].get("ENABLED") is True
+        and out["unset"].get("m41") is True
         and out["0"].get("ENABLED") is False
         and out["0"].get("m41") is False
         and out["1"].get("ENABLED") is True
