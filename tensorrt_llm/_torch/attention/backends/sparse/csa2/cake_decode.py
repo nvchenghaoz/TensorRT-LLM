@@ -34,7 +34,34 @@ import triton.language as tl
 _HEAD_DIM = 512
 
 
-@triton.jit
+# Every runtime argument stays unspecialized: eager mixed steps see new batch shapes
+# (page-table rows, slice offsets), and a value/alignment specialization would JIT a
+# new variant mid-serving instead of reusing the one warmed up before capture.
+_RUNTIME_INTS = [
+    "swa_rs",
+    "swa_cs",
+    "swa_capacity",
+    "main_rs",
+    "main_cs",
+    "main_capacity",
+    "table_rows",
+    "table_cols",
+    "table_stride",
+    "page_size",
+    "max_positions",
+]
+_RUNTIME_PTRS = [
+    "swa_ptr",
+    "swa_out",
+    "main_ptr",
+    "main_out",
+    "table_ptr",
+    "requests_ptr",
+    "visible_ptr",
+]
+
+
+@triton.jit(do_not_specialize=_RUNTIME_INTS, do_not_specialize_on_alignment=_RUNTIME_PTRS)
 def _cake_index_prep_kernel(
     swa_ptr,
     swa_rs,
@@ -144,6 +171,47 @@ def prepare_cake_indices(
         MAPPED=mapped,
         num_warps=4,
     )
+
+
+def _flat_pool(pool: torch.Tensor, row_bytes: int) -> torch.Tensor:
+    """Flat uint8 span of a ``[rows, row_bytes]`` pool view (page_size=1 footer layout)."""
+    span = (pool.shape[0] - 1) * pool.stride(0) + row_bytes
+    return pool.as_strided((span,), (1,), pool.storage_offset())
+
+
+def _cache_launch(q, swa_pool, main_pool, swa_width, main_width, variant, scale, info):
+    """Resolve the exact plan the validated public call used, for direct binding launches."""
+    from flashinfer.mla._sparse_mla_sm120 import cake_dsv41_mixed as cdm
+
+    plan = cdm._resolve_plan(
+        num_tokens=int(q.shape[0]),
+        num_heads=int(q.shape[1]),
+        topk=swa_width,
+        extra_topk=main_width,
+        dual=main_pool is not None,
+        ragged=False,
+        device=q.device,
+        num_splits=None,
+        max_splits=16,
+        variant=variant,
+        page_size=1,
+        extra_page_size=1 if main_pool is not None else 0,
+    )
+    if (plan.variant, plan.num_splits, plan.chunks_per_block) != (
+        info["variant"],
+        info["num_splits"],
+        info["chunks_per_block"],
+    ):
+        return None  # never take the direct path on a plan the public call did not run
+    key = (
+        swa_pool.data_ptr(),
+        swa_pool.shape,
+        swa_pool.stride(),
+        None if main_pool is None else (main_pool.data_ptr(), main_pool.shape, main_pool.stride()),
+        scale,
+    )
+    entry = cdm.get_cake_sparse_mla_sm120_dsv41_mixed_module().raw_decode
+    return key, entry, plan, cdm._resolve_enable_pdl(None, q.device)
 
 
 @functools.lru_cache(maxsize=None)
@@ -294,7 +362,45 @@ class CakeDecode:
         )
         if sink.dtype != torch.float32 or not sink.is_contiguous():
             sink = sink.float().contiguous()
-        cake_sparse_mla_sm120_dsv41_mixed_decode(
+        launch = buffers.get("launch")
+        if launch is not None and launch[0] == (
+            swa_pool.data_ptr(),
+            swa_pool.shape,
+            swa_pool.stride(),
+            None if not has_main else (main_pool.data_ptr(), main_pool.shape, main_pool.stride()),
+            float(scale),
+        ):
+            # Same shape and pools as the validated first call: launch the binding directly
+            # (eager mixed steps pay no per-call validation / plan resolution).
+            entry, plan, enable_pdl = launch[1:]
+            entry(
+                q,
+                _flat_pool(swa_pool, 528),
+                buffers["swa"],
+                _flat_pool(main_pool, 288) if has_main else None,
+                buffers["main"] if has_main else None,
+                None,
+                None,
+                sink,
+                out,
+                buffers["lse"],
+                buffers["mid_out"] if plan.num_splits > 1 else None,
+                buffers["mid_lse"] if plan.num_splits > 1 else None,
+                1,
+                swa_pool.stride(0),
+                1 if has_main else 0,
+                main_pool.stride(0) if has_main else 0,
+                plan.chunks_per_block,
+                plan.decode_body,
+                plan.merge_body,
+                plan.hb_major,
+                float(scale),
+                1.0,
+                enable_pdl,
+            )
+            return out
+        variant = "default" if self._use_f32(heads) else None
+        info = cake_sparse_mla_sm120_dsv41_mixed_decode(
             q,
             swa_pool,
             buffers["swa"],
@@ -306,8 +412,13 @@ class CakeDecode:
             extra_indices=buffers["main"] if has_main else None,
             mid_out=buffers["mid_out"],
             mid_lse=buffers["mid_lse"],
-            variant="default" if self._use_f32(heads) else None,
+            variant=variant,
         )
+        if not torch.cuda.is_current_stream_capturing():
+            buffers["launch"] = _cache_launch(
+                q, swa_pool, main_pool if has_main else None, swa_width, main_width, variant,
+                float(scale), info,
+            )
         return out
 
 
