@@ -202,7 +202,8 @@ def run_arm(arm, ckpt, port):
                               for x in tt)
         # profile window
         ctl = {}
-        ctl["start"] = http(f"{url}/start_profile", {"output_dir": str(d), "activities": ["GPU"]}, timeout=120)
+        acts = os.environ.get("B123_ACTIVITIES", "GPU").split(",")
+        ctl["start"] = http(f"{url}/start_profile", {"output_dir": str(d), "activities": acts}, timeout=120)
         time.sleep(1.0)
         prof = []
         for i in range(N_PROF):

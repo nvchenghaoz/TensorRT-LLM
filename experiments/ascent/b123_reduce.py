@@ -40,6 +40,9 @@ def base_name(n):
     return n[:90]
 
 
+LAUNCH = {}  # path -> {correlation: host launch ts}
+
+
 def load(path):
     with open(path) as f:
         data = json.load(f)
@@ -47,6 +50,15 @@ def load(path):
     k = [e for e in evs if isinstance(e, dict) and e.get("ph") == "X"
          and e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset") and e.get("dur") is not None]
     k.sort(key=lambda e: e["ts"])
+    corr = {}
+    for e in evs:
+        if isinstance(e, dict) and e.get("ph") == "X" and e.get("cat") in ("cuda_runtime", "cuda_driver"):
+            c = (e.get("args") or {}).get("correlation")
+            if c is not None:
+                corr[c] = e["ts"]
+    for e in k:
+        c = (e.get("args") or {}).get("correlation")
+        e["_launch"] = corr.get(c)
     return k
 
 
@@ -91,7 +103,12 @@ def step_info(seg):
     # intervals between ARs: [prev AR end, AR start]
     ivs = []
     prev_end = t0
+    prev_launch = seg[0].get("_launch")
     for a in ars:
+        la = a.get("_launch")
+        host = (la - prev_launch) if (la is not None and prev_launch is not None) else None
+        lag = (a["ts"] - la) if la is not None else None
+        prev_launch = la
         inside = [e for e in non if e["ts"] >= prev_end - 1 and e["ts"] < a["ts"]]
         is_moe = any(MOE_RE.search(e.get("name", "")) for e in inside)
         names = []
@@ -101,7 +118,8 @@ def step_info(seg):
                 names.append(b)
         ivs.append({"compute": a["ts"] - prev_end, "ar_dur": a["dur"], "moe": is_moe,
                     "busy": union([(e["ts"], e["ts"] + e["dur"]) for e in inside]),
-                    "ar_name": base_name(a.get("name", "")), "names": names[:4], "nk": len(inside)})
+                    "ar_name": base_name(a.get("name", "")), "names": names[:4], "nk": len(inside),
+                    "host": host, "lag": lag})
         prev_end = a["ts"] + a["dur"]
     tail = t1 - prev_end
     return {"span": t1 - t0, "n": len(seg), "n_ar": len(ars), "ar_sum": sum(a["dur"] for a in ars),
@@ -239,6 +257,32 @@ def main():
                     f"{sum(x['d_crit'] for x in s2) / 1e3:.3f} ms; gap sum per rank ep4 "
                     f"{[round(sum(x['gap_ep4'][r] for x in s2) / 1e3, 3) for r in range(4)]} ep2tp2 "
                     f"{[round(sum(x['gap_ep2tp2'][r] for x in s2) / 1e3, 3) for r in range(4)]}")
+        # host-side: per rank, sum of host launch intervals between consecutive ARs (mean over steps), per half,
+        # and the host lead at each AR (AR kernel start - its launch; ~0 means the GPU waited for the host)
+        host = {}
+        for arm in ("ep4", "ep2tp2"):
+            ranks = sorted(wins[arm])
+            ns = min(len(wins[arm][r]) for r in ranks)
+            n_ivh = min(len(wins[arm][r][s]["ivs"]) for r in ranks for s in range(ns))
+            hh = {}
+            for half, lo, hi in (("first", 1, n_ivh // 2), ("second", n_ivh // 2, n_ivh)):
+                hsum, lag_med = [], []
+                for r in ranks:
+                    vals, lags = [], []
+                    for s in range(ns):
+                        ivs = wins[arm][r][s]["ivs"]
+                        v = [ivs[i]["host"] for i in range(lo, hi)]
+                        if any(x is None for x in v):
+                            vals = None
+                            break
+                        vals.append(sum(v))
+                        lags.extend(ivs[i]["lag"] for i in range(lo, hi))
+                    hsum.append(None if vals is None else round(sum(vals) / len(vals) / 1e3, 3))
+                    lag_med.append(None if not lags else round(sorted(lags)[len(lags) // 2], 1))
+                hh[half] = {"host_ms_per_rank": hsum, "ar_lead_us_median": lag_med}
+            host[arm] = hh
+            log(f"run {run} {arm} HOST: {json.dumps(hh)}")
+        rr["host"] = host
         log(f"run {run} top intervals by d_crit:")
         for x in sorted(ivd, key=lambda x: -abs(x["d_crit"]))[:14]:
             log("   ", json.dumps(x))
