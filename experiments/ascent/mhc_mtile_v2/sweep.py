@@ -21,6 +21,8 @@ DEFAULT_KSET = ";".join([
     "v2<24,4,false,1>()", "v2<24,3,false,1>()", "v2<12,4,false,1>()", "v2<8,4,false,1>()",
     "v2<12,6,false,1>()", "v2<8,6,false,1>()", "v2<6,4,false,1>()", "v2<4,4,false,1>()",
     "v2<12,2,false,1>()", "v2<12,2,false,2>()",
+    "v2<24,4,false,1,true>()", "v2<24,3,false,1,true>()", "v2<12,4,false,1,true>()", "v2<8,4,false,1,true>()",
+    "v2<12,6,false,1,true>()", "v2<8,6,false,1,true>()", "v2<4,4,false,1,true>()", "v2<24,4,true,1,true>()",
     "v2<24,4,true,1>()", "v2<12,4,true,1>()", "v2<24,3,true,1>()", "v2<8,4,true,1>()",
     "v2<24,2,true,2>()", "v2<12,2,true,2>()",
 ])

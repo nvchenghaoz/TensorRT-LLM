@@ -648,6 +648,19 @@ static FmaMtileFn pickFhcFmaMtile(int tile_n, int tile_m)
     FHCFMA_MT2_CASE(4, 4);
     FHCFMA_MT2_CASE(12, 2);
 #undef FHCFMA_MT2_CASE
+    // Variant 2: as variant 1 with the j loop kept rolled (J_ROLLED; same math and order).
+#define FHCFMA_MT3_CASE(TN, TM)                                                                                        \
+    if (tile_n == (TN) && tile_m == (32 + (TM)))                                                                       \
+    return &fused_fma_kernels::fused_pmap_gemm_fma_mtile_v2<TN, TM, false, 1, true>
+
+    FHCFMA_MT3_CASE(24, 3);
+    FHCFMA_MT3_CASE(24, 4);
+    FHCFMA_MT3_CASE(12, 4);
+    FHCFMA_MT3_CASE(8, 4);
+    FHCFMA_MT3_CASE(6, 4);
+    FHCFMA_MT3_CASE(4, 4);
+    FHCFMA_MT3_CASE(12, 2);
+#undef FHCFMA_MT3_CASE
     TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaMtileLaunch: unsupported (tile_n=%d, tile_m=%d)", tile_n, tile_m);
     return nullptr;
 }

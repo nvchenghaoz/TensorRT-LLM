@@ -48,13 +48,13 @@ static float urand(uint64_t& s)
     return (lcg(s) & 0xFFFFFF) / float(0x1000000);
 }
 
-template <int TN, int TM, bool S, int MB>
+template <int TN, int TM, bool S, int MB, bool JR = false>
 Kern v2()
 {
     char buf[128];
-    snprintf(buf, sizeof(buf), "v2<%d,%d,%s,%d>", TN, TM, S ? "smem" : "reg", MB);
+    snprintf(buf, sizeof(buf), "v2<%d,%d,%s,%d,%s>", TN, TM, S ? "smem" : "reg", MB, JR ? "jrolled" : "junroll");
     int smem = S ? TM * 5 * 256 * 16 : 0;
-    Fn f = &fused_pmap_gemm_fma_mtile_v2<TN, TM, S, MB>;
+    Fn f = &fused_pmap_gemm_fma_mtile_v2<TN, TM, S, MB, JR>;
     if (smem > 48 * 1024)
         CK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     return Kern{buf, f, TN, TM, smem};

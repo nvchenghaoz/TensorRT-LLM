@@ -1274,7 +1274,7 @@ __device__ __forceinline__ void mtile_v2_issue_raw(uint4* s_raw, __nv_bfloat16 c
     asm volatile("cp.async.commit_group;\n" ::: "memory");
 }
 
-template <int N_PER_BLOCK, int TM, bool RAW_SMEM, int MIN_BLOCKS>
+template <int N_PER_BLOCK, int TM, bool RAW_SMEM, int MIN_BLOCKS, bool J_ROLLED = false>
 __launch_bounds__(256, MIN_BLOCKS) __global__
     void fused_pmap_gemm_fma_mtile_v2(__nv_bfloat16 const* __restrict__ residual_in,
         __nv_bfloat16 const* __restrict__ x_in, float const* __restrict__ post_mix,
@@ -1370,7 +1370,10 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
             }
         }
 
-#pragma unroll
+        // J_ROLLED keeps the j loop rolled: nothing register-resident is indexed by j
+        // (s_post/s_comb are smem, W_T/residual_out are addresses), so this only stops ptxas
+        // from overlapping j+1's new_r with j's GEMM, which costs 8 * TM extra live registers.
+#pragma unroll(J_ROLLED ? 1 : HC_MULT)
         for (int j = 0; j < HC_MULT; j++)
         {
             float new_r[TM][BF16_VEC];
@@ -1444,12 +1447,14 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
             {
                 float const* wp = W_T + (n_start + n) * K + j * hidden_size + h;
                 float w[BF16_VEC];
-                asm("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
-                    : "=f"(w[0]), "=f"(w[1]), "=f"(w[2]), "=f"(w[3])
-                    : "l"(wp));
-                asm("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
-                    : "=f"(w[4]), "=f"(w[5]), "=f"(w[6]), "=f"(w[7])
-                    : "l"(wp + 4));
+                // volatile, as in v1: job 1426 showed non-volatile W_T loads let ptxas hoist
+                // them across n/j and spill (STACK 536-1200 B at 255 regs).
+                asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                             : "=f"(w[0]), "=f"(w[1]), "=f"(w[2]), "=f"(w[3])
+                             : "l"(wp));
+                asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                             : "=f"(w[4]), "=f"(w[5]), "=f"(w[6]), "=f"(w[7])
+                             : "l"(wp + 4));
 #pragma unroll
                 for (int t = 0; t < TM; t++)
 #pragma unroll

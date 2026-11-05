@@ -654,6 +654,8 @@ _FUSED_HC_HALF_FMA_MT_TN_TM = (
 # Their tactic tile_m is _FUSED_HC_MT2_ID_BASE + tokens per CTA, so the ids of the
 # tactics above are unchanged. Must stay in sync with the C++ pickFhcFmaMtile() table.
 _FUSED_HC_MT2_ID_BASE = 16
+# Same builds with the j loop kept rolled (J_ROLLED): tile_m = 32 + tokens per CTA.
+_FUSED_HC_MT2_ROLLED_ID_BASE = 32
 _FUSED_HC_HALF_FMA_MT2_TN_TM = (
     (24, 3),
     (24, 4),
@@ -989,8 +991,9 @@ class MhcFusedHcRunner(TunableRunner):
             for tn, tm in _FUSED_HC_HALF_FMA_MT_TN_TM:
                 add(("fused_half_fma", tn, 1, bs, tm))
             if M * self.n * self.hidden_size < 2**31:  # int32 token offsets
-                for tn, tm in _FUSED_HC_HALF_FMA_MT2_TN_TM:
-                    add(("fused_half_fma", tn, 1, bs, _FUSED_HC_MT2_ID_BASE + tm))
+                for id_base in (_FUSED_HC_MT2_ID_BASE, _FUSED_HC_MT2_ROLLED_ID_BASE):
+                    for tn, tm in _FUSED_HC_HALF_FMA_MT2_TN_TM:
+                        add(("fused_half_fma", tn, 1, bs, id_base + tm))
 
         return tactics
 

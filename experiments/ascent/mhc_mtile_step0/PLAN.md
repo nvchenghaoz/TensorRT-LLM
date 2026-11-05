@@ -1,3 +1,38 @@
+# STATUS branch 148 (idea 212), 04:4x PST 11-05 -- WIP, NOT SUBMITTED
+
+DONE (measured, synced to main 31878478):
+- Step 0 receipt, job 1385 (base tree): every v1 mtile instantiation spills. REG/STACK:
+  <24,2> 128/400, <24,3> 255/176, <24,4> 255/408, <12,2> 128/248, <12,4> 128/1216, <8,4> 128/1064.
+  No PTX .local depot (spills come from ptxas allocation, not dynamic indexing). Full op
+  (mtile + bigfuse, cold L2) V4.1-lagged: M=128 tuner (12,1,512,2) 73.8 us (best ksplit<3> 61.4);
+  M=2048 tuner (24,..,3) 409.8 us, best (24,4) 406.6; M=4096 (24,4) 762; M=8192 (24,4) 1363.
+  (12,4)/(8,4) at the 128-reg cap: 1056-1140 us at M=2048.
+- Job 1426 (commit cd73712d): mtile_v2<TN,TM,false,1> (minBlocks=1, int32 offsets, NON-volatile
+  W_T loads), ids tile_m = 16+TM. Bitwise PASSED vs ksplit (24,1,bs,1) for every old and new
+  tactic at M=33,64,127,128,129,255,512,1000,1024,2047,2048,4096,4099,8192, V4 and V4.1-lagged,
+  NaN-poisoned outputs, 8 calls each; M=128 CUDA-graph 12 replays x 7 tactics x 2 modes, 0 bad.
+  BUT every v2 build still spilled at 255 regs (STACK: <12,2> 16, <4,4> 536, <6,4> 648, <8,4> 720,
+  <12,4> 912, <24,3> 664, <24,4> 1200) and none beat v1 at M>=2048 (e.g. v2 <24,4> 633 us vs
+  v1 408). Lesson: dropping `volatile` on the W_T ld.global.L1::evict_last asm let ptxas hoist the
+  loads across n/j and blow up the live set; the counted live set (PLAN below) is not what ptxas
+  allocates. Only M=128 gained: v2 (12,2) 63.7-65.5 us vs v1 tuner pick 73.8-75.8 (the tuner
+  picked it), still above ksplit<3> 61.6.
+
+UNTESTED (committed after 1426):
+- W_T loads are volatile again in v2 (same body as v1).
+- New template knob J_ROLLED (ids tile_m = 32+TM): `#pragma unroll 1` on the j loop. Exact:
+  nothing register-resident is indexed by j. Aim: stop ptxas overlapping j+1's new_r with j's GEMM.
+
+NEXT (exact command order):
+1. Fast loop without the lib rebuild: run_gpu_job microbench
+   ["{python}", "experiments/ascent/mhc_mtile_v2/sweep.py", "2048,128,33,2047", "10"]
+   It prints ptxas regs/stack/spills per v1/v2 instantiation (incl. jrolled and the RAW_SMEM
+   cp.async path) and cold-L2 kernel-only time + bitwise vs ksplit<24,1>. Keep only builds with
+   stack 0 in the C++/Python tables (acceptance item 2).
+2. ["{python}", "experiments/ascent/mhc_mtile_v2/s1_check.py"] (one job: in-tree rebuild, bitwise,
+   repeated-exec NaN-poisoned, M=128 graph, step0 regs + tuner picks). Must print v2_spill_free true.
+3. run_gpu_pair both arms ["{python}", "experiments/ascent/mhc_mtile_v2/pair.py", "128,512,2048,8192"].
+
 # Idea 144 Step 0: fused_pmap_gemm_fma_mtile spill gate (branch 110)
 
 STATUS: the receipt script is committed but the GPU receipt has NOT run. Job 1038 was cancelled
