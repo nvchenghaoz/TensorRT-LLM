@@ -104,6 +104,10 @@ def _glue_kernels():
     def bitcast_u32_f32(bits, *, loc=None, ip=None):
         return Float32(llvm.bitcast(T.f32(), cutlass.Uint32(bits).ir_value(loc=loc, ip=ip)))
 
+    @dsl_user_op
+    def bitcast_f32_i32(value, *, loc=None, ip=None):
+        return Int32(llvm.bitcast(T.i32(), Float32(value).ir_value(loc=loc, ip=ip)))
+
     @cute.jit
     def floor_div(a: Int64, b: Int64) -> Int64:
         """PyTorch ``//`` for signed integers (round toward negative infinity)."""
@@ -928,6 +932,13 @@ def _glue_kernels():
             self.sparse_block = sparse_block
             self.ratio = block_size // sparse_block if sparse_block else 1
             self.threads = max(32, min(1024, padded_blocks // 2 if padded_blocks >= 64 else 32))
+            # Above 4096 blocks two padded bitonic sorts in one CTA are slower than
+            # the PyTorch path, so the wide path selects the Top-K blocks with a
+            # radix select of the K-th block key plus one block scan that compacts
+            # them in ascending block order (same set and tie rule: larger value,
+            # then smaller block id), and reads the scores coalesced.
+            self.wide = padded_blocks > 4096
+            self.coalesced = self.wide and 32 % block_size == 0
 
         @cute.jit
         def __call__(
@@ -991,6 +1002,181 @@ def _glue_kernels():
                     stride = stride // 2
                 size = size * 2
 
+        @cute.jit
+        def _block_sum2(self, a, b, partial, base: cutlass.Constexpr, lane, warp):
+            """Block-wide sums of two Int32 values; ``partial[base:base+2*warps]`` scratch."""
+            warps = self.threads // 32
+            offset = 1
+            while offset < 32:
+                a = a + cute.arch.shuffle_sync_bfly(a, offset=offset)
+                b = b + cute.arch.shuffle_sync_bfly(b, offset=offset)
+                offset = offset * 2
+            if lane == 0:
+                partial[base + warp] = a
+                partial[base + warps + warp] = b
+            cute.arch.barrier()
+            a = Int32(0)
+            b = Int32(0)
+            if lane < warps:
+                a = partial[base + lane]
+                b = partial[base + warps + lane]
+            offset = 1
+            while offset < 32:
+                a = a + cute.arch.shuffle_sync_bfly(a, offset=offset)
+                b = b + cute.arch.shuffle_sync_bfly(b, offset=offset)
+                offset = offset * 2
+            return a, b
+
+        @cute.jit
+        def _select_wide(
+            self, score_t, keys, ids, partial, q, width, blocks, selected_blocks, latest, tid
+        ):
+            """Top-K blocks in ascending id order into ``ids`` (``INT32_MAX`` tail).
+
+            ``keys`` holds an order-preserving Int32 image of each block maximum
+            (``-0.0`` folded into ``+0.0``; padding below ``-inf``). The K-th
+            largest key ``T`` is found 2 bits per round; blocks above ``T`` and
+            the first ``K - #above`` blocks equal to ``T`` (ascending id) are
+            selected, and unreachable ``-inf`` blocks are dropped.
+            """
+            lane = tid % 32
+            warp = tid // 32
+            warps = self.threads // 32
+            per_thread = self.padded // self.threads
+            bs = self.block_size
+            pad_key = Int32(-(2**31))
+            bias = Int64(2**31)
+            neg_inf_u = Int64(0x007FFFFF)  # key of -inf, biased to [0, 2**32)
+            for b in cutlass.range(tid, self.padded, self.threads):
+                ids[b] = Int32(_INT32_MAX)
+            for b in cutlass.range(blocks + tid, self.padded, self.threads):
+                keys[b] = pad_key
+            if cutlass.const_expr(self.coalesced):
+                unroll = 8
+                span = blocks * Int32(bs)
+                for base in cutlass.range(0, span, self.threads * unroll):
+                    loaded = []
+                    for u in cutlass.range_constexpr(unroll):
+                        column = base + Int32(u * self.threads) + tid
+                        clamped = column
+                        if clamped >= width:
+                            clamped = width - 1
+                        value = Float32(score_t[q, clamped])
+                        if column >= width:
+                            value = Float32(float("-inf"))
+                        loaded.append(value)
+                    for u in cutlass.range_constexpr(unroll):
+                        value = loaded[u]
+                        offset = 1
+                        while offset < bs:
+                            value = cute.arch.fmax(
+                                value, cute.arch.shuffle_sync_bfly(value, offset=offset)
+                            )
+                            offset = offset * 2
+                        column = base + Int32(u * self.threads) + tid
+                        b = column // Int32(bs)
+                        if (column % Int32(bs) == 0) & (b < blocks):
+                            if Int64(b) == latest:
+                                value = Float32(float("inf"))
+                            bits = bitcast_f32_i32(value + Float32(0.0))
+                            if bits < 0:
+                                bits = bits ^ Int32(0x7FFFFFFF)
+                            keys[b] = bits
+            else:
+                for b in cutlass.range(tid, blocks, self.threads):
+                    value = Float32(float("-inf"))
+                    first = Int64(b) * Int64(bs)
+                    last = first + Int64(bs)
+                    if last > Int64(width):
+                        last = Int64(width)
+                    for column in cutlass.range(first, last, 1):
+                        value = cute.arch.fmax(value, Float32(score_t[q, Int32(column)]))
+                    if Int64(b) == latest:
+                        value = Float32(float("inf"))
+                    bits = bitcast_f32_i32(value + Float32(0.0))
+                    if bits < 0:
+                        bits = bits ^ Int32(0x7FFFFFFF)
+                    keys[b] = bits
+            cute.arch.barrier()
+            # T = K-th largest biased key; every block is selected when K >= blocks.
+            threshold = neg_inf_u
+            if selected_blocks < blocks:
+                threshold = Int64(0)
+                for r in cutlass.range_constexpr(16):
+                    shift = 30 - 2 * r
+                    c1 = threshold + Int64(1 << shift)
+                    c2 = threshold + Int64(2 << shift)
+                    c3 = threshold + Int64(3 << shift)
+                    n12 = Int32(0)
+                    n3 = Int32(0)
+                    for i in cutlass.range_constexpr(per_thread):
+                        key = Int64(keys[tid + i * self.threads]) + bias
+                        if key >= c1:
+                            n12 = n12 + 1
+                        if key >= c2:
+                            n12 = n12 + 65536
+                        if key >= c3:
+                            n3 = n3 + 1
+                    t12, t3 = self._block_sum2(n12, n3, partial, (r % 2) * 2 * warps, lane, warp)
+                    chosen = threshold
+                    if (t12 & 65535) >= selected_blocks:
+                        chosen = c1
+                    if (t12 >> 16) >= selected_blocks:
+                        chosen = c2
+                    if t3 >= selected_blocks:
+                        chosen = c3
+                    threshold = chosen
+            # One scan of packed (above, equal) counts over contiguous chunks.
+            local = Int32(0)
+            for i in cutlass.range_constexpr(per_thread):
+                key = Int64(keys[tid * per_thread + i]) + bias
+                if key > threshold:
+                    local = local + 1
+                if key == threshold:
+                    local = local + 65536
+            inclusive = local
+            offset = 1
+            while offset < 32:
+                other = cute.arch.shuffle_sync(inclusive, lane - offset)
+                if lane >= offset:
+                    inclusive = inclusive + other
+                offset = offset * 2
+            scan_base = 4 * warps
+            if lane == 31:
+                partial[scan_base + warp] = inclusive
+            cute.arch.barrier()
+            warp_total = Int32(0)
+            if lane < warps:
+                warp_total = partial[scan_base + lane]
+            warp_inclusive = warp_total
+            offset = 1
+            while offset < 32:
+                other = cute.arch.shuffle_sync(warp_inclusive, lane - offset)
+                if lane >= offset:
+                    warp_inclusive = warp_inclusive + other
+                offset = offset * 2
+            total = cute.arch.shuffle_sync(warp_inclusive, Int32(31))
+            before_warp = cute.arch.shuffle_sync(warp_inclusive, warp) - partial[scan_base + warp]
+            prefix = before_warp + inclusive - local
+            above = prefix & 65535
+            equal = prefix >> 16
+            take = selected_blocks - (total & 65535)
+            if threshold == neg_inf_u:
+                take = Int32(0)  # ties at -inf are unreachable
+            for i in cutlass.range_constexpr(per_thread):
+                b = tid * per_thread + i
+                key = Int64(keys[b]) + bias
+                taken = equal
+                if taken > take:
+                    taken = take
+                if (key > threshold) | ((key == threshold) & (equal < take)):
+                    ids[above + taken] = Int32(b)
+                if key > threshold:
+                    above = above + 1
+                if key == threshold:
+                    equal = equal + 1
+            cute.arch.barrier()
+
         @cute.kernel
         def kernel(
             self,
@@ -1011,14 +1197,51 @@ def _glue_kernels():
             tid, _, _ = cute.arch.thread_idx()
             q, _, _ = cute.arch.block_idx()
             smem = SmemAllocator()
-            values = smem.allocate_tensor(Float32, cute.make_layout(self.padded), 16)
-            ids = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
-            partial = smem.allocate_tensor(Int32, cute.make_layout(max(self.threads // 32, 1)), 16)
             n = Int64(count)
             block_size = Int64(self.block_size)
             score_t = tensor2d(scores, n, Int64(width), scores_stride)
             visible_length = Int64(tensor1d(visible, n)[q])
             latest = floor_div(visible_length - 1, block_size)
+            if cutlass.const_expr(self.wide):
+                keys = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
+                ids = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
+                partial = smem.allocate_tensor(
+                    Int32, cute.make_layout(5 * max(self.threads // 32, 1)), 16
+                )
+                self._select_wide(
+                    score_t, keys, ids, partial, q, width, blocks, selected_blocks, latest, tid
+                )
+            else:
+                values = smem.allocate_tensor(Float32, cute.make_layout(self.padded), 16)
+                ids = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
+                partial = smem.allocate_tensor(
+                    Int32, cute.make_layout(max(self.threads // 32, 1)), 16
+                )
+                self._select_sorted(
+                    score_t, values, ids, width, blocks, selected_blocks, latest, q, tid
+                )
+            self._publish(
+                output,
+                sparse_ids,
+                sparse_counts,
+                ids,
+                partial,
+                n,
+                q,
+                width,
+                selected_blocks,
+                published_width,
+                output_stride,
+                sparse_stride,
+                visible_length,
+                tid,
+            )
+
+        @cute.jit
+        def _select_sorted(
+            self, score_t, values, ids, width, blocks, selected_blocks, latest, q, tid
+        ):
+            block_size = Int64(self.block_size)
             for b in cutlass.range(tid, self.padded, self.threads):
                 value = Float32(float("-inf"))
                 identifier = Int32(_INT32_MAX)
@@ -1046,6 +1269,26 @@ def _glue_kernels():
                     ids[k] = Int32(_INT32_MAX)
             cute.arch.barrier()
             self._bitonic_sort(values, ids, False, tid)
+
+        @cute.jit
+        def _publish(
+            self,
+            output,
+            sparse_ids,
+            sparse_counts,
+            ids,
+            partial,
+            n,
+            q,
+            width,
+            selected_blocks,
+            published_width,
+            output_stride,
+            sparse_stride,
+            visible_length,
+            tid,
+        ):
+            block_size = Int64(self.block_size)
             out_t = tensor2d(output, n, Int64(published_width), output_stride)
             selected_width = Int64(selected_blocks) * block_size
             local_valid = Int32(0)
