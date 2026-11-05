@@ -246,7 +246,24 @@ def _kernel_receipt(layer, graph_names, eager_names) -> None:
         )
 
 
+def _compare(names, got, ref):
+    """Per-output diffs: list of 'name max_abs a n_diff k/N' for unequal outputs, and max abs."""
+    bad, worst = [], 0.0
+    for name, g, e in zip(names, got, ref):
+        if g.shape != e.shape or g.dtype != e.dtype:
+            bad.append(f"{name} shape/dtype {tuple(g.shape)}/{g.dtype} vs {tuple(e.shape)}/{e.dtype}")
+            worst = float("inf")
+        elif not torch.equal(g, e):
+            d = (g.float() - e.float()).abs()
+            m = d.max().item()
+            worst = max(worst, m)
+            bad.append(f"{name} max_abs {m:.3e} n_diff {int((d != 0).sum().item())}/{d.numel()}")
+    return bad, worst
+
+
 def _verify(layer, state: _LayerGraph, inputs, attn_metadata, graph_names=None) -> None:
+    # Snapshot the graph outputs first: the eager runs below must not be able to alias them.
+    graph_out = tuple(t.clone() for t in state.static_out)
     if graph_names is not None:
         eager, eager_names = _kernel_names(
             lambda: moe_window(layer, *inputs[:5], attn_metadata, inputs[5])
@@ -255,26 +272,29 @@ def _verify(layer, state: _LayerGraph, inputs, attn_metadata, graph_names=None) 
             _kernel_receipt(layer, graph_names, eager_names)
     else:
         eager = moe_window(layer, *inputs[:5], attn_metadata, inputs[5])
+    eager = tuple(t.clone() for t in eager)
+    # Control: main's eager window run again on the same inputs (its own run-to-run spread;
+    # the fused-finalize MoE epilogue accumulates top-k rows with atomics).
+    eager2 = moe_window(layer, *inputs[:5], attn_metadata, inputs[5])
     names = (
         ("residual", "post_mix", "comb_mix", "x_ffn", "ffn_pre")
         if len(eager) == 5
         else ("residual", "ffn_pre")
     )
-    bad = []
-    for name, g, e in zip(names, state.static_out, eager):
-        if g.shape != e.shape or g.dtype != e.dtype or not torch.equal(g, e):
-            diff = (
-                (g.float() - e.float()).abs().max().item() if g.shape == e.shape else float("nan")
-            )
-            bad.append(f"{name} max_abs {diff:.3e}")
+    bad, g_worst = _compare(names, graph_out, eager)
+    bad_ee, e_worst = _compare(names, eager2, eager)
     state.verified += 1
-    stats = _verify_stats["layers"].setdefault(layer.layer_idx, [0, 0])
+    stats = _verify_stats["layers"].setdefault(layer.layer_idx, [0, 0, 0, 0.0, 0.0])
     stats[0] += 1
     stats[1] += 1 if bad else 0
+    stats[2] += 1 if bad_ee else 0
+    stats[3] = max(stats[3], g_worst)
+    stats[4] = max(stats[4], e_worst)
     logger.info(
         f"[TAIL_MOE_GRAPH VERIFY] rank {layer.mapping.rank} layer {layer.layer_idx} "
-        f"replay {state.replays}: {'MISMATCH ' + ', '.join(bad) if bad else 'equal'} "
-        f"({', '.join(names)})"
+        f"replay {state.replays}: graph-vs-eager "
+        f"{'MISMATCH ' + ', '.join(bad) if bad else 'equal'}; eager-vs-eager "
+        f"{'MISMATCH ' + ', '.join(bad_ee) if bad_ee else 'equal'} ({', '.join(names)})"
     )
     layers = _verify_stats["layers"]
     if (
@@ -285,9 +305,14 @@ def _verify(layer, state: _LayerGraph, inputs, attn_metadata, graph_names=None) 
         _verify_stats["reported"] = True
         total = sum(v[0] for v in layers.values())
         mism = sum(v[1] for v in layers.values())
+        mism_ee = sum(v[2] for v in layers.values())
+        g_max = max(v[3] for v in layers.values())
+        e_max = max(v[4] for v in layers.values())
         logger.info(
             f"[TAIL_MOE_GRAPH VERIFY SUMMARY] rank {layer.mapping.rank}: {len(layers)} layers "
-            f"({min(layers)}-{max(layers)}), {total} graphed windows compared, {mism} mismatches"
+            f"({min(layers)}-{max(layers)}), {total} graphed windows compared, {mism} mismatches "
+            f"(max_abs {g_max:.3e}); eager-vs-eager control: {mism_ee} mismatches "
+            f"(max_abs {e_max:.3e})"
         )
 
 
