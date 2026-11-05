@@ -635,6 +635,10 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
         self.callable_e_score_correction_bias = callable_e_score_correction_bias
         self.callable_tid2eid = callable_tid2eid
         self.callable_e_score_correction_bias_vl = callable_e_score_correction_bias_vl
+        # (logits, indices, weights) of the decode fused router (DeepseekV4Gate.fused_forward), which computed
+        # the routing of exactly that logits tensor with gate_forward's arithmetic. Consumed by the next apply().
+        self.fused_routing: Optional[tuple[torch.Tensor, torch.Tensor,
+                                           torch.Tensor]] = None
 
     def apply_with_aux(
         self,
@@ -692,6 +696,13 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
         logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        fused = self.fused_routing
+        if fused is not None:
+            self.fused_routing = None
+            if fused[0] is logits:
+                # The fused router already ran gate_forward's body on these logits (bitwise the same ids and
+                # weights); any other tensor (e.g. a perfect-router swap) is routed below as before.
+                return fused[1], fused[2]
         # gate_forward kernel requires float32 input scores
         logits = logits.to(torch.float32)
         # gate_forward supports target geometries (256/384 experts, top-6),
