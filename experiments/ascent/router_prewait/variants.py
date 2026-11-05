@@ -141,6 +141,88 @@ __global__ __launch_bounds__(640, 1) void rk(float* out, __nv_bfloat16 const* A,
     asm volatile("griddepcontrol.launch_dependents;");
 }
 
+// V9: warp-specialised. 4 extra loader warps cp.async the CTA's whole weight slice (80 KB) into shared memory before
+// (and without) any griddepcontrol.wait; the 20 compute warps execute the wait with no memory op in flight, load A,
+// then meet the loaders at named barrier 1 and read B from shared memory. Same MMA order / reduction as V0.
+template <int M>
+__global__ __launch_bounds__(768, 1) void rk9(float* out, __nv_bfloat16 const* A, __nv_bfloat16 const* B) {
+    constexpr int H = 5120, E = 384, NW = 20, CH = 32, CPW = 8;
+    __shared__ float red[NW][32][4];
+    int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int const n_base = blockIdx.x * 8;
+    if (warp >= NW) {
+        int const lt = threadIdx.x - NW * 32;
+#pragma unroll 4
+        for (int i = lt; i < NW * 32 * CPW; i += 128) {
+            int const c = i / (NW * 32), t = i % (NW * 32);
+            int const w = t / 32, l = t % 32, g = l / 4, q = l % 4;
+            __nv_bfloat16 const* src = B + static_cast<int64_t>(n_base + g) * H + w * (CPW * CH) + q * 8 + c * CH;
+            uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(&dyn_smem[i]));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(src));
+        }
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_all;" ::: "memory");
+        asm volatile("bar.arrive 1, 768;" ::: "memory");
+    } else {
+        int const g = lane / 4, q = lane % 4;
+        int const k_warp = warp * (CPW * CH);
+        __nv_bfloat16 const* ap = A + g * H + k_warp + q * 8;
+        bool const row0_valid = g < M;
+        uint4 const zero4 = make_uint4(0u, 0u, 0u, 0u);
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        uint4 a0[CPW];
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+#pragma unroll
+        for (int c = 0; c < CPW; c++) a0[c] = row0_valid ? *reinterpret_cast<uint4 const*>(ap + c * CH) : zero4;
+        asm volatile("bar.sync 1, 768;" ::: "memory");
+#pragma unroll
+        for (int c = 0; c < CPW; c++) {
+            uint4 const bv = dyn_smem[c * (NW * 32) + threadIdx.x];
+            uint32_t const af0[4] = {a0[c].x, 0u, a0[c].y, 0u};
+            uint32_t const af1[4] = {a0[c].z, 0u, a0[c].w, 0u};
+            uint32_t const bf0[2] = {bv.x, bv.y};
+            uint32_t const bf1[2] = {bv.z, bv.w};
+            float (&accr)[4] = acc;
+            mma16816(accr, af0, bf0);
+            mma16816(accr, af1, bf1);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; i++) red[warp][lane][i] = acc[i];
+    }
+    __syncthreads();
+    if (threadIdx.x < 128) {
+        int const l = threadIdx.x / 4, i = threadIdx.x % 4;
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NW; w++) sum += red[w][l][i];
+        int const row = (l / 4) + (i >= 2 ? 8 : 0);
+        int const col = n_base + (l % 4) * 2 + (i & 1);
+        if (row < M) out[row * E + col] = sum;
+    }
+    asm volatile("griddepcontrol.launch_dependents;");
+}
+
+template <int M>
+static void launch9(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(48);
+    cfg.blockDim = dim3(768);
+    cfg.stream = at::cuda::getCurrentCUDAStream();
+    static bool once = false;
+    if (!once) {
+        cudaFuncSetAttribute(rk9<M>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 640 * 16);
+        once = true;
+    }
+    cfg.dynamicSmemBytes = 8 * 640 * 16;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, rk9<M>, (float*)out.data_ptr(), (__nv_bfloat16 const*)x.data_ptr(),
+                       (__nv_bfloat16 const*)w.data_ptr());
+}
+
 template <int M, int V>
 static void launch(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
     cudaLaunchConfig_t cfg = {};
@@ -174,6 +256,7 @@ static void by_v(int64_t v, torch::Tensor x, torch::Tensor w, torch::Tensor out)
         case 4: launch<M, 4>(x, w, out); break;
         case 5: launch<M, 5>(x, w, out); break;
         case 6: launch<M, 6>(x, w, out); break;
+        case 9: launch9<M>(x, w, out); break;
         default: TORCH_CHECK(false, "variant");
     }
 }
@@ -192,7 +275,7 @@ void router_variant(int64_t variant, torch::Tensor x, torch::Tensor w, torch::Te
 
 HIDDEN, EXPERTS, LAYERS, TOPK, SCALE = 5120, 384, 40, 6, 1.5
 MS = (1, 2, 4, 8)
-VARIANTS = tuple(int(v) for v in os.environ.get("VARIANTS", "0,1,5,6").split(","))
+VARIANTS = tuple(int(v) for v in os.environ.get("VARIANTS", "0,1,9").split(","))
 WARMUP, ITERS = 10, 50
 SEED = 22301
 
