@@ -129,8 +129,8 @@ def eager_ref_hash(ws):
 
 
 class Prod:
-    def __init__(self, spin_ns, grid, traffic_mb, trigger):
-        self.spin_ns, self.grid, self.trigger = int(spin_ns), int(grid), bool(trigger)
+    def __init__(self, spin_ns, grid, traffic_mb, trigger, block=256):
+        self.spin_ns, self.grid, self.trigger, self.block = int(spin_ns), int(grid), bool(trigger), int(block)
         n = int(traffic_mb * 1024 * 1024) // 16 * 16
         self.n = n
         # Distinct read-only slice per layer (as a DRAM-heavy predecessor would stream new bytes each layer).
@@ -141,26 +141,39 @@ class Prod:
             sb = self.buf.view(torch.uint8)[li * self.n:(li + 1) * self.n]
         else:
             sb = pdl_ext.empty()
-        pdl_ext.ext().producer(src, dst, self.spin_ns, self.grid, 256, sb, self.trigger)
+        pdl_ext.ext().producer(src, dst, self.spin_ns, self.grid, self.block, sb, self.trigger)
+
+
+# Stage 0 (job 1065, server trace job 1021, ranks 0-3): the router's predecessor is _mhc_lagged_layer_input_kernel,
+# grid [M] x 128 threads (1 CTA per token), not DRAM-bound; the router starts ~0.7 us after it at c1 (early trigger)
+# and waits p50 4.1-4.6 us (c1) / 2.6-2.9 us (c4) for it to end. Stand-in: grid M x 128, trigger at start, spin so
+# that pred_end - router_start matches those windows.
+SERVER_SPIN_NS = {1: 4800, 2: 4800, 4: 3500, 8: 3500}
+
+
+def server_prod(m):
+    return Prod(SERVER_SPIN_NS[m], m, 0.0, 1, block=128)
 
 
 def bench():
     arm = sys.argv[2] if len(sys.argv) > 2 else "ARM?"
-    spin_ns = float(sys.argv[3]) if len(sys.argv) > 3 else 3000
-    grid = int(sys.argv[4]) if len(sys.argv) > 4 else 24
-    traffic_mb = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
-    trigger = int(sys.argv[6]) if len(sys.argv) > 6 else 1
+    server = len(sys.argv) <= 3 or sys.argv[3] == "server"
+    if not server:
+        spin_ns = float(sys.argv[3])
+        grid = int(sys.argv[4]) if len(sys.argv) > 4 else 24
+        traffic_mb = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
+        trigger = int(sys.argv[6]) if len(sys.argv) > 6 else 1
     import tensorrt_llm  # noqa: F401
     ext = pdl_ext.ext()  # noqa: F841  build before timing
     gen = torch.Generator(device="cuda").manual_seed(SEED)
     ws, bias = make_weights(gen)
-    prod = Prod(spin_ns, grid, traffic_mb, trigger)
     flush = torch.ones(512 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
-    log(f"{arm} producer stand-in: grid {grid} x 256, spin {spin_ns} ns, traffic {traffic_mb} MB/layer, "
-        f"trigger {'start' if trigger else 'end'}")
     batch = {}
     p1_hash = hashlib.sha256()
     for m in MS:
+        prod = server_prod(m) if server else Prod(spin_ns, grid, traffic_mb, trigger)
+        log(f"{arm} M={m} producer stand-in: grid {prod.grid} x {prod.block}, spin {prod.spin_ns} ns, traffic "
+            f"{prod.n / 2**20:.2f} MB/layer, trigger {'start' if prod.trigger else 'end'}")
         xs = make_x(gen, m)
         dsts = [torch.empty_like(x) for x in xs]
         scs = [router(x, w) for x, w in zip(xs, ws)]
@@ -226,7 +239,8 @@ def bench():
     ph = p1_hash.hexdigest()[:16]
     log(f"{arm} output hashes: eager M=1..16 x 40 weights {eh}; P1 graph outputs {ph}")
     print(json.dumps({"arm": arm, "batch": batch, "output": {"class": "exact", "eager_hash": eh, "p1_hash": ph},
-                      "producer": {"spin_ns": spin_ns, "grid": grid, "traffic_mb": traffic_mb, "trigger": trigger}}))
+                      "producer": "server" if server else {"spin_ns": spin_ns, "grid": grid,
+                                                           "traffic_mb": traffic_mb, "trigger": trigger}}))
 
 
 def check():
