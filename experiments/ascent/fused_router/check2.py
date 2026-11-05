@@ -235,7 +235,7 @@ def main():
             if order == "router_first" and i == 5:
                 with torch.cuda.stream(side):
                     aux.launch(20_000_000)
-            poison(wc, bc, i)
+            poison(wc, bc)  # same poison as the reference: unrouted tails must match too
             c = run_cand(x, ws_w[0], b, off, wc, bc, e)
             nb += int(not all(compare(r, c, wr, wc, br, bc).values()))
         torch.cuda.synchronize()
@@ -267,16 +267,20 @@ def main():
             fused_out = state.run(x, ids, wts).clone()
             again = state.run(x, ids0, w0).clone()  # no stash: plain route
             d = (fused_out.float() - base_out.float()).abs().max().item()
+            # fc2_finalize scatter-adds the top-k rows with atomics: main's own output varies run to run (pitfall
+            # 990). Tolerance = 2x main's run-to-run spread or 2^-6 of the output amplitude (a few bf16 ulps).
+            nd = (again.float() - base_out.float()).abs().max().item()
+            tol = max(2.0 * nd, base_out.float().abs().max().item() * 2.0 ** -6)
             key = f"{lname}_M{m}"
             local_pairs = int(((ids0 >= slot) & (ids0 < slot + e_loc)).sum())
-            leaf[key] = {"bitwise_vs_plain": same(fused_out, base_out), "max_abs_diff": d,
+            leaf[key] = {"bitwise_vs_plain": same(fused_out, base_out), "max_abs_diff": d, "main_repeat_diff": nd,
+                         "tol": tol, "within_tol": d <= tol,
                          "plain_repeat_bitwise": same(again, base_out), "stash_cleared": state._prerouted is None,
                          "finite": bool(torch.isfinite(fused_out.float()).all()), "local_pairs": local_pairs}
             # a stash for another x is ignored
             state.set_prerouted(make_x(m, 0), ids, wts, ws, buf)
             other = state.run(x, ids0, w0).clone()
-            leaf[key]["foreign_stash_ignored"] = same(other, base_out) or \
-                (other.float() - base_out.float()).abs().max().item() <= d
+            leaf[key]["foreign_stash_ignored"] = (other.float() - base_out.float()).abs().max().item() <= tol
             # module path: DeepseekV4Gate.fused_forward(decode_state) -> routing_method.apply -> state.run
             gm = DeepseekV4Gate(hidden_size=HIDDEN, num_experts=EXPERTS, top_k=6, n_group=1, topk_group=1,
                                 routed_scaling_factor=SCALE, is_hashed=False, vocab_size=1024,
@@ -289,15 +293,14 @@ def main():
             mod_out = state.run(x, gi, gw).clone()
             leaf[key]["module_stage2"] = took_stage2
             leaf[key]["module_routing_bitwise"] = bool(torch.equal(gi, ids0)) and same(gw, w0)
-            leaf[key]["module_out_ok"] = same(mod_out, base_out) or \
-                (mod_out.float() - base_out.float()).abs().max().item() <= d
+            leaf[key]["module_out_ok"] = (mod_out.float() - base_out.float()).abs().max().item() <= tol
             leaf[key]["module_stash_cleared"] = state._prerouted is None and gm.routing_method.fused_routing is None
             del gm
         del state
         torch.cuda.empty_cache()
     res["leaf"] = leaf
     for m, v in leaf.items():
-        if not (v["finite"] and v["stash_cleared"] and (v["bitwise_vs_plain"] or not v["plain_repeat_bitwise"])
+        if not (v["finite"] and v["stash_cleared"] and v["within_tol"]
                 and v["foreign_stash_ignored"] and v["module_stage2"] and v["module_routing_bitwise"]
                 and v["module_out_ok"] and v["module_stash_cleared"] and v["local_pairs"] > 0):
             fails.append({"stage": "leaf", "m": m, **v})

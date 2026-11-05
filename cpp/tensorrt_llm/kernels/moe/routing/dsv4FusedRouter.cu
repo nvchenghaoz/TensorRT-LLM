@@ -121,6 +121,8 @@ constexpr int kQTiles = kHiddenDim / kQTileK;   // 40 exponent tiles per token
 constexpr int kSfPack = 4;                      // exponents per int32 scale word
 constexpr int kSfBlocks = kQTiles / kSfPack;     // 10 scale words per routed row
 constexpr int kMaxPairs = kMaxTokens * kTopK;   // 48
+static_assert(kNumWarps * 2 == kQTiles && kChunksPerWarp * kChunk == 2 * kQTileK,
+    "each warp's GEMV k-range is exactly two q0 tiles");
 
 template <int kNumTokens, bool kRoute>
 __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRouterParams const __grid_constant__ p)
@@ -391,23 +393,27 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
 
         // _mxfp8_q0_route_direct_kernel: per token and 128-wide tile, amax (floor 1e-4) -> ue8m0 exponent
         // (amax / 448, rounded up, clamped to 1..254) -> e4m3 of x / 2^(exp-127), scattered to the token's routed rows.
-        for (int tile = warpId; tile < kNumTokens * kQTiles; tile += kNumWarps)
-        {
-            int const t = tile / kQTiles;
-            int const kt = tile % kQTiles;
-            uint2 const raw = __ldcg(reinterpret_cast<uint2 const*>(p.x + t * kHiddenDim + kt * kQTileK + lane * 4));
-            __nv_bfloat162 const h0 = *reinterpret_cast<__nv_bfloat162 const*>(&raw.x);
-            __nv_bfloat162 const h1 = *reinterpret_cast<__nv_bfloat162 const*>(&raw.y);
-            float const v0 = __low2float(h0);
-            float const v1 = __high2float(h0);
-            float const v2 = __low2float(h1);
-            float const v3 = __high2float(h1);
-            float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+        // The x values come from this CTA's GEMV operand registers (a0, loaded after the wait): warp w holds tiles
+        // 2w (chunks 0..3) and 2w+1 (chunks 4..7) of token g, lanes 4g..4g+3 (q) splitting each tile's 128 values.
+        // amax is a max (order-free) and the rest is elementwise, so this is bitwise the per-tile kernel.
 #pragma unroll
-            for (int off = 16; off > 0; off /= 2)
+        for (int h = 0; h < 2; ++h)
+        {
+            int const kt = 2 * warpId + h;
+            float amax = 0.0f;
+#pragma unroll
+            for (int cc = 0; cc < 4; ++cc)
             {
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+                __nv_bfloat162 const* hv = reinterpret_cast<__nv_bfloat162 const*>(&a0[h * 4 + cc]);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    amax = fmaxf(amax, fmaxf(fabsf(__low2float(hv[j])), fabsf(__high2float(hv[j]))));
+                }
             }
+            // lanes of one token differ only in q = lane % 4 (rows g >= kNumTokens hold zeros and are not stored)
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
             amax = fmaxf(amax, 1.0e-4f);
             float const sf = kQuantDiv(amax, 448.0f);
             uint32_t const bitsSf = __float_as_uint(sf);
@@ -415,20 +421,36 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
             exp = min(max(exp, 1), 254);
             float const sfE8 = __uint_as_float(static_cast<uint32_t>(exp) << 23);
             float const inv = kQuantDiv(1.0f, sfE8);
-            uint32_t const packed = packE4m3x4(v0 * inv, v1 * inv, v2 * inv, v3 * inv);
+            if (row0Valid)
+            {
+                uint2 packed[4];
 #pragma unroll
-            for (int s = 0; s < kTopK; ++s)
-            {
-                int const r = smDst[t * kTopK + s];
-                if (r >= 0)
+                for (int cc = 0; cc < 4; ++cc)
                 {
-                    *reinterpret_cast<uint32_t*>(p.qOut + static_cast<int64_t>(r) * kHiddenDim + kt * kQTileK + lane * 4)
-                        = packed;
+                    __nv_bfloat162 const* hv = reinterpret_cast<__nv_bfloat162 const*>(&a0[h * 4 + cc]);
+                    packed[cc].x = packE4m3x4(__low2float(hv[0]) * inv, __high2float(hv[0]) * inv,
+                        __low2float(hv[1]) * inv, __high2float(hv[1]) * inv);
+                    packed[cc].y = packE4m3x4(__low2float(hv[2]) * inv, __high2float(hv[2]) * inv,
+                        __low2float(hv[3]) * inv, __high2float(hv[3]) * inv);
                 }
-            }
-            if (lane == 0)
-            {
-                smExp[t][kt] = static_cast<uint32_t>(exp);
+#pragma unroll
+                for (int s = 0; s < kTopK; ++s)
+                {
+                    int const r = smDst[g * kTopK + s];
+                    if (r >= 0)
+                    {
+                        uint8_t* dstRow = p.qOut + static_cast<int64_t>(r) * kHiddenDim + kWarp + h * 4 * kChunk + q * 8;
+#pragma unroll
+                        for (int cc = 0; cc < 4; ++cc)
+                        {
+                            *reinterpret_cast<uint2*>(dstRow + cc * kChunk) = packed[cc];
+                        }
+                    }
+                }
+                if (q == 0)
+                {
+                    smExp[g][kt] = static_cast<uint32_t>(exp);
+                }
             }
         }
         __syncthreads();
