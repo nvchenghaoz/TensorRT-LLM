@@ -53,7 +53,6 @@ namespace
 {
 
 constexpr int kWoRowPad = 32;
-constexpr bool kTriggerAtStart = true;
 
 struct WoaParams
 {
@@ -186,6 +185,9 @@ template <int WARPS, int CLUSTER_K, int RT>
 __global__ void __launch_bounds__(WARPS * 32) csa2_lowm_wo_a_kernel(WoaParams const p, int red_aliased)
 {
 #if CSA2_LOW_M_WO_ENABLED
+    // Trigger the dependents right after the pre-wait weight staging: the wo_b kernel that follows only stages its
+    // own weights before its griddepcontrol.wait, so its staging overlaps this kernel.
+    constexpr bool kTriggerAtStart = true;
     constexpr int kThreads = WARPS * 32;
     constexpr int kRows = 16 * RT;
     constexpr int kTile = kRows * 8;
