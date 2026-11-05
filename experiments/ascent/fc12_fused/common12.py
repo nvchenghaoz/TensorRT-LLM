@@ -60,11 +60,11 @@ def uniform_routing(m, seed):
     return torch.tensor(ids, dtype=torch.int32).cuda(), w.cuda(), cnt[r0]
 
 
-def make_state(enable_pdl=True):
+def make_state(enable_pdl=True, seed=0):
     from tensorrt_llm._torch.moe.fused_moe.cutlass import w4a8_mxfp4_mxfp8_sm12x_decode as leaf
 
-    torch.manual_seed(0)
-    w1, s1, w2, s2 = _common.make_weights()
+    torch.manual_seed(seed)
+    w1, s1, w2, s2 = _common.make_weights(seed=seed)
     w31, s31, w2v, s2s = _common.trtllm_layout(w1, s1, w2, s2)
     del w1, s1, w2, s2
     st = leaf.Sm12xW4a8DecodeState(
@@ -110,11 +110,12 @@ class Runner:
         offsets, token_map, rw, a_q, a_sf = route(
             x, ids, w, st.num_experts, workspace=ws, enable_pdl=st.enable_pdl,
             expert_offset=st.slot_start, zero_buf=buf)
-        if mode == "base":
+        if mode in ("base", "base_fc1"):
             fc1(a_q, a_sf, st.w1, st.w1_sf, offsets, tune=False, enable_pdl=st.enable_pdl,
                 out_q=q1, out_sf=sf1, activation=fi_act.Swiglu, swiglu_limit=st.swiglu_limit)
-            fc2(q1, sf1, st.w2, st.w2_sf, offsets, token_map, rw, m, tune=False,
-                enable_pdl=st.enable_pdl, out=out)
+            if mode == "base":
+                fc2(q1, sf1, st.w2, st.w2_sf, offsets, token_map, rw, m, tune=False,
+                    enable_pdl=st.enable_pdl, out=out)
         else:
             self.fk.cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4(
                 a_q, a_sf, st.w1, st.w1_sf, offsets, st.w2, st.w2_sf, token_map, rw, m,

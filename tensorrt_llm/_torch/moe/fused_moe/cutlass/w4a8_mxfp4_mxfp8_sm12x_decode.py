@@ -44,10 +44,33 @@ FI_DECODE_MAX_TOKENS = int(os.environ.get("TRTLLM_SM12X_W4A8_FI_DECODE_MAX_TOKEN
 
 _ENABLE_ENV = "TRTLLM_SM12X_W4A8_FI_DECODE"
 
+#: Run fc1_act_q1 + fc2_finalize as ONE persistent kernel (FlashInfer SM12x
+#: kernel_moe_mxfp8_mxfp4_fc12_fused.py: one atomic work counter, all fc1 units before any fc2
+#: tile, per-expert release/acquire counters) when the FlashInfer build has it and the route
+#: zero-fills the outputs itself; "0" keeps the two-kernel chain.
+FC12_FUSED = os.environ.get("TRTLLM_SM12X_FI_FC12_FUSED", "1") == "1"
+
 _LOCK = threading.Lock()
 _OPS = None  # (route, make_ws, fc1, out_sf_shape, fc2, FiActivation) once imported
+_FUSED_OP = None  # the fused fc1+fc2 entry point, or False when unavailable
 _WARMED: set = set()
 _WORKSPACES: dict = {}
+
+
+def _fused_op():
+    global _FUSED_OP
+    if _FUSED_OP is None:
+        _FUSED_OP = False
+        if FC12_FUSED:
+            try:
+                from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.kernel_moe_mxfp8_mxfp4_fc12_fused import (
+                    cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4,
+                )
+
+                _FUSED_OP = cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4
+            except ImportError as e:
+                logger.info(f"SM12x fused fc1+fc2 decode kernel unavailable: {e!r}")
+    return _FUSED_OP
 
 
 def _load_ops():
@@ -223,6 +246,14 @@ class Sm12xW4a8DecodeState:
             offsets, token_map, route_weights, a_q, a_sf = route(
                 x, ids, weights, self.num_experts, workspace=ws, enable_pdl=self.enable_pdl
             )
+        fused_fc12 = _fused_op() if fused else False
+        if fused_fc12:
+            # q1/sf1 bitwise those of fc1_act_q1; out differs only by the scatter atomics'
+            # order, as main's own fc2_finalize does from replay to replay.
+            fused_fc12(a_q, a_sf, self.w1, self.w1_sf, offsets, self.w2, self.w2_sf,
+                       token_map, route_weights, m, out_q=q1, out_sf=sf1, out=out,
+                       swiglu_limit=self.swiglu_limit, enable_pdl=self.enable_pdl)
+            return out
         fc1(a_q, a_sf, self.w1, self.w1_sf, offsets, tune=False, enable_pdl=self.enable_pdl,
             out_q=q1, out_sf=sf1, activation=fi_act.Swiglu, swiglu_limit=self.swiglu_limit)
         fc2(q1, sf1, self.w2, self.w2_sf, offsets, token_map, route_weights, m, tune=False,
@@ -237,7 +268,7 @@ class Sm12xW4a8DecodeState:
         arguments, so each batch size up to the threshold is run once.
         """
         key = (self.hidden, self.inter, self.num_experts, top_k, self.enable_pdl,
-               self.swiglu_limit)
+               self.swiglu_limit, self.slot_start, bool(_route_fuses_prologue() and _fused_op()))
         with _LOCK:
             if key in _WARMED:
                 return
