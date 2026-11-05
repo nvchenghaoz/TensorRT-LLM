@@ -917,8 +917,10 @@ def _glue_kernels():
         def __init__(self, block_size: int, padded_blocks: int, sparse_block: int = 0):
             if block_size <= 0 or padded_blocks <= 0 or padded_blocks & (padded_blocks - 1):
                 raise ValueError("CSA2 candidate publication needs a power-of-two block capacity")
-            if padded_blocks > 4096:
-                raise ValueError("CSA2 candidate publication supports up to 4096 blocks")
+            if padded_blocks > 8192:
+                # 8192 fp32 values + int32 ids = 64 KB of dynamic shared memory
+                # (above the 48 KB default; SM120 opts in up to 99 KB per block).
+                raise ValueError("CSA2 candidate publication supports up to 8192 blocks")
             if sparse_block < 0 or (sparse_block and block_size % sparse_block):
                 raise ValueError("CSA2 sparse blocks must divide the candidate block")
             self.block_size = block_size
@@ -2136,7 +2138,7 @@ def publish_candidates_(
     blocks = -(-width // block_size)
     if count == 0:
         return True
-    if blocks == 0 or blocks > 4096 or block_size <= 0:
+    if blocks == 0 or blocks > 8192 or block_size <= 0:
         return False
     published_width = int(output.shape[1])
     selected_blocks = min(int(top_k_blocks), blocks)
