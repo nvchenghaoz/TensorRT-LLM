@@ -65,7 +65,8 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import stor
 CANDIDATE = hasattr(DeepseekV41Attention, "_lowm_wo_follows")
 GROUP_SIZES = (5, 5, 5, 5, 5, 5, 4, 4)
 LAYERS = [(128, 0), (128, 0)] + [(640, 1 + g) for g, n in enumerate(GROUP_SIZES) for _ in range(n)]
-K_PREP, K_BODY, K_MERGE, K2, K3 = ("_cake_index_prep_kernel", "decode_body", "CakeMergeF32Kernel",
+K_PREP, K_BODY, K_MERGE, K2, K3 = ("_cake_index_prep_kernel", "kernel_sm120_dsv41_mixed_sparse_mla",
+                                   "CakeMergeF32Kernel",
                                    "csa2_lowm_wo_a_kernel", "csa2_mxfp8_low_m_gemm_kernel")
 ART = Path(os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp/cake_q1"))
 ART.mkdir(parents=True, exist_ok=True)
