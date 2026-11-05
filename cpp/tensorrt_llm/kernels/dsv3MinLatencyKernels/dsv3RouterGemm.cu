@@ -242,6 +242,27 @@ __device__ __forceinline__ void routerGemmMma(float* out, __nv_bfloat16 const* m
 
     float acc[kTilesN][4] = {};
 
+    // When the whole K-slice of a warp fits in one load batch (384 x 5120, 640 threads: 8 chunks per warp) and
+    // there is no latent output, issue the weight (B) loads before the PDL wait: the weights are constants that no
+    // predecessor kernel writes, so their DRAM latency overlaps the predecessor's tail. Activation (A) loads stay
+    // after the wait. MMA order and the reduction are unchanged (bitwise). Other instances keep the old path.
+    constexpr bool kPreWaitWeights = (kChunksPerWarp == kBatch) && (kLatentDim == 0);
+    uint4 b_pre[kPreWaitWeights ? kBatch : 1][kTilesN];
+    if constexpr (kPreWaitWeights)
+    {
+        int const k_lane = k_warp + q * 8;
+#pragma unroll
+        for (int c = 0; c < kBatch; c++)
+        {
+#pragma unroll
+            for (int t = 0; t < kTilesN; t++)
+            {
+                b_pre[c][t] = *reinterpret_cast<uint4 const*>(
+                    mat_b + static_cast<int64_t>(n_base + t * 8 + g) * kHiddenDim + k_lane + c * kChunk);
+            }
+        }
+    }
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
@@ -277,8 +298,15 @@ __device__ __forceinline__ void routerGemmMma(float* out, __nv_bfloat16 const* m
 #pragma unroll
             for (int t = 0; t < kTilesN; t++)
             {
-                b[c][t] = *reinterpret_cast<uint4 const*>(
-                    weight + static_cast<int64_t>(weightColumn + t * 8 + g) * kHiddenDim + k);
+                if constexpr (kPreWaitWeights)
+                {
+                    b[c][t] = b_pre[c][t];
+                }
+                else
+                {
+                    b[c][t] = *reinterpret_cast<uint4 const*>(
+                        weight + static_cast<int64_t>(weightColumn + t * 8 + g) * kHiddenDim + k);
+                }
             }
         }
 #pragma unroll
