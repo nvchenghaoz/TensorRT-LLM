@@ -1512,6 +1512,9 @@ _DSV4_FUSED_ROUTER = os.environ.get("TRTLLM_DSV4_FUSED_ROUTER", "1") == "1"
 # ... and, when the routed experts take the SM12x FlashInfer decode chain, also its route_assign_decode + MXFP8 q0
 # (written into the chain's route workspace, so the chain skips route()). TRTLLM_DSV4_FUSED_ROUTER_ROUTE=0: off.
 _DSV4_FUSED_ROUTER_ROUTE = os.environ.get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE", "1") == "1"
+# Stage 2 runs route + q0 in the router's last CTA: it pays at 1-2 tokens; above that Stage 1 + FlashInfer's route
+# is faster (same-GPU 40-layer chain behind the real mHC K1, EP4 and EP2xTP2).
+_DSV4_FUSED_ROUTER_ROUTE_MAX_M = int(os.environ.get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE_MAX_M", "2"))
 
 
 class DeepseekV4Gate(nn.Module):
@@ -1643,6 +1646,7 @@ class DeepseekV4Gate(nn.Module):
         if (
             decode_state is not None
             and _DSV4_FUSED_ROUTER_ROUTE
+            and hidden_states.shape[0] <= _DSV4_FUSED_ROUTER_ROUTE_MAX_M
             and hasattr(torch.ops.trtllm, "dsv4_fused_router_route")
         ):
             pre = decode_state.preroute_buffers(hidden_states, self.top_k)

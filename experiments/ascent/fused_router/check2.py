@@ -291,7 +291,9 @@ def main():
             took_stage2 = state._prerouted is not None
             gi, gw = gm.routing_method.apply(lg)
             mod_out = state.run(x, gi, gw).clone()
-            leaf[key]["module_stage2"] = took_stage2
+            # fused_forward takes Stage 2 exactly at M <= TRTLLM_DSV4_FUSED_ROUTER_ROUTE_MAX_M (2), else Stage 1
+            leaf[key]["module_stage2"] = took_stage2 == (m <= int(os.environ.get(
+                "TRTLLM_DSV4_FUSED_ROUTER_ROUTE_MAX_M", "2")))
             leaf[key]["module_routing_bitwise"] = bool(torch.equal(gi, ids0)) and same(gw, w0)
             leaf[key]["module_out_ok"] = (mod_out.float() - base_out.float()).abs().max().item() <= tol
             leaf[key]["module_stash_cleared"] = state._prerouted is None and gm.routing_method.fused_routing is None

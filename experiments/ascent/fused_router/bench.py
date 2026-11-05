@@ -31,6 +31,7 @@ import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
 
 WARMUP, ITERS = 5, 40
+ROUTE_MAX_M = int(os.environ.get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE_MAX_M", "2"))  # modeling_deepseekv4.py's gate
 K1_P = 224  # fused_half_fma bigfuse 256 tactic's phase-2 threads (4 warps per K1 program)
 CASES = [("ep4", 96, 2304, 0, m) for m in (1, 2, 4, 8)] + [("ep2tp2", 192, 1152, 192, m) for m in (1, 2, 4)]
 
@@ -63,12 +64,14 @@ def main():
 
     cand_tree = has_fused()
     has_route = hasattr(torch.ops.trtllm, "dsv4_fused_router_route")
-    arms = ["BASE", "CAND1", "CAND"] if args.both else (["CAND1", "CAND"] if cand_tree else ["BASE"])
+    arms = ["BASE", "CAND1", "CAND2"] if args.both else (["CAND"] if cand_tree else ["BASE"])
     assert all(a == "BASE" for a in arms) or (cand_tree and has_route)
     kname = {"BASE": "router_gemm_mma_kernel+gate_forward_kernel | route: _route_assign_decode_kernel+"
                      "_mxfp8_q0_route_direct_kernel",
              "CAND1": "dsv4FusedRouterKernel<M,false> | route: _route_assign_decode_kernel+_mxfp8_q0_route_direct_kernel",
-             "CAND": "dsv4FusedRouterKernel<M,true> (route+q0 fused) | route: none"}
+             "CAND2": "dsv4FusedRouterKernel<M,true> (route+q0 fused) | route: none",
+             "CAND": f"production policy: dsv4FusedRouterKernel<M,true> at M<={ROUTE_MAX_M} (no route kernels), "
+                     f"else dsv4FusedRouterKernel<M,false> + _route_assign_decode_kernel+_mxfp8_q0_route_direct_kernel"}
     main_arm = arms[-1]
     dev = "cuda"
     log("arms", arms, "judged", main_arm, torch.cuda.get_device_name(), {a: kname[a] for a in arms})
@@ -94,9 +97,10 @@ def main():
             log(f"decode state E={state.num_experts} inter={state.inter} slot_start={state.slot_start}")
 
         def row(arm, li, x, with_run):
-            if arm == "CAND" and with_run:
+            # CAND = production policy (DeepseekV4Gate.fused_forward): Stage 2 at M <= ROUTE_MAX_M, else Stage 1
+            if (arm == "CAND2" or (arm == "CAND" and m <= ROUTE_MAX_M)) and with_run:
                 ids, wts, _ = fused_route(state, x, rws[li], bs[li], counters[li])
-            elif arm in ("CAND", "CAND1"):
+            elif arm in ("CAND", "CAND1", "CAND2"):
                 ids, wts, _ = fused(x, rws[li], bs[li], counters[li])
             else:
                 ids, wts = gate_main(router_main(x, rws[li]), bs[li])
@@ -123,7 +127,7 @@ def main():
             for arm in arms:
                 ci, cw = row(arm, li, xs[li], False)
                 ok = torch.equal(ri, ci) and torch.equal(rw.view(torch.int32), cw.view(torch.int32))
-                if arm == "CAND":
+                if arm in ("CAND", "CAND2"):
                     fi, fw, _ = fused_route(state, xs[li], rws[li], bs[li], counters[li])
                     assert state._prerouted is not None
                     o = state.run(xs[li], fi, fw)
@@ -152,7 +156,7 @@ def main():
         graphs = {}
         for arm in arms:
             for kind in kinds:
-                if arm == "CAND" and kind == "REAL":
+                if arm in ("CAND", "CAND2") and kind == "REAL":
                     continue  # Stage 2 without its run() is not a router row; CAND1:REAL is
                 graphs[f"{arm}:{kind}"] = capture(mk(arm, kind))[0]
         if lay == "ep4":
@@ -186,7 +190,7 @@ def main():
         if "K1_NULL" in r:
             log(f"{label} K1_NULL (K1 -> null) {r['K1_NULL']['us_layer']:.3f} us/layer")
         if args.both:
-            for c in ("CAND1", "CAND"):
+            for c in ("CAND1", "CAND2"):
                 d = {k: r[f"{c}:{k}"]["us_layer"] - r[f"BASE:{k}"]["us_layer"] for k in kinds if f"{c}:{k}" in r}
                 log(f"{label} {c}-BASE us/layer: " + " ".join(f"{k}={v:+.3f}" for k, v in d.items()))
         out[label] = {"kernel_ms": r[f"{main_arm}:REAL_RUN"]["ms"], "noise_floor": r[f"{main_arm}:REAL_RUN"]["noise"]}
