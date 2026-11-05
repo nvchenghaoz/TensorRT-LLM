@@ -242,6 +242,32 @@ __device__ __forceinline__ void routerGemmMma(float* out, __nv_bfloat16 const* m
 
     float acc[kTilesN][4] = {};
 
+    // When the whole K-slice of a warp fits in one load batch (384 x 5120, 640 threads: 8 chunks per warp) and
+    // there is no latent output, issue the first kPreWaitChunks weight (B) chunks before the PDL wait: the weights
+    // are constants that no predecessor kernel writes, so their DRAM latency overlaps the predecessor's tail (in the
+    // DeepSeek-V4.1 decode step the predecessor is the mHC layer-input kernel, which releases the router early).
+    // Activation (A) loads and the remaining B chunks stay after the wait. MMA order and the reduction are unchanged
+    // (bitwise). Depth 2 of 8: deeper pre-wait loading saves more behind a long predecessor but slows the kernel by
+    // 2-9% when there is no PDL window (RTX PRO 6000, 40-layer chain); depth 2 is neutral there. Other instances
+    // keep the old path.
+    constexpr bool kPreWaitWeights = (kChunksPerWarp == kBatch) && (kLatentDim == 0);
+    constexpr int kPreWaitChunks = kPreWaitWeights ? 2 : 0;
+    uint4 b_pre[kPreWaitWeights ? kPreWaitChunks : 1][kTilesN];
+    if constexpr (kPreWaitWeights)
+    {
+        int const k_lane = k_warp + q * 8;
+#pragma unroll
+        for (int c = 0; c < kPreWaitChunks; c++)
+        {
+#pragma unroll
+            for (int t = 0; t < kTilesN; t++)
+            {
+                b_pre[c][t] = *reinterpret_cast<uint4 const*>(
+                    mat_b + static_cast<int64_t>(n_base + t * 8 + g) * kHiddenDim + k_lane + c * kChunk);
+            }
+        }
+    }
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
@@ -277,8 +303,15 @@ __device__ __forceinline__ void routerGemmMma(float* out, __nv_bfloat16 const* m
 #pragma unroll
             for (int t = 0; t < kTilesN; t++)
             {
-                b[c][t] = *reinterpret_cast<uint4 const*>(
-                    weight + static_cast<int64_t>(weightColumn + t * 8 + g) * kHiddenDim + k);
+                if (kPreWaitWeights && batch + c < kPreWaitChunks)
+                {
+                    b[c][t] = b_pre[(batch + c < kPreWaitChunks) ? c : 0][t];
+                }
+                else
+                {
+                    b[c][t] = *reinterpret_cast<uint4 const*>(
+                        weight + static_cast<int64_t>(weightColumn + t * 8 + g) * kHiddenDim + k);
+                }
             }
         }
 #pragma unroll
