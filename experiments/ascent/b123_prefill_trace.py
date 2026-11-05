@@ -90,9 +90,29 @@ def http(url, body=None, timeout=900):
         return {"text": txt[:300]}
 
 
+_BUILDER = [None]
+
+
+def real_prompt():
+    """B123_REAL=1: the frozen harness's real-text prompts (common.PromptBuilder, 32768 shared + 2048 unique)."""
+    if _BUILDER[0] is None:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ascent-benchmark"))
+        import common  # noqa: E402
+        tok = common.load_tokenizer(CKPT[0])
+        _BUILDER[0] = common.PromptBuilder(tok, PREFIX, SUFFIX)
+    i = _sfx[0]
+    _sfx[0] += 1
+    return _BUILDER[0].prompt(f"prof-prefill-{i}").text
+
+
+CKPT = [None]
+REAL = os.environ.get("B123_REAL", "0") == "1"
+
+
 def stream_ttft(url, n):
     """One streaming request; returns ttft_s (first choices chunk), total_s and usage."""
-    body = {"model": MODEL, "prompt": PREFIX_IDS + suffix(), "max_tokens": n, "temperature": 0.0,
+    body = {"model": MODEL, "prompt": real_prompt() if REAL else PREFIX_IDS + suffix(), "max_tokens": n,
+            "temperature": 0.0,
             "ignore_eos": True, "stream": True, "stream_options": {"include_usage": True}}
     req = urllib.request.Request(f"{url}/v1/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
@@ -358,6 +378,7 @@ def diff_tables(a, b, key, top=45):
 
 def main():
     ckpt = sys.argv[1]
+    CKPT[0] = ckpt
     arms = (sys.argv[2] if len(sys.argv) > 2 else "ep4,ep2tp2").split(",")
     ART.mkdir(parents=True, exist_ok=True)
     log(f"engine overlay in tree: {ENGINE}; arms {arms}")
