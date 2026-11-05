@@ -49,9 +49,8 @@ def main():
         max_seq_len=36864,
     )
     print(f"[verify] LLM ready in {time.time() - t0:.0f}s", flush=True)
-    tok = llm.tokenizer
     rng = random.Random(0)
-    vocab = tok.vocab_size if hasattr(tok, "vocab_size") else 100000
+    vocab = 100000  # tokenizer.vocab_size raises NotImplementedError here; ids < 100000 are valid
     sp = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
     out = []
     for i in range(steps):
