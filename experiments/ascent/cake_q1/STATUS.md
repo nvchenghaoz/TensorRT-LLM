@@ -1,3 +1,8 @@
+# Branch 157 session 9, node smc521ge-0072 (new lease)
+- Jobs 1486 and 1515 were both cancelled while queued (no slot, empty log, never ran): infrastructure, not evidence.
+- Resubmitting the same server_audit.py (arms W,A1,A1b,A2,A3) on 4 GPUs, timeout_s 10800 (cold slot build ~24 min
+  + 5 model loads). Code commit 1c78969e unchanged. A stall at the first warmup forward is a NODE SUSPECT (11:4x rule).
+
 # Branch 157 (idea 296, build_on 145) session 8, 11:2x PST 11-05, node smc521ge-0109
 - Job 1486 (4-GPU audit) was cancelled while queued; it never ran (no slot, empty log). Not evidence.
 - Resubmitted server_audit.py with arms W,A1,A1b,A2,A3 (W writes the shared TLLM_AUTOTUNER_CACHE_PATH and records
