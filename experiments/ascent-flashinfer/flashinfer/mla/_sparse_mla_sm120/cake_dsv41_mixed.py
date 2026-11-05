@@ -1036,7 +1036,7 @@ def get_cake_sparse_mla_sm120_dsv41_mixed_module():
             hb_major,
             sm_scale,
             lse_scale,
-            enable_pdl,
+            int(bool(enable_pdl)),  # binding int64: bit 0 = PDL attribute (bit 1 is the TRT-LLM trigger-first)
         )
 
     @register_fake_op("flashinfer::cake_sparse_mla_sm120_dsv41_mixed_decode")

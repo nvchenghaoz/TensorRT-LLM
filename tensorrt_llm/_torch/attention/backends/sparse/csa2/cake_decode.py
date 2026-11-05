@@ -340,8 +340,14 @@ class CakeDecode:
         scale,
         out,
         mapping=None,
+        pdl_consumer=False,
     ):
-        """``out[i]`` = sink attention of ``q[i]`` over its selected SWA and main rows."""
+        """``out[i]`` = sink attention of ``q[i]`` over its selected SWA and main rows.
+
+        ``pdl_consumer``: the next launch is a PDL kernel that reads ``out`` only after its
+        griddepcontrol.wait (csa2_lowm_wo_a), so the fp32 split merge may trigger its
+        dependents first (binding ``enable_pdl`` bit 1). Launch attributes only; same math.
+        """
         from flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed import (
             cake_sparse_mla_sm120_dsv41_mixed_decode,
         )
@@ -396,7 +402,7 @@ class CakeDecode:
                 plan.hb_major,
                 float(scale),
                 1.0,
-                enable_pdl,
+                int(bool(enable_pdl)) | (2 if pdl_consumer else 0),
             )
             return out
         variant = "default" if self._use_f32(heads) else None
