@@ -24,6 +24,7 @@ ARGS = (HC, HID, 1e-6, 1e-6, 1e-6, 2.0, 20)
 MS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "128,512,1024,2048,4096,8192").split(",")]
 ITERS = int(os.environ.get("ITERS", "20"))
 REPS = int(os.environ.get("REPS", "5"))
+FIX_MS = [int(x) for x in os.environ.get("FIX_MS", "2048").split(",")]
 
 flush = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
 
@@ -65,6 +66,23 @@ for M in MS:
                    "rep_medians_us": [round(m * 1000, 1) for m in meds]}
     print(f"M={M}: tactic {tac} {med*1000:.1f} us noise {max(noises):.3f} reps {out[str(M)]['rep_medians_us']}",
           flush=True)
+    if M in FIX_MS:
+        # Diagnostic (area lead 13:3x): fixed-tactic full-op time of v1 <24,3>, v1 <24,4> and, when the
+        # tree offers it, the mtile_v2 id (tile_m = 16 + 4), same cold-L2 timing, V4.1-lagged call.
+        rn = mhc_cuda.MhcFusedHcRunner(*ARGS)
+        offered = set(tuple(t) for t in rn.get_valid_tactics(inputs, None))
+        fixed = {}
+        for t in [("fused_half_fma", 24, 1, 256, 3), ("fused_half_fma", 24, 1, 256, 4),
+                  ("fused_half_fma", 24, 1, 256, 20)]:
+            if t not in offered:
+                continue
+            ftn = lambda t=t: rn.forward(inputs, tactic=list(t), **kw)  # noqa: E731
+            for _ in range(5):
+                ftn()
+            fm = sorted(time_fn(ftn, ITERS)[ITERS // 2] for _ in range(REPS))
+            fixed[str(t)] = round(fm[len(fm) // 2] * 1000, 1)
+        out[str(M)]["fixed_tactic_us"] = fixed
+        print(f"M={M}: fixed tactics {fixed}", flush=True)
     del inputs
     torch.cuda.empty_cache()
 print(json.dumps({"batch": out, "output": {"class": "exact"}}))

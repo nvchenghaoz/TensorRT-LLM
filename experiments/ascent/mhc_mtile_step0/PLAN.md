@@ -1,4 +1,31 @@
-# S0 TABLE (branch 163 / idea 285), job 1489, node smc521ge-0109 austin:7, commit 0642890c
+# S0 TABLE part 2 (branch 163 / idea 285): SMEM + J_ROLLED family after the tok_x cut, job 1548
+# (ptxas also in 1530), node smc521ge-0072 austin:5 (NUMA 1), commit c92e7496. Same method as part 1.
+
+tok_x is now derived as tok_res >> 2 inside the cp.async issue (no tok_x registers live across h).
+That made <24,4,SMEM,JROLLED> STACK = 0. Bitwise vs ksplit<24,1>: 0 bad iterations for every
+variant at every M. TM=6 SMEM builds need 120 KB dynamic smem (> SM120's per-block max): not runnable.
+
+| kernel | regs | stack B | spill st/ld B | M=33 | M=128 | M=512 | M=1024 | M=2047 | M=2048 | M=4096 | M=8192 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| v1<24,4> | 255 | 408 | 832/1300 | 104.4 | 115.7 | 148.5 | 240.6 | 363.5 | 361.5 | 611.3 | 1072.1 |
+| v1<24,3> | 255 | 176 | 528/524 | 91.1 | 101.4 | 137.2 | 222.2 | 365.6 | 367.6 | 646.1 | 1154.0 |
+| v1<12,2> | 128 | 248 | 432/500 | 52.2 | 69.6 | 156.7 | 234.5 | 412.7 | 416.8 | 739.3 | 1335.3 |
+| **v2<24,4,S,JR>** | 255 | **0** | 0/0 | 76.8 | 87.0 | 113.7 | 189.4 | **283.6** | **285.7** | **490.5** | **838.7** |
+| v2<24,3,S,JR> | 255 | 8 | 8/16 | 56.3 | 66.6 | 99.3 | 171.0 | 310.3 | 312.3 | 576.5 | 1088.5 |
+| v2<24,2,S,JR> | 255 | 0 | 0/0 | 41.0 | 48.1 | 126.0 | 201.7 | 365.6 | 367.6 | 672.8 | 1264.6 |
+| v2<12,4,S,JR> | 255 | 0 | 0/0 | 37.9 | 48.1 | 105.5 | 161.8 | 295.9 | 295.9 | 533.5 | 963.6 |
+| v2<12,3,S,JR> | 254 | 0 | 0/0 | 31.7 | 44.0 | 105.5 | 187.4 | 336.9 | 338.9 | 619.5 | 1176.6 |
+| v2<12,2,S,JR> | 228 | 0 | 0/0 | 28.7 | 39.9 | 119.8 | 214.0 | 379.9 | 379.9 | 705.5 | 1344.5 |
+| v2<8,4,S,JR> | 242 | 0 | 0/0 | 29.7 | 41.0 | 107.5 | 177.2 | 326.7 | 326.7 | 625.7 | 1172.5 |
+| v2<6,4,S,JR> | 206 | 0 | 0/0 | 29.7 | 41.0 | 105.5 | 193.5 | 367.6 | 367.6 | 760.8 | 1436.7 |
+| v2<8,6,S,JR> | 255 | 0 | 0/0 | (120 KB smem, not launchable) |
+| v2<12,6,S,JR> | 255 | 8 | 8/8 | (120 KB smem, not launchable) |
+
+Readings: <24,4,SMEM,JROLLED> is spill-free and -21% at M=2048 vs the better v1 (<24,4> 361.5), -20% at
+4096, -22% at 8192. It is the S1a tactic: id (fused_half_fma, 24, 1, bs, 16+4). Small-M follow-ups (each
+its own later submission): <12,2,S,JR> 39.9 us at M=128 vs v1<12,2> 69.6; <12,4,S,JR> 161.8 at M=1024.
+
+# S0 TABLE part 1 (branch 163 / idea 285), job 1489, node smc521ge-0109 austin:7, commit 0642890c
 
 Standalone nvcc -O3 sm_120 -Xptxas -v build of proto.cu (experiments/ascent/mhc_mtile_v2/sweep.py),
 kernel-only cold-L2 (256 MB memset between calls) median of 10 timed after 3 warmup, us.
