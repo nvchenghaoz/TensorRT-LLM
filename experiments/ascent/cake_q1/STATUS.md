@@ -2,6 +2,17 @@
 - Jobs 1486 and 1515 were both cancelled while queued (no slot, empty log, never ran): infrastructure, not evidence.
 - Resubmitting the same server_audit.py (arms W,A1,A1b,A2,A3) on 4 GPUs, timeout_s 10800 (cold slot build ~24 min
   + 5 model loads). Code commit 1c78969e unchanged. A stall at the first warmup forward is a NODE SUSPECT (11:4x rule).
+## DONE (session 9, node 0072)
+- Audit 1526 (4 GPUs, austin:0 = GPUs 0-3, NUMA 0, rc 0): arms W (writes cache), A1, A1b, A2 (ATTN_PDL=0), A3 (ENABLE_PDL=0).
+  G1 cache-load line on ranks 0-3 in A1/A1b/A2/A3 (W saved on 0-3); G2 prefill first token+logprob identical in all
+  arms; G3 A1 == A1b bitwise (tokens + logprobs, c1 and c4, 63 decode tokens); A2 == A1 and A3 == A1 bitwise.
+  Route: on every rank, c1 and c4, merge<true> 40/step, <false> 0, K2' follows every merge (1600/1600), starts before
+  merge end 1600/1600 (-4.55 us p50), the AR follows the AR-feeding K3' 1600 times. Graph capture 1/2/4/8 on all ranks
+  in every arm, 0 eager fallbacks. The top-level "passed": false comes only from A5_vs_A4, judged although the
+  A4/A5 arms were not run (not required by idea 296).
+- Fresh kernel pair 1546/1547 (same slot austin:6, node 0072): chain 1.118->0.932 ms c1 (-16.7%), 1.128->0.936 c2
+  (-17.1%), 1.150->1.002 c4 (-12.8%), 1.211->1.134 c8 (-6.4%); noise <= 0.55%.
+- Repeated-execution check 1550 (austin:0): passed, bitwise over 110 iterations at M=1/2/4/8; the skip-wait control fails.
 
 # Branch 157 (idea 296, build_on 145) session 8, 11:2x PST 11-05, node smc521ge-0109
 - Job 1486 (4-GPU audit) was cancelled while queued; it never ran (no slot, empty log). Not evidence.
