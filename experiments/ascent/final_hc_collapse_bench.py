@@ -400,4 +400,4 @@ if __name__ == "__main__":
     log(f"[start] mode={mode} gpu={torch.cuda.get_device_name()}")
     with torch.inference_mode():
         bench() if mode == "bench" else check()
-    log(f"[done] {time.time() - t0:.1f}s")
+    print(f"[done] {time.time() - t0:.1f}s", file=sys.stderr, flush=True)  # JSON stays the last stdout line
