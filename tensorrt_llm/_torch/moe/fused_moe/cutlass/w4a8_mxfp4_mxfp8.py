@@ -142,6 +142,7 @@ class TrtllmCutlassW4a8Mxfp4Mxfp8Impl(CutlassFusedMoEBase):
             enable_pdl=os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1",
         )
         state.warmup(self.routing_method.get_experts_per_token())
+        state.warmup_prefill(self.routing_method.get_experts_per_token())
         self._fi_decode = state
         logger.info_once(
             "W4A8 MXFP4xMXFP8 SM12x FlashInfer decode chain on: decode calls of at most "
@@ -168,6 +169,24 @@ class TrtllmCutlassW4a8Mxfp4Mxfp8Impl(CutlassFusedMoEBase):
             and 0 < x.shape[0] <= self._fi_max_tokens()
         )
 
+    def _takes_fi_chain(self, x) -> bool:
+        """Decode calls the FlashInfer chain takes (_takes_fi_decode), plus the prefill calls its
+        gate (fi_prefill_takes: token range and TRTLLM_SM12X_W4A8_FI_PREFILL mode) sends there."""
+        if self._takes_fi_decode(x):
+            return True
+        if (
+            getattr(self, "_fi_decode", None) is None
+            or not isinstance(x, torch.Tensor)
+            or x.dtype != torch.bfloat16
+            or x.dim() != 2
+            or x.shape[1] != self.hidden_size
+            or not x.is_contiguous()
+        ):
+            return False
+        from .w4a8_mxfp4_mxfp8_sm12x_decode import fi_prefill_takes
+
+        return fi_prefill_takes(x.shape[0])
+
     def _folds_quant_into_cutlass(self, x) -> bool:
         """BF16 call above the FlashInfer decode range whose MXFP8 quant ``fused_moe`` does in-kernel."""
         if _MXFP8_FOLD_MAX_TOKENS == 0 or not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
@@ -188,12 +207,12 @@ class TrtllmCutlassW4a8Mxfp4Mxfp8Impl(CutlassFusedMoEBase):
         FlashInfer chain, which quantizes them itself, and CUTLASS calls above that range in
         BF16 too: ``fused_moe``'s row expansion quantizes them in-kernel, bitwise as here.
         Calls followed by communication (``post_quant_comm``) always quantize here."""
-        if not post_quant_comm and (self._takes_fi_decode(x) or self._folds_quant_into_cutlass(x)):
+        if not post_quant_comm and (self._takes_fi_chain(x) or self._folds_quant_into_cutlass(x)):
             return x, None
         return quantize_input_mxfp8(self, x, post_quant_comm=post_quant_comm, **kwargs)
 
     def run_moe(self, ctx: MoERunContext, *, workspace: dict | None = None) -> torch.Tensor:
-        if ctx.x_sf is not None or not self._takes_fi_decode(ctx.x):
+        if ctx.x_sf is not None or not self._takes_fi_chain(ctx.x):
             return super().run_moe(ctx, workspace=workspace)
         plan = require_comm_plan(self, ctx)
         if (
