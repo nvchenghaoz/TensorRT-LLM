@@ -4,7 +4,9 @@ Every Python process of the server (main + MPI ranks) writes <JITWATCH_DIR>/<pid
   <unix time> <event> <detail>
 events: 'hook' (installed, argv), 'patched' (module wrapped), 'triton.compile' (one call of
 triton.compiler.compiler.compile = an in-memory Triton cache miss, disk hit or not), 'cute.compile' (one call of
-cutlass.cute.compile = a CuTe-DSL JIT). The wrappers only log and forward; they change no arguments or results.
+cutlass.cute.compile = a CuTe-DSL JIT), 'driver.cuModuleLoad*' / 'driver.cuLibraryLoad*' (Python callers of
+cuda.bindings.driver only: CuTe-DSL module loads; C/C++ callers such as Triton's launcher or CUDA lazy loading of
+TRT-LLM's own kernels are not visible here). The wrappers only log and forward; they change no arguments or results.
 Any other sitecustomize on sys.path is executed afterwards, so the environment is otherwise unchanged.
 """
 import os
@@ -68,6 +70,19 @@ def _patch(name, module):
         elif name == "cutlass.cute" and hasattr(module, "compile"):
             module.compile = _CompileProxy(module.compile)
             _emit("patched", name)
+        elif name == "cuda.bindings.driver":
+            done = []
+            for attr in dir(module):
+                if attr.startswith(("cuModuleLoad", "cuLibraryLoad")):
+                    inner = getattr(module, attr)
+
+                    def wrap(*args, _inner=inner, _attr=attr, **kwargs):
+                        _emit("driver." + _attr, "")
+                        return _inner(*args, **kwargs)
+
+                    setattr(module, attr, wrap)
+                    done.append(attr)
+            _emit("patched", f"{name} {','.join(done)}")
     except Exception as exc:  # noqa: BLE001
         _emit("patch_error", f"{name} {exc!r}")
 
@@ -76,7 +91,7 @@ def _install():
     import importlib.abc
     import importlib.machinery
 
-    targets = {"triton.compiler.compiler", "cutlass.cute"}
+    targets = {"triton.compiler.compiler", "cutlass.cute", "cuda.bindings.driver"}
 
     class _Finder(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path, target=None):
