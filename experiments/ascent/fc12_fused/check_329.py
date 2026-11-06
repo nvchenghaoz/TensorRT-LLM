@@ -33,7 +33,42 @@ KNOBS = {"KACQ": "TRTLLM_SM12X_FI_FC12_KACQ", "EW2": "TRTLLM_SM12X_FI_FC12_EARLY
 DEFAULT_CONFIGS = "OFF:;KACQ:KACQ;ACQREL:ACQREL;EW2:EW2;KACQ_ACQREL:KACQ,ACQREL;ALL:KACQ,EW2,ACQREL"
 
 
+def slot_guard(limit_gib=4.0, wait_s=180, poll_s=10):
+    """WAIT-ONLY dirty-slot guard (top lead rulings 20:5x / 21:0x PST 11-05, pitfalls 3067/3072).
+
+    Polls nvidia-smi memory.used for this job's CUDA_VISIBLE_DEVICES for up to wait_s. If any
+    GPU stays above limit_gib, prints 'DIRTY SLOT' with per-GPU memory and exits 3 before any
+    CUDA allocation. Never kills processes."""
+    import time
+    vis = [v.strip() for v in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if v.strip()]
+    t0 = time.time()
+    while True:
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,memory.used",
+                                  "--format=csv,noheader,nounits"], capture_output=True,
+                                 text=True, timeout=30).stdout
+        except Exception as e:  # no nvidia-smi: report and go on (torch check follows in child)
+            print(f"[check_329] slot guard: nvidia-smi unavailable ({e})", flush=True)
+            return
+        used = {}
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 3 and (not vis or parts[0] in vis or parts[1] in vis):
+                used[parts[1]] = float(parts[2]) / 1024.0
+        dirty = {k: round(v, 2) for k, v in used.items() if v > limit_gib}
+        print(f"[check_329] slot guard t+{time.time() - t0:.0f}s memory.used GiB "
+              f"{ {k: round(v, 2) for k, v in used.items()} }", flush=True)
+        if not dirty:
+            return
+        if time.time() - t0 >= wait_s:
+            print(f"DIRTY SLOT {dirty}", flush=True)
+            print(json.dumps({"passed": False, "error": f"DIRTY SLOT {dirty} (infra, pitfall 3072)"}))
+            sys.exit(3)
+        time.sleep(poll_s)
+
+
 def driver():
+    slot_guard()
     slots = [s for s in os.environ.get("CHECK_SLOTS", "0,192").split(",") if s]
     results, ok = [], True
     for s in slots:
