@@ -32,7 +32,18 @@ import torch  # noqa: E402
 import pdl_ext  # noqa: E402
 
 K1_P = int(os.environ.get("K1FOLD_P", "224"))
-SPIN_NS = int(os.environ.get("K1FOLD_SPIN_NS", "6000"))
+# Stand-in attention-AR window per M = W_crit (top-lead ruling 17:5x PST 11-05 (A)/(C)): the attention AR's own
+# duration on the last-arriving rank. No profile row is reduced here, so the ruling's fallback is declared:
+# 3.0 us at M=1, 3.5 us at M=2 (M=4 takes M=2's value; the fold is off at M=4 by default). Override with
+# K1FOLD_SPIN_NS (one value for every M) or K1FOLD_SPIN_NS_BY_M ("1:3000,2:3500,4:3500").
+W_CRIT_NS = {1: 3000, 2: 3500, 4: 3500}
+if os.environ.get("K1FOLD_SPIN_NS"):
+    SPIN_BY_M = {m: int(os.environ["K1FOLD_SPIN_NS"]) for m in W_CRIT_NS}
+else:
+    SPIN_BY_M = dict(W_CRIT_NS)
+    for kv in filter(None, os.environ.get("K1FOLD_SPIN_NS_BY_M", "").split(",")):
+        k, v = kv.split(":")
+        SPIN_BY_M[int(k)] = int(v)
 EPS = 1e-6
 SCALE = 1.5
 WARMUP = 5
@@ -91,7 +102,7 @@ def main():
     arm = "CAND" if has_fold else "BASE"
     dev = "cuda"
     ext = pdl_ext.ext()
-    log("ARM", arm, torch.cuda.get_device_name(), "K1 P", K1_P, "AR stand-in spin", SPIN_NS, "ns")
+    log("ARM", arm, torch.cuda.get_device_name(), "K1 P", K1_P, "AR stand-in window (W_crit) ns by M", SPIN_BY_M)
     gen = torch.Generator(device=dev).manual_seed(31301)
     rws = router_weights(gen, LAYERS)
     bs = biases(gen, LAYERS)
@@ -103,6 +114,7 @@ def main():
     all_ok = True
     for m, samples, reps in CASES:
         route = m <= 2
+        SPIN_NS = SPIN_BY_M[m]
         x0 = torch.zeros(m, HIDDEN, dtype=torch.bfloat16, device=dev)
         i0 = (torch.arange(m * TOPK, device=dev, dtype=torch.int32) % 96).view(m, TOPK)
         state.run(x0, i0, torch.full((m, TOPK), 1.0 / TOPK, device=dev))
@@ -272,7 +284,8 @@ def main():
             del g
         graphs.clear()
     print(json.dumps({"batch": batch, "secondary": secondary, "output": {"class": "exact"}, "arm": arm,
-                      "checks_passed": all_ok, "k1_p": K1_P, "spin_ns": SPIN_NS, "deltas": extra}))
+                      "checks_passed": all_ok, "k1_p": K1_P, "spin_ns_by_m": SPIN_BY_M,
+                      "w_crit": "fallback 3.0 us M1 / 3.5 us M2 (ruling 17:5x PST 11-05)", "deltas": extra}))
     if not all_ok:
         sys.exit(1)
 
