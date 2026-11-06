@@ -94,9 +94,24 @@ def rank_chain(env):
         del full, chk
         torch.cuda.synchronize()
         bench._barrier()
-        f0 = bench._lp_flag_state(torch, mapping)
+        # LP calls (host flag increments) per pipelined boundary and per serial full-T AR: the C++ op splits a
+        # message above its workspace (LP_ALLREDUCE_MAX_ELTS_IN_WORKSPACE; T=8192 x 5120 bf16) into several calls.
+        st.refill(3)
+        fa = bench._lp_flag_state(torch, mapping)
+        pipe.run(ar, mhc, st.x, st.res, st.post, st.comb, st.pre, nw, neps, bounds)
+        torch.cuda.synchronize()
+        bench._barrier()
+        fb = bench._lp_flag_state(torch, mapping)
+        ar(st.x)
+        torch.cuda.synchronize()
+        bench._barrier()
+        fc = bench._lp_flag_state(torch, mapping)
+        adv_p, adv_s = fb["counter"] - fa["counter"], fc["counter"] - fb["counter"]
+        out["lp_calls_per_pipelined_boundary"] = adv_p
+        out["lp_calls_per_serial_ar"] = adv_s
+        out["flags_ok"] = out["flags_ok"] and adv_p == len(bounds) and fa["ok"] and fb["ok"] and fc["ok"]
+        f0 = fc
         out["flag_states"].append(f0)
-        out["flags_ok"] = out["flags_ok"] and f0["ok"]
         last = f0["counter"]
         done = 0
         keep = {}
@@ -131,7 +146,7 @@ def rank_chain(env):
             # before the next reset barrier: the LP IPC flags must hold what the next call expects
             fs = bench._lp_flag_state(torch, mapping)
             fs["advanced_by"] = fs["counter"] - last
-            fs["expected_advance"] = nc * (len(bounds) + 1)
+            fs["expected_advance"] = nc * (adv_p + adv_s)
             fs["ok"] = fs["ok"] and fs["advanced_by"] == fs["expected_advance"]
             out["flag_states"].append(fs)
             out["flags_ok"] = out["flags_ok"] and fs["ok"]
@@ -164,7 +179,7 @@ def rank_chain(env):
         bench._barrier()
         fs = bench._lp_flag_state(torch, mapping)
         fs["advanced_by"] = fs["counter"] - last
-        fs["expected_advance"] = len(keep) * len(bounds)
+        fs["expected_advance"] = len(keep) * adv_p
         fs["ok"] = fs["ok"] and fs["advanced_by"] == fs["expected_advance"]
         out["flag_states"].append(fs)
         out["flags_ok"] = out["flags_ok"] and fs["ok"]
@@ -213,6 +228,8 @@ def main():
              "flag_checks_per_rank": len(per[0]["flag_states"]),
              "rerun_mismatch": sum(p["rerun_mismatch"] for p in per), "reruns_per_rank": per[0]["reruns"],
              "mhc_identity_bitwise_all_ranks": all(p["mhc_identity_bitwise"] for p in per),
+             "lp_calls_per_pipelined_boundary": per[0].get("lp_calls_per_pipelined_boundary"),
+             "lp_calls_per_serial_ar": per[0].get("lp_calls_per_serial_ar"),
              "flag_states_rank0_last": per[0]["flag_states"][-1]}
         ok = (s["calls_per_rank"] == CALLS and s["nonfinite_calls"] == 0 and s["ipc_flags_ok_all_ranks"]
               and s["rerun_mismatch"] == 0 and s["mhc_identity_bitwise_all_ranks"]
