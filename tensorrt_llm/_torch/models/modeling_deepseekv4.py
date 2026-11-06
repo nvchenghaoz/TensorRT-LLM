@@ -3271,6 +3271,10 @@ class DeepseekV4Model(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
+            # One Triton gather launch (bitwise the masked F.embedding path) instead of 9 ATen launches;
+            # its first data consumer is the fused mHC seed in forward (or the ATen repeat when
+            # TRTLLM_DSV4_HC_SEED_FAST=0). TRTLLM_DSV4_EMBED_GATHER=0 restores the masked path.
+            use_gather_kernel=os.environ.get("TRTLLM_DSV4_EMBED_GATHER", "1") == "1",
         )
 
         self.hc_head = HCHead(config.hc_mult, config.hidden_size) if self.uses_hc_head else None
