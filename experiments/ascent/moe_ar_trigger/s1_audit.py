@@ -135,7 +135,8 @@ def static_audit():
         ok &= ln is not None
     with open(os.path.join(ROOT, WO)) as f:
         # Main (landing 55) owns the only override: _attn_all_reduce_params' trigger_completion_at_end=False.
-        wo_clean = f.read().count("trigger_completion_at_end=False") == 1
+        # (the docstring also names it, so count the constructor call only)
+        wo_clean = f.read().count("AllReduceParams(trigger_completion_at_end=False)") == 1
     log(f"  b12x_wo.py has only main's single (175) trigger override: {wo_clean}")
     return bool(ok and wo_clean), rows
 
