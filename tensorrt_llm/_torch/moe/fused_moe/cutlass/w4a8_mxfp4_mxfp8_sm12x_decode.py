@@ -332,8 +332,14 @@ class Sm12xW4a8DecodeState:
         layer and every decode batch; the Triton route kernels specialize on scalar
         arguments, so each batch size up to the threshold is run once.
         """
+        # The FlashInfer SM12x kernels read their TRTLLM_SM12X_FI_* knobs (split-K, fused
+        # fc12 KACQ / EARLY_W2 / prefetch / debug) into their compile keys at call time, so a
+        # knob changed after warmup must warm again rather than JIT inside a graph capture.
+        fi_env = tuple(sorted((k, v) for k, v in os.environ.items()
+                              if k.startswith("TRTLLM_SM12X_FI_")))
         key = (self.hidden, self.inter, self.num_experts, top_k, self.enable_pdl,
-               self.swiglu_limit, self.slot_start, bool(_route_fuses_prologue() and _fused_op()))
+               self.swiglu_limit, self.slot_start, bool(_route_fuses_prologue() and _fused_op()),
+               fi_env)
         with _LOCK:
             if key in _WARMED:
                 return

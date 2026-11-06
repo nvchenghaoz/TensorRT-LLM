@@ -55,8 +55,19 @@ def debug_nocount() -> bool:
     return os.environ.get("TRTLLM_SM12X_FI_SPLITK_DEBUG_NOCOUNT", "0") == "1"
 
 
+ENV_ACQREL = "TRTLLM_SM12X_FI_SPLITK_ACQREL"
+
+
+def acqrel() -> bool:
+    """CUTLASS-semaphore form of the slice hand-off: bar.sync, then ONE atom.acq_rel.gpu by
+    thread 0 (release of the CTA's partial stores by cumulativity, acquire of the other
+    slices' partials), then bar.red.or; no per-thread membar.gl before the count and none
+    before the slot loads.  Same values, same slice order: the sum is bitwise unchanged."""
+    return os.environ.get(ENV_ACQREL, "1") == "1"
+
+
 def key():
-    return (enabled(), max_splits(), min_splits(), debug_nocount())
+    return (enabled(), max_splits(), min_splits(), debug_nocount(), acqrel())
 
 
 _WS: dict = {}
@@ -122,6 +133,23 @@ def atom_add_i32(addr: Int64, v: Int32, *, loc=None, ip=None) -> Int32:
             T.i32(),
             [Int64(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
             "atom.global.add.s32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def atom_add_acqrel_i32(addr: Int64, v: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
+            "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
             "=r,l,r",
             has_side_effects=True,
             is_align_stack=False,
@@ -279,9 +307,14 @@ def reduce_partials(
     tidx,
     nthreads: cutlass.Constexpr,
     bar_id: cutlass.Constexpr,
+    use_acqrel: cutlass.Constexpr = False,
 ):
     """All nthreads math threads of a split CTA.  Returns 1 on the CTA that must finish the
-    tile (with acc_u / acc_g holding the slice-ordered sum), 0 elsewhere."""
+    tile (with acc_u / acc_g holding the slice-ordered sum), 0 elsewhere.
+
+    use_acqrel (see acqrel()): bar.sync -> thread 0 atom.acq_rel.gpu -> bar.red.or, the
+    CUTLASS split-K semaphore pattern, instead of per-thread membar.gl before the count and
+    again before the slot loads (two dependent L2 round trips less on the last slice)."""
     nv = cute.size(acc_u)
     slot_bytes = 2 * nv * nthreads * 4
     base = _addr(gScratch)
@@ -289,19 +322,25 @@ def reduce_partials(
     for i in cutlass.range_constexpr(nv):
         st_f32(my + Int64(i * nthreads * 4), acc_u[i])
         st_f32(my + Int64((nv + i) * nthreads * 4), acc_g[i])
-    membar_gl()
+    if cutlass.const_expr(not use_acqrel):
+        membar_gl()
     cute.arch.barrier(barrier_id=bar_id, number_of_threads=nthreads)
     t = bidx // S
     flag = Int32(0)
     if tidx == Int32(0):
         caddr = _addr(gCnt) + Int64(t) * Int64(4)
-        old = atom_add_i32(caddr, Int32(1))
+        old = Int32(0)
+        if cutlass.const_expr(use_acqrel):
+            old = atom_add_acqrel_i32(caddr, Int32(1))
+        else:
+            old = atom_add_i32(caddr, Int32(1))
         if old == S - Int32(1):
             st_i32(caddr, Int32(0))
             flag = Int32(1)
     last = bar_red_or(flag, bar_id, nthreads)
     if last != Int32(0):
-        membar_gl()
+        if cutlass.const_expr(not use_acqrel):
+            membar_gl()
         first = base + Int64(t * S) * Int64(slot_bytes) + Int64(tidx) * Int64(4)
         for i in cutlass.range_constexpr(nv):
             acc_u[i] = ld_cg_f32(first + Int64(i * nthreads * 4))

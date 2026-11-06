@@ -54,6 +54,33 @@ PREFETCH_ENV = "TRTLLM_SM12X_FI_FC12_PREFETCH_MIN_T1"
 TRANS_BAR_ID = 5
 SYNC_HEADER = 4  # [0] claim counter, [1] exit counter, [2..3] unused; [4 + e] expert e done
 MAX_GROUPS = 1024
+# [KDONE_BASE + e * KCOLS_MAX + n]: fc1 m-blocks of expert e whose column tile n is released
+KCOLS_MAX = 32
+KDONE_BASE = SYNC_HEADER + 2 * MAX_GROUPS
+SYNC_WORDS = KDONE_BASE + MAX_GROUPS * KCOLS_MAX
+#: Per-SF-cycle fc2 acquire: fc1 releases per (expert, column tile); fc2's q1 loader waits per
+#: SF cycle only for the column tiles that cycle reads (its SFA pack spans several), and in
+#: no-prefetch launches the weight loader waits only for cycle 0.
+KACQ_ENV = "TRTLLM_SM12X_FI_FC12_KACQ"
+#: The fc2 weight loader of a CTA that ran an fc1 unit starts its first fc2 tile's weights at
+#: once (into the fc1 stages its mainloop has drained), without the expert wait and without
+#: the phase barrier, when sB/sSFB do not overlap the fc1 epilogue's sC.
+EARLY_W2_ENV = "TRTLLM_SM12X_FI_FC12_EARLY_W2"
+
+
+def kacq_enabled() -> bool:
+    return os.environ.get(KACQ_ENV, "1") == "1"
+
+
+def early_w2_enabled() -> bool:
+    return os.environ.get(EARLY_W2_ENV, "1") == "1"
+
+
+def compile_env_key():
+    """Every environment knob that is part of this kernel's compile key (for warmup keys)."""
+    return (split_k.key(), os.environ.get("TRTLLM_SM12X_FI_FC12_DEBUG", ""),
+            os.environ.get("TRTLLM_SM12X_FI_FC12_SLEEP", "32"),
+            os.environ.get(PREFETCH_ENV, "81"), kacq_enabled(), early_w2_enabled())
 
 
 # --------------------------------------------------------------------------- PTX helpers
@@ -125,8 +152,130 @@ def bar_sync(bar_id: int, nthreads: int, *, loc=None, ip=None):
     _asm(None, [], f"bar.sync {int(bar_id)}, {int(nthreads)};", "", loc, ip)
 
 
+@dsl_user_op
+def vote_all(flag: Int32, *, loc=None, ip=None) -> Int32:
+    """1 on every lane if flag != 0 on every lane of the (full) warp."""
+    return Int32(
+        _asm(T.i32(), [Int32(flag).ir_value(loc=loc, ip=ip)],
+             "{ .reg .pred p, q; setp.ne.s32 p, $1, 0; "
+             "vote.sync.all.pred q, p, 0xffffffff; selp.s32 $0, 1, 0, q; }",
+             "=r,r", loc, ip)
+    )
+
+
 def is_fc1(valid):
     return (valid & Int32(1)) * (Int32(1) - ((valid >> Int32(PHASE2_BIT)) & Int32(1)))
+
+
+@cute.jit
+def acquire_cols(kbase: Int64, c0, ncols: cutlass.Constexpr, nnb, need,
+                 sleep_ns: cutlass.Constexpr):
+    """Whole warp: wait until every column tile in [c0, min(c0 + ncols, nnb)) of one expert
+    has `need` released fc1 m-blocks (lane l polls column c0 + l with ld.acquire.gpu), then
+    bar.warp.sync so the elected lane's TMA is ordered after every lane's acquire."""
+    lane = cute.arch.lane_idx()
+    col = c0 + lane
+    live = Int32(0)
+    if lane < Int32(ncols):
+        if col < nnb:
+            live = Int32(1)
+    ok = Int32(1)
+    if live != Int32(0):
+        seen = ld_acquire_i32(kbase + Int64(col) * Int64(4))
+        if seen < need:
+            ok = Int32(0)
+    allok = vote_all(ok)
+    while allok == Int32(0):
+        nanosleep(sleep_ns)
+        if ok == Int32(0):
+            seen2 = ld_acquire_i32(kbase + Int64(col) * Int64(4))
+            if seen2 >= need:
+                ok = Int32(1)
+        allok = vote_all(ok)
+    cute.arch.sync_warp()
+
+
+@cute.jit
+def load_a_sfa_kacq(
+    tma_atom_a,
+    tma_atom_sfa,
+    tma_tensor_a,
+    tma_tensor_sfa,
+    sA,
+    sSFA,
+    tile_mnk,
+    tile,
+    a_full,
+    a_empty,
+    a_bytes,
+    sfa_bytes,
+    num_sf_cycles,
+    sf_stages: cutlass.Constexpr,
+    kt_per_pack: cutlass.Constexpr,
+    ab_stages: cutlass.Constexpr,
+    a_phase,
+    kbase: Int64,
+    need,
+    nnb1,
+    cols_per_cycle: cutlass.Constexpr,
+    sleep_ns: cutlass.Constexpr,
+):
+    """fc2_finalize's load_a_sfa (same TMA copies, same order) with a per-SF-cycle acquire:
+    cycle c's q1 K-tiles and SFA pack read fc1 column tiles [c*cols, (c+1)*cols) only."""
+    i32 = cutlass.Int32
+    cluster = cute.make_layout((1, 1, 1))
+    multicast = cute.make_layout(cute.slice_(cluster, (0, None, 0)).shape)
+    mA = cute.domain_offset((tile.m_offset, 0), tma_tensor_a)
+    gA_mkl = cute.local_tile(mA, cute.slice_(tile_mnk, (None, 0, None)), (None, None))
+    tAsA, tAgA = cpasync.tma_partition(
+        tma_atom_a,
+        i32(0),
+        multicast,
+        cute.group_modes(sA, 0, 2),
+        cute.group_modes(gA_mkl, 0, 2),
+    )
+    sf_m_off = (tile.m_offset + tile.group * i32(SF_M_ALIGN - 1)) & i32(-SF_M_ALIGN)
+    mSFA = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfa)
+    gSFA_ml = cute.local_tile(mSFA, (tile_mnk[0], 1), (None, None, None))
+    tAsSFA, tAgSFA = cpasync.tma_partition(
+        tma_atom_sfa,
+        i32(0),
+        multicast,
+        cute.group_modes(sSFA, 0, 2),
+        cute.group_modes(gSFA_ml, 0, 2),
+    )
+    for sf_cycle in cutlass.range(num_sf_cycles):
+        acquire_cols(kbase, sf_cycle * i32(cols_per_cycle), cols_per_cycle, nnb1, need,
+                     sleep_ns)
+        fence_proxy_async_global()
+        for sf_stage in cutlass.range_constexpr(sf_stages):
+            global_sf_stage = sf_cycle * sf_stages + sf_stage
+            for k_in_sf in cutlass.range_constexpr(kt_per_pack):
+                local_k_tile = sf_stage * kt_per_pack + k_in_sf
+                global_k_tile = sf_cycle * sf_stages * kt_per_pack + local_k_tile
+                stage = local_k_tile & (ab_stages - 1)
+                cute.arch.mbarrier_wait(a_empty + stage, a_phase)
+                tx_bytes = a_bytes
+                if cutlass.const_expr(k_in_sf == 0):
+                    tx_bytes += sfa_bytes
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(a_full + stage, tx_bytes)
+                if cutlass.const_expr(k_in_sf == 0):
+                    cute.copy(
+                        tma_atom_sfa,
+                        tAgSFA[(None, tile.m_block, global_sf_stage, 0)],
+                        tAsSFA[(None, sf_stage)],
+                        tma_bar_ptr=a_full + stage,
+                    )
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, tile.m_block, global_k_tile)],
+                    tAsA[(None, stage)],
+                    tma_bar_ptr=a_full + stage,
+                )
+                if cutlass.const_expr(stage == ab_stages - 1):
+                    a_phase ^= 1
+    return a_phase
 
 
 # --------------------------------------------------------------------- work tile + pipe
@@ -253,6 +402,9 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
         self.split_k = split_k.enabled()
         self.split_max = split_k.max_splits()
         self.split_min = split_k.min_splits()
+        self.acqrel = split_k.acqrel()
+        self.kacq = kacq_enabled()
+        self.early_w2 = early_w2_enabled()
         self.qcfg = fc1k._DEFAULT_QCFG
         self.sf1, self.sf2 = cfg1.load_sf, cfg2.load_sf
         bk1 = cfg1.TILE[2]
@@ -394,7 +546,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
         sfw = sf_dtype.width
         offs1 = {}
         cur = 0
-        for name, nbytes in (
+        regions1 = [
             ("sA", cute.cosize(b_smem1) * c1.load_ab.b_smem_dtype.width // 8),
             ("sU", cute.cosize(a_smem1) * c1.load_ab.a_smem_dtype.width // 8),
             ("sG", cute.cosize(a_smem1) * c1.load_ab.a_smem_dtype.width // 8),
@@ -402,7 +554,13 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
             ("sSFG", cute.cosize(sfa_smem1) * sfw // 8),
             ("sSFA", cute.cosize(sfb_smem1) * sfw // 8),
             ("sC", cute.cosize(epi_smem1) * c1.epi.out_dtype.width // 8 if c1.owns_epi_smem else 0),
-        ):
+        ]
+        if cutlass.const_expr(self.early_w2):
+            # fc1's epilogue sC first: it then lies under fc2's sA (q1), which the q1 loader
+            # fills only after the phase barrier, and clear of sB/sSFB that EARLY_W2 fills
+            # during that epilogue.  Every region stays 1024-aligned.
+            regions1 = regions1[-1:] + regions1[:-1]
+        for name, nbytes in regions1:
             cur = _align(cur, 1024)
             offs1[name] = cur
             cur += nbytes
@@ -423,6 +581,20 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
         union_bytes2 = c2.epi.smem_bytes(c2.TILE) + c2.epi.aux_smem_bytes(c2.TILE)
         assert union_bytes2 <= offs2["sSFB"], "fc2 sC + meta must stay inside sA/sB"
         self.offs1, self.offs2 = offs1, offs2
+        # EARLY_W2 writes sB/sSFB (fc2) while the math warps still run the fc1 epilogue,
+        # which touches only sC (fc1): the byte ranges must be disjoint.
+        sz2 = {"sB": cute.cosize(b_smem2) * c2.load_ab.b_smem_dtype.width // 8,
+               "sSFB": cute.cosize(sfb_smem2) * sfw // 8}
+        sc1 = (offs1["sC"], offs1["sC"] + dict(regions1)["sC"])
+        rng2 = {k: (offs2[k], offs2[k] + v) for k, v in sz2.items()}
+        overlap = any(lo < sc1[1] and sc1[0] < hi for lo, hi in rng2.values())
+        print(f"[fc12_fused] smem pool: sC1=[{sc1[0]},{sc1[1]}) sB2=[{rng2['sB'][0]},"
+              f"{rng2['sB'][1]}) sSFB2=[{rng2['sSFB'][0]},{rng2['sSFB'][1]}) "
+              f"overlap={overlap} kacq={self.kacq} early_w2={self.early_w2} "
+              f"acqrel={self.acqrel}", flush=True)
+        if cutlass.const_expr(self.early_w2):
+            assert not overlap, "EARLY_W2 needs sB/sSFB (fc2) disjoint from sC (fc1)"
+            assert c1.owns_epi_smem, "EARLY_W2 needs the fc1 epilogue's own sC region"
         pool_bytes = _align(max(end1, end2), 1024)
         epi_empty_bars2 = c2.epi.num_empty_barriers
         assert c1.epi.num_empty_barriers == 0
@@ -577,6 +749,11 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
         kt_per_pack2 = self.sf2.k_tiles_per_pack_a(bk2)
         sf_stages2 = self.sf2.sfa_stages(c2.ab_stage, bk2)
         ncyc2 = ceil_div(K2, self.sf2.grank_a * self.sf2.PACK_NSF * sf_stages2)
+        # fc1 column tiles (pn1 wide) one fc2 SF cycle reads (its K-tiles and its SFA packs)
+        kcols2 = sf_stages2 * kt_per_pack2 * bk2 // pn1
+        if cutlass.const_expr(self.kacq):
+            assert kcols2 * pn1 == sf_stages2 * kt_per_pack2 * bk2 and 1 <= kcols2 <= 32
+            assert self.sf2.grank_a * self.sf2.PACK_NSF * sf_stages2 == kcols2 * pn1
 
         smem = cutlass.utils.SmemAllocator()
         stg = smem.allocate(self.storage)
@@ -655,7 +832,8 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
         cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
 
-        trans_threads = c1.mma_threads + 64
+        # The phase barrier: math warps + both loader warps (EARLY_W2: + the q1 loader only).
+        trans_threads = c1.mma_threads + (32 if self.early_w2 else 64)
         # Everything that calls into the configs is hoisted out of the runtime `if`.
         tiled_s2r1 = c1.epi.make_tiled_s2r(c1.TILE)
         swap_threads_m = c1.epi.s2g_threads_n(c1.TILE)
@@ -772,31 +950,57 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
                 fence_proxy_async_shared()
                 a_phase2, epi_phase = i32(1), i32(1)
                 while tile.valid != i32(0):
-                    need = ceil_div(tile.m_boundary - tile.m_offset, pm1) * nnb1
                     caddr = sync_base + Int64(SYNC_HEADER + tile.group) * Int64(4)
-                    seen = ld_acquire_i32(caddr)
-                    if cutlass.const_expr(self.debug == "nowait"):
-                        seen = need
-                    while seen < need:
-                        nanosleep(self.sleep_ns)
-                        seen = ld_acquire_i32(caddr)
-                    fence_proxy_async_global()
-                    cute.arch.mbarrier_wait(epi_empty2, epi_phase)
-                    epi_phase ^= 1
-                    a_phase2 = fc2k.load_a_sfa(
-                        tma_atom_a2, tma_atom_sfa2, tma_tensor_a2, tma_tensor_sfa2,
-                        sA2, sSFA2, c2.TILE, tile, a_full2, a_empty2,
-                        self.a_bytes2, self.sfa_bytes2, ncyc2, sf_stages2, kt_per_pack2,
-                        c2.ab_stage, a_phase2,
-                    )
-                    # The expert's last fc2 tile past its acquire puts both counters back.
-                    if lane == i32(0):
+                    if cutlass.const_expr(self.kacq):
+                        kbase = sync_base + Int64(KDONE_BASE + tile.group * KCOLS_MAX) * Int64(4)
+                        need_c = ceil_div(tile.m_boundary - tile.m_offset, pm1)
+                        cute.arch.mbarrier_wait(epi_empty2, epi_phase)
+                        epi_phase ^= 1
+                        a_phase2 = load_a_sfa_kacq(
+                            tma_atom_a2, tma_atom_sfa2, tma_tensor_a2, tma_tensor_sfa2,
+                            sA2, sSFA2, c2.TILE, tile, a_full2, a_empty2,
+                            self.a_bytes2, self.sfa_bytes2, ncyc2, sf_stages2, kt_per_pack2,
+                            c2.ab_stage, a_phase2, kbase, need_c, nnb1, kcols2,
+                            self.sleep_ns,
+                        )
+                        # The expert's last fc2 tile past its acquires puts the counters back.
+                        rd = i32(0)
+                        if lane == i32(0):
+                            raddr = sync_base + Int64(SYNC_HEADER + MAX_GROUPS + tile.group) * Int64(4)
+                            rd = atom_add_relaxed_i32(raddr, i32(1))
+                        rd = cute.arch.shuffle_sync(rd, i32(0))
                         t2e = ceil_div(tile.m_boundary - tile.m_offset, pm2) * nnb2
-                        raddr = sync_base + Int64(SYNC_HEADER + MAX_GROUPS + tile.group) * Int64(4)
-                        rd = atom_add_relaxed_i32(raddr, i32(1))
                         if rd == t2e - i32(1):
-                            split_k.st_i32(caddr, i32(0))
-                            split_k.st_i32(raddr, i32(0))
+                            if lane < nnb1:
+                                split_k.st_i32(kbase + Int64(lane) * Int64(4), i32(0))
+                            if lane == i32(0):
+                                raddr0 = sync_base + Int64(SYNC_HEADER + MAX_GROUPS + tile.group) * Int64(4)
+                                split_k.st_i32(raddr0, i32(0))
+                    else:
+                        need = ceil_div(tile.m_boundary - tile.m_offset, pm1) * nnb1
+                        seen = ld_acquire_i32(caddr)
+                        if cutlass.const_expr(self.debug == "nowait"):
+                            seen = need
+                        while seen < need:
+                            nanosleep(self.sleep_ns)
+                            seen = ld_acquire_i32(caddr)
+                        fence_proxy_async_global()
+                        cute.arch.mbarrier_wait(epi_empty2, epi_phase)
+                        epi_phase ^= 1
+                        a_phase2 = fc2k.load_a_sfa(
+                            tma_atom_a2, tma_atom_sfa2, tma_tensor_a2, tma_tensor_sfa2,
+                            sA2, sSFA2, c2.TILE, tile, a_full2, a_empty2,
+                            self.a_bytes2, self.sfa_bytes2, ncyc2, sf_stages2, kt_per_pack2,
+                            c2.ab_stage, a_phase2,
+                        )
+                        # The expert's last fc2 tile past its acquire puts both counters back.
+                        if lane == i32(0):
+                            t2e = ceil_div(tile.m_boundary - tile.m_offset, pm2) * nnb2
+                            raddr = sync_base + Int64(SYNC_HEADER + MAX_GROUPS + tile.group) * Int64(4)
+                            rd = atom_add_relaxed_i32(raddr, i32(1))
+                            if rd == t2e - i32(1):
+                                split_k.st_i32(caddr, i32(0))
+                                split_k.st_i32(raddr, i32(0))
                     tile = cons.get_next_tile(sWork, sfull, sempty)
 
             if warp_idx == c1.load_warp_1:
@@ -805,6 +1009,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
                 tile = cons.get_next_tile(sWork, sfull, sempty)
                 b_phase = i32(1)
                 go = is_fc1(tile.valid)
+                ran_fc1 = go
                 if go != i32(0):
                     if cutlass.const_expr(c1.enable_pdl):
                         cute.arch.griddepcontrol_wait()
@@ -818,18 +1023,44 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
                     )
                     tile = cons.get_next_tile(sWork, sfull, sempty)
                     go = is_fc1(tile.valid)
-                bar_sync(TRANS_BAR_ID, trans_threads)
-                fence_proxy_async_shared()
+                if cutlass.const_expr(not self.early_w2):
+                    bar_sync(TRANS_BAR_ID, trans_threads)
+                    fence_proxy_async_shared()
+                # EARLY_W2: sB/sSFB are disjoint from the fc1 epilogue's sC, and every fc1
+                # stage this CTA loaded was consumed before its mainloop arrived on tdone
+                # (which the scheduler waited on before publishing this fc2 tile).
                 b_phase2, epi_phase = i32(1), i32(1)
+                first_w2 = ran_fc1
                 while tile.valid != i32(0):
-                    if ((tile.valid >> i32(PREFETCH_BIT)) & i32(1)) == i32(0):
-                        # No early weight stream for this launch: wait for the expert too.
-                        need_b = ceil_div(tile.m_boundary - tile.m_offset, pm1) * nnb1
-                        caddr_b = sync_base + Int64(SYNC_HEADER + tile.group) * Int64(4)
-                        seen_b = ld_acquire_i32(caddr_b)
-                        while seen_b < need_b:
-                            nanosleep(self.sleep_ns)
+                    if cutlass.const_expr(not (self.early_w2 or self.kacq)):
+                        if ((tile.valid >> i32(PREFETCH_BIT)) & i32(1)) == i32(0):
+                            # No early weight stream for this launch: wait for the expert too.
+                            need_b = ceil_div(tile.m_boundary - tile.m_offset, pm1) * nnb1
+                            caddr_b = sync_base + Int64(SYNC_HEADER + tile.group) * Int64(4)
                             seen_b = ld_acquire_i32(caddr_b)
+                            while seen_b < need_b:
+                                nanosleep(self.sleep_ns)
+                                seen_b = ld_acquire_i32(caddr_b)
+                    else:
+                        wait_b = i32(1) - ((tile.valid >> i32(PREFETCH_BIT)) & i32(1))
+                        if cutlass.const_expr(self.early_w2):
+                            if first_w2 != i32(0):
+                                wait_b = i32(0)
+                            first_w2 = i32(0)
+                        if wait_b != i32(0):
+                            # No early weight stream for this launch: wait for the expert too.
+                            if cutlass.const_expr(self.kacq):
+                                kbase_b = sync_base + Int64(KDONE_BASE + tile.group * KCOLS_MAX) * Int64(4)
+                                acquire_cols(kbase_b, i32(0), kcols2, nnb1,
+                                             ceil_div(tile.m_boundary - tile.m_offset, pm1),
+                                             self.sleep_ns)
+                            else:
+                                need_b = ceil_div(tile.m_boundary - tile.m_offset, pm1) * nnb1
+                                caddr_b = sync_base + Int64(SYNC_HEADER + tile.group) * Int64(4)
+                                seen_b = ld_acquire_i32(caddr_b)
+                                while seen_b < need_b:
+                                    nanosleep(self.sleep_ns)
+                                    seen_b = ld_acquire_i32(caddr_b)
                     cute.arch.mbarrier_wait(epi_empty2, epi_phase)
                     epi_phase ^= 1
                     b_phase2 = fc2k.load_b_sfb(
@@ -869,10 +1100,16 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
                 fin = i32(1)
                 S_t = split_k.splits_of(tile.valid)
                 if S_t > i32(1):
-                    fin = split_k.reduce_partials(
-                        acc, acc_g, gSplit, gCnt, tile.unit, S_t, tidx,
-                        c1.mma_threads, c1.epi_bar_id,
-                    )
+                    if cutlass.const_expr(self.acqrel):
+                        fin = split_k.reduce_partials(
+                            acc, acc_g, gSplit, gCnt, tile.unit, S_t, tidx,
+                            c1.mma_threads, c1.epi_bar_id, True,
+                        )
+                    else:
+                        fin = split_k.reduce_partials(
+                            acc, acc_g, gSplit, gCnt, tile.unit, S_t, tidx,
+                            c1.mma_threads, c1.epi_bar_id,
+                        )
                 split_act(acc, acc_g)
                 if fin != i32(0):
                     moe_epilogue.store_wg_q1_swap(
@@ -881,13 +1118,24 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
                         SF_M_ALIGN, UE8M0_PACK_NUM, tidx, swap_threads_m, swap_n_store,
                     )
                     # release this tile's q1/sf1 to the fc2 tiles of its expert
-                    split_k.membar_gl()
+                    if cutlass.const_expr(not self.acqrel):
+                        # (ACQREL: thread 0's atom.release after the CTA barrier covers every
+                        # math thread's q1/sf1 stores by cumulativity, as CUTLASS's semaphore.)
+                        split_k.membar_gl()
                     fence_proxy_async_global()
                     cute.arch.barrier(barrier_id=c1.epi_bar_id, number_of_threads=c1.mma_threads)
                     if tidx == i32(0):
-                        atom_add_release_i32(
-                            sync_base + Int64(SYNC_HEADER + tile.group) * Int64(4), i32(1)
-                        )
+                        if cutlass.const_expr(self.kacq):
+                            atom_add_release_i32(
+                                sync_base
+                                + Int64(KDONE_BASE + tile.group * KCOLS_MAX + tile.m_block)
+                                * Int64(4),
+                                i32(1),
+                            )
+                        else:
+                            atom_add_release_i32(
+                                sync_base + Int64(SYNC_HEADER + tile.group) * Int64(4), i32(1)
+                            )
                 tile = cons.get_next_tile(sWork, sfull, sempty)
                 go = is_fc1(tile.valid)
             fence_proxy_async_shared()
@@ -926,7 +1174,7 @@ def sync_workspace(device):
     key = torch.device(device)
     ws = _SYNC.get(key)
     if ws is None:
-        ws = torch.zeros(SYNC_HEADER + 2 * MAX_GROUPS, dtype=torch.int32, device=device)
+        ws = torch.zeros(SYNC_WORDS, dtype=torch.int32, device=device)
         _SYNC[key] = ws
     return ws
 
@@ -995,10 +1243,10 @@ def cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4(
     )
     sync = from_dlpack(sync_workspace(a_q.device), assumed_align=16).mark_layout_dynamic()
     args = (*args1[:9], *args2[:7], sync, args1[9])
-    key = (op1.tactic, op2.tactic, enable_pdl, swiglu_limit, grid_x, sm_version, split_k.key(),
-           os.environ.get("TRTLLM_SM12X_FI_FC12_DEBUG", ""),
-           os.environ.get("TRTLLM_SM12X_FI_FC12_SLEEP", "32"),
-           os.environ.get(PREFETCH_ENV, "81"))
+    if kacq_enabled():
+        assert ceil_div(n1, 128) <= KCOLS_MAX, "KACQ: more fc1 column tiles than KCOLS_MAX"
+    key = (op1.tactic, op2.tactic, enable_pdl, swiglu_limit, grid_x, sm_version,
+           *compile_env_key())
     hit = _COMPILED.get(key)
     if hit is None:
         hit = cute.compile(CuteDslSm120MoeMxfp8Mxfp4Fc12Fused(op1.cfg, op2.cfg, grid_x), *args)
