@@ -46,10 +46,26 @@
 - Workspace memory delta per GPU: 0 B (barrier buffer still one 2 MiB page; no new buffers).
 
 ## (e) Jobs
-- dev job: `bash experiments/ascent/lp_push/run.sh {python} dev` (4 GPUs). Start time: (filled after queueing).
-- kernel pair: `bash experiments/ascent/lp_push/run.sh {python} pair` on both arms (run_gpu_pair, gpus=4).
+- dev job 1983 (head a44f6195, base 9ac8398e): `bash experiments/ascent/lp_push/run.sh {python} dev`, 4 GPUs,
+  smc521ge-0043 half austin:4-7 (NUMA 1). Queued 08:28 PST, STARTED 08:42 PST, done 08:49. PASSED:
+  - bitwise push vs pull (TRTLLM_LP_AR_PUSH=0), 3 inputs each (one heavy-tailed), all 4 ranks, every element:
+    0 mismatches at M = 205/257/1024/1536/2047/2048/3001/4096/6144/8192 (8192 = two workspace parts).
+  - 1000 back-to-back push calls, shapes 2048/257/6144 cycling, 4 inputs per shape, reset barrier every 250:
+    0 mismatched / 0 non-finite calls; both ping/pong parities at every shape; IPC flags ok before every reset.
+  - dispatch: oneshot_lamport at M=1/2/4/8, NCCL at 128 and 204 (< 2 MiB), push kernel only at 205 and 2048 with
+    push=1 (no preprocess kernel), preprocess + pull two-shot with push=0.
+  - same-process timing (per call, max over ranks, median of 3 x 100): pull vs push us
+    1024: 247.4 -> 220.7 (-10.8%); 2048: 478.9 -> 431.6 (-9.9%); 4096: 949.0 -> 867.9 (-8.6%);
+    6144: 1448.7 -> 1293.9 (-10.7%); noise 1.2-2.8%.
+  - LP IPC allocation per GPU 75,497,472 B (workspace 34,670,592 x 2 + barrier 6,688 B x 2, 2 MiB pages): the
+    barrier grows 4128 -> 6688 B inside the same 2 MiB page, so the per-GPU memory delta is 0.
+- kernel pair 1995 (base 9ac8398e) / 1996 (head a44f6195): `bash experiments/ascent/lp_push/run.sh {python} pair`,
+  gpus=4, queued 08:50 PST.
 
 ## DONE / UNTESTED / NEXT
-- DONE: kernel, switch, flag sizing, dev/pair script.
-- UNTESTED: everything on GPU.
-- NEXT: dev job (bitwise + 1000-call + dispatch + timing), then the kernel pair if the dev job passes.
+- DONE: kernel, switch, flag sizing, dev/pair script, dev job 1983 (all checks pass).
+- NEXT: kernel pair 1995/1996 -> submit kernel_time EXACT. If it cannot run this session, re-queue exactly
+  run_gpu_pair(baseline=candidate=["bash","experiments/ascent/lp_push/run.sh","{python}","pair"], gpus=4).
+- Measured push is ~432 us at 2048, not the ~380 predicted: each phase is ~2x 8.1 MB per rank, so effective
+  ~37.5 GB/s. Possible follow-up (not in this branch): overlap the scatter and reduce phases per warp-group
+  chunk flags instead of one flag per CTA.
