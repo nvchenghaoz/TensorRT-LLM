@@ -26,11 +26,15 @@ import triton.language as tl
 from tensorrt_llm.quantization.utils.fp8_utils import check_sf_layout
 
 _ENV = "TRTLLM_DSV4_PREFILL_WO_QUANT"
-_BLOCK_M = int(os.environ.get("TRTLLM_DSV4_PREFILL_WO_QUANT_BLOCK_M", "16"))
+# Graph-replay sweep on RTX PRO 6000 (experiments/ascent/prefill_wo_quant/bench.py sweep, jobs
+# 1925/1928): FULL_TILE, BLOCK_M=4, 4 warps is best or within ~2 us of best at M=16..4096.
+_BLOCK_M = int(os.environ.get("TRTLLM_DSV4_PREFILL_WO_QUANT_BLOCK_M", "4"))
 _NUM_WARPS = int(os.environ.get("TRTLLM_DSV4_PREFILL_WO_QUANT_WARPS", "4"))
 _FULL_TILE = os.environ.get("TRTLLM_DSV4_PREFILL_WO_QUANT_FULL_TILE", "1") != "0"
 _HEAD_DIM = 512
 _WORD = 512  # 4 x 128-column quant groups per int32 scale word
+# per_token_quant_and_transform passes torch.finfo(float8_e4m3fn).max (448.0) the same way.
+_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 # Set after the first eager launch; a CUDA-graph capture never JIT-compiles this kernel.
 _compiled = False
@@ -183,7 +187,6 @@ def inv_rope_quant_permute102(
     m_padded = (m + 3) // 4 * 4
     values = torch.empty((groups, m, gw), dtype=torch.float8_e4m3fn, device=o3.device)
     scale = torch.empty((groups, words, m_padded), dtype=torch.int32, device=o3.device)
-    finfo = torch.finfo(torch.float8_e4m3fn)
     _inv_rope_quant_permute102_kernel[(triton.cdiv(m, _BLOCK_M), groups, words)](
         o3,
         positions,
@@ -194,8 +197,8 @@ def inv_rope_quant_permute102(
         cos_sin.stride(0),
         scale.stride(0),
         scale.stride(1),
-        finfo.max,
-        -finfo.max,
+        _FP8_MAX,
+        -_FP8_MAX,
         O_STRIDE=o3.stride(0),
         GROUP_WIDTH=gw,
         NOPE_DIM=nope_dim,
