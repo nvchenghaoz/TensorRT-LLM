@@ -650,6 +650,9 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 ev0,
                 ev1,
                 defer_k1=defer_k1,
+                # Only the hc_attn boundary (0): its K1's PDL dependent is the attention-input
+                # wq_a||wkv low-M GEMM, which stages constant weights before its wait (idea 208).
+                k1_trigger_first=which == 0,
             )
             if split is not None:
                 return split

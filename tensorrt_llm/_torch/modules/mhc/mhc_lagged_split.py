@@ -157,11 +157,22 @@ def _mhc_lagged_layer_input_kernel(
     SCR: tl.constexpr,
     DEBUG: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    TRIGGER_FIRST: tl.constexpr = 0,
 ):
     if LAUNCH_WITH_PDL:
-        # First statement: no global access may be hoisted above the wait (memory clobber).
-        gdc_wait_with_memory_clobber()
-        tl.extra.cuda.gdc_launch_dependents()
+        if TRIGGER_FIRST == 1:
+            # Trigger first (idea 208): the dependent (wq_a||wkv, which stages only constant
+            # weights before its own wait) may launch while this kernel's producer still runs.
+            # Still no global access above the wait (memory clobber).
+            tl.extra.cuda.gdc_launch_dependents()
+            gdc_wait_with_memory_clobber()
+        elif TRIGGER_FIRST == 2:
+            # Test-only negative control: trigger and SKIP the wait (reads a live producer's output).
+            tl.extra.cuda.gdc_launch_dependents()
+        else:
+            # First statement: no global access may be hoisted above the wait (memory clobber).
+            gdc_wait_with_memory_clobber()
+            tl.extra.cuda.gdc_launch_dependents()
     tok = tl.program_id(0).to(tl.int64)
     NCHUNK: tl.constexpr = HIDDEN // 8
 
@@ -239,6 +250,14 @@ def _mhc_lagged_layer_input_kernel(
 
 _SPLIT_ENV_ON = os.environ.get("TRTLLM_MHC_SPLIT_LAGGED", "1") != "0"
 _SPLIT_MAX_TOKENS = 8
+# K1 trigger-first (idea 208), used only where the caller asks for it (the hc_attn boundary, whose
+# PDL dependent is the attention-input wq_a||wkv low-M GEMM). 0 keeps the wait-then-trigger K1
+# (the old compile key: TRIGGER_FIRST is then not passed at all).
+K1_TRIGGER_FIRST_ENV = os.environ.get("TRTLLM_MHC_K1_TRIGGER_FIRST", "1") != "0"
+# Per-M rule (idea 208 gate, 1-GPU chain at the last arriver's AR window W_crit): trigger-first
+# pays only from this row count up. Below it, A's early launch costs more than its staging hides
+# inside a ~3 us all-reduce, so K1 keeps wait-then-trigger there. Read at call (capture) time.
+K1_TRIGGER_FIRST_MIN_TOKENS = int(os.environ.get("TRTLLM_MHC_K1_TRIGGER_FIRST_MIN_TOKENS", "4"))
 # Test-only race probe (default 0, never set in timed or serving runs): cycles of
 # torch.cuda._sleep on the aux stream before every K2. Read at capture time.
 TEST_AUX_SLEEP_CYCLES = int(os.environ.get("TRTLLM_MHC_SPLIT_TEST_SLEEP_CYCLES", "0"))
@@ -380,6 +399,8 @@ def mhc_lagged_layer_input(
     debug: Optional[torch.Tensor] = None,
     debug_li: bool = False,
     num_warps: Optional[int] = None,
+    trigger_first: bool = False,
+    _test_skip_wait: bool = False,
 ) -> torch.Tensor:
     """K1: post update + lagged collapse + RMSNorm -> layer_input [M, hidden] bf16.
 
@@ -387,6 +408,11 @@ def mhc_lagged_layer_input(
     tactic whose phase-2 thread count is ``reducer_threads`` (see module docstring).
     ``debug`` (test-only, fp32 [M, 2]) receives (sum of squares, rstd); with ``debug_li`` the
     output is the unnormalized collapse.
+    ``trigger_first`` (honoured when TRTLLM_MHC_K1_TRIGGER_FIRST != 0, PDL is on and
+    M >= K1_TRIGGER_FIRST_MIN_TOKENS) launches
+    the PDL dependents before this kernel's own wait; its successor must read nothing produced
+    upstream before its own griddepcontrol.wait. ``_test_skip_wait`` is a test-only negative
+    control (trigger, no wait).
     """
     M, hidden = x_prev.shape
     assert residual_prev.shape == (M, 4, hidden) and residual_prev.is_contiguous()
@@ -412,6 +438,11 @@ def mhc_lagged_layer_input(
     if M == 0:
         return out
     scratch = torch.empty((M, SCR), dtype=torch.float32, device=x_prev.device)
+    extra = {}
+    if enable_pdl and _test_skip_wait:
+        extra["TRIGGER_FIRST"] = 2
+    elif enable_pdl and trigger_first and K1_TRIGGER_FIRST_ENV and M >= K1_TRIGGER_FIRST_MIN_TOKENS:
+        extra["TRIGGER_FIRST"] = 1
     _mhc_lagged_layer_input_kernel[(M,)](
         x_prev,
         residual_prev,
@@ -435,5 +466,6 @@ def mhc_lagged_layer_input(
         num_warps=num_warps if num_warps is not None else _DEFAULT_NUM_WARPS,
         enable_fp_fusion=False,
         launch_pdl=bool(enable_pdl),
+        **extra,
     )
     return out

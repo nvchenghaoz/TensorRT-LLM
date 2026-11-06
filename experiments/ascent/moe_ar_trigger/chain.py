@@ -1,0 +1,468 @@
+"""Idea 208: MoE-AR early trigger + hc_attn K1 trigger-first, 1-GPU stand-in chain (SM120 decode M<=8).
+
+Per boundary (36 per step, layers with / without index_wq_b interleaved as in the checkpoint):
+  P  = stand-in MoE all-reduce: experiments/ascent/router_prewait/pdl_ext.py producer (plain launch, globaltimer
+       spin of W us, then src -> x_prev copy; trigger at END or EARLY). Grid 4*M x 160 threads = the SM120 plain
+       one-shot lamport AR launch shape at hidden 5120 (allReduceFusionKernels.cu kSm120DefaultCtasPerToken = 4).
+  K1 = the real hc_attn K1 (mhc_lagged_split.mhc_lagged_layer_input, PDL), trigger_first per arm.
+  A  = real wq_a||wkv low-M GEMM (trigger at start, bit 1), B = real fused q_norm + quant + wq_b(||index_wq_b),
+       both through the tree's DeepseekV41Attention._project_inputs (csa2_shared_proj_bench.Probe, own weights per
+       layer, ~25 MB/layer so every layer streams cold from DRAM).
+  S  = non-PDL separator (the rest of the layer).
+Arms: base (END, K1 wait-first) | a (EARLY, K1 wait-first) | ab (EARLY, K1 trigger-first). A tree without
+trigger_first (the branch base) runs base and a only.
+
+  --mode bench : per M and W, ABBA-interleaved CUDA-graph replays of every arm; us/boundary median, p10, p90.
+                 The evidence JSON reports --pair-arm at W = --pair-w us (kernel_ms = one step of 36 boundaries).
+  --mode check : candidate tree. Untimed repeated sequence: per iteration new inputs, NaN-poisoned x_prev and
+                 outputs, every arm/W graph replayed and every boundary's K1 layer_input and A/B outputs (qr, q, swa,
+                 index_q) compared bitwise with an eager no-overlap reference AND with the base graph. Arms also
+                 include PDL0 (TRTLLM_ENABLE_PDL=0). No Triton JIT during capture. 1000 back-to-back replays at
+                 M=1 and M=8. Negative controls each in a subprocess (--mode negctl --ctl k1nowait|lowmskip).
+"""
+
+import argparse
+import inspect
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+
+import torch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, ".."))
+sys.path.insert(0, os.path.join(HERE, "..", "router_prewait"))
+import csa2_shared_proj_bench as PB  # noqa: E402
+import pdl_ext  # noqa: E402
+
+from tensorrt_llm._torch.modules.mhc import mhc_lagged_split as S  # noqa: E402
+
+HIDDEN = 5120
+HAS_TF = "trigger_first" in inspect.signature(S.mhc_lagged_layer_input).parameters
+HAS_GATE = hasattr(S, "K1_TRIGGER_FIRST_MIN_TOKENS")
+TREE_MIN = getattr(S, "K1_TRIGGER_FIRST_MIN_TOKENS", 1)
+ARMS = {"base": (False, False), "a": (True, False), "ab": (True, True)}
+try:
+    from tensorrt_llm._torch.models.modeling_deepseekv4 import _moe_ar_trigger_at_end as _TREE_AR_END
+except Exception:  # noqa: BLE001  (branch base: the MoE AR always triggers at its end)
+    _TREE_AR_END = None
+
+
+def arm_params(arm, M):
+    """(early AR trigger, K1 trigger_first kwarg, K1 min-tokens gate in force at capture).
+
+    base / a / ab are forced arms (ab = trigger-first at every M, gate off); tree = what the tree's model runs
+    at the hc_attn boundary: the MoE AR rule of modeling_deepseekv4 and trigger_first=True with the tree's own
+    per-M gate (branch base: END trigger, wait-first K1)."""
+    if arm == "tree":
+        early = _TREE_AR_END is not None and not _TREE_AR_END(M)
+        return early, HAS_TF, TREE_MIN
+    early, tf = ARMS[arm]
+    return early, tf, 1
+
+
+def set_gate(v):
+    if HAS_GATE:
+        S.K1_TRIGGER_FIRST_MIN_TOKENS = v
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def layer_order(n_index, n_swa):
+    order, acc = [], 0.0
+    total = n_index + n_swa
+    for _ in range(total):
+        acc += n_index / total
+        if acc >= 1.0 - 1e-9:
+            order.append(True)
+            acc -= 1.0
+        else:
+            order.append(False)
+    return order
+
+
+class Chain:
+    def __init__(self, n_bnd, ckpt, P):
+        import tensorrt_llm._torch.custom_ops  # noqa: F401
+
+        argv = sys.argv
+        sys.argv = [argv[0], "x", ckpt]  # csa2_shared_proj_bench.layer_counts reads argv[2]
+        n_index, n_swa = PB.layer_counts()
+        sys.argv = argv
+        tot = n_index + n_swa
+        # Scale the checkpoint's index/no-index split to n_bnd boundaries.
+        ni = round(n_index * n_bnd / tot)
+        self.order = layer_order(ni, n_bnd - ni)
+        gen = torch.Generator(device="cuda").manual_seed(PB.SEED)
+        self.probes = []
+        for wi in self.order:
+            p = PB.Probe(wi, gen)
+            assert PB.attach_branch(p), "DeepseekV41Attention._project_inputs missing"
+            self.probes.append(p)
+        self.nw = [(1.0 + 0.1 * torch.randn(HIDDEN, generator=gen, device="cuda")).to(torch.bfloat16)
+                   for _ in range(n_bnd)]
+        self.n = n_bnd
+        self.P = P
+        self.scratch = torch.empty((8, 8), dtype=torch.bfloat16, device="cuda")
+        log(f"chain: {n_bnd} boundaries ({ni} with index_wq_b), checkpoint split {n_index}/{n_swa}, P={P}, "
+            f"trigger_first in tree: {HAS_TF}")
+
+    def bufs(self, M):
+        d = "cuda"
+        return {
+            "src": [torch.empty(M, HIDDEN, dtype=torch.bfloat16, device=d) for _ in range(self.n)],
+            "x": [torch.empty(M, HIDDEN, dtype=torch.bfloat16, device=d) for _ in range(self.n)],
+            "res": [torch.empty(M, 4, HIDDEN, dtype=torch.bfloat16, device=d) for _ in range(self.n)],
+            "post": [torch.empty(M, 4, dtype=torch.float32, device=d) for _ in range(self.n)],
+            "comb": [torch.empty(M, 16, dtype=torch.float32, device=d) for _ in range(self.n)],
+            "pre": [torch.empty(M, 4, dtype=torch.float32, device=d) for _ in range(self.n)],
+        }
+
+    @staticmethod
+    def fill(b, seed):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        for i in range(len(b["src"])):
+            b["src"][i].copy_(torch.randn(b["src"][i].shape, generator=g, device="cuda"))
+            b["res"][i].copy_(torch.randn(b["res"][i].shape, generator=g, device="cuda"))
+            b["post"][i].copy_(torch.rand(b["post"][i].shape, generator=g, device="cuda") * 2)
+            b["comb"][i].copy_(torch.rand(b["comb"][i].shape, generator=g, device="cuda") * 0.5)
+            b["pre"][i].copy_(torch.rand(b["pre"][i].shape, generator=g, device="cuda") + 0.05)
+
+    def run(self, b, M, w_us, early, tf, k1_skip_wait=False, direct_x=False):
+        """One step. direct_x: eager reference (x_prev = src copied by torch, no producer overlap)."""
+        ext = pdl_ext.ext()
+        outs = []
+        for i in range(self.n):
+            if direct_x:
+                b["x"][i].copy_(b["src"][i])
+            else:
+                ext.producer(b["src"][i], b["x"][i], int(w_us * 1000), 4 * M, 160, pdl_ext.empty(), bool(early))
+            kw = {}
+            if HAS_TF:
+                kw["trigger_first"] = bool(tf)
+                if k1_skip_wait:
+                    kw["_test_skip_wait"] = True
+            li = S.mhc_lagged_layer_input(b["x"][i], b["res"][i], b["post"][i], b["comb"][i], b["pre"][i],
+                                          self.nw[i], 1e-6, self.P, **kw)
+            qr, q, swa, idx = PB.branch(self.probes[i], li)
+            self.scratch[:M].copy_(q[:, :8])  # non-PDL separator: the rest of the layer
+            outs.append((li, qr, q, swa, idx))
+        return outs
+
+
+def capture(fn):
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    c0 = k1_cache_size()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        out = fn()
+    torch.cuda.synchronize()
+    return g, out, k1_cache_size() - c0
+
+
+def k1_cache_size():
+    n = 0
+    for c in getattr(S._mhc_lagged_layer_input_kernel, "device_caches", {}).values():
+        try:
+            n += len(c[0])
+        except Exception:  # noqa: BLE001
+            pass
+    return n
+
+
+def pct(v, q):
+    v = sorted(v)
+    return v[int(q * (len(v) - 1))]
+
+
+# ------------------------------------------------------------------------------------------------- bench
+def beyond(win, lose, table, key):
+    """True if arm `win` is faster than arm `lose` at table key prefix beyond the larger arm noise."""
+    w, l_ = table[f"{key}_{win}"], table[f"{key}_{lose}"]
+    gain = (l_["us_per_boundary"] - w["us_per_boundary"]) / l_["us_per_boundary"]
+    return gain > max(w["noise"], l_["noise"]), gain
+
+
+def bench(args):
+    import wcrit
+
+    # (i) W_crit: trace part (CPU) + stand-in overhead, printed before any arm is timed.
+    wc = wcrit.compute(args.batches) if args.wcrit else {"W_crit": {M: {"W_crit_p10": args.pair_w,
+                                                                          "W_crit_p50": args.pair_w,
+                                                                          "source": "--pair-w"} for M in args.batches}}
+    wtab = wc["W_crit"]
+    log("DECLARED judged points (W_crit, us): " + json.dumps(wtab))
+    log("DECLARED GATE: (a) on at M if a beats base beyond noise at W_crit p50; (b) on at M only if ab beats a "
+        "beyond noise at W_crit p50 AND ab is not worse than a beyond noise at W_crit p10. Pair point: arm 'tree' "
+        f"at W_crit p50 per M. Tree gate in force: K1 trigger-first from M >= {TREE_MIN} (HAS_GATE {HAS_GATE}).")
+    ch = Chain(args.boundaries, args.ckpt, args.P)
+    arms = [a for a in ("base", "a", "ab") if HAS_TF or a != "ab"] + ["tree"]
+    table = {}
+    for M in args.batches:
+        b = ch.bufs(M)
+        Chain.fill(b, 1)
+        graphs = {}
+        ws = sorted(set([float(w) for w in args.ws] + [wtab[M]["W_crit_p10"], wtab[M]["W_crit_p50"]]))
+        for w in ws:
+            for arm in arms:
+                early, tf, gate = arm_params(arm, M)
+                set_gate(gate)
+                graphs[(w, arm)] = capture(lambda: ch.run(b, M, w, early, tf))
+        set_gate(TREE_MIN)
+        jit = {f"W{k[0]:g}_{k[1]}": v[2] for k, v in graphs.items() if v[2]}
+        log(f"M={M}: captured {len(graphs)} graphs, ws {ws}, arm params "
+            f"{ {a: arm_params(a, M) for a in arms} }, K1 JIT growth during capture {jit or 'none'}")
+        for w in ws:
+            for arm in arms:
+                for _ in range(5):
+                    graphs[(w, arm)][0].replay()
+            torch.cuda.synchronize()
+            times = {a: [] for a in arms}
+            for r in range(args.reps):
+                seq = arms if r % 2 == 0 else list(reversed(arms))
+                for arm in seq:
+                    g = graphs[(w, arm)][0]
+                    e0 = torch.cuda.Event(enable_timing=True)
+                    e1 = torch.cuda.Event(enable_timing=True)
+                    e0.record()
+                    for _ in range(args.inner):
+                        g.replay()
+                    e1.record()
+                    e1.synchronize()
+                    times[arm].append(e0.elapsed_time(e1) / args.inner)
+            for arm in arms:
+                t = times[arm]
+                med = statistics.median(t)
+                table[f"M{M}_W{w:g}_{arm}"] = {
+                    "step_ms": med, "us_per_boundary": med * 1000 / ch.n,
+                    "p10_us_per_boundary": pct(t, 0.1) * 1000 / ch.n, "p90_us_per_boundary": pct(t, 0.9) * 1000 / ch.n,
+                    "noise": (pct(t, 0.9) - pct(t, 0.1)) / med}
+            line = "  ".join(f"{a}: {table[f'M{M}_W{w:g}_{a}']['us_per_boundary']:.2f}"
+                             f" [{table[f'M{M}_W{w:g}_{a}']['p10_us_per_boundary']:.2f},"
+                             f"{table[f'M{M}_W{w:g}_{a}']['p90_us_per_boundary']:.2f}]" for a in arms)
+            log(f"M={M} W={w:g}us us/boundary {line}")
+        del graphs
+        torch.cuda.empty_cache()
+    pair_arm = args.pair_arm if args.pair_arm in arms else "tree"
+    batch, gate, pair_w = {}, {}, {}
+    for M in args.batches:
+        w50, w10 = wtab[M]["W_crit_p50"], wtab[M]["W_crit_p10"]
+        pw = w50 if args.wcrit else args.pair_w
+        pair_w[str(M)] = pw
+        e = table[f"M{M}_W{pw:g}_{pair_arm}"]
+        eb = table[f"M{M}_W{pw:g}_base"]
+        batch[str(M)] = {"kernel_ms": e["step_ms"], "noise_floor": e["noise"],
+                         "us_per_boundary": e["us_per_boundary"], "W_us": pw,
+                         "in_job_base_us_per_boundary": eb["us_per_boundary"],
+                         "in_job_gain_vs_base": (eb["us_per_boundary"] - e["us_per_boundary"]) / eb["us_per_boundary"]}
+        g = {}
+        g["a_on"], g["a_gain_vs_base_p50"] = beyond("a", "base", table, f"M{M}_W{w50:g}")
+        if "ab" in arms:
+            b50, g["ab_gain_vs_a_p50"] = beyond("ab", "a", table, f"M{M}_W{w50:g}")
+            worse10, g["a_gain_vs_ab_p10"] = beyond("a", "ab", table, f"M{M}_W{w10:g}")
+            g["b_on"] = bool(b50 and not worse10)
+            g["tree_runs_b"] = M >= TREE_MIN
+            g["tree_matches_gate"] = g["tree_runs_b"] == g["b_on"]
+        gate[str(M)] = g
+        log(f"GATE M={M} at W_crit p50 {w50} / p10 {w10}: {g}")
+    print(json.dumps({"batch": batch, "output": {"class": "exact"}, "pair_arm": pair_arm, "pair_w_us": pair_w,
+                      "boundaries": ch.n, "trigger_first_in_tree": HAS_TF, "tree_k1_min_tokens": TREE_MIN,
+                      "gate": gate, "W_crit": wtab, "wcrit_detail": {k: v for k, v in wc.items() if k != "W_crit"},
+                      "table": table}))
+
+
+# ------------------------------------------------------------------------------------------------- check
+def flat(outs):
+    r = []
+    for t in outs:
+        r.extend(x for x in t if x is not None)
+    return r
+
+
+def nbad(a, b):
+    return sum(int((x.view(torch.uint8) != y.view(torch.uint8)).sum().item()) for x, y in zip(a, b))
+
+
+def nonfinite(vals):
+    return sum(int((~torch.isfinite(v.float())).sum().item()) for v in vals)
+
+
+def poison(b, outs):
+    for x in b["x"]:
+        x.fill_(float("nan"))
+    for t in flat(outs):
+        t.fill_(float("nan"))
+
+
+def check(args):
+    assert HAS_TF, "check needs the candidate tree"
+    ch = Chain(args.boundaries, args.ckpt, args.P)
+    failures = []
+    report = {}
+    for M in args.batches:
+        b = ch.bufs(M)
+        Chain.fill(b, 1)
+        cfgs = []
+        for w in args.ws:
+            for arm in ("base", "a", "ab", "tree"):
+                cfgs.append((f"{arm}_W{w:g}", w, *arm_params(arm, M), "1"))
+        cfgs.append((f"ab_W{args.ws[-1]:g}_PDL0", args.ws[-1], True, True, 1, "0"))
+        cfgs.append((f"tree_W{args.ws[-1]:g}_PDL0", args.ws[-1], *arm_params("tree", M), "0"))
+        graphs = {}
+        jit = {}
+        for name, w, early, tf, gate, pdl in cfgs:
+            os.environ["TRTLLM_ENABLE_PDL"] = pdl
+            set_gate(gate)
+            ch.run(b, M, w, early, tf)  # eager warm (JIT) first, as the CUDA-graph runner does
+            torch.cuda.synchronize()
+            g, outs, grew = capture(lambda: ch.run(b, M, w, early, tf))
+            graphs[name] = (g, outs)
+            jit[name] = grew
+        set_gate(TREE_MIN)
+        os.environ["TRTLLM_ENABLE_PDL"] = "1"
+        report_tree = {"tree_arm_params": arm_params("tree", M), "tree_k1_trigger_first": HAS_TF and M >= TREE_MIN}
+        jit_bad = {k: v for k, v in jit.items() if v}
+        if jit_bad:
+            failures.append(f"M={M} K1 JIT during capture {jit_bad}")
+        mism = {}
+        n_cmp = 0
+        for it in range(args.iters):
+            seed = 100 + it
+            Chain.fill(b, seed)
+            ref = [t.clone() for t in flat(ch.run(b, M, 0, False, False, direct_x=True))]
+            torch.cuda.synchronize()
+            n_cmp = len(ref)
+            base_vals = None
+            for name, *_ in cfgs:
+                g, outs = graphs[name]
+                Chain.fill(b, seed)
+                poison(b, outs)
+                g.replay()
+                torch.cuda.synchronize()
+                vals = flat(outs)
+                bad_ref = nbad(vals, ref)
+                if base_vals is None:  # first cfg is base_W<first>
+                    base_vals = [v.clone() for v in vals]
+                bad_base = nbad(vals, base_vals)
+                nf = nonfinite(vals)
+                mism.setdefault(name, []).append(bad_ref + bad_base + nf)
+                if bad_ref or bad_base or nf:
+                    failures.append(f"M={M} {name} iter {it}: bad_ref {bad_ref} bad_base {bad_base} nonfinite {nf}")
+        report[f"M{M}"] = {"max_mismatch_bytes_over_iters": {k: max(v) for k, v in mism.items()},
+                           "iters": args.iters, "jit_in_capture": jit, "graphs": len(graphs),
+                           "tensors_compared_per_replay": n_cmp, **report_tree}
+        log(f"M={M}: {json.dumps(report[f'M{M}'])}")
+        for la in (("ab", "tree") if M in (1, 8) else ()):
+            g, outs = graphs[f"{la}_W{args.ws[0]:g}"]
+            Chain.fill(b, 7)
+            t0 = time.time()
+            for _ in range(args.long_replays):
+                g.replay()
+            torch.cuda.synchronize()
+            dt = time.time() - t0
+            vals = [v.clone() for v in flat(outs)]
+            ref = flat(ch.run(b, M, 0, False, False, direct_x=True))
+            bad = nbad(vals, ref)
+            report[f"M{M}"][f"long_replays_{la}"] = {"n": args.long_replays, "s": round(dt, 2), "final_bad_bytes": bad}
+            log(f"M={M} {la}: {args.long_replays} back-to-back replays in {dt:.2f}s, final bad {bad}")
+            if bad:
+                failures.append(f"M={M} {la} long replays final mismatch {bad}")
+        del graphs
+        torch.cuda.empty_cache()
+    neg = {}
+    for ctl in ("k1nowait", "lowmskip"):
+        cmd = [sys.executable, os.path.abspath(__file__), "--mode", "negctl", "--ctl", ctl, "--ckpt", args.ckpt,
+               "--boundaries", "8", "--batches", "1", "4"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        last = (r.stdout.strip().splitlines() or ["{}"])[-1]
+        try:
+            res = json.loads(last)
+        except Exception:  # noqa: BLE001
+            res = {"parse_error": last[-500:], "stderr": r.stderr[-2000:]}
+        res["rc"] = r.returncode
+        neg[ctl] = res
+        log(f"negctl {ctl}: {json.dumps(res)[:600]}")
+        if not res.get("caught"):
+            failures.append(f"negative control {ctl} not caught")
+    report["negative_controls"] = neg
+    print(json.dumps({"passed": not failures, "failures": failures[:20],
+                      "compared": "every boundary's K1 layer_input + A/B outputs (qr, q, swa, index_q), graphs of "
+                                  "arms base/a/ab(forced)/tree(per-M gate) x W and ab/tree PDL0, NaN-poisoned per replay, bitwise vs eager "
+                                  "no-overlap reference and vs the base graph, every iteration",
+                      "report": report}))
+
+
+def negctl(args):
+    """A control that must be CAUGHT: K1 triggers first and skips its wait, or A (low-M) skips its wait."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import low_m_gemm as LM
+
+    ch = Chain(args.boundaries, args.ckpt, args.P)
+    set_gate(1)  # the controls run K1 trigger-first at every M, as before the per-M gate
+    caught = {}
+    for M in args.batches:
+        b = ch.bufs(M)
+        Chain.fill(b, 1)
+        if args.ctl == "k1nowait":
+            fn = lambda: ch.run(b, M, 10, True, True, k1_skip_wait=True)  # noqa: E731
+        else:
+            LM._TRIGGER_AT_START = 3  # bit 1 trigger at start + bit 0 skip griddepcontrol.wait (test-only)
+            fn = lambda: ch.run(b, M, 10, True, True)  # noqa: E731
+        g, outs, _ = capture(fn)
+        LM._TRIGGER_AT_START = 2
+        bad_total = 0
+        for it in range(4):
+            Chain.fill(b, 300 + it)
+            ref = [t.clone() for t in flat(ch.run(b, M, 0, False, False, direct_x=True))]
+            Chain.fill(b, 300 + it)
+            poison(b, outs)
+            g.replay()
+            torch.cuda.synchronize()
+            vals = flat(outs)
+            bad_total += nbad(vals, ref) + nonfinite(vals)
+        caught[str(M)] = bad_total
+        log(f"negctl {args.ctl} M={M}: mismatching bytes+nonfinite over 4 replays = {bad_total}")
+        del g
+    print(json.dumps({"ctl": args.ctl, "caught": all(v > 0 for v in caught.values()), "per_M": caught}))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", default="bench")
+    p.add_argument("--ckpt", default="")
+    p.add_argument("--boundaries", type=int, default=36)
+    p.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8])
+    p.add_argument("--ws", type=float, nargs="+", default=[2, 5, 10])
+    p.add_argument("--P", type=int, default=480)
+    p.add_argument("--reps", type=int, default=40)
+    p.add_argument("--inner", type=int, default=5)
+    p.add_argument("--iters", type=int, default=8)
+    p.add_argument("--long-replays", type=int, default=1000)
+    p.add_argument("--pair-arm", default="tree")
+    p.add_argument("--pair-w", type=float, default=5)
+    p.add_argument("--wcrit", type=int, default=1, help="1: judge/pair at the W_crit table (wcrit.py)")
+    p.add_argument("--ctl", default="k1nowait")
+    args = p.parse_args()
+    torch.cuda.set_device(0)
+    pdl_ext.ext()
+    if args.mode == "bench":
+        bench(args)
+    elif args.mode == "check":
+        check(args)
+    else:
+        negctl(args)
+
+
+if __name__ == "__main__":
+    main()

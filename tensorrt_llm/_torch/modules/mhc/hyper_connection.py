@@ -408,8 +408,12 @@ class mHC(nn.Module):
         event0: torch.cuda.Event,
         event1: torch.cuda.Event,
         defer_k1: bool = False,
+        k1_trigger_first: bool = False,
     ):
         """:meth:`fused_hc_lagged` split over two streams (decode, small M; SM120).
+
+        ``k1_trigger_first``: K1 launches its PDL dependents before its own wait (idea 208; only
+        for a boundary whose next kernel stages constant weights before its own wait).
 
         ``defer_k1`` (K1 fold, M <= 4): K1 is not launched; ``layer_input`` is an empty tensor that the
         consumer must produce through ``join.k1_fold`` (a :class:`mhc_lagged_split.K1FoldPending`).
@@ -501,6 +505,7 @@ class mHC(nn.Module):
                 nw,
                 norm_eps,
                 reducer_threads,
+                trigger_first=k1_trigger_first,
             )
 
         def k2():
