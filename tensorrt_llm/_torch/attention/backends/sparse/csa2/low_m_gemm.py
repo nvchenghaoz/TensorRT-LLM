@@ -157,6 +157,117 @@ def chain_a_config_for(n: int, k: int, m: int):
     return None if table is None else table.get(m)
 
 
+# hc_attn K1 fold into the attention-input chain's A (idea 386, SM120 decode M <= 2): the boundary's mHC lagged K1
+# (mhc_lagged_split.mhc_lagged_layer_input) is not launched; A = torch.ops.trtllm.csa2_mxfp8_low_m_gemm_k1fold computes
+# layer_input itself after its PDL wait, bit for bit (cluster split of K1's reduction, DSMEM exchange), quantizes it in
+# registers and writes it to the boundary's layer_input tensor; the CSA2 aux stream runs its own K1 copy.
+# TRTLLM_CSA2_A_K1_FOLD=0 turns it off; TRTLLM_CSA2_A_K1_FOLD_MAX_M (default 2, at most 2) bounds the row count.
+A_K1_FOLD_ENV_ON = os.environ.get("TRTLLM_CSA2_A_K1_FOLD", "1") != "0"
+A_K1_FOLD_MAX_M = max(0, min(2, int(os.environ.get("TRTLLM_CSA2_A_K1_FOLD_MAX_M", "2"))))
+_K1_HIDDEN = 5120
+_K1FOLD_CONFIGS = ((4, 4, 2), (8, 2, 2))  # chain-A configurations with a K1FOLD kernel instance
+_K1_MAX_UNITS, _K1_MAX_BLOCKS = 3, 2  # the kernel's register plan (kK1MaxUnits / kK1MaxBlocks)
+
+
+def _k1_first_block(w: int, p: int, c_lo: int) -> int:
+    s = 32 * w
+    return 0 if s >= c_lo else (c_lo - s + p - 1) // p
+
+
+def _k1_blocks_in(w: int, p: int, c_lo: int, cpr: int) -> int:
+    n = 0
+    s = 32 * w + _k1_first_block(w, p, c_lo) * p
+    while s < c_lo + cpr:
+        n += 1
+        s += p
+    return n
+
+
+def k1fold_plan_ok(warps: int, cluster_k: int, m: int, p: int) -> bool:
+    """Mirror of isCsa2K1FoldSupported (mxfp8LowMGemm.cu) for one chain-A configuration."""
+    chunks = _K1_HIDDEN // 8
+    if not 1 <= m <= 2 or p <= 0 or p % 32 or p // 32 > 16 or p > chunks or chunks % cluster_k:
+        return False
+    cpr = chunks // cluster_k
+    if cpr % 32:
+        return False
+    for r in range(cluster_k):
+        wr = 0
+        for w in range(p // 32):
+            n = _k1_blocks_in(w, p, r * cpr, cpr)
+            if n > _K1_MAX_BLOCKS:
+                return False
+            wr += 1 if n else 0
+        if (m * wr + warps - 1) // warps > _K1_MAX_UNITS:
+            return False
+    return True
+
+
+def k1fold_applies(m: int, reducer_threads: int, a_weight: torch.Tensor) -> bool:
+    """Whether A (wq_a||wkv chain configuration) can take the hc_attn K1 at ``m`` rows (needs k1fold_warmup first)."""
+    if not A_K1_FOLD_ENV_ON or not 1 <= m <= A_K1_FOLD_MAX_M or a_weight.dim() != 2:
+        return False
+    if not hasattr(torch.ops.trtllm, "csa2_mxfp8_low_m_gemm_k1fold") or not _available(a_weight.device):
+        return False
+    n, k = a_weight.shape
+    cfg = chain_a_config_for(n, k, m)
+    if k != _K1_HIDDEN or cfg is None or tuple(cfg) not in _K1FOLD_CONFIGS:
+        return False
+    if ("k1fold", a_weight.device.index, n, k) not in _warmed:
+        return False
+    return k1fold_plan_ok(cfg[0], cfg[1], m, int(reducer_threads))
+
+
+def k1fold_warmup(a_weight: torch.Tensor, a_weight_scale: torch.Tensor) -> None:
+    """Eager launch of every K1FOLD instance (with and without the L2 prefetch) before any graph capture."""
+    n, k = a_weight.shape
+    key = ("k1fold", a_weight.device.index, n, k)
+    if key in _warmed or torch.cuda.is_current_stream_capturing() or not A_K1_FOLD_ENV_ON:
+        return
+    if k != _K1_HIDDEN or not hasattr(torch.ops.trtllm, "csa2_mxfp8_low_m_gemm_k1fold"):
+        return
+    if not _available(a_weight.device):
+        return
+    dev = a_weight.device
+    for m in range(1, A_K1_FOLD_MAX_M + 1):
+        cfg = chain_a_config_for(n, k, m)
+        if cfg is None or tuple(cfg) not in _K1FOLD_CONFIGS or not k1fold_plan_ok(cfg[0], cfg[1], m, 480):
+            continue
+        x = torch.zeros((m, k), dtype=torch.bfloat16, device=dev)
+        res = torch.zeros((m, 4, k), dtype=torch.bfloat16, device=dev)
+        post = torch.zeros((m, 4), dtype=torch.float32, device=dev)
+        comb = torch.zeros((m, 16), dtype=torch.float32, device=dev)
+        nw = torch.ones((k,), dtype=torch.bfloat16, device=dev)
+        li = torch.empty((m, k), dtype=torch.bfloat16, device=dev)
+        for pf in (False, True):
+            extra = {"debug_flags": _TRIGGER_AT_START}
+            if pf:
+                extra = {"debug_flags": _TRIGGER_AT_START | _L2PF | (1 << 3), "pf_w": a_weight, "pf_sf": a_weight_scale,
+                         "pf_frac": 1}
+            torch.ops.trtllm.csa2_mxfp8_low_m_gemm_k1fold(x, res, post, comb, post, nw, 1e-6, 480, li, a_weight,
+                                                          a_weight_scale, cfg[0], cfg[1], cfg[2], True, **extra)
+    _warmed.add(key)
+
+
+def low_m_mm_k1fold(pending, weight: torch.Tensor, weight_scale: torch.Tensor, l2_prefetch=None) -> torch.Tensor:
+    """A of the attention-input chain (``low_m_mm(layer_input, ..., trigger_at_start=True, l2_prefetch=...)``) with the
+    deferred hc_attn K1 ``pending`` (mhc_lagged_split.K1FoldPending) folded in: writes ``pending.out`` and returns the
+    [M, N] rows. Only call it when ``k1fold_applies``."""
+    x_prev, residual, post, comb, pre, nw, eps, p = pending.fold_args()
+    m, k = x_prev.shape
+    cfg = chain_a_config_for(weight.shape[0], k, m)
+    flags = _TRIGGER_AT_START
+    pf = l2pf_setting(m) if l2_prefetch is not None else None
+    extra = {}
+    if pf is not None:
+        pos, last, frac = pf
+        flags |= _L2PF | (pos << 3) | ((1 if last else 0) << 5)
+        extra = {"pf_w": l2_prefetch[0], "pf_sf": l2_prefetch[1], "pf_frac": frac}
+    return torch.ops.trtllm.csa2_mxfp8_low_m_gemm_k1fold(x_prev, residual, post, comb, pre, nw, eps, p, pending.out,
+                                                         weight, weight_scale, cfg[0], cfg[1], cfg[2], True,
+                                                         debug_flags=flags, **extra)
+
+
 def qnorm_config_for(n: int, k: int, m: int):
     table = _QNORM_CONFIGS.get((n, k))
     return None if table is None else table.get(m)
@@ -243,6 +354,14 @@ if hasattr(torch.ops.trtllm, "csa2_mxfp8_low_m_gemm"):
         if n_split == 0:
             return [x.new_empty((x.shape[0], n))]
         return [x.new_empty((x.shape[0], n_split)), x.new_empty((x.shape[0], n - n_split))]
+
+
+if hasattr(torch.ops.trtllm, "csa2_mxfp8_low_m_gemm_k1fold"):
+
+    @torch.library.register_fake("trtllm::csa2_mxfp8_low_m_gemm_k1fold")
+    def _(x_prev, residual, post, comb, pre, norm_w, eps, reducer_threads, layer_input, w, wsf, warps, cluster_k,
+          row_tiles, pdl, debug_flags=0, pf_w=None, pf_sf=None, pf_frac=256, xq_out=None, xsf_out=None):
+        return x_prev.new_empty((x_prev.shape[0], w.shape[0]))
 
 
 if hasattr(torch.ops.trtllm, "csa2_qnorm_low_m_gemm"):

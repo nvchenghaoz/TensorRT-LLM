@@ -50,6 +50,12 @@ try:
     from tensorrt_llm._torch.models.modeling_deepseekv4 import _moe_ar_trigger_at_end as _TREE_AR_END
 except Exception:  # noqa: BLE001  (branch base: the MoE AR always triggers at its end)
     _TREE_AR_END = None
+try:  # idea 386: hc_attn K1 folded into A (csa2_mxfp8_low_m_gemm_k1fold); absent on the branch base
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import low_m_gemm as LMG
+
+    HAS_FOLD = hasattr(LMG, "low_m_mm_k1fold")
+except Exception:  # noqa: BLE001
+    LMG, HAS_FOLD = None, False
 
 
 def arm_params(arm, M):
@@ -58,7 +64,7 @@ def arm_params(arm, M):
     base / a / ab are forced arms (ab = trigger-first at every M, gate off); tree = what the tree's model runs
     at the hc_attn boundary: the MoE AR rule of modeling_deepseekv4 and trigger_first=True with the tree's own
     per-M gate (branch base: END trigger, wait-first K1)."""
-    if arm in ("tree", "tree_fast0"):
+    if arm in ("tree", "tree_fast0", "fold", "tree_k1"):
         early = _TREE_AR_END is not None and not _TREE_AR_END(M)
         return early, HAS_TF, TREE_MIN
     if arm == "ideal":  # idea 352: producer EARLY, no K1 (A is the producer's direct PDL dependent)
@@ -68,7 +74,9 @@ def arm_params(arm, M):
 
 
 def arm_k1(arm):
-    return {"tree_fast0": "fast0", "ideal": "none"}.get(arm, "k1")
+    """tree = the tree's production hc_attn boundary ('auto': the K1 fold where the tree's low_m_gemm admits it,
+    else K1 -> A); fold / tree_k1 force one of the two (head tree only)."""
+    return {"tree_fast0": "fast0", "ideal": "none", "tree": "auto", "fold": "fold", "tree_k1": "k1"}.get(arm, "k1")
 
 
 def set_gate(v):
@@ -116,6 +124,8 @@ class Chain:
         self.n = n_bnd
         self.P = P
         self.scratch = torch.empty((8, 8), dtype=torch.bfloat16, device="cuda")
+        if HAS_FOLD:
+            LMG.k1fold_warmup(*self.probes[0]._wq_a_wkv)  # eager, before any capture
         log(f"chain: {n_bnd} boundaries ({ni} with index_wq_b), checkpoint split {n_index}/{n_swa}, P={P}, "
             f"trigger_first in tree: {HAS_TF}")
 
@@ -168,6 +178,21 @@ class Chain:
                     kw["_test_skip_wait"] = True
             if k1 == "fast0":
                 kw["fast"] = False
+            # 'fold' and 'auto' both fold exactly where the tree's gate admits it (M <= 2); elsewhere K1 -> A.
+            use_fold = k1 in ("fold", "auto") and HAS_FOLD and LMG.k1fold_applies(
+                M, self.P, self.probes[i]._wq_a_wkv[0])
+            if use_fold:
+                # Idea 386: no K1; A computes layer_input (pend.out) after its PDL wait on the producer.
+                pend = S.K1FoldPending(torch.empty_like(b["x"][i]),
+                                       (b["x"][i], b["res"][i], b["post"][i], b["comb"][i], b["pre"][i], self.nw[i]),
+                                       1e-6, self.P)
+                p = self.probes[i]
+                qr, q, swa, idx = p._project_inputs(pend.out, k1_fold=pend)
+                if p.with_index and idx is None:
+                    idx = p.index_wq_b(qr)
+                self.scratch[:M].copy_(q[:, :8])
+                outs.append((pend.out, qr, q, swa, idx))
+                continue
             if k1 == "none":
                 li = b["li_pre"][i]
             else:
@@ -306,7 +331,7 @@ def bench(args):
         for wl, wv in (("p50", w50), ("p10", w10)):
             key = f"M{M}_W{wv:g}"
             t = table.get(f"{key}_tree")
-            for other in ("ideal", "tree_fast0"):
+            for other in ("ideal", "tree_fast0", "fold", "tree_k1"):
                 o = table.get(f"{key}_{other}")
                 if t and o:
                     d = t["us_per_boundary"] - o["us_per_boundary"]
@@ -456,7 +481,7 @@ def check352(args):
     (main's default K1 -> A -> B on x_prev = src) and with the tree graph of the same iteration; the K1 layer_input
     of tree and tree_fast0 with the reference; ideal's precomputed layer_input with the reference."""
     ch = Chain(args.boundaries, args.ckpt, args.P)
-    arms = ("tree", "tree_fast0", "ideal")
+    arms = ("tree", "tree_fast0", "ideal") + (("fold", "tree_k1") if HAS_FOLD else ())
     failures, report = [], {}
     for M in args.batches:
         b = ch.bufs(M)
@@ -512,7 +537,9 @@ def check352(args):
                         failures.append(f"M={M} W={w:g} {arm} iter {it}: {r}")
         report[f"M{M}"] = {"iters": args.iters, "max_mismatch_over_iters": {k: max(v) for k, v in mism.items()},
                            "jit_in_capture": jit, "tensors_ab_per_replay": len(ref_ab),
-                           "arm_params": {a: arm_params(a, M) for a in arms}}
+                           "arm_params": {a: arm_params(a, M) for a in arms},
+                           "tree_runs_fold": bool(HAS_FOLD and LMG.k1fold_applies(
+                               M, ch.P, ch.probes[0]._wq_a_wkv[0]))}
         log(f"M={M}: {json.dumps(report[f'M{M}'])}")
         del graphs
         torch.cuda.empty_cache()
