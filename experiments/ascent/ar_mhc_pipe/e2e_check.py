@@ -43,6 +43,10 @@ LP_TOL, TIE_TOL = 1.6835, 3.3669
 CAP_RE = re.compile(r"\[TAIL_MOE_GRAPH\] rank (\d+) layer (\d+): captured")
 FAIL_RE = re.compile(r"\[TAIL_MOE_GRAPH\][^\n]*capture failed")
 STEP_RE = re.compile(r"^(step\[(EXTEND|DECODE)[^\]]*\])")
+# KV-cache capacity at startup (idea 374 acceptance 2): the memory-profiling summary and the per-window block counts.
+KV_RE = re.compile(r"(Peak memory during memory usage profiling.*|\[KVCacheManager\] blocks_per_window.*"
+                   r"|max_tokens=\d+.*|[Mm]ax (KV )?tokens.*\d+.*)")
+PREPOP_RE = re.compile(r"memory_pool_prepop|after_memory_pool_prepop")
 
 
 def log(*a):
@@ -286,7 +290,7 @@ def main():
     outdir = os.path.join(art, "e2e")
     head = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     log(f"head={head} arms={arms} reps={reps}")
-    results, caps = {}, {}
+    results, caps, kvs = {}, {}, {}
     for arm in arms:
         env = dict(os.environ)
         env.setdefault("TLLM_LOG_LEVEL", "INFO")
@@ -302,6 +306,7 @@ def main():
                              env=env, start_new_session=True)
         last = [time.time()]
         captured, failed = set(), []
+        kv_lines, prepop_lines = [], []
 
         def watchdog():
             while p.poll() is None:
@@ -322,16 +327,33 @@ def main():
                 captured.add((int(m.group(1)), int(m.group(2))))
             elif FAIL_RE.search(line):
                 failed.append(line.strip()[:300])
+            km = KV_RE.search(line)
+            if km and len(kv_lines) < 64:
+                kv_lines.append(km.group(1).strip()[:400])
+            if PREPOP_RE.search(line) and len(prepop_lines) < 16:
+                prepop_lines.append(line.strip()[:300])
             sys.stdout.write(line if len(line) < 3000 else line[:1500] + " ...[truncated]\n")
             sys.stdout.flush()
         p.wait()
         caps[arm] = {"captured_pairs": len(captured), "ranks": len({r for r, _ in captured}), "failed": failed[:4],
                      "rc": p.returncode}
+        kvs[arm] = {"lines": kv_lines, "prepop_lines": prepop_lines,
+                    "blocks_per_window": sorted({ln for ln in kv_lines if "blocks_per_window" in ln}),
+                    "available_kv_GiB": sorted({m.group(1) for ln in kv_lines
+                                                for m in [re.search(r"available KV cache memory[^:]*: ([\d.]+) GiB",
+                                                                    ln)] if m})}
         f = Path(outdir) / f"arm_{arm}.json"
         results[arm] = json.loads(f.read_text()) if f.exists() else {"records": {}, "errors": ["no output"]}
         log(f"arm {arm} rc={p.returncode} records={len(results[arm]['records'])} tail_graph={caps[arm]}")
     out = {"head": head, "tail_graph": caps, "sha256": {a: results[a].get("sha256") for a in results},
-           "errors": {a: results[a].get("errors") for a in results}}
+           "errors": {a: results[a].get("errors") for a in results}, "batch": BATCH,
+           "kv_capacity": {a: {k: v for k, v in kvs[a].items() if k != "lines"} for a in kvs}}
+    if "off" in kvs and "on" in kvs:
+        out["kv_capacity_equal"] = (kvs["off"]["blocks_per_window"] == kvs["on"]["blocks_per_window"]
+                                    and kvs["off"]["available_kv_GiB"] == kvs["on"]["available_kv_GiB"]
+                                    and bool(kvs["on"]["blocks_per_window"]))
+    Path(outdir).mkdir(parents=True, exist_ok=True)
+    Path(outdir, "kv_lines.json").write_text(json.dumps(kvs, indent=1))
     passed = all(not results[a].get("errors") and len(results[a]["records"]) == (BATCH + 1) * reps for a in results)
     passed = passed and all(c["captured_pairs"] == 80 and not c["failed"] for c in caps.values())
     if "off" in results and "on" in results:
@@ -356,7 +378,7 @@ def main():
         dec_ok = bool(census) and all(c.get("decode", {}).get("lp", 1) == 0 and c.get("decode", {}).get("lamport", 0) > 0
                                       for c in census.values())
         out["decode_lamport_only_0_LP"] = dec_ok
-        passed = passed and dec_ok
+        passed = passed and dec_ok and bool(out.get("kv_capacity_equal", True))
     out["passed"] = bool(passed)
     Path(outdir, "e2e_summary.json").write_text(json.dumps(out, indent=1))
     print(json.dumps(out))
