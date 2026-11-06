@@ -26,7 +26,18 @@ TRTLLM_LP_AR_TWOSHOT_CTAS for the sweep only. LP ipc_barriers_in/out sized (1 + 
 - Measure: TTFT-specific. TARGETS: c1 TTFT mean and c4 TTFT mean, each judged alone (lower is better).
 - GUARDS: c2 TTFT not slower beyond the gate floor; c1/c2/c4 TPOT not slower beyond max(gate floor, 2.9%), valid
   only with this branch's own trace showing DECODE unchanged (0 LP, lamport only).
-- Numerics: mode_switch (LP FP8 payload vs NCCL bf16); the grid change is bitwise vs LP-16CTA.
+- Numerics: PRECISION (top lead 9958: allreduceOp.cpp isUsingLowPrecision(hidden_size) never picks LP for hidden
+  5120, so this routing is not a framework mode); landing accuracy decides. The grid code is bitwise vs LP-16CTA.
+- Job B = GPU job 1655 (austin:0, commit e3073677, default 16): PASSED. Grid [16,1,1] on all ranks; lp_check, width
+  bitwise (all widths == 16), 1000-call robust (0 nonfinite, IPC flags OK, 0 re-run mismatches), trace 40 LP + 40 NCCL
+  EXTEND, DECODE 0 LP / 400 lamport, tail graph 80/80, 0 capture failed. Job 1640's topo preamble is in its 12 MB
+  stderr.log, over the artifact download limit; not posted.
+- Serving pair: 1663 (base 8e291e60) / 1664 (cand e3073677), back to back on austin:4-7, both valid.
+  | case | TTFT mean base -> cand (p50) | TPOT base -> cand |
+  | c1 | 143.72 -> 142.34 (-1.0%; p50 139.15 -> 134.79, -3.1%; cand max 199.7 outlier, rse 3.87%) | 5.123 -> 5.105 (-0.34%) |
+  | c2 | 304.46 -> 295.49 (-2.9%) | 6.187 -> 6.216 (+0.47%) |
+  | c4 | 443.94 -> 409.92 (-7.7%) | 7.5771 -> 7.5775 (+0.01%) |
+  Guards pass. Submitted serving_latency, numerics precision, targets c1/c4 TTFT.
 - Pair: ONE run_serving_pair, base = current main 8e291e60, candidate = this head, back to back on one half.
 
 # Idea 94 (branch 94): LOWPRECISION FP8-payload two-shot AR for prefill-size messages: status
