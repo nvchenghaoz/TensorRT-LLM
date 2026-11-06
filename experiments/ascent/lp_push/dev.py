@@ -135,7 +135,8 @@ def _stats(seqs):
     med = sorted(meds)[len(meds) // 2]
     return {"median_ms": med, "seq_medians_ms": meds, "p10": flat[n // 10], "p90": flat[(9 * n) // 10],
             "noise_floor": (flat[(9 * n) // 10] - flat[n // 10]) / med,
-            "seq_dispersion": (max(meds) - min(meds)) / med}
+            "seq_dispersion": (max(meds) - min(meds)) / med,
+            "mean_ms": sum(flat) / n, "seq_means_ms": [sum(s) / len(s) for s in seqs]}
 
 
 def _time(torch, run, m, rank, dev):
@@ -678,6 +679,7 @@ def main_pair():
                 "seq_dispersion": max(r["timing_repeat"][m]["seq_dispersion"] for r in rs),
                 "sm_clock_under_load_min_mhz": min((c for r in rs for c in r["timing_repeat"][m]["sm_clock_under_load_mhz"]
                                                     if c is not None), default=None)}
+        batch[m]["mean_us_max_rank"] = round(max(r["timing"][m]["mean_ms"] for r in rs) * 1e3, 1)
         batch[m]["seq_dispersion"] = max(r["timing"][m]["seq_dispersion"] for r in rs)
         batch[m]["p90_p10"] = max(r["timing"][m]["noise_floor"] for r in rs)
     ab = {}
@@ -692,11 +694,22 @@ def main_pair():
                       "seq_dispersion": round(max(r["ab"][m][k]["seq_dispersion"] for r in rs), 4),
                       "block_medians_us_max_rank": [round(max(r["ab"][m][k]["seq_medians_ms"][i] for r in rs) * 1e3, 1)
                                                     for i in range(AB_ROUNDS)],
+                      "mean_us_max_rank": round(max(r["ab"][m][k]["mean_ms"] for r in rs) * 1e3, 1),
+                      "block_means_us_max_rank": [round(max(r["ab"][m][k]["seq_means_ms"][i] for r in rs) * 1e3, 1)
+                                                  for i in range(AB_ROUNDS)],
                       "even_odd_call_median_us_max_rank": [
                           round(max(r["ab"][m][k]["even_call_median_ms"] for r in rs) * 1e3, 1),
                           round(max(r["ab"][m][k]["odd_call_median_ms"] for r in rs) * 1e3, 1)],
                       "sm_clock_under_load_min_mhz": min(clk) if clk else None}
+        for k in ("push0", "push1"):
+            b = sorted(row[k]["block_medians_us_max_rank"])
+            mid = (b[(len(b) - 1) // 2] + b[len(b) // 2]) / 2.0
+            row[k]["median_of_block_medians_us"] = round(mid, 2)
+            row[k]["block_median_spread"] = round((b[-1] - b[0]) / mid, 4)
         row["push1_vs_push0"] = round(row["push1"]["max_rank_us"] / row["push0"]["max_rank_us"] - 1.0, 4)
+        row["gain_block_medians"] = round(row["push1"]["median_of_block_medians_us"]
+                                          / row["push0"]["median_of_block_medians_us"] - 1.0, 4)
+        row["gain_mean"] = round(row["push1"]["mean_us_max_rank"] / row["push0"]["mean_us_max_rank"] - 1.0, 4)
         ab[m] = row
         log(f"[ab-table] m={m} push0={row['push0']['max_rank_us']} push1={row['push1']['max_rank_us']} "
             f"({row['push1_vs_push0']:+.1%}) noise={max(row['push0']['noise_floor'], row['push1']['noise_floor'])} "
