@@ -401,6 +401,17 @@ def main():
                                      "noise_floor": r["a_prepare"]["noise_floor"]}
                                  for s, r in res.items()},
                        "detail": res, "output": {"class": "exact"}}
+            elif MODE == "pair":
+                # Digest on the fresh rig first (identical in both trees), then timing.
+                steps, total = run_digest(rig)
+                log(f"PAIR DIGEST {total}")
+                res = run_time(rig)
+                out = {"batch": {s: {"step_ms": r["a_prepare"]["median_ms"],
+                                     "noise_floor": r["a_prepare"]["noise_floor"]}
+                                 for s, r in res.items()},
+                       "detail": res, "digest": total,
+                       "digest_steps": [(s["after_prepare"], s["after_replay_entry"]) for s in steps],
+                       "output": {"class": "exact"}}
             elif MODE == "diag":
                 out = {"passed": True, "diag": run_diag(rig)}
             else:
