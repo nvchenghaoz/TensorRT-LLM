@@ -88,6 +88,23 @@
     The JSON carries tree, kernel_receipt (default_path must be pull on base, push on head), ab_in_process,
     correctness, load_average start/end, per-rank GPU uuid.
 
+- PAIR 2025 (base 9ac8398e) / 2026 (head de1a863d), smc521ge-0046 austin:0-3 (NUMA 0), same slot, consecutive,
+  other half running window job 2004 in BOTH arms, loadavg 8-10 (base) / 6-7 (head), clocks under load >= 2220 MHz.
+  Receipts OK: base = preprocess + lowPrecisionTwoShotAllReduceKernel (unset and =0); head = push kernel alone
+  (unset), pull pair (=0); strings found in libth_common.so (TRTLLM_LP_AR_TWOSHOT_CTAS in both arms).
+  | M | pull | push | delta | noise base/head (max p90-p10, seq disp) | head seq disp |
+  | 1024 | 246.6 | 214.6 | -13.0% | 1.8% / 1.9% | 0.05% |
+  | 2048 | 478.0 | 433.8 | -9.3% | 1.5% / 5.0% | 0.4% |
+  | 4096 | 943.1 | 900.7 | -4.5% | 1.4% / 6.4% | 0.8% |
+  | 6144 | 1436.4 | 1358.4 | -5.4% | 1.4% / 5.8% | 0.6% |
+  Head in-process A/B (=0 vs unset, 3 rounds): -13.0 / -9.3 / -4.8 / -5.1%; base control 0.0 / 0.0 / +0.1 / +0.1%.
+  Bitwise 10 shapes and 1000-call sequence pass on 0046 (head arm). The head's p90-p10 at >= 2048 is the push
+  kernel's own per-call spread (same in the in-process A/B with pull at 1.1-1.3% in the same process), not the
+  neighbour: p10 at 4096 = 864 us ~ 2 x 432, median 900.
+- Rulings 13a/13c (3622/3628): claim shapes 1024/2048/8192, 4096/6144 secondary; ABAB 4+4 in both arms with
+  per-block neighbour log; receipt with PUSH=1; strings over every .so in tensorrt_llm/libs + mapped. dev.py pair
+  updated accordingly (adds 8192, even/odd-call medians, in-job repeat on a trigger).
+
 ## DONE / UNTESTED / NEXT
 - DONE: kernel, switch, flag sizing, dev/pair script, dev job 1983 (all checks pass).
 - DONE: kernel pair 2005/2006 -> submitted kernel_time EXACT.
