@@ -105,6 +105,26 @@
   per-block neighbour log; receipt with PUSH=1; strings over every .so in tensorrt_llm/libs + mapped. dev.py pair
   updated accordingly (adds 8192, even/odd-call medians, in-job repeat on a trigger).
 
+- PAIR 2032/2033 (head 7d00d213, austin:0-3): INVALID under 13c(3). The neighbour was busy in 50/50 base blocks
+  and 0/54 head blocks. Its checks pass. Head ABAB cross-check: 1024 -13.1%, 2048 -9.1%, 8192 -8.1%,
+  4096 -4.3%, 6144 -4.9%.
+- PAIR 2047 (base 9ac8398e) / 2048 (head 33f14a5c), smc521ge-0046 austin:4-7 (NUMA 1), same slot,
+  consecutive. Receipts (CUPTI unset/=1/=0), strings in libth_common.so, bitwise 0/10 shapes and the
+  1000-call sequence all PASS. SM clock under load >= 2295 MHz. Neighbour: merge job 2045 on austin:0-3 was
+  busy in 50/50 base-arm blocks and 0/53 head-arm blocks.
+  Head in-job ABAB, median of 4 block medians (us), PUSH=0 -> PUSH=1:
+  | M | PUSH=0 | PUSH=1 | gain | spread0/spread1 | mean gain | cross-arm base -> head |
+  | 1024 | 247.5 | 214.6 | -13.3% | 0.40% / 0.09% | -13.5% | 248.6 -> 214.6 |
+  | 2048 | 481.95 | 424.45 | -11.9% | 0.04% / 0.49% | -11.7% | 482.2 -> 423.5 (-12.2%) |
+  | 4096 | 953.2 | 875.7 | -8.1% | 0.12% / 0.25% | -8.4% | 954.1 -> 874.1 |
+  | 6144 | 1451.85 | 1279.05 | -11.9% | 0.10% / 0.48% | -11.6% | 1454.6 -> 1275.5 |
+  | 8192 | 1967.9 | 1715.9 | -12.8% | 0.06% / 0.30% | -12.9% | 1969.8 -> 1717.2 (-12.8%) |
+  Base-arm control (env ignored): ABAB 0.0% at every shape. Workspace delta per GPU: 0 B (75,497,472 both).
+  13g(c) base pull vs head PUSH=0: 2048/4096/6144/8192 hold (0.03-0.19% vs 0.25-0.49%); 1024 FAILS by
+  0.04 pp (0.44% vs 0.40%). Reported to the area lead. Third pair 2058/2059 was cancelled by a lead while
+  queued. I am waiting for consent for a third pair, or a ruling.
+  ms/req at c1 = 40 x 56.5 us (mean delta, 2048) = 2.26 ms/req on austin:4-7.
+
 ## DONE / UNTESTED / NEXT
 - DONE: kernel, switch, flag sizing, dev/pair script, dev job 1983 (all checks pass).
 - DONE: kernel pair 2005/2006 -> submitted kernel_time EXACT.
