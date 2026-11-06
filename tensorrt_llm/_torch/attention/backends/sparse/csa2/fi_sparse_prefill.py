@@ -261,6 +261,8 @@ def supported(q, swa_pool, swa_slots, main_pool, main_logical, mapping, plan) ->
 class FISharedPrefill:
     """Per-shape int32 index scratch, one FullBF16 wrapper per cache form, and the launch."""
 
+    _MAX_SHAPES = 8
+
     def __init__(self) -> None:
         self._buffers: dict[tuple, dict[str, torch.Tensor]] = {}
         self._wrappers: dict[tuple, object] = {}
@@ -284,19 +286,20 @@ class FISharedPrefill:
 
     def _scratch(self, count, heads, swa_width, main_width, device):
         key = (count, heads, swa_width, main_width, device)
-        buffers = self._buffers.get(key)
+        # Pop and re-insert: the dict's order is the LRU order.
+        buffers = self._buffers.pop(key, None)
         if buffers is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm up the CSA2 FlashInfer prefill shape before capture")
-            # Keep only the latest eager shape per (heads, widths): prefill shapes vary.
-            for previous in [k for k in self._buffers if k[1:] == key[1:]]:
-                del self._buffers[previous]
+            # Eager prefill shapes vary per step; retain the most recent few only.
+            while len(self._buffers) >= self._MAX_SHAPES:
+                del self._buffers[next(iter(self._buffers))]
             buffers = {
                 "swa": torch.empty((count, swa_width), dtype=torch.int32, device=device),
                 "main": torch.empty((count, max(main_width, 1)), dtype=torch.int32, device=device),
                 "lse": torch.empty((count, heads), dtype=torch.float32, device=device),
             }
-            self._buffers[key] = buffers
+        self._buffers[key] = buffers
         return buffers
 
     def __call__(self, q, swa_pool, swa_slots, main_pool, main_logical, mapping, plan, sink, scale, out):

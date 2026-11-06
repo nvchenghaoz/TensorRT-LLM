@@ -195,8 +195,9 @@ class Scenario:
     def run_fi_kernel_only(self, fi):
         # Attention launch alone, on the already-prepared index scratch.
         has_main = self.has_main
-        bufs = fi._scratch(self.count, HEADS, W, M if has_main else 0, DEV)
-        fi._wrapper(has_main, DEV).run(
+        dev = self.q.device  # the key FISharedPrefill uses (cuda:N, not bare cuda)
+        bufs = fi._scratch(self.count, HEADS, W, M if has_main else 0, dev)
+        fi._wrapper(has_main, dev).run(
             self.q,
             self.swa_pool.view(-1, 1, 528),
             bufs["swa"],
