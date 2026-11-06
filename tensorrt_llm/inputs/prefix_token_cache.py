@@ -81,6 +81,20 @@ MAX_SHARED_PREFIX_SIBLINGS = 32  # a spliced prompt becomes an entry only below 
 # looks again. The launcher sets it to a directory inside its multi-frontend
 # ipc dir (serve.py ``_share_prefix_token_dir``). Unset: no file I/O.
 SHARED_DIR_ENV = "TLLM_PREFIX_TOKEN_CACHE_SHARED_DIR"
+# Parallel tail tokenization. With the shared-prefix splice on, the cut rule of
+# ``_is_exact_cut`` also splits a text into pieces whose ids concatenate to the
+# ids of the whole text. ``_tokenize_tail`` cuts a tail (or a missed prompt)
+# into up to PARALLEL_MAX_PIECES // texts-in-flight pieces of at least
+# PARALLEL_PIECE_CHARS, searching up to PARALLEL_CUT_SEARCH chars past each
+# nominal cut, and encodes them with ONE ``backend_tokenizer.encode_batch``
+# call, which releases the GIL and runs the pieces on the backend's thread
+# pool. Offsets are read lazily (``_PieceOffsets``): the cache only reads the
+# grid points and the next split. Read once at import; benches flip the module
+# attribute. ``TLLM_PREFIX_TOKEN_CACHE_PARALLEL=0`` keeps the single HF call.
+PARALLEL_TAIL = os.environ.get("TLLM_PREFIX_TOKEN_CACHE_PARALLEL", "1") != "0"
+PARALLEL_PIECE_CHARS = 1024
+PARALLEL_CUT_SEARCH = 256
+PARALLEL_MAX_PIECES = 8
 SHARED_MAX_FILES = 64  # entries published per fingerprint directory
 SHARED_SUFFIX = ".ptc"
 SHARED_VERSION = 1
@@ -149,6 +163,144 @@ def _offset_grid(offsets: Sequence[tuple[int, int]], base_char: int, base_token:
     """Start chars of the grid tokens among ``offsets``, whose first token is ``base_token``."""
     first = -base_token % GRID_STRIDE
     return array("i", [base_char + off[0] for off in offsets[first::GRID_STRIDE]])
+
+
+def _piece_cuts(text: str, n_pieces: int) -> list[int]:
+    """Exact cuts splitting ``text`` into at most ``n_pieces`` pieces of >= PARALLEL_PIECE_CHARS.
+
+    Each cut is the first ``_is_exact_cut`` point at or after the nominal cut,
+    looking PARALLEL_CUT_SEARCH chars ahead; if a window has none, the piece
+    grows into the next window. The last piece is also >= PARALLEL_PIECE_CHARS.
+    """
+    n = len(text)
+    if n_pieces <= 1 or n < 2 * PARALLEL_PIECE_CHARS:
+        return []
+    size = max(PARALLEL_PIECE_CHARS, -(-n // n_pieces))
+    last = n - PARALLEL_PIECE_CHARS  # a cut may lie at most here
+    cuts: list[int] = []
+    lo = size
+    while len(cuts) < n_pieces - 1 and lo <= last:
+        hi = min(lo + PARALLEL_CUT_SEARCH, last)
+        c = text.find(" ", lo, hi + 1)
+        while c != -1 and not _is_exact_cut(text, c):
+            c = text.find(" ", c + 1, hi + 1)
+        if c == -1:
+            lo = hi + 1
+            continue
+        cuts.append(c)
+        lo = c + size
+    return cuts
+
+
+class _PieceOffsets:
+    """Offsets of concatenated piece encodings, read lazily through ``token_to_chars``.
+
+    Indexing (int or slice) returns the same ``(start, end)`` tuples, in chars
+    of the whole text, as the single call's ``offset_mapping``.
+    """
+
+    __slots__ = ("_encs", "_char_starts", "_tok_starts", "_n")
+
+    def __init__(self, encs: Sequence, char_starts: Sequence[int], lengths: Sequence[int]):
+        self._encs = encs
+        self._char_starts = char_starts
+        tok_starts = []
+        n = 0
+        for length in lengths:
+            tok_starts.append(n)
+            n += length
+        self._tok_starts = tok_starts
+        self._n = n
+
+    def __len__(self) -> int:
+        return self._n
+
+    def _at(self, i: int) -> tuple[int, int]:
+        p = bisect_right(self._tok_starts, i) - 1
+        start, end = self._encs[p].token_to_chars(i - self._tok_starts[p])
+        base = self._char_starts[p]
+        return (base + start, base + end)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self._at(j) for j in range(*i.indices(self._n))]
+        if i < 0:
+            i += self._n
+        if not 0 <= i < self._n:
+            raise IndexError("offset index out of range")
+        return self._at(i)
+
+
+def _encode_pieces(
+    backend: object, text: str, n_pieces: int
+) -> tuple[list[int], _PieceOffsets] | None:
+    """Ids and lazy offsets of ``text`` from one ``encode_batch`` over exact pieces.
+
+    None when a piece's encoding does not span exactly its piece (the caller
+    then makes the single HF call).
+    """
+    cuts = _piece_cuts(text, n_pieces)
+    starts = [0, *cuts]
+    ends = [*cuts, len(text)]
+    pieces = [text[a:b] for a, b in zip(starts, ends)]
+    encs = backend.encode_batch(pieces, add_special_tokens=False)
+    ids: list[int] = []
+    lengths = []
+    for enc, piece in zip(encs, pieces):
+        n = len(enc)
+        first = enc.token_to_chars(0) if n else None
+        end = enc.token_to_chars(n - 1) if n else None
+        if first is None or end is None or first[0] != 0 or end[1] != len(piece):
+            return None
+        ids.extend(enc.ids)
+        lengths.append(n)
+    return ids, _PieceOffsets(encs, starts, lengths)
+
+
+def _backend_state_is_plain(tokenizer: object, backend: object) -> bool:
+    """Whether ``encode_batch`` sees the state the HF call would reset it to.
+
+    ``encode_batch`` skips the HF call's truncation/padding/special-token reset.
+    """
+    return (
+        backend.truncation is None
+        and backend.padding is None
+        and not getattr(backend, "encode_special_tokens", False)
+        and not getattr(tokenizer, "split_special_tokens", False)
+    )
+
+
+def _parallel_tail_gate(tokenizer: object) -> tuple[object | None, str]:
+    """The backend to encode pieces with, or None, and why.
+
+    Called only for a tokenizer that passed ``_lcp_splice_gate`` (so the cut
+    rule is exact); checks the backend API and an empirical probe against the
+    single HF call, ids and every offset.
+    """
+    try:
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        if backend is None or not hasattr(backend, "encode_batch"):
+            return None, "no backend encode_batch"
+        if not _backend_state_is_plain(tokenizer, backend):
+            return None, "backend truncation/padding/special-token state set"
+        unit = (
+            "Alpha beta,  gamma\t delta 12345 x中文 y こん z.  "
+            "<|end|> été \U0001f600 ok\n\n  next (paren) 'quote' end. "
+        )
+        probe = unit * (6 * PARALLEL_PIECE_CHARS // len(unit) + 1)
+        enc = tokenizer(probe, add_special_tokens=False, return_offsets_mapping=True)
+        ref_ids, ref_offsets = list(enc["input_ids"]), [tuple(o) for o in enc["offset_mapping"]]
+        got = _encode_pieces(backend, probe, 4)
+        if got is None:
+            return None, "probe pieces do not span their text"
+        ids, offsets = got
+        if ids != ref_ids:
+            return None, "probe piece ids differ from the single call"
+        if list(offsets[0:]) != ref_offsets:
+            return None, "probe piece offsets differ from the single call"
+        return backend, "encode_batch over exact pieces matches the single call"
+    except Exception as e:  # noqa: BLE001 - any doubt keeps the single call
+        return None, f"probe failed ({e!r})"
 
 
 class OffsetTokenizer(Protocol):
@@ -236,8 +388,16 @@ class PrefixTokenCache:
         config: PrefixTokenCacheConfig,
         lcp_splice: bool = False,
         fingerprint: str | None = None,
+        parallel_backend: object | None = None,
     ) -> None:
         self._config = config
+        # Backend for parallel tail tokenization (see _tokenize_tail); only for
+        # a tokenizer that passed _lcp_splice_gate and _parallel_tail_gate.
+        self._parallel_backend = parallel_backend if lcp_splice else None
+        self._inflight_lock = threading.Lock()
+        self._inflight = 0  # texts inside _tokenize_tail's encode_batch
+        self.parallel_tails = 0
+        self.parallel_fallbacks = 0
         # Shared-prefix splice; only for a tokenizer that passed _lcp_splice_gate.
         self._lcp_splice = lcp_splice
         # Tokenizer fingerprint naming the cross-process directory; None keeps
@@ -304,6 +464,11 @@ class PrefixTokenCache:
                 f"{self.splice_no_cut} without an exact cut, "
                 f"{splice_ms:.2f} ms per spliced vs {full_ms:.2f} ms per full request"
             )
+            if self._parallel_backend is not None:
+                text += (
+                    f"; parallel tails: {self.parallel_tails}, "
+                    f"{self.parallel_fallbacks} fallbacks"
+                )
             if self._shared_path is not None:
                 text += (
                     f"; shared: {self.shared_loads} loaded, "
@@ -330,7 +495,7 @@ class PrefixTokenCache:
         splice_fallback = splice_no_cut = False
         if found is not None:
             eid, entry = found
-            tail_ids, tail_offsets = self._tokenize(tokenizer, text[entry.split_char :])
+            tail_ids, tail_offsets = self._tokenize_tail(tokenizer, text[entry.split_char :])
             if self._resynced(entry, tail_ids):
                 ids = entry.ids[: entry.split_token].tolist() + list(tail_ids)
                 base_token, base_char = entry.split_token, entry.split_char
@@ -350,7 +515,7 @@ class PrefixTokenCache:
                 if tok < 0:
                     splice_no_cut = True
                 else:
-                    tail_ids, tail_offsets = self._tokenize(tokenizer, text[cut:])
+                    tail_ids, tail_offsets = self._tokenize_tail(tokenizer, text[cut:])
                     if self._lcp_resynced(entry, tok, tail_ids):
                         ids = entry.ids[:tok].tolist() + list(tail_ids)
                         base_token, base_char = tok, cut
@@ -359,7 +524,7 @@ class PrefixTokenCache:
                     else:
                         splice_fallback = True
         if ids is None:
-            tail_ids, tail_offsets = self._tokenize(tokenizer, text)
+            tail_ids, tail_offsets = self._tokenize_tail(tokenizer, text)
             ids, base_token, base_char = tail_ids, 0, 0
             base_entry = None
 
@@ -583,6 +748,33 @@ class PrefixTokenCache:
         enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
         return enc["input_ids"], enc["offset_mapping"]
 
+    def _tokenize_tail(
+        self, tokenizer: OffsetTokenizer, text: str
+    ) -> tuple[list[int], Sequence[tuple[int, int]]]:
+        """``_tokenize``, through one GIL-releasing ``encode_batch`` over exact pieces when on."""
+        backend = self._parallel_backend
+        if (
+            not PARALLEL_TAIL
+            or backend is None
+            or len(text) < 2 * PARALLEL_PIECE_CHARS
+            or getattr(tokenizer, "backend_tokenizer", None) is not backend
+            or not _backend_state_is_plain(tokenizer, backend)
+        ):
+            return self._tokenize(tokenizer, text)
+        with self._inflight_lock:
+            self._inflight += 1
+            inflight = self._inflight
+        try:
+            got = _encode_pieces(backend, text, max(1, PARALLEL_MAX_PIECES // inflight))
+        finally:
+            with self._inflight_lock:
+                self._inflight -= 1
+        if got is None:
+            self.parallel_fallbacks += 1
+            return self._tokenize(tokenizer, text)
+        self.parallel_tails += 1
+        return got
+
     def _resynced(self, entry: _Entry, tail_ids: Sequence[int]) -> bool:
         """Whether the tokenizer re-synchronized with the cached ids at the seam."""
         cached_tail = entry.ids[entry.split_token :]
@@ -713,12 +905,24 @@ def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
     config = PrefixTokenCacheConfig.from_env()
     lcp_splice, why = _lcp_splice_gate(tokenizer)
     fingerprint = _tokenizer_fingerprint(tokenizer) if lcp_splice else None
+    parallel_backend, parallel_why = (
+        _parallel_tail_gate(tokenizer) if lcp_splice and PARALLEL_TAIL else (None, "")
+    )
     logger.info(
         f"Prefix token cache enabled: {config}; shared-prefix splice "
         f"{'on' if lcp_splice else 'off'} ({why})"
         + (f"; cross-process fingerprint {fingerprint}" if fingerprint else "")
+        + (
+            f"; parallel tail tokenization {'on' if parallel_backend is not None else 'off'} "
+            f"(PARALLEL_TAIL=True, {PARALLEL_MAX_PIECES} pieces of >= {PARALLEL_PIECE_CHARS} "
+            f"chars: {parallel_why})"
+            if parallel_why
+            else ""
+        )
     )
-    return PrefixTokenCache(config, lcp_splice=lcp_splice, fingerprint=fingerprint)
+    return PrefixTokenCache(
+        config, lcp_splice=lcp_splice, fingerprint=fingerprint, parallel_backend=parallel_backend
+    )
 
 
 def _tokenizer_fingerprint(tokenizer: object) -> str | None:
