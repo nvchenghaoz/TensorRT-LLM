@@ -78,7 +78,8 @@ for M in MS:
         offered = set(tuple(t) for t in rn.get_valid_tactics(inputs, None))
         fixed = {}
         for t in [("fused_half_fma", 24, 1, 256, 3), ("fused_half_fma", 24, 1, 256, 4),
-                  ("fused_half_fma", 24, 1, 256, 20), ("fused_half_fma", 24, 1, 256, 72)]:
+                  ("fused_half_fma", 24, 1, 256, 20), ("fused_half_fma", 24, 1, 256, 72)]
+                  + [("fused_half_fma", 24, 1, 256, 64 + tm) for tm in range(9, 17)]:
             if t not in offered:
                 continue
             ftn = lambda t=t: rn.forward(inputs, tactic=list(t), **kw)  # noqa: E731

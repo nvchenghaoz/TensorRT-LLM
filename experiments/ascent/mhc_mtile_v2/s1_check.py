@@ -139,19 +139,30 @@ for M in MS:
     del inputs, snap
     torch.cuda.empty_cache()
 
-# ------------------------------------------------------------------ B. M=128 graph replay
-M = 128
-inputs, nw = make_inputs(M, seed=11)
-pre_ext = torch.rand((M, HC), device="cuda").float() + 0.5
-new128 = [t for t in rn.get_valid_tactics(inputs, None) if t[0] == "fused_half_fma" and t[4] >= NEW_ID_MIN]
+# ------------------------------------------------------------------ B. graph replay (GRAPH_MS, default 128)
+GRAPH_MS = [int(x) for x in os.environ.get("GRAPH_MS", "128").split(",")]
 keep = []  # keep every captured graph's tensors alive (pitfall 2156)
-for t in new128:
+new128 = []
+graph_cases = []
+for M in GRAPH_MS:
+    inputs, nw = make_inputs(M, seed=11)
+    pre_ext = torch.rand((M, HC), device="cuda").float() + 0.5
+    new_m = [t for t in rn.get_valid_tactics(inputs, None) if t[0] == "fused_half_fma" and t[4] >= NEW_ID_MIN]
+    new128 += new_m
+    graph_cases += [(M, inputs, nw, pre_ext, t) for t in new_m]
+for M, inputs, nw, pre_ext, t in graph_cases:
     for mode, pe in (("v4", None), ("v41_lagged", pre_ext)):
         op = Op(inputs, nw, pe)
+        op.poison()
+        op(("fused_half_fma", 24, 1, 512 if M < 512 else 256, 1))  # ks=1 reference
+        torch.cuda.synchronize()
+        ks1 = [o.clone() for o in op.outs()]
         op.poison()
         op(t)
         torch.cuda.synchronize()
         eager = [o.clone() for o in op.outs()]
+        eager_ok = all(same(a, b) for a, b in zip(eager, ks1))
+        allpass &= eager_ok
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -172,8 +183,8 @@ for t in new128:
                 bad += 1
         ok = bad == 0
         allpass &= ok
-        report["B"][f"{t}_{mode}"] = {"replays": n_rep, "bad": bad}
-        print(f"[B] M=128 {t} {mode}: replays={n_rep} bad={bad}", flush=True)
+        report["B"][f"M{M}_{t}_{mode}"] = {"replays": n_rep, "bad": bad, "eager_vs_ks1_bitwise": eager_ok}
+        print(f"[B] M={M} {t} {mode}: replays={n_rep} bad={bad} eager_vs_ks1={eager_ok}", flush=True)
 report["B"]["n_new_tactics"] = len(new128)
 allpass &= len(new128) > 0
 

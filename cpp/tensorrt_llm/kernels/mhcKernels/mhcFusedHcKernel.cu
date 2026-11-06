@@ -652,6 +652,7 @@ static FmaMtileFn pickFhcFmaMtile(int tile_n, int tile_m)
     return &fused_fma_kernels::fused_pmap_gemm_fma_mtile_v3<TM, NG, 1>
 
     FHCFMA_MT3_CASE(8, 8);
+    FHCFMA_MT3_CASE(11, 8); // 187 CTAs at M = 2048: one wave on 188 SMs
 #undef FHCFMA_MT3_CASE
     TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaMtileLaunch: unsupported (tile_n=%d, tile_m=%d)", tile_n, tile_m);
     return nullptr;
@@ -706,7 +707,17 @@ void mhcFusedHcFmaMtileLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
         static_cast<unsigned>((M + tokens_per_cta - 1) / tokens_per_cta), static_cast<unsigned>(N / tile_n), 1u);
     dim3 const block(256);
     int const smem = fhcFmaMtileSmem(tile_m);
-    if (smem > 48 * 1024)
+    // The opt-in is needed once dynamic + static smem exceeds 48 KB. The v3 build carries
+    // TM-sized static smem (s_part etc.), so e.g. TM = 11 (44 KB dynamic + 9.7 KB static)
+    // needs it even though its dynamic smem alone is below 48 KB.
+    int static_smem = 0;
+    if (tile_m >= 64 && smem <= 48 * 1024)
+    {
+        cudaFuncAttributes fa;
+        TLLM_CUDA_CHECK(cudaFuncGetAttributes(&fa, reinterpret_cast<void const*>(fn)));
+        static_smem = static_cast<int>(fa.sharedSizeBytes);
+    }
+    if (smem > 48 * 1024 || smem + static_smem > 48 * 1024)
     {
         TLLM_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     }
