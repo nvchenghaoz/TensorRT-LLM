@@ -24,6 +24,36 @@ from guard import dirty_guard  # noqa: E402
 
 dirty_guard()
 
+
+def lib_receipt():
+    """Pitfall 3271 receipt: the libtensorrt_llm.so actually loaded (path, mtime, kernel symbol counts)."""
+    import mmap
+    import time as _t
+    rec = {}
+    for ln in open("/proc/self/maps"):
+        if "libtensorrt_llm.so" in ln:
+            p = ln.split()[-1]
+            if p in rec:
+                continue
+            with open(p, "rb") as fh:
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+
+                def cnt(pat):
+                    n, i = 0, mm.find(pat)
+                    while i != -1:
+                        n += 1
+                        i = mm.find(pat, i + 1)
+                    return n
+                rec[p] = {"mtime": _t.ctime(os.path.getmtime(p)),
+                          "mtile_v3_TM8": cnt(b"fused_pmap_gemm_fma_mtile_v3ILi8ELi8ELi1E"),
+                          "mtile_v3_TM11": cnt(b"fused_pmap_gemm_fma_mtile_v3ILi11ELi8ELi1E")}
+                mm.close()
+    return rec
+
+
+LIB = lib_receipt()
+print("[lib receipt]", json.dumps(LIB), flush=True)
+
 HC, HID = 4, 5120
 ARGS = (HC, HID, 1e-6, 1e-6, 1e-6, 2.0, 20)
 MS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "128,512,1024,2048,4096,8192").split(",")]
@@ -91,4 +121,4 @@ for M in MS:
         print(f"M={M}: fixed tactics {fixed}", flush=True)
     del inputs
     torch.cuda.empty_cache()
-print(json.dumps({"batch": out, "output": {"class": "exact"}}))
+print(json.dumps({"batch": out, "output": {"class": "exact"}, "lib_receipt": LIB}))
