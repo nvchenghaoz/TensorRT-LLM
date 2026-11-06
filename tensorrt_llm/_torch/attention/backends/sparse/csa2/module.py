@@ -450,7 +450,8 @@ class DeepseekV41Attention(nn.Module):
             # SM120 decode attention-input chain: wq_a||wkv triggers its dependents at start, so the fused
             # q_norm + MXFP8 quant + wq_b(||index_wq_b) kernel, launched right after it, stages its weights while
             # wq_a||wkv streams. It reads the rows only after its PDL wait.
-            rows = low_m_mm(hidden_states, *self._wq_a_wkv, trigger_at_start=True)
+            # It also L2-prefetches B's weight + scale bytes (TRTLLM_CSA2_QB_L2PF; a hint, outputs unchanged).
+            rows = low_m_mm(hidden_states, *self._wq_a_wkv, trigger_at_start=True, l2_prefetch=chain[:2])
         if rows is not None:
             weight, weight_scale, n_split = chain
             outs = qnorm_mm(

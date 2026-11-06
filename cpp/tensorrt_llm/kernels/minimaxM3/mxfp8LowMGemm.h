@@ -57,7 +57,12 @@ void invokeCsa2Mxfp8LowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int
     uint8_t const* wsf, __nv_bfloat16* out, int32_t ldo, __nv_bfloat16* out2, int32_t ldo2, int32_t nSplit,
     uint8_t const* xq, uint8_t const* xsf, uint8_t* xqOut, uint8_t* xsfOut, int32_t warps, int32_t clusterK,
     int32_t rowTiles, bool pdl, cudaStream_t stream, unsigned long long* dbgTs = nullptr, int32_t stages = 1,
-    int32_t debugFlags = 0);
+    int32_t debugFlags = 0, uint8_t const* pfP0 = nullptr, int64_t pfN0 = 0, uint8_t const* pfP1 = nullptr,
+    int64_t pfN1 = 0, int32_t pfFrac = 256);
+//! debugFlags bit 2 (with pfP0/pfP1): warp 0 of every CTA issues cp.async.bulk.prefetch.L2 over its 1/gridDim share
+//! of the LAST pfFrac/256 of each byte range [pfP0, pfP0 + pfN0) and [pfP1, pfP1 + pfN1) (the next kernel's weight and
+//! scale bytes). Bits 3-4 place it: 0 after the CTA's own bulk copies (before the trigger), 1 after its own weight
+//! mbarrier completes, 2 after griddepcontrol.wait. Bit 5 uses an L2 evict_last policy. A hint: outputs unchanged.
 
 //! Whether `invokeCsa2QnormLowMGemm` is built for (warps, clusterK, rowTiles) at M rows and K columns (K = 1280).
 bool isCsa2QnormLowMGemmSupported(int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t k);

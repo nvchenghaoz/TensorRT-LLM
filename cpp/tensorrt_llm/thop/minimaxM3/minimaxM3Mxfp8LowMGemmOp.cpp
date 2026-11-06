@@ -80,7 +80,8 @@ torch::Tensor minimaxM3Mxfp8LowMGemm(torch::Tensor const& x, torch::Tensor const
 std::vector<torch::Tensor> csa2Mxfp8LowMGemm(torch::Tensor const& x, torch::Tensor const& w, torch::Tensor const& wsf,
     int64_t warps, int64_t clusterK, int64_t rowTiles, int64_t nSplit, bool pdl, std::optional<torch::Tensor> xq,
     std::optional<torch::Tensor> xsf, std::optional<torch::Tensor> xqOut, std::optional<torch::Tensor> xsfOut,
-    std::optional<torch::Tensor> dbgTs, int64_t stages, int64_t debugFlags)
+    std::optional<torch::Tensor> dbgTs, int64_t stages, int64_t debugFlags, std::optional<torch::Tensor> pfW,
+    std::optional<torch::Tensor> pfSf, int64_t pfFrac)
 {
     int const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 120, "csa2_mxfp8_low_m_gemm requires SM120, got SM", sm);
@@ -126,6 +127,19 @@ std::vector<torch::Tensor> csa2Mxfp8LowMGemm(torch::Tensor const& x, torch::Tens
         TORCH_CHECK(xsfOut->is_contiguous() && xsfOut->numel() >= sfActNeed && xsfOut->element_size() == 1,
             "xsf_out is too small");
     }
+    auto pfRange = [&](std::optional<torch::Tensor> const& t) -> std::pair<uint8_t const*, int64_t>
+    {
+        if (!t.has_value())
+        {
+            return {nullptr, 0};
+        }
+        TORCH_CHECK(t->is_cuda() && t->is_contiguous() && t->get_device() == x.get_device()
+                && reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+            "pf_w / pf_sf must be contiguous 16-byte aligned CUDA tensors on x's device");
+        return {reinterpret_cast<uint8_t const*>(t->data_ptr()), t->numel() * t->element_size()};
+    };
+    auto const pf0 = pfRange(pfW);
+    auto const pf1 = pfRange(pfSf);
     c10::cuda::CUDAGuard const deviceGuard{x.device()};
     int64_t const n1 = nSplit == 0 ? n : nSplit;
     auto out = torch::empty({m, n1}, x.options());
@@ -151,7 +165,8 @@ std::vector<torch::Tensor> csa2Mxfp8LowMGemm(torch::Tensor const& x, torch::Tens
         static_cast<int32_t>(clusterK), static_cast<int32_t>(rowTiles), pdl && tensorrt_llm::common::getEnvEnablePDL(),
         at::cuda::getCurrentCUDAStream(x.get_device()),
         dbgTs.has_value() ? reinterpret_cast<unsigned long long*>(dbgTs->data_ptr()) : nullptr,
-        static_cast<int32_t>(stages), static_cast<int32_t>(debugFlags));
+        static_cast<int32_t>(stages), static_cast<int32_t>(debugFlags), pf0.first, pf0.second, pf1.first, pf1.second,
+        static_cast<int32_t>(pfFrac));
     return outs;
 }
 
@@ -244,7 +259,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "csa2_mxfp8_low_m_gemm(Tensor x, Tensor w, Tensor wsf, int warps, int cluster_k, int row_tiles, int n_split, "
         "bool pdl, Tensor? xq=None, Tensor? xsf=None, Tensor(a!)? xq_out=None, Tensor(b!)? xsf_out=None, "
-        "Tensor(c!)? dbg_ts=None, int stages=1, int debug_flags=0) -> Tensor[]");
+        "Tensor(c!)? dbg_ts=None, int stages=1, int debug_flags=0, Tensor? pf_w=None, Tensor? pf_sf=None, "
+        "int pf_frac=256) -> Tensor[]");
     m.def(
         "csa2_qnorm_low_m_gemm(Tensor x, Tensor w, Tensor wsf, Tensor norm_w, float eps, int warps, int cluster_k, "
         "int row_tiles, int n_split, bool pdl, int debug_flags=0, Tensor(a!)? xq_out=None, Tensor(b!)? xsf_out=None) "

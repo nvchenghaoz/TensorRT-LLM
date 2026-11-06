@@ -54,6 +54,36 @@ _QNORM_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int, int]]] = {
     (12288, 1280): {1: (4, 1, 2), 2: (8, 1, 2), 3: (4, 1, 1), 4: (4, 1, 1)},
 }
 _TRIGGER_AT_START = 2  # csa2_mxfp8_low_m_gemm debug_flags bit 1: trigger dependents at start
+_L2PF = 4  # debug_flags bit 2: L2-prefetch pf_w / pf_sf (bits 3-4 position, bit 5 evict_last)
+
+# Attention-input chain L2 prefetch (TRTLLM_CSA2_QB_L2PF, idea 272): wq_a||wkv (A) prefetches the tail of the fused
+# q_norm + wq_b(||index_wq_b) kernel's (B) weight + scale bytes into L2, so B's CTAs that only become resident once
+# A's CTAs exit stage from L2 instead of DRAM. Per M: (position, evict_last, frac/256); position 0 = after A's own
+# bulk copies (before its trigger), 1 = after A's weights landed, 2 = after A's PDL wait. A prefetch is a hint, so
+# outputs are bitwise unchanged. TRTLLM_CSA2_QB_L2PF=0 disables it; "pos,evict_last,frac" overrides every M.
+# Measured in the 40-layer cold-L2 chain with the real hc_attn K1 (experiments/ascent/qb_l2pf/bench.py arms, job
+# 1592), us/layer vs off: M=1 every arm slower (+0.5..+2.1: all of B's CTAs are co-resident there, so the prefetch
+# only lengthens A) -> off; M=2 pos 1 frac 154 -0.73 (25.48 vs 26.21); M=4 pos 2 frac 102 -1.58 (25.91 vs 27.49).
+# M=3 shares M=4's A/B configurations; M>=5 was not measured and stays off.
+_L2PF_DEFAULT: dict[int, tuple[int, int, int]] = {2: (1, 0, 154), 3: (2, 0, 102), 4: (2, 0, 102)}
+_l2pf_cache: dict = {}
+
+
+def l2pf_setting(m: int):
+    """``(position, evict_last, frac)`` of the attention-input chain's L2 prefetch at ``m`` rows, or ``None``."""
+    env = os.environ.get("TRTLLM_CSA2_QB_L2PF", "1")
+    key = (env, m)
+    if key not in _l2pf_cache:
+        if env == "0":
+            val = None
+        elif env == "1":
+            val = _L2PF_DEFAULT.get(m)
+        else:
+            pos, last, frac = (int(v) for v in env.split(","))
+            val = (pos, last, frac)
+        _l2pf_cache[key] = val
+    return _l2pf_cache[key]
+
 
 _state: dict = {}
 
@@ -90,11 +120,14 @@ def _warmup(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor) -
 _warmed: set = set()
 
 
-def low_m_mm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, trigger_at_start: bool = False):
+def low_m_mm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, trigger_at_start: bool = False,
+             l2_prefetch=None):
     """``mxfp8(x) @ weight^T`` in BF16 through the fused kernel, or ``None`` when it does not apply.
 
     ``trigger_at_start`` launches the attention-input chain's configuration, which triggers its PDL dependents at
     start (its consumer must be ``qnorm_mm``, whose kernel reads nothing of this output before its PDL wait).
+    ``l2_prefetch`` = (weight, weight_scale) of that consumer: with ``trigger_at_start`` and
+    ``l2pf_setting(m)`` on, the kernel L2-prefetches them (a hint; the output is unchanged).
     """
     if x.dim() != 2 or x.dtype != torch.bfloat16 or weight.dtype != torch.float8_e4m3fn:
         return None
@@ -108,6 +141,13 @@ def low_m_mm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, 
     if x.stride(1) != 1 or x.stride(0) % 8 != 0 or x.data_ptr() % 16 != 0:
         x = x.contiguous()
     flags = _TRIGGER_AT_START if trigger_at_start else 0
+    pf = l2pf_setting(m) if (trigger_at_start and l2_prefetch is not None) else None
+    if pf is not None:
+        pos, last, frac = pf
+        flags |= _L2PF | (pos << 3) | ((1 if last else 0) << 5)
+        return torch.ops.trtllm.csa2_mxfp8_low_m_gemm(x, weight, weight_scale, cfg[0], cfg[1], cfg[2], 0, True,
+                                                     debug_flags=flags, pf_w=l2_prefetch[0],
+                                                     pf_sf=l2_prefetch[1], pf_frac=frac)[0]
     return torch.ops.trtllm.csa2_mxfp8_low_m_gemm(x, weight, weight_scale, cfg[0], cfg[1], cfg[2], 0, True,
                                                  debug_flags=flags)[0]
 
@@ -198,7 +238,7 @@ if hasattr(torch.ops.trtllm, "csa2_mxfp8_low_m_gemm"):
 
     @torch.library.register_fake("trtllm::csa2_mxfp8_low_m_gemm")
     def _(x, w, wsf, warps, cluster_k, row_tiles, n_split, pdl, xq=None, xsf=None, xq_out=None, xsf_out=None,
-          dbg_ts=None, stages=1, debug_flags=0):
+          dbg_ts=None, stages=1, debug_flags=0, pf_w=None, pf_sf=None, pf_frac=256):
         n = w.shape[0]
         if n_split == 0:
             return [x.new_empty((x.shape[0], n))]

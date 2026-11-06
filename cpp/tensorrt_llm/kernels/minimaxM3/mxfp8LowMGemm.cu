@@ -849,7 +849,58 @@ struct QoutArgs
     unsigned long long* ts; // debug: per-CTA %globaltimer at 5 phase points, or null
     int flags;              // debug: bit 0 skips griddepcontrol.wait (negative control of the PDL checks only)
                             // bit 1: trigger dependents at start
+                            // bit 2: L2-prefetch the L2pfArgs ranges (bits 3-4 position, bit 5 evict_last)
 };
+
+// L2 prefetch of the NEXT kernel's weight + scale bytes (debug flag bit 2). Each CTA's warp 0 prefetches its
+// 1/gridDim share of the last frac/256 of each range; the successor's late (high-row) CTAs then stage from L2.
+struct L2pfArgs
+{
+    uint8_t const* p0;
+    long long n0;
+    uint8_t const* p1;
+    long long n1;
+    int frac; // out of 256
+};
+
+__device__ __forceinline__ void csa2_l2_prefetch(L2pfArgs const& pf, int lane, bool evict_last)
+{
+    constexpr long long kChunk = 16384;
+    long long const t0 = (pf.n0 * pf.frac / 256) & ~15ll;
+    long long const t1 = (pf.n1 * pf.frac / 256) & ~15ll;
+    long long const s0 = pf.n0 - t0; // first byte of the prefetched tail
+    long long const s1 = pf.n1 - t1;
+    long long const c0 = (t0 + kChunk - 1) / kChunk;
+    long long const c1 = (t1 + kChunk - 1) / kChunk;
+    uint64_t pol = 0;
+    if (evict_last)
+    {
+        asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(pol));
+    }
+    long long const grid = gridDim.x;
+    for (long long c = static_cast<long long>(lane) * grid + blockIdx.x; c < c0 + c1; c += 32 * grid)
+    {
+        bool const first = c < c0;
+        long long const off = first ? s0 + c * kChunk : s1 + (c - c0) * kChunk;
+        long long const end = first ? pf.n0 : pf.n1;
+        long long const rem = end - off;
+        unsigned int const n = static_cast<unsigned int>(rem < kChunk ? rem : kChunk) & ~15u;
+        uint8_t const* a = (first ? pf.p0 : pf.p1) + off;
+        if (n == 0 || (reinterpret_cast<uintptr_t>(a) & 15) != 0)
+        {
+            continue;
+        }
+        if (evict_last)
+        {
+            asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;\n" ::"l"(a), "r"(n), "l"(pol)
+                         : "memory");
+        }
+        else
+        {
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"(n) : "memory");
+        }
+    }
+}
 
 // Fused q_norm prologue (NORM instances): the activation is the raw [M, K] row view, normalized in-kernel exactly
 // as FlashInfer rmsnorm_cute (H = K = 1280) before the MXFP8 quantization; tile 0 writes the normalized rows.
@@ -979,11 +1030,13 @@ __device__ __forceinline__ int csa2_sf_offset(int m, int kb, int sf_k_tiles)
 // STAGES: the CTA's K slice is split into STAGES consecutive sub-slices, each bulk-copied (in order) onto its own
 // mbarrier; all warps consume stage s while later stages are still arriving.
 // NORM: x is the raw (un-normalized) K = 1280 row view; the CTA applies q_norm in-kernel (csa2_qnorm_quant_row).
-template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false>
+// PF: the instance carries the L2 prefetch (flag bit 2); PF = false instances compile it out entirely, so the
+// gate-off path runs the same code as before the prefetch existed.
+template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false, bool PF = false>
 __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_bfloat16 const* __restrict__ x,
     int ldx, int M, int N, int K, uint8_t const* __restrict__ w, uint8_t const* __restrict__ wsf, int num_k_tiles,
     __nv_bfloat16* __restrict__ out, int ldo, __nv_bfloat16* __restrict__ out2, int ldo2, int n_split,
-    int red_aliased, PreqArgs preq, QoutArgs qout, NormArgs nrm)
+    int red_aliased, PreqArgs preq, QoutArgs qout, NormArgs nrm, L2pfArgs pf)
 {
 #if CSA2_SM120_LOW_M_GEMM_ENABLED
     constexpr int kThreads = WARPS * 32;
@@ -1075,6 +1128,13 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
             }
         }
     }
+    bool const pf_on = PF && (qout.flags & 4) != 0;
+    int const pf_pos = (qout.flags >> 3) & 3;
+    bool const pf_last = (qout.flags & 32) != 0;
+    if (pf_on && pf_pos == 0 && warp == 0)
+    {
+        csa2_l2_prefetch(pf, lane, pf_last);
+    }
     if (qout.flags & 2)
     {
         asm volatile("griddepcontrol.launch_dependents;");
@@ -1092,6 +1152,10 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     if ((qout.flags & 1) == 0)
     {
         asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    if (pf_on && pf_pos == 2 && warp == 0)
+    {
+        csa2_l2_prefetch(pf, lane, pf_last);
     }
     if constexpr (NORM)
     {
@@ -1226,6 +1290,10 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     {
         csa2_stamp(qout, 2);
     }
+    if (s == STAGES - 1 && pf_on && pf_pos == 1 && warp == 0)
+    {
+        csa2_l2_prefetch(pf, lane, pf_last);
+    }
 #pragma unroll 2
     for (int i = 0; i < bps; ++i)
     {
@@ -1354,10 +1422,10 @@ size_t csa2SmemBytes(int warps, int clusterK, int rowTiles, int m, int k)
         + (aliased ? 0 : red_bytes);
 }
 
-template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false>
+template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false, bool PF = false>
 void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t const* w, uint8_t const* wsf,
     __nv_bfloat16* out, int ldo, __nv_bfloat16* out2, int ldo2, int nSplit, PreqArgs preq, QoutArgs qout, bool pdl,
-    cudaStream_t stream, NormArgs nrm = NormArgs{})
+    cudaStream_t stream, NormArgs nrm = NormArgs{}, L2pfArgs pf = L2pfArgs{})
 {
     int const kc = K / CLUSTER_K;
     int const kc_blocks = kc / 32;
@@ -1369,7 +1437,7 @@ void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t co
     size_t const red_bytes = static_cast<size_t>(WARPS) * 16 * RT * 8 * sizeof(float);
     int const red_aliased = red_bytes <= w_bytes ? 1 : 0;
     size_t const smem = csa2SmemBytes(WARPS, CLUSTER_K, RT, M, K);
-    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, STAGES, NORM>;
+    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, STAGES, NORM, PF>;
     static bool const configured = [&]()
     {
         int device = 0, max_optin = 0;
@@ -1416,7 +1484,7 @@ void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t co
     cfg.attrs = attr;
     cfg.numAttrs = 2;
     cudaError_t const err = cudaLaunchKernelEx(&cfg, kernel, x, ldx, M, N, K, w, wsf, (K / 32 + 3) / 4, out, ldo,
-        out2, ldo2, nSplit, red_aliased, preq, qout, nrm);
+        out2, ldo2, nSplit, red_aliased, preq, qout, nrm, pf);
     if (err != cudaSuccess)
     {
         cudaGetLastError();
@@ -1450,18 +1518,43 @@ size_t csa2Mxfp8LowMGemmSmemBytes(int32_t warps, int32_t clusterK, int32_t rowTi
 void invokeCsa2Mxfp8LowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t n, int32_t k, uint8_t const* w,
     uint8_t const* wsf, __nv_bfloat16* out, int32_t ldo, __nv_bfloat16* out2, int32_t ldo2, int32_t nSplit,
     uint8_t const* xq, uint8_t const* xsf, uint8_t* xqOut, uint8_t* xsfOut, int32_t warps, int32_t clusterK,
-    int32_t rowTiles, bool pdl, cudaStream_t stream, unsigned long long* dbgTs, int32_t stages, int32_t debugFlags)
+    int32_t rowTiles, bool pdl, cudaStream_t stream, unsigned long long* dbgTs, int32_t stages, int32_t debugFlags,
+    uint8_t const* pfP0, int64_t pfN0, uint8_t const* pfP1, int64_t pfN1, int32_t pfFrac)
 {
     TLLM_CHECK_WITH_INFO(isCsa2Mxfp8LowMGemmSupported(warps, clusterK, rowTiles, m, stages),
         "csa2_mxfp8_low_m_gemm: unsupported configuration (warps %d, cluster_k %d, row_tiles %d, stages %d) at M=%d",
         warps, clusterK, rowTiles, stages, m);
     int const sfKTiles = (k / 32 + 3) / 4;
     PreqArgs const preq{xq, xsf, sfKTiles};
+    if (pfP0 == nullptr && pfP1 == nullptr)
+    {
+        debugFlags &= ~4;
+    }
+    L2pfArgs const pf{pfP0, pfP0 == nullptr ? 0 : pfN0, pfP1, pfP1 == nullptr ? 0 : pfN1,
+        pfFrac < 0 ? 0 : (pfFrac > 256 ? 256 : pfFrac)};
+    if (debugFlags & 4)
+    {
+        // Only the attention-input chain's wq_a||wkv configurations carry a prefetch instance (PF = true).
+        QoutArgs const qoutPf{xqOut, xsfOut, sfKTiles, dbgTs, debugFlags};
+#define CSA2_PF_DISPATCH(W, C, R, S)                                                                                   \
+    if (warps == W && clusterK == C && rowTiles == R && stages == S)                                                   \
+    {                                                                                                                  \
+        launchCsa2<W, C, R, S, false, true>(                                                                           \
+            x, ldx, m, n, k, w, wsf, out, ldo, out2, ldo2, nSplit, preq, qoutPf, pdl, stream, NormArgs{}, pf);         \
+        return;                                                                                                        \
+    }
+        CSA2_PF_DISPATCH(4, 4, 2, 1)
+        CSA2_PF_DISPATCH(8, 2, 2, 1)
+        CSA2_PF_DISPATCH(8, 4, 1, 1)
+#undef CSA2_PF_DISPATCH
+        debugFlags &= ~4; // no prefetch instance for this configuration: the prefetch is a hint, drop it
+    }
     QoutArgs const qout{xqOut, xsfOut, sfKTiles, dbgTs, debugFlags};
 #define CSA2_DISPATCH(W, C, R, S)                                                                                      \
     if (warps == W && clusterK == C && rowTiles == R && stages == S)                                                   \
     {                                                                                                                  \
-        launchCsa2<W, C, R, S>(x, ldx, m, n, k, w, wsf, out, ldo, out2, ldo2, nSplit, preq, qout, pdl, stream);        \
+        launchCsa2<W, C, R, S>(                                                                                        \
+            x, ldx, m, n, k, w, wsf, out, ldo, out2, ldo2, nSplit, preq, qout, pdl, stream, NormArgs{}, pf);           \
         return;                                                                                                        \
     }
     CSA2_LOW_M_CONFIGS(CSA2_DISPATCH)
