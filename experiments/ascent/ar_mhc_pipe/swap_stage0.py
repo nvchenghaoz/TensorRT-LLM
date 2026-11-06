@@ -1,5 +1,8 @@
 """Idea 374 / branch 226 STAGE 0: design B (stream-role swap) vs design D (comm role) per prefill boundary, 4 GPUs.
 
+Ran as job 2022 on commit 86194012, whose ar_pipeline.py had the env-selectable ArFusedHcPipeline(role=...). The
+landed code gates the roles on T (SWAP_ABOVE_ROWS) instead, so this script no longer runs as is.
+
 Per rank (mpi4py.futures), real tensorrt_llm AllReduce(LOWPRECISION) and a real mHC at V4.1 dims (autotuned like
 warm-up). Per T in {4096, 6144, 8192} with the model's k(T) chunk bounds:
   serial      y = AR(x); mHC.fused_hc_lagged(y, ...)                         (main's unpipelined path)

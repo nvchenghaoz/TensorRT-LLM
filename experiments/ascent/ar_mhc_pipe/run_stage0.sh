@@ -65,6 +65,29 @@ print(json.dumps({"passed": bool(c.get("passed")) and bool(e.get("passed")), "ch
                   "chain_rc": int(sys.argv[3]), "e2e_rc": int(sys.argv[4]), "stage0": s}))
 ' "$CHAIN" "$E2E" "$CRC" "$ERC" "$S0"
 fi
+if [ "$WHAT" = "gate" ]; then
+  # idea 374 / branch 226 (plan 15f (2)): gate receipts (a)-(c) + the 4-rank 1000-call chain check
+  mkdir -p "${AUTO_DEV_ARTIFACTS:-.}"
+  echo "=== GATE CHECK $(date -Is)" 1>&2
+  "$PY" "$HERE/gate_check.py" "$CKPT" 2>&1 | tee "${AUTO_DEV_ARTIFACTS:-.}/gate_stdout.log" | cut -c1-1500 1>&2
+  GRC=${PIPESTATUS[0]}
+  GATE=$(tail -n 1 "${AUTO_DEV_ARTIFACTS:-.}/gate_stdout.log")
+  echo "=== CHAIN CHECK $(date -Is) (gate rc=$GRC)" 1>&2
+  "$PY" "$HERE/chain_check.py" "$CKPT" 2>&1 | tee "${AUTO_DEV_ARTIFACTS:-.}/chain_stdout.log" | cut -c1-1500 1>&2
+  CRC=${PIPESTATUS[0]}
+  CHAIN=$(tail -n 1 "${AUTO_DEV_ARTIFACTS:-.}/chain_stdout.log")
+  exec "$PY" -c '
+import json, sys
+def parse(s):
+    try:
+        return json.loads(s)
+    except Exception:
+        return {"passed": False, "unparsed": s[:500]}
+g, c = parse(sys.argv[1]), parse(sys.argv[2])
+print(json.dumps({"passed": bool(g.get("passed")) and bool(c.get("passed")), "gate": g, "chain": c,
+                  "gate_rc": int(sys.argv[3]), "chain_rc": int(sys.argv[4])}))
+' "$GATE" "$CHAIN" "$GRC" "$CRC"
+fi
 if [ "$WHAT" = "stage0" ]; then
   echo "=== STAGE 0 $(date -Is)" 1>&2
   exec "$PY" "$HERE/stage0.py" "$CKPT"

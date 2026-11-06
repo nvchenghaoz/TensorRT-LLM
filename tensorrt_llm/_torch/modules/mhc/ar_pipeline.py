@@ -22,12 +22,14 @@ Env:
       boundary adds ~0.1-0.3 ms of host launch work, which the host-paced c1 prefill (T=2048) would pay 1:1).
   ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_MAX_ROWS``: largest boundary T that is pipelined (default 8192 =
       max_num_tokens of the served engine).
-  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_ROLE``: ``swap`` (default) = the chunk all-reduces run on the CURRENT (main)
-      stream and the chunk mHCs on a side stream, so every allocation of the boundary (the chunk all-reduce outputs
-      included) lands in the main stream's allocator pool, exactly where the unpipelined boundary allocates it, and
-      the side stream allocates nothing; ``comm`` = design D's original roles (chunk all-reduces on a priority -1
-      comm stream, whose allocator pool holds the chunk outputs: out of memory at the T=8192 peak, job 1898).
-  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_SIDE_PRIORITY``: priority of the swap role's mHC side stream (default 0).
+
+Stream roles by T (constant ``SWAP_ABOVE_ROWS`` = 6144):
+  T <= 6144: chunk all-reduces on the priority -1 comm stream, chunk mHCs on the caller (main) stream.
+  T >  6144: ROLE SWAP (design B, idea 374): chunk all-reduces on the caller (main) stream, chunk mHCs on a priority 0
+      side stream. Every allocation of the boundary (the chunk all-reduce outputs included) then lands in the main
+      stream's allocator pool, where the unpipelined boundary allocates it, and the side stream allocates nothing. With
+      the comm-stream roles the chunk outputs lived in the comm stream's pool, which pushed the max_num_tokens=8192
+      warm-up peak out of memory (branch 199, job 1898). Same kernels, bounds and tactic in both roles: bitwise equal.
 """
 
 import os
@@ -59,17 +61,13 @@ PIPELINE_ON = _RAW not in ("0", "1", "off", "false", "no")
 PIPELINE_K = 0 if _RAW in ("", "auto") or not PIPELINE_ON else int(_RAW)  # 0 = k(T)
 PIPELINE_CHUNK_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_CHUNK_ROWS", 1024)
 PIPELINE_MIN_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_MIN_ROWS", 4096)
-# Largest boundary T that is pipelined. The served engine's activation peak is at max_num_tokens (8192), where main
-# already runs with only ~0.1-0.3 GB of headroom. Under the ``comm`` role the comm-stream allocator pool the chunk
-# all-reduce outputs live in (~T x hidden x 2 bytes) pushed a T=8192 step out of memory in the serving guard (branch
-# 199, job 1898), so that role stays capped at 6144. The ``swap`` role allocates only on the main stream, as the
-# unpipelined boundary does, and covers T up to max_num_tokens.
-PIPELINE_ROLE = os.environ.get("TRTLLM_DSV41_PREFILL_AR_PIPELINE_ROLE", "swap").strip().lower() or "swap"
-if PIPELINE_ROLE not in ("swap", "comm"):
-    raise ValueError(f"TRTLLM_DSV41_PREFILL_AR_PIPELINE_ROLE={PIPELINE_ROLE!r}: expected swap or comm")
-PIPELINE_MAX_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_MAX_ROWS",
-                             8192 if PIPELINE_ROLE == "swap" else 6144)
-PIPELINE_SIDE_PRIORITY = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_SIDE_PRIORITY", 0)
+# Largest boundary T that is pipelined: the served engine's max_num_tokens (8192). Above SWAP_ABOVE_ROWS the boundary
+# runs with swapped stream roles (_run_swap), which allocate only on the main stream; the comm-stream roles' chunk
+# outputs (~T x hidden x 2 bytes in the comm stream's pool) pushed the T=8192 activation peak out of memory (branch
+# 199, job 1898).
+PIPELINE_MAX_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_MAX_ROWS", 8192)
+# Boundaries with more rows than this run the swapped roles (chunk ARs on main, chunk mHCs on a side stream).
+SWAP_ABOVE_ROWS = 6144
 
 
 def k_for(T: int) -> int:
@@ -111,22 +109,24 @@ def plan(T: int):
 class ArFusedHcPipeline:
     """One per model: owns the comm stream that every pipelined boundary's chunk all-reduces run on."""
 
-    def __init__(self, priority: int | None = None, role: str | None = None):
-        self.role = PIPELINE_ROLE if role is None else role
-        if self.role not in ("swap", "comm"):
-            raise ValueError(f"ArFusedHcPipeline role {self.role!r}: expected swap or comm")
-        if priority is None:
-            priority = PIPELINE_SIDE_PRIORITY if self.role == "swap" else -1
+    def __init__(self, priority: int = -1):
         self._priority = priority
         self._stream = None
         self._events = []
+        self._side_stream = None  # T > SWAP_ABOVE_ROWS: the chunk mHCs' stream (priority 0)
+        self._swap_events = []
 
     @property
     def stream(self) -> torch.cuda.Stream:
-        """The side stream: the chunk mHCs' under the ``swap`` role, the chunk all-reduces' under ``comm``."""
         if self._stream is None:
             self._stream = torch.cuda.Stream(priority=self._priority)
         return self._stream
+
+    @property
+    def side_stream(self) -> torch.cuda.Stream:
+        if self._side_stream is None:
+            self._side_stream = torch.cuda.Stream(priority=0)
+        return self._side_stream
 
     def _event(self, i: int) -> torch.cuda.Event:
         # Reused across calls: each is recorded and then waited on within one call, in order.
@@ -134,15 +134,20 @@ class ArFusedHcPipeline:
             self._events.append(torch.cuda.Event())
         return self._events[i]
 
+    def _swap_event(self, i: int) -> torch.cuda.Event:
+        while len(self._swap_events) <= i:
+            self._swap_events.append(torch.cuda.Event())
+        return self._swap_events[i]
+
     def run(self, allreduce_fn, mhc, x_partial, residual_prev, post_mix_prev, comb_mix_prev, pre_mix, norm_weight,
             norm_eps, bounds, tactic=None):
         """``mhc.fused_hc_lagged(allreduce_fn(x_partial), residual_prev, ...)`` with k-chunk AR/mHC overlap.
 
-        ``allreduce_fn(rows)`` must return the all-reduced rows; it is called once per chunk, in chunk order, on the
-        current stream (``swap`` role) or on the comm stream (``comm`` role). Returns ``fused_hc_lagged``'s 5-tuple
-        ``(residual, pre, post, comb, layer_input)``; the current stream has waited on every chunk on return.
+        ``allreduce_fn(rows)`` must return the all-reduced rows; it is called on the comm stream once per chunk,
+        in chunk order. Returns ``fused_hc_lagged``'s 5-tuple ``(residual, pre, post, comb, layer_input)``.
+        Boundaries with more than SWAP_ABOVE_ROWS rows run _run_swap (chunk ARs on the current stream instead).
         """
-        if self.role == "swap":
+        if x_partial.numel() // mhc.hidden_size > SWAP_ABOVE_ROWS:
             return self._run_swap(allreduce_fn, mhc, x_partial, residual_prev, post_mix_prev, comb_mix_prev,
                                   pre_mix, norm_weight, norm_eps, bounds, tactic)
         n = mhc.mult
@@ -219,14 +224,14 @@ class ArFusedHcPipeline:
 
     def _run_swap(self, allreduce_fn, mhc, x_partial, residual_prev, post_mix_prev, comb_mix_prev, pre_mix,
                   norm_weight, norm_eps, bounds, tactic):
-        """``swap`` role: chunk ARs on the current (main) stream, chunk mHCs on the side stream.
+        """T > SWAP_ABOVE_ROWS: chunk ARs on the current (main) stream, chunk mHCs on the priority 0 side stream.
 
         Every tensor of the boundary is allocated on main (the chunk AR outputs by the AR op itself, on main; the mHC
         outputs and scratch here, before the loop), so the side stream allocates nothing and its kernels only read
         and write main-allocated memory. Every such tensor stays referenced until main has waited on the side
         stream's last chunk, so main's allocator cannot hand its blocks out while a side kernel still uses them.
-        Same kernels, same chunk bounds and the same pinned full-M tactic as the ``comm`` role: outputs are bitwise
-        equal to it.
+        Same kernels, same chunk bounds and the same pinned full-M tactic as the comm-stream roles: outputs are
+        bitwise equal to them.
         """
         n = mhc.mult
         hidden = mhc.hidden_size
@@ -269,12 +274,12 @@ class ArFusedHcPipeline:
             scratch = [_alloc_fused_hc_scratch(backend, b - a, n, num_k_splits, tile_m, x2.device) for a, b in bounds]
 
         main = torch.cuda.current_stream()
-        side = self.stream
+        side = self.side_stream
         ys = []
         for i, (a, b) in enumerate(bounds):
             y = allreduce_fn(x2[a:b])  # main stream: its output comes from main's pool
             ys.append(y)
-            ev = self._event(i)
+            ev = self._swap_event(i)
             ev.record(main)
             side.wait_event(ev)  # also orders every main-stream producer of this call's inputs before the side
             m = b - a
@@ -286,7 +291,7 @@ class ArFusedHcPipeline:
                                mhc.eps, mhc.sinkhorn_eps, mhc.post_mult_value, mhc.sinkhorn_iters,
                                norm_weight=nw, norm_eps=norm_eps, pre_mix_ext=pre_f[a:b],
                                pre_mix_out=pre_cur[a:b])
-        done = self._event(len(bounds))
+        done = self._swap_event(len(bounds))
         done.record(side)
         main.wait_event(done)
         # ys, scratch and the inputs above are released after this wait in main's stream order.
