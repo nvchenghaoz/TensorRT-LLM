@@ -328,6 +328,66 @@ def run_digest(rig):
     return steps, total
 
 
+def run_diag(rig):
+    """Where does (a)'s coalesced-upload copy_ spend its time?"""
+    import tensorrt_llm._torch.host_staging as hs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import metadata as mdmod
+
+    records = []
+    orig = hs.copy_host_to_device
+
+    def timed(store, key, destination, value):
+        stream = torch.cuda.current_stream()
+        idle = stream.query()
+        t0 = time.perf_counter()
+        slot = (key, value.dtype)
+        ring = store.get(slot)
+        event = None if ring is None else ring["events"][ring["next"]]
+        if event is not None:
+            event.synchronize()
+        t1 = time.perf_counter()
+        orig(store, key, destination, value)
+        t2 = time.perf_counter()
+        records.append((key, value.numel() * value.element_size(), value.is_pinned(),
+                        idle, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
+
+    hs.copy_host_to_device = timed
+    orig_flush = mdmod._CoalescedUploads.flush
+
+    def flush(self):
+        stream = torch.cuda.current_stream()
+        idle = stream.query()
+        t0 = time.perf_counter()
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        orig_flush(self)
+        t2 = time.perf_counter()
+        records.append(("FLUSH(sync-first)", self._bytes, None, idle, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
+
+    out = {}
+    for shape in ("c1", "c4"):
+        for i in range(6):
+            records.clear()
+            if i == 3:
+                mdmod._CoalescedUploads.flush = flush
+            ta, reqs = rig.step_a(shape)
+            ra = list(records)
+            records.clear()
+            tb, plan = rig.step_b(reqs)
+            rb = list(records)
+            rig.exit_b(plan)
+            torch.cuda.synchronize()
+            mdmod._CoalescedUploads.flush = orig_flush
+            log(f"DIAG {shape} iter {i}: (a) {ta:.3f} ms  (b) {tb:.3f} ms")
+            for name, recs in (("a", ra), ("b", rb)):
+                for key, nbytes, pinned, idle, wait_ms, copy_ms in recs:
+                    log(f"   {name} {key!s:28} bytes {nbytes:8} pinned {pinned} gpu_idle {idle} "
+                        f"wait {wait_ms:.3f} copy {copy_ms:.3f}")
+            out[f"{shape}_{i}"] = {"a_ms": ta, "b_ms": tb}
+    hs.copy_host_to_device = orig
+    return out
+
+
 def main():
     torch.manual_seed(0)
     log(f"host {os.uname().nodename} gpu {torch.cuda.get_device_name()} mode {MODE} "
@@ -341,6 +401,8 @@ def main():
                                      "noise_floor": r["a_prepare"]["noise_floor"]}
                                  for s, r in res.items()},
                        "detail": res, "output": {"class": "exact"}}
+            elif MODE == "diag":
+                out = {"passed": True, "diag": run_diag(rig)}
             else:
                 steps, total = run_digest(rig)
                 out = {"passed": True, "digest": total, "steps": steps,
