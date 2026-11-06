@@ -96,7 +96,10 @@ AUDIT = [
     # --- consumers of K1 (hc_attn) when it triggers first ---
     ("K1 caller: trigger_first only at hc_attn", V41, r"k1_trigger_first=which == 0", None, 1),
     ("K1 successor A: wq_a||wkv low_m_mm trigger_at_start", "tensorrt_llm/_torch/attention/backends/sparse/csa2/module.py",
-     r"rows = low_m_mm\(hidden_states, \*self._wq_a_wkv, trigger_at_start=True\)", None, 1),
+     # Landing 56 (branch 179) appended l2_prefetch=chain[:2] (a hint on B's constant weights) to this call.
+     r"rows = low_m_mm\(hidden_states, \*self._wq_a_wkv, trigger_at_start=True(, l2_prefetch=chain\[:2\])?\)", None, 1),
+    ("K1 successor A (no B chain): plain low_m_mm, wait-first", "tensorrt_llm/_torch/attention/backends/sparse/csa2/module.py",
+     r"rows = low_m_mm\(hidden_states, \*self._wq_a_wkv\)$", None, 1),
     ("A kernel: launch_dependents (bit 1) after weight staging", LOWM, r"griddepcontrol.launch_dependents;", None, 2),
     ("A kernel: wait before reading activations", LOWM, r"griddepcontrol.wait;", None, 2),
     ("A fallback: mxfp8_quantize wait first", "cpp/tensorrt_llm/kernels/quantization.cuh",
@@ -117,7 +120,7 @@ AUDIT = [
      r"all_reduce_params=_attn_all_reduce_params\(output.shape\[0\]\)", None, 1),
     ("175 K1 fold only at hc_ffn (which=1)", V41, r"defer_k1 = self._k1_fold_eligible\(x_attn, image_mask\)", None, 1),
     ("175 fold consumer dsv4FusedRouterKernel: wait before reading activations",
-     "cpp/tensorrt_llm/kernels/moe/routing/dsv4FusedRouter.cu", r"griddepcontrol.wait;", None, 1),
+     "cpp/tensorrt_llm/kernels/moe/routing/dsv4FusedRouter.cu", r"asm volatile\(\"griddepcontrol.wait;\"", None, 1),
     ("175 shared-expert K1 on aux (run_copy): default wait-first, no trigger_first", SPLIT,
      r"return mhc_lagged_layer_input\(\*self.args, self.norm_eps, self.reducer_threads\)$", r"def run_copy", 1),
 ]
