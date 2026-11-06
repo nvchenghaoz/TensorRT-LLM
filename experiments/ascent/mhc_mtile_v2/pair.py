@@ -19,6 +19,11 @@ from tensorrt_llm._torch.modules.mhc import mhc_cuda
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from mhc_fhc_bench import make_inputs  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guard import dirty_guard  # noqa: E402
+
+dirty_guard()
+
 HC, HID = 4, 5120
 ARGS = (HC, HID, 1e-6, 1e-6, 1e-6, 2.0, 20)
 MS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "128,512,1024,2048,4096,8192").split(",")]
@@ -73,7 +78,7 @@ for M in MS:
         offered = set(tuple(t) for t in rn.get_valid_tactics(inputs, None))
         fixed = {}
         for t in [("fused_half_fma", 24, 1, 256, 3), ("fused_half_fma", 24, 1, 256, 4),
-                  ("fused_half_fma", 24, 1, 256, 20)]:
+                  ("fused_half_fma", 24, 1, 256, 20), ("fused_half_fma", 24, 1, 256, 72)]:
             if t not in offered:
                 continue
             ftn = lambda t=t: rn.forward(inputs, tactic=list(t), **kw)  # noqa: E731

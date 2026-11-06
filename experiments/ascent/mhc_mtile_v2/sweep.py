@@ -98,6 +98,12 @@ while True:
         except Exception:  # noqa: BLE001
             pass
     print(f"[guard] t={time.time() - _t0:.0f}s {out.replace(chr(10), ' | ')}", flush=True)
+    try:
+        apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader"],
+                              capture_output=True, text=True, timeout=30).stdout.strip()
+        print("[guard] compute-apps:", apps.replace("\n", " | ") or "none", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print("[guard] compute-apps failed:", e, flush=True)
     if not used or max(used) <= 4.0:
         break
     if time.time() - _t0 > 180:

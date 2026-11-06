@@ -642,20 +642,34 @@ static FmaMtileFn pickFhcFmaMtile(int tile_n, int tile_m)
 
     FHCFMA_MT2_CASE(24, 4);
 #undef FHCFMA_MT2_CASE
+
+    // tile_m = 64 + TM selects fused_pmap_gemm_fma_mtile_v3<TM, NG, MIN_BLOCKS=1> (same math,
+    // bitwise equal; see the order map above that kernel): TM tokens x all 24 columns per CTA,
+    // new_r staged in dynamic shared memory (fhcFmaMtileSmem bytes). tile_n must be 24.
+    // Must stay in sync with the Python _FUSED_HC_HALF_FMA_MT3_TM table.
+#define FHCFMA_MT3_CASE(TM, NG)                                                                                        \
+    if (tile_n == 24 && tile_m == (64 + (TM)))                                                                         \
+    return &fused_fma_kernels::fused_pmap_gemm_fma_mtile_v3<TM, NG, 1>
+
+    FHCFMA_MT3_CASE(8, 8);
+#undef FHCFMA_MT3_CASE
     TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaMtileLaunch: unsupported (tile_n=%d, tile_m=%d)", tile_n, tile_m);
     return nullptr;
 }
 
-// Tokens per CTA of an mtile tactic id (tile_m = 16 + TM for the v2 build).
+// Tokens per CTA of an mtile tactic id (tile_m = 16 + TM for the v2 build, 64 + TM for v3).
 static int fhcFmaMtileTokens(int tile_m)
 {
-    return tile_m >= 16 ? (tile_m - 16) : tile_m;
+    return tile_m >= 64 ? (tile_m - 64) : tile_m >= 16 ? (tile_m - 16) : tile_m;
 }
 
 // Dynamic shared memory of an mtile tactic: the v2 build stages TM tokens x 5 bf16
-// streams x 256 threads x 16 bytes; v1 uses none.
+// streams x 256 threads x 16 bytes; v3 stages new_r of one virtual-warp step
+// (4 hc x TM tokens x 32 lanes x 8 fp32 = TM x 4 KB); v1 uses none.
 static int fhcFmaMtileSmem(int tile_m)
 {
+    if (tile_m >= 64)
+        return fhcFmaMtileTokens(tile_m) * 4 * 32 * 8 * 4;
     return tile_m >= 16 ? fhcFmaMtileTokens(tile_m) * 5 * 256 * 16 : 0;
 }
 

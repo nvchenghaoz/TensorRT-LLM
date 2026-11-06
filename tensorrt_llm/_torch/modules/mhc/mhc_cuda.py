@@ -656,6 +656,12 @@ _FUSED_HC_HALF_FMA_MT_TN_TM = (
 # Must stay in sync with the C++ pickFhcFmaMtile() table.
 _FUSED_HC_MT2_ID_BASE = 16
 _FUSED_HC_HALF_FMA_MT2_TN_TM = ((24, 4),)
+# M-tiled build v3 (fused_pmap_gemm_fma_mtile_v3<TM, NG, 1>: TM tokens x all 24 columns per
+# CTA, new_r staged in shared memory, int32 token offsets): tokens per CTA. tile_n is 24.
+# Bitwise equal to the tactics above. Its tactic tile_m is _FUSED_HC_MT3_ID_BASE + TM, so
+# every id above is unchanged. Must stay in sync with the C++ pickFhcFmaMtile() table.
+_FUSED_HC_MT3_ID_BASE = 64
+_FUSED_HC_HALF_FMA_MT3_TM = (8,)
 # Tactics for the half-fused MMA path: (num_k_splits,). Matches Path D
 # (pickFhcAllInOne) so the autotuner can compare half-fused vs all-in-one at
 # the same ks across the full range. Includes high-KS divisors of HIDDEN/64
@@ -984,6 +990,8 @@ class MhcFusedHcRunner(TunableRunner):
             if M * self.n * self.hidden_size < 2**31:  # int32 token offsets
                 for tn, tm in _FUSED_HC_HALF_FMA_MT2_TN_TM:
                     add(("fused_half_fma", tn, 1, bs, _FUSED_HC_MT2_ID_BASE + tm))
+                for tm in _FUSED_HC_HALF_FMA_MT3_TM:
+                    add(("fused_half_fma", 24, 1, bs, _FUSED_HC_MT3_ID_BASE + tm))
 
         return tactics
 

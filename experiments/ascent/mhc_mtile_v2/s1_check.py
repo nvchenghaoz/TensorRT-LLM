@@ -27,6 +27,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 from mhc_fhc_bench import make_inputs, ref_residual  # noqa: E402
 
+sys.path.insert(0, HERE)
+from guard import dirty_guard  # noqa: E402
+
+dirty_guard()
+# Which tactic ids count as "new" (graph-replay section B) and which built kernels must be spill-free
+# (section C). Defaults: idea 212's mtile_v2 (tile_m >= 16). Idea 292: NEW_ID_MIN=64 SPILL_KEY=mtile_v3.
+NEW_ID_MIN = int(os.environ.get("NEW_ID_MIN", str(mhc_cuda._FUSED_HC_MT2_ID_BASE)))
+SPILL_KEY = os.environ.get("SPILL_KEY", "mtile_v2")
+
 HC, HID = 4, 5120
 N = HC * (2 + HC)
 EPS = dict(rms_eps=1e-6, hc_pre_eps=1e-6, hc_sinkhorn_eps=1e-6, hc_post_mult_value=2.0, sinkhorn_repeat=20)
@@ -92,9 +101,11 @@ for M in MS:
     bs = 512 if M < 512 else 256
     ref_t = ("fused_half_fma", 24, 1, bs, 1)
     tacs = [t for t in rn.get_valid_tactics(inputs, None) if t[0] == "fused_half_fma" and t[2] == 1 and t != ref_t]
-    new = [t for t in tacs if t[4] >= mhc_cuda._FUSED_HC_MT2_ID_BASE]
+    new = [t for t in tacs if t[4] >= NEW_ID_MIN]
     new_ids_seen.update(new)
     rep = {"n_tactics": len(tacs), "new": [list(t) for t in new]}
+    if M in (128, 2048):
+        rep["all_offered"] = [list(t) for t in rn.get_valid_tactics(inputs, None)]
     for mode, pe in (("v4", None), ("v41_lagged", pre_ext)):
         op = Op(inputs, nw, pe)
         op.poison()
@@ -132,7 +143,7 @@ for M in MS:
 M = 128
 inputs, nw = make_inputs(M, seed=11)
 pre_ext = torch.rand((M, HC), device="cuda").float() + 0.5
-new128 = [t for t in rn.get_valid_tactics(inputs, None) if t[0] == "fused_half_fma" and t[4] >= mhc_cuda._FUSED_HC_MT2_ID_BASE]
+new128 = [t for t in rn.get_valid_tactics(inputs, None) if t[0] == "fused_half_fma" and t[4] >= NEW_ID_MIN]
 keep = []  # keep every captured graph's tensors alive (pitfall 2156)
 for t in new128:
     for mode, pe in (("v4", None), ("v41_lagged", pre_ext)):
@@ -180,7 +191,7 @@ for line in reversed(r.stdout.splitlines()):
             break
         except Exception:
             pass
-v2rows = {k: v for k, v in s0.get("built", {}).items() if "mtile_v2" in k}
+v2rows = {k: v for k, v in s0.get("built", {}).items() if SPILL_KEY in k}
 spill_free = bool(v2rows) and all(v["STACK"] == 0 and v["LOCAL"] == 0 and v["LDL"] == 0 and v["STL"] == 0
                                   for v in v2rows.values())
 allpass &= spill_free
