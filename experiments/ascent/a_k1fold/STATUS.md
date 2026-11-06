@@ -37,6 +37,14 @@ Base: main ef96a2e4 (landings 1-83; TRTLLM_CSA2_A_K1_FOLD absent on main). Build
   spill, occupancy unchanged 94 clusters); head chain us/boundary fold (tree) vs tree_k1: M1 24.86 vs 25.44
   (-0.58 [-0.63,-0.50]), M2 26.11 vs 28.40 (-2.29 [-2.44,-2.21]), M4 29.77 vs 29.77; fold - ideal 2.63 / 2.64.
 
-## NEXT
-- Rerun run_all (check + layer + chain + bench) on b5bebc56; if fold beats tree_k1, run the base/head pair and the
-  SASS pair (sass.py in both arms), then submit; if not, close with the measured dead end.
+- SUBMITTED EVIDENCE (code = 8892f9c6, evidence commit 61d0d919):
+  - Pair 2106 (base ef96a2e4) / 2107 (head), austin:4, chain.py tree arm at W_crit p50, us/boundary:
+    M1 25.185 -> 24.694 (-1.95%), M2 27.940 -> 25.723 (-7.9%), M4 29.478 -> 29.506 (unchanged). Same pair: SASS
+    hashes of all 32 K1FOLD=false csa2_mxfp8_low_m_gemm_kernel instances identical base vs head (libth_common.so).
+  - Correctness 2110: check.py, layer_check.py (M=1/2/4 FOLD/NOFOLD/SLEEP/NOPDL vs REF bitwise, 717 tensors),
+    chain check352 (no JIT in capture) all PASS.
+
+## NEXT (later work)
+- fold - ideal is still 2.6 (M1) / 2.3 (M2) us/boundary: the 2 DSMEM hops (carry, warp values) and the post-wait
+  x_prev/residual loads. M=3/4 (c4) keep K1; an M<=4 extension needs a (8,4,1)-config K1FOLD instance and a 4-slot
+  plan, sized against this branch's fold - ideal.
