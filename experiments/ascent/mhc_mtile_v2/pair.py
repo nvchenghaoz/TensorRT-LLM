@@ -45,6 +45,7 @@ def lib_receipt():
                         i = mm.find(pat, i + 1)
                     return n
                 rec[p] = {"mtime": _t.ctime(os.path.getmtime(p)),
+                          "mtile_v3_all": cnt(b"fused_pmap_gemm_fma_mtile_v3"),
                           "mtile_v3_TM8": cnt(b"fused_pmap_gemm_fma_mtile_v3ILi8ELi8ELi1E"),
                           "mtile_v3_TM11": cnt(b"fused_pmap_gemm_fma_mtile_v3ILi11ELi8ELi1E")}
                 mm.close()
