@@ -5071,7 +5071,7 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
 }
 
 #define CAKE_FOLD_H16_INSTANTIATE(P2, F32) \
-template __global__ void decode_body<P2, F32>(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major, float* __restrict__ mid_out_f32);
+template __global__ void decode_body<P2, F32>(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major, float* __restrict__ mid_out_f32, int trigger_entry);
 CAKE_FOLD_H16_INSTANTIATE(false, false)
 CAKE_FOLD_H16_INSTANTIATE(true, false)
 CAKE_FOLD_H16_INSTANTIATE(false, true)
