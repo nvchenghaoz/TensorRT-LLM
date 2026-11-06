@@ -83,7 +83,13 @@ def triton_cache_size():
 
 
 def run_recorded(c):
-    """One eager or captured call; returns (masked scores, raw logits) clones."""
+    """One eager or captured call; returns (masked scores, raw logits) clones.
+
+    The raw DeepGEMM output (clean_logits=False) is only defined on each replica
+    block's scored sub-range (lane 0, ``chunk`` keys); the rest is never written, so
+    the recorded logits are that region assembled to ``[rows, width]``, exactly as
+    main's split-key assembly reads it.
+    """
     REC["logits"].clear()
     c.hooked = []
     FLAGS["record"] = True
@@ -91,7 +97,14 @@ def run_recorded(c):
         c.new(record=True)
     finally:
         FLAGS["record"] = False
-    return c.hooked[0], REC["logits"][0]
+    raw = REC["logits"][0]
+    m, width = c.m, c.width
+    splits = indexer_mod._split_decode_count(m, width)
+    block = indexer_mod._SPLIT_DECODE_BLOCK_Q
+    chunk = width // splits
+    stride = raw.stride(0)
+    assembled = raw.as_strided((m, splits, chunk), (splits * block * stride, block * stride, 1))
+    return c.hooked[0], assembled.contiguous().view(m, width)
 
 
 def eager_ref(c):
