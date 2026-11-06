@@ -45,18 +45,23 @@ class CustomAllReduceHelper:
     # Max grid of lowPrecisionTwoShotAllReduceKernel; mirrors LP_TWOSHOT_MAX_CTAS in
     # cpp/tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h.
     LP_TWOSHOT_MAX_CTAS = 128
+    # CTAs per destination rank of lowPrecisionTwoShotPushAllReduceKernel; mirrors LP_PUSH_CTAS_PER_PEER in
+    # customLowPrecisionAllReduceKernels.cu.
+    LP_PUSH_CTAS_PER_PEER = 16
 
     @staticmethod
     def lowprecision_barrier_bytes(tp_size: int) -> int:
         """Bytes of each LOWPRECISION barrier IPC buffer (ipc_barriers_in/out) per rank.
 
-        The two-shot kernel uses uint64 flags [0, tp) for its entry barrier and tp + b * tp + r for block b's
-        inter-stage barrier, so it needs tp * (1 + LP_TWOSHOT_MAX_CTAS) uint64 flags. Never below the old size.
+        The pull two-shot kernel uses uint64 flags [0, tp) for its entry barrier and tp + b * tp + r for block b's
+        inter-stage barrier, so it needs tp * (1 + LP_TWOSHOT_MAX_CTAS) uint64 flags. The push two-shot kernel adds,
+        after those, tp * LP_PUSH_CTAS_PER_PEER scatter flags and tp * (tp * LP_PUSH_CTAS_PER_PEER) gather flags.
+        Never below the old size.
         """
-        return max(
-            IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * tp_size * 2,
-            (1 + CustomAllReduceHelper.LP_TWOSHOT_MAX_CTAS) * tp_size * 8,
-        )
+        helper = CustomAllReduceHelper
+        flags = tp_size * (1 + helper.LP_TWOSHOT_MAX_CTAS)
+        flags += tp_size * helper.LP_PUSH_CTAS_PER_PEER + tp_size * tp_size * helper.LP_PUSH_CTAS_PER_PEER
+        return max(IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * tp_size * 2, flags * 8)
 
     @staticmethod
     def max_workspace_size_auto(tp_size: int, support_deterministic=True) -> int:
