@@ -96,7 +96,6 @@ class ArFusedHcPipeline:
         self._priority = priority
         self._stream = None
         self._events = []
-        self._tactics = {}
 
     @property
     def stream(self) -> torch.cuda.Stream:
@@ -146,17 +145,13 @@ class ArFusedHcPipeline:
         x2.record_stream(comm)
 
         if tactic is None:
-            # The full-M tactic, pinned for every chunk (the autotuner's choice at this boundary's M; fixed once
-            # warm-up has tuned, so it is looked up once per M).
-            key = (n, hidden, B, nw is None, float(norm_eps), mhc.norm_eps, mhc.eps, mhc.sinkhorn_eps,
-                   mhc.post_mult_value, mhc.sinkhorn_iters)
-            tactic = self._tactics.get(key)
-            if tactic is None:
-                tactic = mhc_fused_hc_tactic(
-                    x2, res_flat, post_f, comb_f, fn, scale, base, n, hidden, mhc.norm_eps, mhc.eps,
-                    mhc.sinkhorn_eps, mhc.post_mult_value, mhc.sinkhorn_iters, norm_weight=nw, norm_eps=norm_eps,
-                    pre_mix_ext=pre_f)
-                self._tactics[key] = tactic
+            # The full-M tactic, pinned for every chunk: the autotuner's choice at this boundary's M, looked up on
+            # every call exactly as main's mhc.fused_hc_lagged does. Never cache it here: a forward that runs before
+            # warm-up tuning (the memory-profiling pass) gets the untuned fallback, which a cache would keep.
+            tactic = mhc_fused_hc_tactic(
+                x2, res_flat, post_f, comb_f, fn, scale, base, n, hidden, mhc.norm_eps, mhc.eps,
+                mhc.sinkhorn_eps, mhc.post_mult_value, mhc.sinkhorn_iters, norm_weight=nw, norm_eps=norm_eps,
+                pre_mix_ext=pre_f)
         backend, tile_n, num_k_splits, bigfuse_bs, tile_m = tactic
         code = _FUSED_HC_BACKEND_CODE[backend]
 
