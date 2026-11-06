@@ -1,7 +1,12 @@
 # Branch 215 / idea 360 / job 354: PUSH (posted-write) FP8 two-shot for the LOWPRECISION prefill AR
 
 ## (a) Base and STEP 0
-- Branch base: `a9ae1a75e113fcc97ae4c76b89de15664c5469b9` (build_on 201). No sync_main (BASE RULE 11482).
+- SYNC 08:3x PST: top lead event 11824 (landing 77 = branch 199 merged first, main 9ac8398e) asked for sync_main
+  before the final pair. Queued dev job 1954 (old base, never started) was cancelled; sync_main -> base
+  `9ac8398edbf2e452e8715e8edc45ed6373fac1f9`, clean three-way merge; landing 77 touches no file of this branch
+  (diff_branch after sync: only this branch's .cu / allreduce_helper.py / experiments files). Timing table adds
+  [1024,5120] (77's served chunk shape at T=4096/6144).
+- Original branch base: `a9ae1a75e113fcc97ae4c76b89de15664c5469b9` (build_on 201).
 - `git diff <base> --stat` before the first edit (diff_branch): only the 3 probe files of branch 201:
   `experiments/ascent/pcie_latency_probe.py` (+958), `experiments/ascent/pcie_probe_driver.sh` (+84),
   `experiments/ascent/pcie_probe_summary.py` (+82).

@@ -33,7 +33,7 @@ import bench  # noqa: E402
 ENV = "TRTLLM_LP_AR_PUSH"
 HIDDEN = bench.HIDDEN
 WORLD = bench.WORLD
-TIME_M = [2048, 4096, 6144]
+TIME_M = [1024, 2048, 4096, 6144]  # 1024: served chunk shape at main's pipelined T=4096/6144 boundaries (landing 77)
 BIT_M = [205, 257, 1024, 1536, 2047, 2048, 3001, 4096, 6144, 8192]
 SEQ_SHAPES = [2048, 257, 6144]
 SEQ_POOL = 4
