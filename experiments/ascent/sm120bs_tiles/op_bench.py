@@ -305,5 +305,10 @@ def check():
 if __name__ == "__main__":
     if "--check" in sys.argv:
         check()
+    elif "--both" in sys.argv:  # check first (untimed), then timing; the timing JSON is the last stdout line
+        check()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        timing()
     else:
         timing()
