@@ -61,6 +61,19 @@ Kern v2()
     return Kern{buf, f, TN, TM, smem};
 }
 
+// fused_pmap_gemm_fma_mtile_v3<TM, NG, MB> (idea 292): TM tokens x all 24 columns per CTA.
+template <int TM, int NG, int MB>
+Kern v3()
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf), "v3<%d,%d,%d>", TM, NG, MB);
+    int smem = TM * 4 * 1024;
+    Fn f = &fused_pmap_gemm_fma_mtile_v3<TM, NG, MB>;
+    if (smem > 48 * 1024)
+        CK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    return Kern{buf, f, 24, TM, smem};
+}
+
 template <int TN, int TM>
 Kern v1()
 {

@@ -69,6 +69,12 @@ if r.returncode != 0:
     print(json.dumps({"passed": False, "error": "nvcc failed"}))
     sys.exit(0)
 
+try:
+    sm = subprocess.run(["nvidia-smi", "--query-gpu=name,uuid,clocks.sm,clocks.max.sm,temperature.gpu",
+                         "--format=csv,noheader"], capture_output=True, text=True, timeout=30).stdout.strip()
+    print("[gpu]", os.uname().nodename, sm, flush=True)
+except Exception as e:  # noqa: BLE001
+    print("[gpu] nvidia-smi failed:", e, flush=True)
 p = subprocess.Popen([exe, Ms, iters], stdout=subprocess.PIPE, text=True)
 rows = []
 passed = False
