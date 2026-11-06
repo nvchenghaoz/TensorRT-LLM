@@ -323,10 +323,14 @@ def count_kernels(g, reps=3):
         for _ in range(reps):
             g.replay()
         torch.cuda.synchronize()
+    path = C.ART / f"census265_{id(g)}.json"
+    prof.export_chrome_trace(str(path))
+    evs = json.load(open(path))
+    evs = evs.get("traceEvents", evs) if isinstance(evs, dict) else evs
     names = {}
-    for e in prof.events():
-        if "CUDA" in str(getattr(e, "device_type", "")):
-            names[e.name] = names.get(e.name, 0) + 1
+    for e in evs:
+        if isinstance(e, dict) and e.get("ph") == "X" and e.get("cat") == "kernel":
+            names[e.get("name", "")] = names.get(e.get("name", ""), 0) + 1
 
     def per(sub):
         return sum(v for k, v in names.items() if sub in k) / reps
@@ -529,7 +533,37 @@ def skip_first_prep_control(chain):
     return sum(int(not torch.equal(a, b)) for a, b in zip(att, ref_att))
 
 
-def mode_check(args):
+def census_passed(census):
+    """Acceptance 3: grouped capture has G prep launches (no per-layer prep), one refresh, no plan/JIT/scratch."""
+    ok = True
+    for row in census["counts"].values():
+        g = row.get("grouped")
+        p = row.get("perlayer")
+        ok &= g is not None and g["kernels_per_replay"]["prep"] == G_EXPECTED
+        ok &= g["no_new_jit_or_scratch"] and g["no_plan_in_capture"]
+        ok &= g["host_calls_in_capture"].get("prepare_cake_indices", 0) == G_EXPECTED
+        ok &= p is not None and p["kernels_per_replay"]["prep"] == NL
+    return bool(ok)
+
+
+def mode_all(args):
+    """check, then the graph census, one process; last line = combined verdict."""
+    check = mode_check(args, emit=False)
+    census = mode_census(args)
+    c_ok = census_passed(census)
+    log("census: " + json.dumps({c: {a: r["kernels_per_replay"] | {"no_new_jit_or_scratch": r["no_new_jit_or_scratch"],
+                                                                  "no_plan_in_capture": r["no_plan_in_capture"],
+                                                                  "calls": r["host_calls_in_capture"]}
+                                     for a, r in row.items()} for c, row in census["counts"].items()}))
+    print(json.dumps({"passed": bool(check["passed"] and c_ok), "check_passed": check["passed"],
+                      "census_passed": c_ok, "compared": check["compared"]
+                      + "; graph census per count: grouped capture launches G=8 preps (perlayer 40), 8 host prep "
+                        "calls in capture, no plan/public-decode call, no Triton/CuTe JIT or Cake scratch allocation "
+                        "in capture (SWA refresh / body / merge counts reported)",
+                      "check": check["report"], "census": census}))
+
+
+def mode_check(args, emit=True):
     assert GROUPED and REFRESH32, "check runs in the candidate tree"
     world = C.World(args.ckpt)
     ok, report = True, {"layout_census": layout_census(args.ckpt)}
@@ -578,7 +612,7 @@ def mode_check(args):
         report[str(count)] = rep
         del chain
         torch.cuda.empty_cache()
-    print(json.dumps({"passed": bool(ok),
+    result = {"passed": bool(ok),
                       "compared": "40-layer Cake attention + LowMWO projection chain, grouped prep (int32 SWA "
                                   "slots from the SWA refresh launch, one main prep per (kv_source, index_source) "
                                   "group) vs branch 129's per-layer prep: per-layer int32 SWA/main indices "
@@ -588,12 +622,15 @@ def mode_check(args):
                                   "Cake scratch, int32 index buffers and sidecar before every replay, scratch "
                                   "shared across layers; >=8 advancing decode steps; a skip-first-prep control "
                                   "must differ",
-                      "report": report}))
+                      "report": report}
+    if emit:
+        print(json.dumps(result))
+    return result
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["time", "check", "census"])
+    ap.add_argument("mode", choices=["time", "check", "census", "all"])
     ap.add_argument("ckpt")
     ap.add_argument("--counts", default="1,2,4,8")
     ap.add_argument("--warmup", type=int, default=10)
@@ -604,5 +641,7 @@ if __name__ == "__main__":
         mode_time(a)
     elif a.mode == "check":
         mode_check(a)
+    elif a.mode == "all":
+        mode_all(a)
     else:
         print(json.dumps({"passed": True, "census": mode_census(a)}))
