@@ -241,8 +241,13 @@ namespace fold {
 // instantiations ignore mid_out_f32.
 template <bool kPow2Pages, bool kF32Mid>
 __global__ __launch_bounds__(384, 1) void
-decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major, float* __restrict__ mid_out_f32)
+decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major, float* __restrict__ mid_out_f32, int trigger_entry)
 {
+    // TRT-LLM CSA2 overlay (binding enable_pdl bit 2): fire the PDL trigger on entry so the merge (and the
+    // weight-staging K2' behind it) launch while this body runs. Launch timing only: every dependent waits for this
+    // whole grid in griddepcontrol.wait before reading its outputs or writing any global memory. The later
+    // triggers below stay (a repeated trigger is a no-op).
+    if (trigger_entry != 0) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
@@ -5066,7 +5071,7 @@ decode_body(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* 
 }
 
 #define CAKE_FOLD_H16_INSTANTIATE(P2, F32) \
-template __global__ void decode_body<P2, F32>(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major, float* __restrict__ mid_out_f32);
+template __global__ void decode_body<P2, F32>(__nv_bfloat16* __restrict__ q, uint8_t* __restrict__ kv_cache, int* __restrict__ indices, uint8_t* __restrict__ extra_kv_cache, int* __restrict__ extra_indices, int* __restrict__ topk_length, int* __restrict__ extra_topk_length, float* __restrict__ attn_sink, __nv_bfloat16* __restrict__ output, float* __restrict__ out_lse, __nv_bfloat16* __restrict__ mid_out, float* __restrict__ mid_lse, int topk, int extra_topk, int page_size, long long page_stride_bytes, int extra_page_size, long long extra_page_stride_bytes, int scratch_split_stride, int chunks_per_block, float sm_scale, float lse_scale, int write_direct, int hb_major, float* __restrict__ mid_out_f32, int trigger_entry);
 CAKE_FOLD_H16_INSTANTIATE(false, false)
 CAKE_FOLD_H16_INSTANTIATE(true, false)
 CAKE_FOLD_H16_INSTANTIATE(false, true)
@@ -5120,7 +5125,7 @@ template <bool kPow2Pages, bool kF32Mid>
 cudaError_t launch_one(const DecodeArgs& a, dim3 grid, cudaStream_t stream) {
   static const cudaError_t smem_status = OptInDynamicSmem(reinterpret_cast<const void*>(&fold::decode_body<kPow2Pages, kF32Mid>), 98432);
   if (smem_status != cudaSuccess) return smem_status;
-  fold::decode_body<kPow2Pages, kF32Mid><<<grid, 384, 98432, stream>>>(a.q, a.kv_cache, a.indices, a.extra_kv_cache, a.extra_indices, a.topk_length, a.extra_topk_length, a.attn_sink, a.output, a.out_lse, a.mid_out, a.mid_lse, a.topk, a.extra_topk, a.page_size, a.page_stride_bytes, a.extra_page_size, a.extra_page_stride_bytes, a.scratch_split_stride, a.chunks_per_block, a.sm_scale, a.lse_scale, a.write_direct, a.hb_major, a.mid_out_f32);
+  fold::decode_body<kPow2Pages, kF32Mid><<<grid, 384, 98432, stream>>>(a.q, a.kv_cache, a.indices, a.extra_kv_cache, a.extra_indices, a.topk_length, a.extra_topk_length, a.attn_sink, a.output, a.out_lse, a.mid_out, a.mid_lse, a.topk, a.extra_topk, a.page_size, a.page_stride_bytes, a.extra_page_size, a.extra_page_stride_bytes, a.scratch_split_stride, a.chunks_per_block, a.sm_scale, a.lse_scale, a.write_direct, a.hb_major, a.mid_out_f32, a.trigger_entry);
   return cudaGetLastError();
 }
 

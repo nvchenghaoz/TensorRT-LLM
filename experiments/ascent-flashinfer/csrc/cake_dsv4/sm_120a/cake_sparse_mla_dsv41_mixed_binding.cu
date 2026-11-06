@@ -279,6 +279,9 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
   // triggers its dependents first (CakeMergeF32Kernel<true>); set only when a PDL waiter is the next launch.
   const bool pdl = (enable_pdl & 1) != 0;
   const bool trigger_first = (enable_pdl & 2) != 0;
+  // Bit 2 (TRT-LLM CSA2 overlay): the decode body fires griddepcontrol.launch_dependents on entry
+  // (DecodeArgs::trigger_entry), so the PDL merge and the PDL kernel behind it launch while the body runs.
+  const bool trigger_entry = (enable_pdl & 4) != 0;
   TVM_FFI_CHECK(q.ndim() == 3, ValueError) << "q must be [tokens, heads, " << kHeadDim << "]";
   const int64_t tokens = q.size(0);
   const int64_t heads = q.size(1);
@@ -396,6 +399,17 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
   args.write_direct = num_splits == 1 ? 1 : 0;
   args.hb_major = hb_major ? 1 : 0;
   args.mid_out_f32 = mid_out_f32_ptr;
+  if (trigger_entry) {
+    // Only these bodies take DecodeArgs::trigger_entry; any other body would silently ignore bit 2.
+    TVM_FFI_CHECK(body.launch == &h16::decode_default::launch || body.launch == &h16::decode_dual_default::launch ||
+                      body.launch == &h16::decode_dual_sa_lq_el::launch ||
+                      body.launch == &h16::decode_dual_sa_pw_lq_el::launch,
+                  ValueError)
+        << "enable_pdl bit 2 (body entry trigger) is served only by the 16-head `default`, `sa+lq+el` and "
+           "`sa+pw+lq+el` decode bodies, not decode body "
+        << decode_body;
+  }
+  args.trigger_entry = trigger_entry ? 1 : 0;
   const unsigned heads_per_cta = static_cast<unsigned>(kHeadsPerBlock * body.tiles);
   const unsigned decode_blocks = static_cast<unsigned>((heads + heads_per_cta - 1) / heads_per_cta);
   const unsigned ntok = static_cast<unsigned>(tokens);
