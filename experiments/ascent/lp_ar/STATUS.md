@@ -54,6 +54,10 @@ TRTLLM_LP_AR_TWOSHOT_CTAS for the sweep only. LP ipc_barriers_in/out sized (1 + 
 - Pair 1698 (base 8e291e60) / 1699 (cand 28bc447f), austin:4-7: base VALID (noise 0.0139; c1 145.00/5.141,
   c2 304.45/6.223, c4 462.25/7.479 TTFT/TPOT ms); candidate INVALID, same orphan-process OOM (free 6.22 GiB; all 8 GPUs
   at ~89.7 GB / 100% util at server launch). Reported to the area lead per rev 6g(3); NOT re-queued. Waiting on a ruling.
+- Rulings 21:0x PST (top lead pitfall 3072, area lead rev 6j/6k): 1699 is infrastructure (leftover-server OOM). Re-queue
+  the WHOLE pair on one slot; base stays 8e291e60 (landing 56 touches no comm file). Pair 1715/1716 (austin:4-7) was
+  CANCELLED during runner recovery (1715 base was still installing the wheel, 1716 never started): no measurement.
+  Re-queued the whole pair (run_serving_pair) once more; class PRECISION, targets c1/c4 TTFT, guards 2588(b).
 
 # Idea 94 (branch 94): LOWPRECISION FP8-payload two-shot AR for prefill-size messages: status
 
