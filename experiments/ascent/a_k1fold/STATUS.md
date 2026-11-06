@@ -33,6 +33,10 @@ Base: main ef96a2e4 (landings 1-83; TRTLLM_CSA2_A_K1_FOLD absent on main). Build
   a per-thread device-side plan (integer divisions) on the prologue path. Second version (commit b5bebc56):
   host-built plan + L2 prefetch of the K1 inputs at kernel start + all loads issued before math. UNTESTED yet.
 
+- Job 2097 (commit 8892f9c6, second kernel version): check.py PASS (now P=96 also at M=2; regs M1 156, M2 209, 0
+  spill, occupancy unchanged 94 clusters); head chain us/boundary fold (tree) vs tree_k1: M1 24.86 vs 25.44
+  (-0.58 [-0.63,-0.50]), M2 26.11 vs 28.40 (-2.29 [-2.44,-2.21]), M4 29.77 vs 29.77; fold - ideal 2.63 / 2.64.
+
 ## NEXT
 - Rerun run_all (check + layer + chain + bench) on b5bebc56; if fold beats tree_k1, run the base/head pair and the
   SASS pair (sass.py in both arms), then submit; if not, close with the measured dead end.
