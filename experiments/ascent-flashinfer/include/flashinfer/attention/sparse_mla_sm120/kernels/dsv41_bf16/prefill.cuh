@@ -48,13 +48,13 @@ __device__ __forceinline__ void run_bf16_tiles(
   static_assert((1u << fp8_scale_shift) == Dsv41Fp8Layout::QUANT_TILE);
 
   // Candidate index of this thread's column (threads < CANDIDATES) in a chunk.
-  auto index_of = [&](int chunk) __attribute__((always_inline)) -> int {
+  auto index_of = [&](int chunk) __attribute__((always_inline)) {
     const bool extra = chunk >= main_chunks;
     const int start = (extra ? chunk - main_chunks : chunk) * R::CANDIDATES;
     const int n = extra ? elen : len;
     const int32_t* ix = extra ? extra_indices + (size_t)t * extra_indices_stride_elems
                               : indices + (size_t)t * indices_stride_elems;
-    return start + tidx < n ? ix[start + tidx] : -1;
+    return start + tidx < n ? int(ix[start + tidx]) : -1;
   };
 
   uint64_t raw_all[ITEMS];
