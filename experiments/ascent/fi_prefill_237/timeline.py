@@ -103,6 +103,19 @@ def warm_list():
         return {"error": repr(exc)[:300]}
 
 
+def text_logs(out_root):
+    """Server/rank log files of one arm (any *.log/*.txt/*.out/*.err, or any file in a 'server' dir)."""
+    out = []
+    for f in glob.glob(str(Path(out_root) / "**" / "*"), recursive=True):
+        p = Path(f)
+        if not p.is_file() or any(s in f for s in ("/jitwatch/", "/traces/", "/cache_triton/", "/cache_cute_dsl/")):
+            continue
+        if p.suffix in (".log", ".txt", ".out", ".err") or "server" in p.parent.name:
+            if p.suffix not in (".json", ".gz", ".yaml", ".yml"):
+                out.append(f)
+    return sorted(out)
+
+
 def count_files(d):
     n = 0
     for _, _, fs in os.walk(d):
@@ -160,6 +173,7 @@ def run_arm(arm, ckpt):
         for k, v in WORKLOAD.items():
             wl.setdefault(k, v)
         wl.setdefault("checkpoint", ckpt)
+        wl["concurrency"] = [1]  # lead's ruling 11044 content: c1 only (warmup c1, decode_c1 window)
         return wl
 
     def artifact_dir(name):
@@ -180,9 +194,7 @@ def run_arm(arm, ckpt):
         r = orig_start(self, *a, **k)
         info["ready_at"] = time.time()
         sizes = {}
-        for f in glob.glob(str(out_root / "**" / "*.log"), recursive=True):
-            if "/jitwatch/" in f:
-                continue
+        for f in text_logs(out_root):
             try:
                 sizes[f] = os.path.getsize(f)
             except OSError:
@@ -195,6 +207,9 @@ def run_arm(arm, ckpt):
     orig_window = profile_run.window
 
     def window(name, fn, trace_root, hb):
+        if name == "decode_c4":
+            log(f"[{arm}] decode_c4 window skipped (c1 only)")
+            return {"name": name, "control": "skipped", "files": []}
         snap(f"before_{name}")
         try:
             return orig_window(name, fn, trace_root, hb)
@@ -404,7 +419,7 @@ def reduce_decode(files, uuids):
 def scan_logs(out_root, info):
     ready = info.get("ready_at") or float("inf")
     sizes = info.get("log_sizes_at_ready") or {}
-    logs = [f for f in sorted(glob.glob(str(out_root / "**" / "*.log"), recursive=True)) if "/jitwatch/" not in f]
+    logs = text_logs(out_root)
     warm, hits, counts = [], [], {"tail_captured_pre": 0, "tail_captured_post": 0, "capture_failed": 0,
                                   "overlap_on": 0, "fc12_smem": 0}
     for f in logs:
@@ -446,13 +461,14 @@ def scan_logs(out_root, info):
                 p["argv"] = detail[:120]
             elif kind == "patched":
                 p["patched"].append(detail.split(" ")[0])
-            elif kind.endswith("compile") or kind.startswith("driver."):
+            elif kind.endswith("compile") or kind.startswith(("driver.", "triton.")):
                 post = ts > ready
                 d = p["post" if post else "pre"]
                 d[kind] = d.get(kind, 0) + 1
                 if post:
                     events.append({"pid": pid, "t_after_ready_s": round(ts - ready, 1), "kind": kind,
                                    "detail": detail[:200]})
+    counts["log_files"] = [f"{os.path.relpath(f, out_root)}:{os.path.getsize(f)}" for f in logs][:20]
     return {"warm_lines": warm, "log_hits": hits, "log_counts": counts, "jit_post_ready": events,
             "jit_processes": procs}
 
@@ -494,6 +510,12 @@ def main():
     arms = (sys.argv[2] if len(sys.argv) > 2 else "overlap_default,serial_100000").split(",")
     ART.mkdir(parents=True, exist_ok=True)
     uuids = [u for u in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if u]
+    log("node/GPUs: " + json.dumps({
+        "hostname": sh(["hostname"]), "cuda_visible_devices": uuids,
+        "gpus": sh(["nvidia-smi", "--query-gpu=index,uuid,memory.used,clocks.sm,clocks.max.sm,temperature.gpu,"
+                    "power.draw", "--format=csv,noheader"]),
+        "topo": sh(["nvidia-smi", "topo", "-m"])[:1500], "slot_env": {k: v for k, v in os.environ.items()
+                                                                    if "SLOT" in k or "AUTO_DEV" in k}}))
     head = {"arms": arms, "lib": lib_info(), "cuda_visible_devices": uuids,
             "nvidia_smi_L": sh(["nvidia-smi", "-L"]), "hostname": sh(["hostname"]),
             "engine_json": (Path.cwd() / "experiments" / "ascent-config" / "engine.json").read_text().strip(),
@@ -518,7 +540,7 @@ def main():
         traces = out_root / "profile" / "traces"
         pre = safe(reduce_prefill, sorted(glob.glob(str(traces / "prefill" / "*.json*"))), uuids)
         dec = {w: safe(reduce_decode, sorted(glob.glob(str(traces / w / "*.json*"))), uuids)
-               for w in ("decode_c1", "decode_c4")}
+               for w in ("decode_c1",)}
         logs = safe(scan_logs, out_root, info)
         if "warm_lines" not in logs:
             logs = {"warm_lines": [], "log_hits": [], "log_counts": {}, "jit_post_ready": [{"error": "scan"}],

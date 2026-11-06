@@ -6,7 +6,8 @@ events: 'hook' (installed, argv), 'patched' (module wrapped), 'triton.compile' (
 triton.compiler.compiler.compile = an in-memory Triton cache miss, disk hit or not), 'cute.compile' (one call of
 cutlass.cute.compile = a CuTe-DSL JIT), 'driver.cuModuleLoad*' / 'driver.cuLibraryLoad*' (Python callers of
 cuda.bindings.driver only: CuTe-DSL module loads; C/C++ callers such as Triton's launcher or CUDA lazy loading of
-TRT-LLM's own kernels are not visible here). The wrappers only log and forward; they change no arguments or results.
+TRT-LLM's own kernels are not visible here), 'triton.load_binary' (Triton's launcher cuModuleLoadData of a
+compiled kernel, triton.backends.nvidia.driver.CudaUtils.load_binary). The wrappers only log and forward; they change no arguments or results.
 Any other sitecustomize on sys.path is executed afterwards, so the environment is otherwise unchanged.
 """
 import os
@@ -70,6 +71,23 @@ def _patch(name, module):
         elif name == "cutlass.cute" and hasattr(module, "compile"):
             module.compile = _CompileProxy(module.compile)
             _emit("patched", name)
+        elif name == "triton.backends.nvidia.driver" and hasattr(module, "CudaUtils"):
+            cls = module.CudaUtils
+            orig_init = cls.__init__
+
+            def __init__(self, *a, _orig=orig_init, **k):
+                _orig(self, *a, **k)
+                lb = getattr(self, "load_binary", None)
+                if lb is not None and not getattr(lb, "_jitwatch", False):
+                    def load_binary(*args, _lb=lb):
+                        _emit("triton.load_binary", args[0] if args and isinstance(args[0], str) else "")
+                        return _lb(*args)
+
+                    load_binary._jitwatch = True
+                    self.load_binary = load_binary
+
+            cls.__init__ = __init__
+            _emit("patched", name)
         elif name == "cuda.bindings.driver":
             done = []
             for attr in dir(module):
@@ -91,7 +109,7 @@ def _install():
     import importlib.abc
     import importlib.machinery
 
-    targets = {"triton.compiler.compiler", "cutlass.cute", "cuda.bindings.driver"}
+    targets = {"triton.compiler.compiler", "cutlass.cute", "cuda.bindings.driver", "triton.backends.nvidia.driver"}
 
     class _Finder(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path, target=None):
