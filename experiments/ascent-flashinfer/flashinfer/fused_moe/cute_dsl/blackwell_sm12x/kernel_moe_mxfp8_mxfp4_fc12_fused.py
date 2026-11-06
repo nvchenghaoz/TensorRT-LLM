@@ -546,7 +546,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
         sfw = sf_dtype.width
         offs1 = {}
         cur = 0
-        for name, nbytes in (
+        regions1 = [
             ("sA", cute.cosize(b_smem1) * c1.load_ab.b_smem_dtype.width // 8),
             ("sU", cute.cosize(a_smem1) * c1.load_ab.a_smem_dtype.width // 8),
             ("sG", cute.cosize(a_smem1) * c1.load_ab.a_smem_dtype.width // 8),
@@ -554,7 +554,13 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
             ("sSFG", cute.cosize(sfa_smem1) * sfw // 8),
             ("sSFA", cute.cosize(sfb_smem1) * sfw // 8),
             ("sC", cute.cosize(epi_smem1) * c1.epi.out_dtype.width // 8 if c1.owns_epi_smem else 0),
-        ):
+        ]
+        if self.early_w2:
+            # fc1's epilogue sC first: it then lies under fc2's sA (q1), which the q1 loader
+            # fills only after the phase barrier, and clear of sB/sSFB that EARLY_W2 fills
+            # during that epilogue.  Every region stays 1024-aligned.
+            regions1 = regions1[-1:] + regions1[:-1]
+        for name, nbytes in regions1:
             cur = _align(cur, 1024)
             offs1[name] = cur
             cur += nbytes
@@ -579,7 +585,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
         # which touches only sC (fc1): the byte ranges must be disjoint.
         sz2 = {"sB": cute.cosize(b_smem2) * c2.load_ab.b_smem_dtype.width // 8,
                "sSFB": cute.cosize(sfb_smem2) * sfw // 8}
-        sc1 = (offs1["sC"], end1)
+        sc1 = (offs1["sC"], offs1["sC"] + dict(regions1)["sC"])
         rng2 = {k: (offs2[k], offs2[k] + v) for k, v in sz2.items()}
         overlap = any(lo < sc1[1] and sc1[0] < hi for lo, hi in rng2.values())
         print(f"[fc12_fused] smem pool: sC1=[{sc1[0]},{sc1[1]}) sB2=[{rng2['sB'][0]},"
