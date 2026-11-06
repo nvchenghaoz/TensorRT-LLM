@@ -24,6 +24,23 @@ if TYPE_CHECKING:
 _SWA_TILE = 128
 _HEAD_DIM = 512
 _TMA_MIN_BACKING_BYTES = 128 * 1024
+# Generation-only steps of at most this many tokens also get the Cake decode's
+# int32 SWA slots from the SWA refresh launch (one int32 per slot of every layer).
+_CAKE_SWA_INT32_MAX_TOKENS = 64
+
+
+def _cake_swa_int32_enabled(device_index: int) -> bool:
+    """Whether the SWA refresh writes the Cake decode's int32 SWA slots on this device.
+
+    ``TRTLLM_CSA2_CAKE_GROUPED_PREP=0`` keeps the per-layer Cake index prep.
+    """
+    import os
+
+    if os.environ.get("TRTLLM_CSA2_CAKE_GROUPED_PREP", "1") == "0":
+        return False
+    from .cake_decode import cake_available
+
+    return cake_available(device_index)
 
 
 def _allocate_staging_pool(
@@ -1288,6 +1305,26 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             self._csa2_swa_ratio_cache = (key, device_ratios)
         return device_ratios
 
+    def _swa_capacity_table(self, layers: int):
+        """Device int64 ``[layers]`` SWA pool rows (0 for unbound layers) and its host tuple.
+
+        The pool geometry is fixed per manager, so rows are read once per (manager, layer).
+        """
+        manager = self.kv_cache_manager
+        rows_cache = self.__dict__.setdefault("_csa2_swa_pool_rows", {})
+        rows = []
+        for layer in range(layers):
+            if self._csa2_swa_page_tables.get(layer) is None:
+                rows.append(0)
+                continue
+            key = (id(manager), layer)
+            value = rows_cache.get(key)
+            if value is None:
+                value = rows_cache[key] = int(manager.get_swa_buffer(layer).shape[0])
+            rows.append(value)
+        table = self._device_descriptors("swa_capacity", [(value,) for value in rows])
+        return table.view(-1), tuple(rows)
+
     def _ensure_swa_slots(self) -> None:
         """Resolve all layers' SWA slots and visible lengths from the bound page tables.
 
@@ -1315,6 +1352,25 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self.csa2_swa_indices = dict(enumerate(reads.unbind(0)))
         self.csa2_swa_write_slots = dict(enumerate(writes.unbind(0)))
         self.csa2_visible_lengths = dict(enumerate(visible.unbind(0)))
+        # Cake decode int32 SWA slots, written by the same refresh launch.
+        self.csa2_swa_indices32 = {}
+        self.csa2_swa_capacities = ()
+        reads32 = capacity = None
+        descriptors = getattr(self, "_csa2_swa_descriptors", None)
+        capacity_table = getattr(self, "_csa2_swa_capacity", None)
+        if (
+            0 < count <= _CAKE_SWA_INT32_MAX_TOKENS
+            and getattr(self, "num_contexts", 1) == 0
+            and descriptors is not None
+            and capacity_table is not None
+            and capacity_table[0].numel() >= layers
+            and positions.is_cuda
+            and kernel.dsl_available()
+        ):
+            capacity = capacity_table[0][:layers]
+            reads32 = self._get_csa2_buffer("swa_reads32", (layers, count, window), torch.int32)
+            self.csa2_swa_indices32 = dict(enumerate(reads32.unbind(0)))
+            self.csa2_swa_capacities = capacity_table[1][:layers]
         missing_slot = getattr(self, "_csa2_missing_swa_slot", None)
         if missing_slot is not None:
             # Context-only caches: layers without SWA pages read no window,
@@ -1329,7 +1385,6 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         read_floors = getattr(self, "_csa2_swa_read_floors", None)
         if read_floors is None:
             read_floors = floors
-        descriptors = getattr(self, "_csa2_swa_descriptors", None)
         if positions.is_cuda and kernel.dsl_available() and descriptors is not None:
             kernel.refresh_swa_slots(
                 positions,
@@ -1342,6 +1397,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 writes,
                 visible,
                 manager.tokens_per_block,
+                reads32=reads32,
+                capacity=capacity,
             )
             return
         # Layers before a decoder-only boundary bind no pages: they read and
@@ -1801,10 +1858,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             # A deferred decode graph resolves them in on_update_kv_lens.
             self._resolve_owner_slots(prepared_ends)
         self._csa2_swa_descriptors = self._csa2_swa_ratios = None
+        self._csa2_swa_capacity = None
         if self.csa2_positions.is_cuda and kernel.dsl_available() and swa_layers:
             # Filled outside graph capture; the forward-time launch reads them.
             self._csa2_swa_descriptors = self._swa_table_descriptors(len(swa_layers))
             self._csa2_swa_ratios = self._swa_ratio_tensor(manager.layout.compress_ratios)
+            if not self.num_contexts and _cake_swa_int32_enabled(self.csa2_positions.device.index):
+                self._csa2_swa_capacity = self._swa_capacity_table(len(swa_layers))
         self._csa2_swa_resolved = False
         if not hasattr(self, "csa2_precomputed_kv_layers"):
             self.csa2_precomputed_kv_layers = set()
@@ -2123,6 +2183,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self.csa2_candidates = {}
         self.csa2_candidate_blocks = {}
         self.csa2_candidate_counts = {}
+        # Cake decode: int32 main slots already prepared in this forward, per staging group.
+        self.csa2_cake_shared = {}
         self._csa2_last_layer = -1
         if getattr(self, "_csa2_swa_resolved", None) is not None:
             self._csa2_swa_resolved = False
