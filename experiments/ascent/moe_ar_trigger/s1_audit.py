@@ -93,6 +93,9 @@ AUDIT = [
     ("C5 ADP zero-row forward_MoE (M=0 -> END)", V41, r"hidden_states=residual\[:, 0, :\],", None, 1),
     ("C6 128-row tail-MoE forward_MoE (M=128 -> END)", "tensorrt_llm/_torch/models/_dsv41_tail_moe_graph.py",
      r"x_ffn = layer.forward_MoE\(", None, 1),
+    ("C7 landing-60 shared-expert eager overlap gate (M >= 1024 -> END; same AR call)", V4,
+     r"and hidden_states.shape\[0\] >= SHARED_OVERLAP_MIN_TOKENS", None, 1),
+    ("C7 landing-60 overlap default threshold", V4, r"SHARED_OVERLAP_MIN_TOKENS = int\(", None, 1),
     # --- consumers of K1 (hc_attn) when it triggers first ---
     ("K1 caller: trigger_first only at hc_attn", V41, r"k1_trigger_first=which == 0", None, 1),
     ("K1 successor A: wq_a||wkv low_m_mm trigger_at_start", "tensorrt_llm/_torch/attention/backends/sparse/csa2/module.py",
@@ -143,7 +146,7 @@ def static_audit():
 
 RULE_SNIPPET = (
     "import json; from tensorrt_llm._torch.models import modeling_deepseekv4 as V4; "
-    "print(json.dumps({m: V4._moe_ar_trigger_at_end(m) for m in [0,1,2,3,4,5,6,7,8,9,16,128,512]}))"
+    "print(json.dumps({m: V4._moe_ar_trigger_at_end(m) for m in [0,1,2,3,4,5,6,7,8,9,16,128,512,1024,4096]}))"
 )
 
 
@@ -173,7 +176,7 @@ def main():
 
     log("== trigger rule ==")
     on, off = rule(False), rule(True)
-    exp_on = {m: not (0 < m <= 8) for m in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 128, 512]}
+    exp_on = {m: not (0 < m <= 8) for m in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 128, 512, 1024, 4096]}
     rule_ok = bool(on == exp_on and off and all(off.values()))
     log(f"default (True = END trigger): {on}\nenv=0: {off}\nrule ok={rule_ok}")
 
