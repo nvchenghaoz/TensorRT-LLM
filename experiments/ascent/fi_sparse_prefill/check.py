@@ -116,6 +116,7 @@ def make_metadata(s):
         prepared_counter=m.prepared_counter,
         shared_plan=s.plan,
         _csa2_graph_reserved=False,
+        num_contexts=s.R,
     )
 
 

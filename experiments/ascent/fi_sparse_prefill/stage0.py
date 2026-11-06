@@ -18,7 +18,6 @@ from types import SimpleNamespace
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2 import fi_sparse_prefill as fsp
 from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2FlashInfer
 from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import stage_shared_rows
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2SharedKVPlan
@@ -325,6 +324,8 @@ def main():
         s = Scenario(r, t, hm, seed=1000 + i)
         scen[s.name] = s
         log(f"built {s.name} bank_rows={s.bank_rows} ({time.time() - t0:.1f}s)")
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import fi_sparse_prefill as fsp
+
     helper = CSA2FlashInfer(attention=None)
     fi = fsp.FISharedPrefill()
     result = {"shapes": {}, "build": {}}
