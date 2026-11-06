@@ -5,6 +5,7 @@
 // cold-L2 timing (256 MB memset between calls). Prints one JSON line per (kernel, M).
 // The kernel set comes from -DKSET="v2<24,4,false,1>(), ..." at compile time.
 #include "mhc_fused_fma.cuh"
+#include "v3x.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -70,6 +71,23 @@ Kern v3()
     int smem = TM * 4 * 1024;
     Fn f = &fused_pmap_gemm_fma_mtile_v3<TM, NG, MB>;
     if (smem > 48 * 1024)
+        CK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    return Kern{buf, f, 24, TM, smem};
+}
+
+// Idea 348: proto-only generalized v3 (TM need not be a multiple of 8; v3x.cuh) with (B): the
+// dynamic-smem opt-in is set whenever dynamic + STATIC smem exceeds 48 KB (the tree sets it only
+// when dynamic smem alone does, so TM = 9..12 would fail to launch there).
+template <int TM, int NG, int MB>
+Kern v3x()
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf), "v3x<%d,%d,%d>", TM, NG, MB);
+    int smem = TM * 4 * 1024;
+    Fn f = &fused_pmap_gemm_fma_mtile_v3x<TM, NG, MB>;
+    cudaFuncAttributes fa;
+    CK(cudaFuncGetAttributes(&fa, reinterpret_cast<void const*>(f)));
+    if (smem + (int) fa.sharedSizeBytes > 48 * 1024)
         CK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     return Kern{buf, f, 24, TM, smem};
 }
@@ -159,6 +177,29 @@ int main(int argc, char** argv)
         for (auto& kn : ks)
         {
             dim3 grid((M + kn.tm - 1) / kn.tm, N / kn.tn, 1);
+            cudaFuncAttributes fa;
+            CK(cudaFuncGetAttributes(&fa, reinterpret_cast<void const*>(kn.fn)));
+            {
+                // Launch-status probe (idea 348): one launch, non-fatal on error.
+                void* args[] = {&dr, &dx, &dpm, &dcm, &dw, &dyp, &drp, (void*) &M, (void*) &HID_v, (void*) &N_v,
+                    (void*) &K_v, &dro};
+                cudaError_t le = cudaLaunchKernel(reinterpret_cast<void const*>(kn.fn), grid, dim3(256), args, kn.smem, 0);
+                if (le == cudaSuccess)
+                    le = cudaGetLastError();
+                if (le == cudaSuccess)
+                    le = cudaDeviceSynchronize();
+                if (le != cudaSuccess)
+                {
+                    printf("{\"kernel\": \"%s\", \"M\": %d, \"launch\": \"%s\", \"regs\": %d, \"static_smem\": %d, "
+                           "\"dyn_smem\": %d, \"local\": %d, \"grid\": %u}\n",
+                        kn.name.c_str(), M, cudaGetErrorString(le), fa.numRegs, (int) fa.sharedSizeBytes, kn.smem,
+                        (int) fa.localSizeBytes, grid.x);
+                    fflush(stdout);
+                    (void) cudaGetLastError();
+                    all_ok = false;
+                    continue;
+                }
+            }
             int bad_iters = 0;
             std::vector<float> ts;
             for (int it = 0; it < 3 + iters; it++)
@@ -192,8 +233,10 @@ int main(int argc, char** argv)
             float p10 = ts[(size_t) (0.1 * (ts.size() - 1))], p90 = ts[(size_t) (0.9 * (ts.size() - 1))];
             all_ok &= bad_iters == 0;
             printf("{\"kernel\": \"%s\", \"M\": %d, \"us_med\": %.1f, \"noise\": %.3f, \"bitwise_bad_iters\": %d, "
-                   "\"iters\": %d}\n",
-                kn.name.c_str(), M, med, (p90 - p10) / med, bad_iters, 3 + iters);
+                   "\"iters\": %d, \"launch\": \"ok\", \"regs\": %d, \"static_smem\": %d, \"dyn_smem\": %d, "
+                   "\"local\": %d, \"grid\": %u}\n",
+                kn.name.c_str(), M, med, (p90 - p10) / med, bad_iters, 3 + iters, fa.numRegs,
+                (int) fa.sharedSizeBytes, kn.smem, (int) fa.localSizeBytes, grid.x);
             fflush(stdout);
         }
     }

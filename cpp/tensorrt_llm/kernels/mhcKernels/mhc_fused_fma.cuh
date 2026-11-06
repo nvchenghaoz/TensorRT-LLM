@@ -1568,7 +1568,10 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
 //     physical warp (lanes = vtids of vw) and lane 0 stores the warp value in
 //     s_part[vw] / s_sqp[vw] (virtual warps with no valid h store 0, as v1's
 //     idle warps do).  The final pass adds s_part[0..7] in order from 0.0f.
-// Constraints: N == 24, M * 4 * hidden < 2^31 (int32 offsets), TM % 8 == 0.
+// TM need not be a multiple of 8: pmap slot i of warp p exists only when t = p + 8 i < TM
+// (compile-time true when TM % 8 == 0, so those builds are unchanged); each token still runs
+// v1's chains once, so the result stays bitwise equal.
+// Constraints: N == 24, M * 4 * hidden < 2^31 (int32 offsets), TM % (8 / NG) == 0.
 // Grid: (ceil(M / TM), 1, 1).  Block: 256 threads.
 // Dynamic smem: 4 * TM * 32 lanes * 8 floats = TM * 4 KB (new_r of one vw step).
 // ===================================================================
@@ -1596,9 +1599,9 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
     constexpr int N_TOTAL = 24;
     constexpr int H_STEP = BLOCK_SIZE * BF16_VEC; // v1's h stride per s step (2048)
     constexpr int VW_SPAN = WARP_SIZE * BF16_VEC; // h span of one v1 warp (256)
-    static_assert(TM % NUM_WARPS == 0, "TM must be a multiple of 8");
     static_assert(NUM_WARPS % NG == 0 && N_TOTAL % NG == 0, "NG must divide 8 and 24");
-    constexpr int NT_R = TM / NUM_WARPS; // pmap tokens per thread
+    constexpr int NT_R = (TM + NUM_WARPS - 1) / NUM_WARPS; // pmap token slots per thread
+    constexpr bool TM_FULL = (TM % NUM_WARPS) == 0;        // every slot of every warp is a token
     constexpr int A_GROUPS = NUM_WARPS / NG;
     static_assert(TM % A_GROUPS == 0, "TM must divide into token groups");
     constexpr int TMT = TM / A_GROUPS;   // GEMM tokens per thread
@@ -1651,6 +1654,8 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
         tok_ok[i] = (tok0 + t) < M;
         tok_res[i] = min(tok0 + t, M - 1) * HC_MULT * hidden_size;
     }
+    // Pmap slot i of this warp holds a CTA token (t = warp_id + 8 i < TM).
+    auto slot_in = [&](int i) { return TM_FULL || (warp_id + NUM_WARPS * i) < TM; };
 
     uint4 raw[NT_R][HC_MULT + 1]; // slot k < 4: residual stream k; slot 4: x
     auto load_raw = [&](int hh)
@@ -1658,10 +1663,13 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
 #pragma unroll
         for (int i = 0; i < NT_R; i++)
         {
+            if (slot_in(i))
+            {
 #pragma unroll
-            for (int k = 0; k < HC_MULT; k++)
-                raw[i][k] = mtile_v3_ld_stream(&residual_in[tok_res[i] + k * hidden_size + hh]);
-            raw[i][HC_MULT] = mtile_v3_ld_stream(&x_in[(tok_res[i] >> 2) + hh]);
+                for (int k = 0; k < HC_MULT; k++)
+                    raw[i][k] = mtile_v3_ld_stream(&residual_in[tok_res[i] + k * hidden_size + hh]);
+                raw[i][HC_MULT] = mtile_v3_ld_stream(&x_in[(tok_res[i] >> 2) + hh]);
+            }
         }
     };
 
@@ -1713,6 +1721,8 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
 #pragma unroll
             for (int i = 0; i < NT_R; i++)
             {
+                if (!slot_in(i))
+                    continue;
                 int const t = warp_id + NUM_WARPS * i;
 #pragma unroll
                 for (int j = 0; j < HC_MULT; j++)
@@ -1832,6 +1842,8 @@ __launch_bounds__(256, MIN_BLOCKS) __global__
 #pragma unroll
             for (int i = 0; i < NT_R; i++)
             {
+                if (!slot_in(i))
+                    continue;
 #pragma unroll
                 for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
                     sqr[i] += __shfl_xor_sync(FULL_WARP_MASK, sqr[i], off);

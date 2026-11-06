@@ -661,7 +661,8 @@ _FUSED_HC_HALF_FMA_MT2_TN_TM = ((24, 4),)
 # Bitwise equal to the tactics above. Its tactic tile_m is _FUSED_HC_MT3_ID_BASE + TM, so
 # every id above is unchanged. Must stay in sync with the C++ pickFhcFmaMtile() table.
 _FUSED_HC_MT3_ID_BASE = 64
-_FUSED_HC_HALF_FMA_MT3_TM = (8,)
+# TM = 11 (id 75): ceil(2048 / 11) = 187 CTAs, one wave on a 188-SM SM120 at M = 2048.
+_FUSED_HC_HALF_FMA_MT3_TM = (8, 11)
 # Tactics for the half-fused MMA path: (num_k_splits,). Matches Path D
 # (pickFhcAllInOne) so the autotuner can compare half-fused vs all-in-one at
 # the same ks across the full range. Includes high-KS divisors of HIDDEN/64
