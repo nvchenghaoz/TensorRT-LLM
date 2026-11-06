@@ -64,6 +64,9 @@ struct DecodeArgs {
   // their normalized split partials here in fp32 (same element layout as mid_out) instead of BF16 mid_out, and
   // the binding merges them with its fp32 merge. Every other body ignores it (the binding rejects that pairing).
   float* mid_out_f32;
+  // Entry trigger (TRT-LLM CSA2 overlay, binding enable_pdl bit 2): non-zero makes the h16 `default` decode bodies
+  // run griddepcontrol.launch_dependents on entry. Every other body ignores it (the binding rejects that pairing).
+  int trigger_entry;
 };
 
 struct MergeArgs {
