@@ -14,6 +14,10 @@ KACQ+EW2+ACQREL plus EW2-only and ACQREL-only), with the knobs set in the enviro
   * Part C: aux-stream contention rounds, no hang, q1/sf1 bitwise, counters 0.
 Also checks that the decode leaf's _WARMED key carries every TRTLLM_SM12X_FI_* knob.
 Last line: {"passed": ..., ...}.
+
+History: job 1662 (rc 1, configs {}) was a compile-time assert, not a numerics result: with
+EARLY_W2 on, fc1's sC sat at [70656,72704) inside fc2's sB [16384,81920). The kernel now puts
+fc1's sC first in the smem pool when EARLY_W2 is on (under fc2's sA), so the ranges are disjoint.
 """
 
 import json
