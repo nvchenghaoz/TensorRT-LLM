@@ -147,8 +147,12 @@ def prepare_shared_prefill_indices(
     plan,
     swa_out,
     main_out=None,
+    direct=False,
 ):
-    """Write int32 physical SWA / main slots (``-1`` = masked) for one shared-plan tile."""
+    """Write int32 physical SWA / main slots (``-1`` = masked) for one shared-plan tile.
+
+    ``direct`` launches through the cached CompiledKernel on a specialization-key hit.
+    """
     count, swa_width = swa_slots.shape
     has_main = main_logical is not None and main_logical.shape[1] > 0
     if has_main:
@@ -162,7 +166,7 @@ def prepare_shared_prefill_indices(
         main_width = 1
     pages = plan.swa_pages
     pages_stride = pages.stride(0) if pages.shape[0] > 1 else pages.shape[1]
-    _shared_prefill_index_kernel[(count,)](
+    args = (
         swa_slots,
         swa_slots.stride(0),
         swa_slots.stride(1) if swa_width > 1 else 1,
@@ -190,13 +194,71 @@ def prepare_shared_prefill_indices(
         visible,
         main_out if has_main else swa_out,
         int(plan.num_requests),
-        SWA_W=int(swa_width),
-        SWA_P2=triton.next_power_of_2(max(int(swa_width), 1)),
-        MAIN_W=main_width,
-        MAIN_P2=triton.next_power_of_2(main_width),
-        HAS_MAIN=has_main,
+    )
+    consts = (
+        int(swa_width),
+        triton.next_power_of_2(max(int(swa_width), 1)),
+        main_width,
+        triton.next_power_of_2(main_width),
+        has_main,
+    )
+    _launch_index_kernel(count, args, consts, direct)
+
+
+# Positions of the tensor (pointer) arguments of ``_shared_prefill_index_kernel``; every
+# other runtime argument is an int listed in ``_RUNTIME_INTS`` (not specialized).
+_PTR_ARGS = (0, 4, 5, 6, 7, 8, 9, 13, 14, 18, 24, 25)
+_INT_ARGS = tuple(i for i in range(27) if i not in _PTR_ARGS)
+_INDEX_KERNELS: dict[tuple, object] = {}
+_INDEX_KERNELS_MAX = 64
+
+
+def _launch_index_kernel(count, args, consts, direct):
+    """Launch the index kernel; on a specialization-key hit, through the cached CompiledKernel.
+
+    Triton specializes this kernel on its constexprs, on each pointer's dtype and 16-byte
+    alignment, and on each int's 32/64-bit width (``do_not_specialize`` drops the value
+    specializations). The key below holds exactly those, so a hit runs the same binary
+    the JIT dispatcher would pick, with the same arguments, minus its Python binding.
+    """
+    key = None
+    if direct and getattr(triton.knobs.runtime, "launch_enter_hook", None) is None:
+        device = torch.cuda.current_device()
+        key = (
+            device,
+            consts,
+            tuple((args[i].dtype, args[i].data_ptr() % 16 == 0) for i in _PTR_ARGS),
+            all(-(2**31) <= args[i] < 2**31 for i in _INT_ARGS),
+        )
+        kernel = _INDEX_KERNELS.get(key)
+        if kernel is not None:
+            kernel.run(
+                count,
+                1,
+                1,
+                torch._C._cuda_getCurrentRawStream(device),
+                kernel.function,
+                kernel.packed_metadata,
+                None,
+                None,
+                triton.knobs.runtime.launch_exit_hook,
+                *args,
+                *consts,
+            )
+            return
+    kernel = _shared_prefill_index_kernel[(count,)](
+        *args,
+        SWA_W=consts[0],
+        SWA_P2=consts[1],
+        MAIN_W=consts[2],
+        MAIN_P2=consts[3],
+        HAS_MAIN=consts[4],
         num_warps=4,
     )
+    if key is not None and kernel is not None and not torch.cuda.is_current_stream_capturing():
+        if len(_INDEX_KERNELS) >= _INDEX_KERNELS_MAX:
+            _INDEX_KERNELS.clear()
+        _INDEX_KERNELS[key] = kernel
 
 
 @functools.lru_cache(maxsize=None)
@@ -266,6 +328,26 @@ class FISharedPrefill:
     def __init__(self) -> None:
         self._buffers: dict[tuple, dict[str, torch.Tensor]] = {}
         self._wrappers: dict[tuple, object] = {}
+        # (PreparedCall, mid, mlse) per call-signature key, LRU like the index scratch.
+        self._prepared: dict[tuple, tuple] = {}
+        self._direct = os.environ.get("TRTLLM_CSA2_FI_DIRECT_EXECUTE", "1") != "0"
+        self._views: dict[str, tuple] = {}
+        self.direct_calls = 0
+        self.wrapper_calls = 0
+        if self._direct:
+            from flashinfer.mla._sparse_mla_sm120 import _calibration, _prepared
+
+            self._calibration = _calibration
+            self._tuning_enabled = _prepared.tuning_enabled
+
+    def _view(self, name, pool, row_bytes):
+        # The page_size=1 cache view of a persistent pool, reused while the pool is.
+        cached = self._views.get(name)
+        if cached is not None and cached[0] is pool:
+            return cached[1]
+        view = pool.view(pool.shape[0], 1, row_bytes)
+        self._views[name] = (pool, view)
+        return view
 
     def _wrapper(self, dual: bool, device):
         key = (dual, device)
@@ -308,6 +390,7 @@ class FISharedPrefill:
         has_main = main_logical is not None and main_logical.shape[1] > 0
         main_width = int(main_logical.shape[1]) if has_main else 0
         buffers = self._scratch(count, heads, swa_width, main_width, q.device)
+        direct = self._direct
         prepare_shared_prefill_indices(
             swa_pool,
             swa_slots,
@@ -317,19 +400,81 @@ class FISharedPrefill:
             plan,
             buffers["swa"],
             buffers["main"] if has_main else None,
+            direct=direct,
         )
         if sink.dtype != torch.float32 or not sink.is_contiguous():
             sink = sink.float().contiguous()
+        if direct:
+            cache = self._view("swa", swa_pool, 528)
+            extra = self._view("main", main_pool, 288) if has_main else None
+        else:
+            cache = swa_pool.view(swa_pool.shape[0], 1, 528)
+            extra = main_pool.view(main_pool.shape[0], 1, 288) if has_main else None
+        extra_indices = buffers["main"] if has_main else None
+        if direct:
+            # Every component of FlashInfer's per-call signature key (shape, stride, dtype,
+            # device of q, caches, indices, output, sink, LSE) is fixed by this key: q,
+            # the pools and the scratch are contiguous (``supported``/``_pool_ok``).
+            key = (
+                has_main,
+                count,
+                heads,
+                swa_width,
+                main_width,
+                q.device,
+                cache.shape[0],
+                extra.shape[0] if has_main else 0,
+                out.dtype,
+                out.stride(),
+                sink.shape,
+                float(scale),
+            )
+            entry = self._prepared.pop(key, None)
+            if (
+                entry is not None
+                and entry[0].epoch == self._calibration._constants_version
+                and not self._tuning_enabled(False)
+            ):
+                self._prepared[key] = entry
+                prepared, mid, mlse = entry
+                prepared.execute(
+                    q,
+                    cache,
+                    buffers["swa"],
+                    out,
+                    scale,
+                    None,
+                    sink,
+                    extra,
+                    extra_indices,
+                    None,
+                    mid,
+                    mlse,
+                    buffers["lse"],
+                    1.0,
+                )
+                self.direct_calls += 1
+                return out
         wrapper = self._wrapper(has_main, q.device)
         wrapper.run(
             q,
-            swa_pool.view(swa_pool.shape[0], 1, 528),
+            cache,
             buffers["swa"],
             out,
             scale,
             attn_sink=sink,
-            extra_kv_cache=main_pool.view(main_pool.shape[0], 1, 288) if has_main else None,
-            extra_indices=buffers["main"] if has_main else None,
+            extra_kv_cache=extra,
+            extra_indices=extra_indices,
             out_lse=buffers["lse"],
         )
+        self.wrapper_calls += 1
+        if direct and not torch.cuda.is_current_stream_capturing():
+            last = getattr(wrapper, "_last_prepared", None)
+            wrapper._last_prepared = None
+            if last is not None:
+                # wrapper.run just executed exactly this PreparedCall with these scratch
+                # views; later calls with the same key replay it directly.
+                while len(self._prepared) >= self._MAX_SHAPES:
+                    del self._prepared[next(iter(self._prepared))]
+                self._prepared[key] = last
         return out
