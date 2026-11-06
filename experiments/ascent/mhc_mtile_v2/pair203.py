@@ -132,7 +132,7 @@ for M in MS:
     print(f"M={M}: fixed tactics cold {fixed}", flush=True)
     if M == 128:
         med, nz, reps = measure(fn, cold=False)
-        out["128_warm"] = {"kernel_ms": med, "noise_floor": nz, "tactic": list(tac), "rep_medians_us": reps}
+        out["128"]["warm"] = {"kernel_ms": med, "noise_floor": nz, "tactic": list(tac), "rep_medians_us": reps}
         print(f"M=128 warm: {med*1000:.1f} us noise {nz:.3f} reps {reps}", flush=True)
         # L20-39 tail-graph proxy: 20 distinct layer input sets, one graph, tuned tactic from the cache.
         layers = []
@@ -152,7 +152,7 @@ for M in MS:
         with torch.cuda.graph(graph):
             gouts = [mhc_cuda.mhc_fused_hc(*li_inputs, *ARGS, **li_kw) for li_inputs, li_kw in layers]
         med, nz, reps = measure(graph.replay, cold=True, scale=GRAPH_LAYERS)
-        out["128_graph"] = {"kernel_ms": med, "noise_floor": nz, "tactic": list(gtac), "rep_medians_us": reps,
+        out["128"]["graph"] = {"kernel_ms": med, "noise_floor": nz, "tactic": list(gtac), "rep_medians_us": reps,
                             "note": f"per call, {GRAPH_LAYERS}-call graph replay / {GRAPH_LAYERS}"}
         print(f"M=128 graph: tactic {gtac} {med*1000:.1f} us/call noise {nz:.3f} reps {reps}", flush=True)
         del graph, gouts, layers
