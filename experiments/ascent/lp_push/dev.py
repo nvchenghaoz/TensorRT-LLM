@@ -6,8 +6,8 @@ path's preprocess + peer-READ two-shot with quantize + posted peer WRITES; TRTLL
 
 Modes:
   dev   one 4-GPU job, in this order (timing before any CUPTI, pitfall 1464):
-        1. TIMING [M,5120] bf16, M = 2048/4096/6144: PULL (env 0) and PUSH (env 1), 20 warmup + 100 timed, median of
-           3 sequences, seeded inputs re-created before each sequence; per call, max over ranks.
+        1. TIMING [M,5120] bf16, M = 1024/2048/4096/6144: PULL (env 0) and PUSH (env 1), 20 warmup + 100 timed,
+           median of 3 sequences, seeded inputs re-created before each sequence; per call, max over ranks.
         2. BITWISE push vs pull on the same inputs at M = 205/257/1024/1536/2047/2048/3001/4096/6144/8192, 3 inputs
            each (one heavy-tailed), every element, every rank; plus error vs the fp32 sum (sanity only).
         3. SEQUENCE 1000 back-to-back push calls, shapes cycling 2048/257/6144 (odd cycle: both ping/pong parities at
@@ -17,7 +17,16 @@ Modes:
            gather flags hold the last call's flag, nothing holds more, counters equal on all ranks).
         4. DISPATCH (CUPTI): LOWPRECISION autotuned at M=1/2/4/8/128 like the served warm-up, then one eager call per
            M = 1/2/4/8/128/204/205/2048 under push=1 and push=0; kernel names per rank.
-  pair  kernel_time evidence: this tree's default LP path (base = pull, branch = push) at M = 2048/4096/6144.
+  pair  kernel_time evidence (both arms run this same script; base = pull, branch = push):
+        1. TIMING this tree's DEFAULT LP path (env unset) at M = 1024/2048/4096/6144, same counts as dev; each rank
+           reads its own SM clock through NVML while the timed sequence is still on the GPU (under load).
+        2. INTERLEAVED in-process A/B: TRTLLM_LP_AR_PUSH=0 vs unset, 3 rounds per M with alternating order
+           (0,u / u,0 / 0,u), one 20+100 sequence per arm per round. On the base tree the env is ignored, so the
+           A/B there is a pull-vs-pull control (expected ~0).
+        3. Candidate tree only (push support present): dev's BITWISE (2) and 1000-call SEQUENCE (3) checks.
+        4. RECEIPT (CUPTI, after all timing): kernel names of one eager call at M=2048, env unset and env=0, every
+           rank; plus rank 0 scans every tensorrt_llm shared object mapped in its process (/proc/self/maps) for
+           the push/pull symbol and getenv strings.
         Last stdout line: {"batch": {M: {"kernel_ms", "noise_floor"}}, "output": {"class": "exact"}, ...}.
 """
 import json
@@ -42,6 +51,10 @@ SEQ_CHUNK = 250
 DISPATCH_M = [1, 2, 4, 8, 128, 204, 205, 2048]
 TUNE_M = [1, 2, 4, 8, 128]
 LP_REL_RMS_BOUND = 2.0 ** -4
+AB_ROUNDS = 3
+RECEIPT_M = 2048
+LIB_STRINGS = ["lowPrecisionTwoShotPushAllReduceKernel", "lowPrecisionTwoShotAllReduceKernel",
+               "lowPrecisionPreprocessKernel", "TRTLLM_LP_AR_PUSH", "TRTLLM_LP_AR_TWOSHOT_CTAS"]
 
 
 def log(*a):
@@ -55,6 +68,11 @@ def _set_push(v):
         os.environ[ENV] = str(v)
 
 
+def _has_push_support():
+    from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper as H
+    return hasattr(H, "LP_PUSH_CTAS_PER_PEER")
+
+
 def _lp_ipc_bytes():
     """Per-GPU bytes of the LOWPRECISION IPC allocations (ping + pong + barrier in + out), 2 MiB aligned."""
     from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper as H
@@ -66,6 +84,52 @@ def _lp_ipc_bytes():
         from tensorrt_llm._ipc_utils import IpcMemory
         bb = IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * WORLD * 2
     return {"workspace_bytes": ws, "barrier_bytes": bb, "allocated_per_gpu": 2 * al(ws) + 2 * al(bb)}
+
+
+def _sm_clock(torch, rank):
+    try:
+        return int(torch.cuda.clock_rate(rank))
+    except Exception:  # noqa
+        return None
+
+
+def _time_seq(torch, run, m, rank, dev):
+    """One timed sequence exactly as bench._time's (input re-created from the seed, 20 warmup, 100 timed).
+    Also reads this GPU's SM clock while the timed calls are still queued (under load)."""
+    run.x.copy_(bench._gen(torch, m, 0, rank, dev))
+    torch.cuda.synchronize()
+    bench._barrier()
+    for _ in range(bench.WARMUP):
+        run()
+    ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(bench.ITERS)]
+    for i in range(bench.ITERS):
+        ev[i][0].record()
+        run()
+        ev[i][1].record()
+    clk = _sm_clock(torch, rank)
+    torch.cuda.synchronize()
+    return sorted(a.elapsed_time(b) for a, b in ev), clk
+
+
+def _stats(seqs):
+    flat = sorted(t for s in seqs for t in s)
+    meds = [s[len(s) // 2] for s in seqs]
+    n = len(flat)
+    med = sorted(meds)[len(meds) // 2]
+    return {"median_ms": med, "seq_medians_ms": meds, "p10": flat[n // 10], "p90": flat[(9 * n) // 10],
+            "noise_floor": (flat[(9 * n) // 10] - flat[n // 10]) / med,
+            "seq_dispersion": (max(meds) - min(meds)) / med}
+
+
+def _time(torch, run, m, rank, dev):
+    seqs, clks = [], []
+    for _ in range(bench.SEQS):
+        ts, c = _time_seq(torch, run, m, rank, dev)
+        seqs.append(ts)
+        clks.append(c)
+    t = _stats(seqs)
+    t["sm_clock_under_load_mhz"] = clks
+    return t
 
 
 def _flag_state(torch, mapping, expect_push):
@@ -113,33 +177,36 @@ def _kernels(torch, fn):
     return [n[:100] for n in names if "Memcpy" not in n and "Memset" not in n]
 
 
-def rank_dev(env):
-    wd = bench._watchdog("dev", 1500)
-    torch, rank, mapping, applied = bench._setup(env)
-    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
-    S = AllReduceStrategy
-    dev = torch.device("cuda", rank)
-    res = {"rank": rank, "timing": {}, "bitwise": {}, "seq": {}, "dispatch": {}, "ipc": _lp_ipc_bytes()}
+def _lib_receipt():
+    """Every tensorrt_llm shared object mapped in THIS process, with counts of the LP symbol / getenv strings."""
+    paths = []
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                parts = line.split()
+                p = parts[-1] if len(parts) >= 6 else ""
+                if ".so" in p and ("tensorrt_llm" in p or "trtllm" in p or "th_common" in p) and p not in paths:
+                    paths.append(p)
+    except Exception as e:  # noqa
+        return {"error": str(e), "libs": {}, "libs_with_string": {}}
+    out = {}
+    for p in paths:
+        try:
+            st = os.stat(p)
+            with open(p, "rb") as f:
+                data = f.read()
+            out[p] = {"size": st.st_size, "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+                      "counts": {s: data.count(s.encode()) for s in LIB_STRINGS}}
+            del data
+        except Exception as e:  # noqa
+            out[p] = {"error": str(e)}
+    hits = {s: sorted(os.path.basename(p) for p, v in out.items() if v.get("counts", {}).get(s)) for s in LIB_STRINGS}
+    return {"libs": out, "libs_with_string": hits}
 
-    # ------------------------------------------------------------------ 1. timing
-    for m in TIME_M:
-        res["timing"][str(m)] = {}
-        run = bench.Runner(torch, mapping, S.LOWPRECISION, m, graph=False)
-        for push in (0, 1):
-            _set_push(push)
-            torch.cuda.synchronize()
-            bench._barrier()
-            t = bench._time(torch, run, m, rank, dev)
-            res["timing"][str(m)][f"push{push}"] = t
-            if rank == 0:
-                log(f"[time] m={m} push={push} med={t['median_ms']*1e3:.1f}us nf={t['noise_floor']:.3f} "
-                    f"seqs={[round(v*1e3, 1) for v in t['seq_medians_ms']]}")
-        del run
-        torch.cuda.synchronize()
-        bench._barrier()
-    res["clocks_after_timing"] = bench._gpu_state() if rank == 0 else None
 
-    # ------------------------------------------------------------------ 2. bitwise push vs pull
+def _bitwise_section(torch, mapping, rank, dev):
+    from tensorrt_llm._torch.distributed import AllReduceStrategy as S
+    rows = {}
     for m in BIT_M:
         run = bench.Runner(torch, mapping, S.LOWPRECISION, m, graph=False)
         row = {"inputs": 0, "mismatched_inputs": 0, "mismatched_elems": 0, "nonfinite": 0, "e": 0.0,
@@ -166,14 +233,18 @@ def rank_dev(env):
             row["rel_rms_push"] = max(row["rel_rms_push"], e1["rel_rms"])
             row["rel_rms_pull"] = max(row["rel_rms_pull"], e0["rel_rms"])
             del ref, ref2, out, r, ab
-        res["bitwise"][str(m)] = row
+        rows[str(m)] = row
         if rank == 0:
             log(f"[bitwise] m={m} {row}")
         del run
         torch.cuda.synchronize()
         bench._barrier()
+    _set_push(None)
+    return rows
 
-    # ------------------------------------------------------------------ 3. 1000-call sequence
+
+def _seq_section(torch, mapping, rank, dev):
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy as S
     ar = AllReduce(mapping=mapping, strategy=S.LOWPRECISION, dtype=torch.bfloat16)
     pool = {m: [bench._gen(torch, m, 2000 + k, rank, dev, heavy=(k == SEQ_POOL - 1)) for k in range(SEQ_POOL)]
             for m in SEQ_SHAPES}
@@ -205,21 +276,88 @@ def rank_dev(env):
         bench._barrier()
         done += n
     badl = bad.tolist()
-    res["seq"] = {"calls": SEQ_CALLS, "mismatched_calls": sum(1 for v in badl if v), "mismatched_elems": sum(badl),
-                  "first_bad": [i for i, v in enumerate(badl) if v][:10], "nonfinite_calls": int((nonfin > 0).sum()),
-                  "flags_ok": all(f["ok"] for f in flags[1:]), "flag_states": flags,
-                  "parities_per_shape": {str(m): sorted({(flags[0]["counter"] + 1 + i) % 2
-                                                         for i in range(SEQ_CALLS)
-                                                         if SEQ_SHAPES[i % len(SEQ_SHAPES)] == m})
-                                         for m in SEQ_SHAPES},
-                  "seconds": round(time.time() - t0, 1)}
+    seq = {"calls": SEQ_CALLS, "mismatched_calls": sum(1 for v in badl if v), "mismatched_elems": sum(badl),
+           "first_bad": [i for i, v in enumerate(badl) if v][:10], "nonfinite_calls": int((nonfin > 0).sum()),
+           "flags_ok": all(f["ok"] for f in flags[1:]), "flag_states": flags,
+           "parities_per_shape": {str(m): sorted({(flags[0]["counter"] + 1 + i) % 2
+                                                  for i in range(SEQ_CALLS)
+                                                  if SEQ_SHAPES[i % len(SEQ_SHAPES)] == m})
+                                  for m in SEQ_SHAPES},
+           "seconds": round(time.time() - t0, 1)}
     if rank == 0:
-        log(f"[seq] { {k: v for k, v in res['seq'].items() if k != 'flag_states'} }")
+        log(f"[seq] { {k: v for k, v in seq.items() if k != 'flag_states'} }")
         for f in flags:
             log(f"[flags] {f}")
     del pool, refs, bad, nonfin
+    _set_push(None)
     torch.cuda.empty_cache()
     bench._barrier()
+    return seq, ar
+
+
+def _merge_bitwise(rs):
+    out, bad = {}, []
+    for m in rs[0]["bitwise"]:
+        v = {"mismatched_inputs": sum(r["bitwise"][m]["mismatched_inputs"] for r in rs),
+             "mismatched_elems": sum(r["bitwise"][m]["mismatched_elems"] for r in rs),
+             "inputs_per_rank": rs[0]["bitwise"][m]["inputs"],
+             "nonfinite": sum(r["bitwise"][m]["nonfinite"] for r in rs),
+             "rel_rms_push": max(r["bitwise"][m]["rel_rms_push"] for r in rs),
+             "rel_rms_pull": max(r["bitwise"][m]["rel_rms_pull"] for r in rs),
+             "pull_deterministic": all(r["bitwise"][m]["pull_deterministic"] for r in rs)}
+        out[m] = v
+        if v["mismatched_inputs"] or v["nonfinite"] or v["rel_rms_push"] > LP_REL_RMS_BOUND:
+            bad.append(f"bitwise m={m}: {v}")
+    return out, bad
+
+
+def _merge_seq(rs):
+    sq = [r["seq"] for r in rs]
+    out = {"calls_per_rank": SEQ_CALLS, "shapes": SEQ_SHAPES, "pool": SEQ_POOL, "reset_every": SEQ_CHUNK,
+           "mismatched_calls": sum(s["mismatched_calls"] for s in sq),
+           "mismatched_elems": sum(s["mismatched_elems"] for s in sq),
+           "first_bad_rank0": sq[0]["first_bad"], "nonfinite_calls": sum(s["nonfinite_calls"] for s in sq),
+           "flags_ok_all_ranks": all(s["flags_ok"] for s in sq),
+           "parities_per_shape": sq[0]["parities_per_shape"],
+           "flag_states_bad": [f for s in sq for f in s["flag_states"][1:] if not f["ok"]][:6],
+           "seconds": max(s["seconds"] for s in sq)}
+    bad = []
+    if out["mismatched_calls"] or out["nonfinite_calls"] or not out["flags_ok_all_ranks"]:
+        bad.append("1000-call sequence")
+    return out, bad
+
+
+def rank_dev(env):
+    wd = bench._watchdog("dev", 1500)
+    torch, rank, mapping, applied = bench._setup(env)
+    from tensorrt_llm._torch.distributed import AllReduceStrategy
+    S = AllReduceStrategy
+    dev = torch.device("cuda", rank)
+    res = {"rank": rank, "timing": {}, "bitwise": {}, "seq": {}, "dispatch": {}, "ipc": _lp_ipc_bytes()}
+
+    # ------------------------------------------------------------------ 1. timing
+    for m in TIME_M:
+        res["timing"][str(m)] = {}
+        run = bench.Runner(torch, mapping, S.LOWPRECISION, m, graph=False)
+        for push in (0, 1):
+            _set_push(push)
+            torch.cuda.synchronize()
+            bench._barrier()
+            t = bench._time(torch, run, m, rank, dev)
+            res["timing"][str(m)][f"push{push}"] = t
+            if rank == 0:
+                log(f"[time] m={m} push={push} med={t['median_ms']*1e3:.1f}us nf={t['noise_floor']:.3f} "
+                    f"seqs={[round(v*1e3, 1) for v in t['seq_medians_ms']]}")
+        del run
+        torch.cuda.synchronize()
+        bench._barrier()
+    res["clocks_after_timing"] = bench._gpu_state() if rank == 0 else None
+
+    # ------------------------------------------------------------------ 2. bitwise push vs pull
+    res["bitwise"] = _bitwise_section(torch, mapping, rank, dev)
+
+    # ------------------------------------------------------------------ 3. 1000-call sequence
+    res["seq"], ar = _seq_section(torch, mapping, rank, dev)
 
     # ------------------------------------------------------------------ 4. dispatch (CUPTI last)
     from tensorrt_llm._torch.autotuner import AutoTuner, autotune
@@ -279,36 +417,16 @@ def main_dev():
         out["timing_us"][m] = row
         log(f"[table] m={m} pull={row['push0']['max_rank_us']} push={row['push1']['max_rank_us']} "
             f"({row['push_vs_pull']:+.1%})")
-    for m in rs[0]["bitwise"]:
-        v = {"mismatched_inputs": sum(r["bitwise"][m]["mismatched_inputs"] for r in rs),
-             "mismatched_elems": sum(r["bitwise"][m]["mismatched_elems"] for r in rs),
-             "inputs_per_rank": rs[0]["bitwise"][m]["inputs"],
-             "nonfinite": sum(r["bitwise"][m]["nonfinite"] for r in rs),
-             "rel_rms_push": max(r["bitwise"][m]["rel_rms_push"] for r in rs),
-             "rel_rms_pull": max(r["bitwise"][m]["rel_rms_pull"] for r in rs),
-             "pull_deterministic": all(r["bitwise"][m]["pull_deterministic"] for r in rs)}
-        out["bitwise"][m] = v
-        if v["mismatched_inputs"] or v["nonfinite"] or v["rel_rms_push"] > LP_REL_RMS_BOUND:
-            out["passed"] = False
-            out["reasons"].append(f"bitwise m={m}: {v}")
-    sq = [r["seq"] for r in rs]
-    out["seq"] = {"calls_per_rank": SEQ_CALLS, "shapes": SEQ_SHAPES, "pool": SEQ_POOL, "reset_every": SEQ_CHUNK,
-                  "mismatched_calls": sum(s["mismatched_calls"] for s in sq),
-                  "mismatched_elems": sum(s["mismatched_elems"] for s in sq),
-                  "first_bad_rank0": sq[0]["first_bad"], "nonfinite_calls": sum(s["nonfinite_calls"] for s in sq),
-                  "flags_ok_all_ranks": all(s["flags_ok"] for s in sq),
-                  "parities_per_shape": sq[0]["parities_per_shape"],
-                  "flag_states_bad": [f for s in sq for f in s["flag_states"][1:] if not f["ok"]][:6],
-                  "seconds": max(s["seconds"] for s in sq)}
-    if out["seq"]["mismatched_calls"] or out["seq"]["nonfinite_calls"] or not out["seq"]["flags_ok_all_ranks"]:
-        out["passed"] = False
-        out["reasons"].append("1000-call sequence")
+    out["bitwise"], bad = _merge_bitwise(rs)
+    out["reasons"] += bad
+    out["seq"], bad = _merge_seq(rs)
+    out["reasons"] += bad
     for m in rs[0]["dispatch"]:
         ok = all(_dispatch_ok(int(m), r["dispatch"][m]) for r in rs)
         out["dispatch"][m] = {"ok_all_ranks": ok, "rank0": rs[0]["dispatch"][m]}
         if not ok:
-            out["passed"] = False
             out["reasons"].append(f"dispatch m={m}")
+    out["passed"] = not out["reasons"]
     out["wall_s"] = round(time.time() - t0, 1)
     out["clocks_before"] = clocks_before
     out["clocks_after_timing_rank0"] = rs[0].get("clocks_after_timing")
@@ -333,26 +451,90 @@ def main_dev():
 
 
 def rank_pair(env):
-    wd = bench._watchdog("pair", 900)
+    wd = bench._watchdog("pair", 1300)
     torch, rank, mapping, applied = bench._setup(env)
-    from tensorrt_llm._torch.distributed import AllReduceStrategy
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+    S = AllReduceStrategy
     dev = torch.device("cuda", rank)
-    res = {"rank": rank, "timing": {}, "env": os.environ.get(ENV), "ipc": _lp_ipc_bytes()}
+    _set_push(None)
+    push_tree = _has_push_support()
+    res = {"rank": rank, "timing": {}, "ab": {}, "env": os.environ.get(ENV), "ipc": _lp_ipc_bytes(),
+           "push_tree": push_tree, "gpu_uuid": str(getattr(torch.cuda.get_device_properties(rank), "uuid", None))}
+
+    # ------------------------------------------------------------------ 1. timing, this tree's default path
     for m in TIME_M:
-        run = bench.Runner(torch, mapping, AllReduceStrategy.LOWPRECISION, m, graph=False)
+        run = bench.Runner(torch, mapping, S.LOWPRECISION, m, graph=False)
         torch.cuda.synchronize()
         bench._barrier()
-        t = bench._time(torch, run, m, rank, dev)
+        t = _time(torch, run, m, rank, dev)
         res["timing"][str(m)] = t
         if rank == 0:
             log(f"[pair] m={m} med={t['median_ms']*1e3:.1f}us nf={t['noise_floor']:.3f} "
-                f"seqs={[round(v*1e3, 1) for v in t['seq_medians_ms']]}")
+                f"seqs={[round(v*1e3, 1) for v in t['seq_medians_ms']]} clk={t['sm_clock_under_load_mhz']}")
         del run
         torch.cuda.synchronize()
         bench._barrier()
+
+    # ------------------------------------------------------------------ 2. interleaved in-process A/B
+    for m in TIME_M:
+        run = bench.Runner(torch, mapping, S.LOWPRECISION, m, graph=False)
+        seqs = {"push0": [], "unset": []}
+        clks = {"push0": [], "unset": []}
+        for rd in range(AB_ROUNDS):
+            order = (0, None) if rd % 2 == 0 else (None, 0)
+            for v in order:
+                _set_push(v)
+                ts, c = _time_seq(torch, run, m, rank, dev)
+                k = "push0" if v == 0 else "unset"
+                seqs[k].append(ts)
+                clks[k].append(c)
+        _set_push(None)
+        ab = {k: _stats(seqs[k]) for k in seqs}
+        for k in ab:
+            ab[k]["sm_clock_under_load_mhz"] = clks[k]
+        res["ab"][str(m)] = ab
+        if rank == 0:
+            log(f"[ab] m={m} push0={ab['push0']['median_ms']*1e3:.1f}us unset={ab['unset']['median_ms']*1e3:.1f}us "
+                f"nf0={ab['push0']['noise_floor']:.3f} nfu={ab['unset']['noise_floor']:.3f}")
+        del run
+        torch.cuda.synchronize()
+        bench._barrier()
+
+    # ------------------------------------------------------------------ 3. correctness (push tree only)
+    if push_tree:
+        res["bitwise"] = _bitwise_section(torch, mapping, rank, dev)
+        res["seq"], _ = _seq_section(torch, mapping, rank, dev)
+
+    # ------------------------------------------------------------------ 4. receipt (CUPTI, after all timing)
+    x = bench._gen(torch, RECEIPT_M, 5, rank, dev)
+    ar = AllReduce(mapping=mapping, strategy=S.LOWPRECISION, dtype=torch.bfloat16)
+    ar(x)
+    torch.cuda.synchronize()
+    res["receipt"] = {}
+    for k, v in (("unset", None), ("push0", 0)):
+        _set_push(v)
+        bench._barrier()
+        res["receipt"][k] = _kernels(torch, lambda: ar(x))
+        bench._barrier()
+    _set_push(None)
+    if rank == 0:
+        log(f"[receipt] M={RECEIPT_M} {res['receipt']}")
+        res["lib"] = _lib_receipt()
+        log(f"[lib] {res['lib']['libs_with_string']}")
+        for p, v in res["lib"]["libs"].items():
+            log(f"[lib]   {p} {v}")
     bench._barrier()
     wd.cancel()
     return res
+
+
+def _pull_ok(s):
+    return "lowPrecisionPreprocessKernel" in s and "lowPrecisionTwoShotAllReduceKernel" in s and "Push" not in s
+
+
+def _push_ok(s):
+    return ("lowPrecisionTwoShotPushAllReduceKernel" in s and "lowPrecisionPreprocessKernel" not in s
+            and "lowPrecisionTwoShotAllReduceKernel" not in s)
 
 
 def main_pair():
@@ -360,13 +542,16 @@ def main_pair():
     log(f"[pair] start {time.strftime('%Y-%m-%d %H:%M:%S %Z')} host={bench.sh(['hostname']).strip()} "
         f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} load={os.getloadavg()}")
     log(bench._gpu_state())
+    log(bench.sh(["nvidia-smi", "--query-gpu=index,uuid,memory.used", "--format=csv"]))
     log(bench.sh(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory", "--format=csv"]))
+    load_start = os.getloadavg()
     stop, samples = threading.Event(), []
     th = threading.Thread(target=bench._clock_sampler, args=(stop, samples), daemon=True)
     th.start()
     rs = bench.run_ranks(rank_pair, {"_name": "pair", "_apply_nccl_tuning": "1"})
     stop.set()
     th.join(timeout=10)
+    load_end = os.getloadavg()
     log(bench._gpu_state())
     clocks = {}
     for p in samples:
@@ -382,15 +567,63 @@ def main_pair():
     batch = {}
     for m in rs[0]["timing"]:
         per = [r["timing"][m]["median_ms"] for r in rs]
+        clk = [c for r in rs for c in r["timing"][m]["sm_clock_under_load_mhz"] if c is not None]
         batch[m] = {"kernel_ms": max(per),
                     "noise_floor": max(max(r["timing"][m]["noise_floor"], r["timing"][m]["seq_dispersion"])
                                        for r in rs),
                     "per_rank_median_us": [round(v * 1e3, 1) for v in per],
                     "rank_dispersion": round((max(per) - min(per)) / max(per), 4),
                     "seq_medians_us_max_rank": [round(max(r["timing"][m]["seq_medians_ms"][s] for r in rs) * 1e3, 1)
-                                                for s in range(bench.SEQS)]}
-    print(json.dumps({"batch": batch, "output": {"class": "exact"}, "ipc": rs[0]["ipc"],
-                      "sm_clocks_by_uuid": clocks}), flush=True)
+                                                for s in range(bench.SEQS)],
+                    "sm_clock_under_load_min_mhz": min(clk) if clk else None,
+                    "sm_clock_under_load_by_rank": [r["timing"][m]["sm_clock_under_load_mhz"] for r in rs]}
+    ab = {}
+    for m in rs[0]["ab"]:
+        row = {}
+        for k in ("push0", "unset"):
+            per = [r["ab"][m][k]["median_ms"] * 1e3 for r in rs]
+            clk = [c for r in rs for c in r["ab"][m][k]["sm_clock_under_load_mhz"] if c is not None]
+            row[k] = {"max_rank_us": round(max(per), 1),
+                      "noise_floor": round(max(max(r["ab"][m][k]["noise_floor"], r["ab"][m][k]["seq_dispersion"])
+                                               for r in rs), 4),
+                      "sm_clock_under_load_min_mhz": min(clk) if clk else None}
+        row["unset_vs_push0"] = round(row["unset"]["max_rank_us"] / row["push0"]["max_rank_us"] - 1.0, 4)
+        ab[m] = row
+        log(f"[ab-table] m={m} push0={row['push0']['max_rank_us']} unset={row['unset']['max_rank_us']} "
+            f"({row['unset_vs_push0']:+.1%}) noise={max(row['push0']['noise_floor'], row['unset']['noise_floor'])}")
+    push_tree = rs[0]["push_tree"]
+    receipt = {"M": RECEIPT_M, "unset_all_ranks": [r["receipt"]["unset"] for r in rs],
+               "push0_all_ranks": [r["receipt"]["push0"] for r in rs]}
+    u = [" ".join(k) for k in receipt["unset_all_ranks"]]
+    z = [" ".join(k) for k in receipt["push0_all_ranks"]]
+    receipt["default_path"] = ("push" if all(_push_ok(s) for s in u) else "pull" if all(_pull_ok(s) for s in u)
+                               else "unexpected")
+    receipt["push0_path"] = "pull" if all(_pull_ok(s) for s in z) else "unexpected"
+    receipt["expected_default"] = "push" if push_tree else "pull"
+    receipt["ok"] = receipt["default_path"] == receipt["expected_default"] and receipt["push0_path"] == "pull"
+    reasons = [] if receipt["ok"] else [f"kernel receipt: {receipt['default_path']}/{receipt['push0_path']}"]
+    corr, bw, sq = None, None, None
+    if push_tree:
+        bw, b1 = _merge_bitwise(rs)
+        sq, b2 = _merge_seq(rs)
+        reasons += b1 + b2
+        corr = {"bitwise_mismatched_inputs": {m: v["mismatched_inputs"] for m, v in bw.items()},
+                "bitwise_rel_rms_push_max": max(v["rel_rms_push"] for v in bw.values()),
+                "seq": {k: sq[k] for k in ("mismatched_calls", "mismatched_elems", "nonfinite_calls",
+                                           "flags_ok_all_ranks", "parities_per_shape", "seconds")}}
+    out = {"batch": batch, "output": {"class": "exact" if not reasons else "failed"}, "passed": not reasons,
+           "reasons": reasons, "tree": "push" if push_tree else "pull", "kernel_receipt": receipt,
+           "lib_strings": rs[0].get("lib", {}).get("libs_with_string"),
+           "ab_in_process": ab, "correctness": corr, "ipc": rs[0]["ipc"],
+           "gpu_uuid_by_rank": [r["gpu_uuid"] for r in rs],
+           "load_average": {"start": load_start, "end": load_end}, "sm_clocks_by_uuid": clocks}
+    art = os.environ.get("AUTO_DEV_ARTIFACTS", ".")
+    os.makedirs(art, exist_ok=True)
+    with open(os.path.join(art, "lp_push_pair.json"), "w") as f:
+        json.dump({"summary": out, "lib": rs[0].get("lib"), "bitwise": bw, "seq": sq}, f, indent=1, default=str)
+    with open(os.path.join(art, "lp_push_pair_raw.json"), "w") as f:
+        json.dump(rs, f, default=str)
+    print(json.dumps(out), flush=True)
 
 
 if __name__ == "__main__":

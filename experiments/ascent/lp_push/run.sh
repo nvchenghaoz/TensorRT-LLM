@@ -29,17 +29,13 @@ echo "[preamble] HEAD $(git -C "$HERE" rev-parse HEAD 2>/dev/null) tree $(git -C
 git -C "$HERE" log --oneline -3 2>/dev/null
 env | grep -E '^(NCCL_|TRTLLM_ENABLE_PDL|TRTLLM_LP_AR|TLLM_AR|TRTLLM_DSV4)' || echo "[preamble] no NCCL_/TRTLLM_ENABLE_PDL/TRTLLM_LP_AR/TLLM_AR/TRTLLM_DSV4 env"
 
-TLLM_DIR=$("$PY" -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("tensorrt_llm").origin))')
-for LIB in "$TLLM_DIR/libs/libtensorrt_llm.so"; do
-  if [ -f "$LIB" ]; then
-    echo "[lib] $(readlink -f "$LIB") mtime=$(stat -c %y "$(readlink -f "$LIB")") size=$(stat -c %s "$(readlink -f "$LIB")")"
-    for S in lowPrecisionTwoShotPushAllReduceKernel TRTLLM_LP_AR_PUSH TRTLLM_LP_AR_TWOSHOT_CTAS; do
-      echo "[lib]   strings count ${S}: $(grep -a -o "$S" "$LIB" | wc -l)"
-    done
-  else
-    echo "[lib] missing $LIB"
-  fi
-done
+echo "[preamble] host=$(hostname) slot GPUs=${CUDA_VISIBLE_DEVICES}"
+nvidia-smi topo -p2p r
+nvidia-smi --query-gpu=index,uuid,clocks.sm,memory.used --format=csv
+nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv
+# Kernel/library receipt: dev.py records it IN-PROCESS (pitfall 3620: a grep of tensorrt_llm/libs/libtensorrt_llm.so
+# found 0 even for strings certainly in the base .cu). pair mode: CUPTI kernel names per rank at M=2048 plus a
+# /proc/self/maps scan of every mapped tensorrt_llm .so; dev mode: CUPTI dispatch table.
 
 "$PY" -c '
 import sys, torch

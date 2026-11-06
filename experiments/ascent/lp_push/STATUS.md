@@ -75,6 +75,19 @@
 - Served sizing from the kernel pair alone (idea 365 Q4(a) not consulted): c-case T=2048 boundaries ~44 us x 40 =
   ~1.8 ms/req kernel time; served gain depends on barrier wait (fact 3520).
 
+- EVALUATOR SEND-BACK (session 12) on pair 2005/2006: candidate arm's noise 4.7-5.9% > 3% and one GPU sampled at
+  1530 MHz (neighbour window job 2003 loading on austin:4-7, load avg 57-65 vs ~4 in the base arm), and the
+  [lib] grep receipt was uninformative (pitfall 3620). Harness changes (experiments only, no kernel change):
+  - run.sh: grep receipt removed; preamble prints hostname, `nvidia-smi topo -p2p r`, per-GPU uuid/clock/memory.used
+    and the compute-process list to stdout.
+  - dev.py pair: (1) default-path timing as before + each rank's NVML SM clock read while its timed sequence is
+    still queued; (2) interleaved in-process A/B TRTLLM_LP_AR_PUSH=0 vs unset at 1024/2048/4096/6144, 3 rounds with
+    alternating order (pull-vs-pull control on base); (3) candidate tree only: dev's bitwise (10 shapes) and
+    1000-call sequence checks; (4) CUPTI kernel receipt at M=2048 (env unset and =0) on every rank, plus an
+    in-process /proc/self/maps scan of every mapped tensorrt_llm .so for the LP kernel / getenv strings.
+    The JSON carries tree, kernel_receipt (default_path must be pull on base, push on head), ab_in_process,
+    correctness, load_average start/end, per-rank GPU uuid.
+
 ## DONE / UNTESTED / NEXT
 - DONE: kernel, switch, flag sizing, dev/pair script, dev job 1983 (all checks pass).
 - DONE: kernel pair 2005/2006 -> submitted kernel_time EXACT.
