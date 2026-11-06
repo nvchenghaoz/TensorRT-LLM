@@ -39,6 +39,18 @@ TRTLLM_LP_AR_TWOSHOT_CTAS for the sweep only. LP ipc_barriers_in/out sized (1 + 
   | c4 | 443.94 -> 409.92 (-7.7%) | 7.5771 -> 7.5775 (+0.01%) |
   Guards pass. Submitted serving_latency, numerics precision, targets c1/c4 TTFT.
 - Pair: ONE run_serving_pair, base = current main 8e291e60, candidate = this head, back to back on one half.
+- RETURNED (session 10, ~20:0x PST): check_submission on 1663/1664 refuses only on proxy noise 0.0320 > 0.03
+  (the c1 TTFT outlier, cand max 199.7 ms; rse 3.87%). Acceptance items 1-4 have no gaps.
+- Rerun pair 1687 (base) / 1688 (cand), austin:4-7: BOTH arms invalid, server exited before ready with
+  'Executor creation failed due to insufficient GPU memory' (free 13.1 / 6.2 GiB of 95). nvidia-smi at arm start
+  showed 62.6 GB (1687) and 89.7 GB (1688) already used on ALL 8 GPUs by another process: infrastructure, no
+  evidence for or against this change.
+- Topo duty (plan 2964 6a-2): job 1640's STEP 0 preamble went to its 12 MB stderr.log. read_gpu_artifact refuses
+  without a download and fetch_gpu_artifacts is banned (controller ENOSPC), so it is NOT posted. Per the top lead,
+  the first of jobs 230/238/292 posts it from its own preamble.
+- Class: PRECISION (top lead 9958). Targets c1/c4 TTFT, each alone; guards 2588(b).
+- DONE: code, checks 1640/1655, pair 1663/1664 (guards pass, c4 TTFT -7.7%). UNTESTED: none.
+  NEXT: ONE run_serving_pair rerun once GPUs are free and the disk is clear, then submit precision with that pair.
 
 # Idea 94 (branch 94): LOWPRECISION FP8-payload two-shot AR for prefill-size messages: status
 
