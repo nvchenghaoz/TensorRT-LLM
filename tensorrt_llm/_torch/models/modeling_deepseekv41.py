@@ -54,6 +54,7 @@ from ..model_config import ModelConfig
 from ..modules.engram import Engram, ShardedFp8MultiHeadEmbedding, engram_gate
 from ..modules.engram.projection import EngramFp8Projection
 from ..modules.mhc.hyper_connection import HCState, mHC
+from ..modules.mhc.mhc_final_collapse import final_collapse_supported, mhc_final_collapse
 from ..speculative import SpecMetadata
 from ..speculative.dspark import DSparkSpecMetadata
 from ..utils import AuxStreamType
@@ -1507,6 +1508,12 @@ class DeepseekV41Model(DeepseekV4Model):
         the head, matching ``head(norm(h))``.
         """
         hc_state = self._resolve_hc_state(hc_state)
+        # Decode shapes (M <= 8, mult 4, contiguous bf16, fp32 pre): one exact Triton launch instead of
+        # mHC.collapse's 12 ATen launches (bitwise equal). The gate is shape-based, so every caller
+        # (including _enter_remote_tail_boundary's 'source' path) stays exact. TRTLLM_FUSED_FINAL_HC=0
+        # keeps mHC.collapse.
+        if final_collapse_supported(hc_state.residual, hc_state.pre_mix):
+            return mhc_final_collapse(hc_state.residual, hc_state.pre_mix)
         return mHC.collapse(hc_state.residual, hc_state.pre_mix)
 
     # The descriptor fields a *constructed* layer observably owns. Everything
