@@ -42,6 +42,60 @@ from tensorrt_llm.logger import logger
 #: (<= 256 pairs) and the GEMMs on the small-M tiles.
 FI_DECODE_MAX_TOKENS = int(os.environ.get("TRTLLM_SM12X_W4A8_FI_DECODE_MAX_TOKENS", "32"))
 
+#: Prefill calls (FI_DECODE_MAX_TOKENS < M <= FI_PREFILL_MAX_TOKENS) take the chain too, as the
+#: two-kernel fc1_act_q1 -> fc2_finalize (never the persistent decode fc12 kernel) at the tiles of
+#: prefill_tiles(), with a per-call route workspace. TRTLLM_SM12X_W4A8_FI_PREFILL selects when:
+#: "graph" (default) only while a CUDA graph is being captured (the host cost of the chain's ~10
+#: enqueues is then paid once at capture), "1" also in eager forwards, "0" never (main's CUTLASS
+#: prefill, byte-identical).
+FI_PREFILL_MODE = os.environ.get("TRTLLM_SM12X_W4A8_FI_PREFILL", "graph")
+FI_PREFILL_MAX_TOKENS = int(os.environ.get("TRTLLM_SM12X_W4A8_FI_PREFILL_MAX_TOKENS", "8192"))
+
+
+def fi_prefill_takes(m: int) -> bool:
+    """Whether a BF16 call of m > FI_DECODE_MAX_TOKENS tokens takes the FlashInfer chain."""
+    if FI_PREFILL_MODE == "0" or not FI_DECODE_MAX_TOKENS < m <= FI_PREFILL_MAX_TOKENS:
+        return False
+    if FI_PREFILL_MODE == "1":
+        return True
+    return FI_PREFILL_MODE == "graph" and torch.cuda.is_current_stream_capturing()
+
+
+#: (max tokens, fc1 tile bm, fc2 tile bm) per prefill bucket; tiles are (bm, 128, BK). None = the
+#: FlashInfer heuristic (select_tile on all pairs: 8x128 / 32x128 up to 32 pairs per local expert,
+#: else 64x128 / 128x128). Measured on one EP2xTP2 rank (192 experts x 1152), idea 237 stage 1
+#: (job 1758): the heuristic is within 1% of the best tile pair at M <= 512 and M > 2048; at
+#: 512 < M <= 2048 it picks fc2 128x128, 4-9% slower than 64x128 + 32x128.
+_PREFILL_TILE_TABLE = ((512, None, None), (2048, 64, 32), (1 << 30, None, None))
+
+
+def prefill_tiles(m: int):
+    """(fc1 tile bm or None, fc2 tile bm or None) of an m-token prefill call."""
+    for max_m, bm1, bm2 in _PREFILL_TILE_TABLE:
+        if m <= max_m:
+            return bm1, bm2
+    return None, None
+
+
+def prefill_warm_tokens() -> list:
+    """Token counts the prefill warmup runs: every Triton int specialization of the route's two
+    paths (<= 256 pairs: route_assign_decode; above: count/prefix/assign) and one call per tile
+    bucket, so no request JITs."""
+    if FI_PREFILL_MODE == "0" or FI_PREFILL_MAX_TOKENS <= FI_DECODE_MAX_TOKENS:
+        return []
+    lo, hi = FI_DECODE_MAX_TOKENS + 1, FI_PREFILL_MAX_TOKENS
+    ms = set(range(lo, min(hi, lo + 23) + 1))
+    prev = FI_DECODE_MAX_TOKENS
+    for max_m, _, _ in _PREFILL_TILE_TABLE:
+        top = min(max_m, hi)
+        if top > prev:
+            ms.update({prev + 1, top, max(prev + 1, top - 1)})
+        prev = top
+        if top >= hi:
+            break
+    return sorted(m for m in ms if lo <= m <= hi)
+
+
 _ENABLE_ENV = "TRTLLM_SM12X_W4A8_FI_DECODE"
 
 #: Run fc1_act_q1 + fc2_finalize as ONE persistent kernel (FlashInfer SM12x
@@ -266,6 +320,8 @@ class Sm12xW4a8DecodeState:
             token_final_scales: torch.Tensor) -> torch.Tensor:
         route, _, fc1, out_sf_shape, fc2, fi_act = _load_ops()
         m = x.shape[0]
+        if m > FI_DECODE_MAX_TOKENS:
+            return self._run_prefill(x, token_selected_experts, token_final_scales)
         fused = _route_fuses_prologue()
         pre = self._take_prerouted(x, token_selected_experts, token_final_scales)
         # The gate already returns int32 ids and FP32 weights: no kernels here.
@@ -324,6 +380,82 @@ class Sm12xW4a8DecodeState:
         fc2(q1, sf1, self.w2, self.w2_sf, offsets, token_map, route_weights, m, tune=False,
             enable_pdl=self.enable_pdl, out=out)
         return out
+
+    def _run_prefill(self, x: torch.Tensor, token_selected_experts: torch.Tensor,
+                     token_final_scales: torch.Tensor) -> torch.Tensor:
+        """A prefill call (m > FI_DECODE_MAX_TOKENS): route -> fc1_act_q1 -> fc2_finalize at the
+        bucket's tiles. The route workspace is allocated per call (the caching allocator reuses it;
+        a per-shape cache would grow with every prefill size), never shared across layers."""
+        route, make_ws, fc1, _, fc2, fi_act = _load_ops()
+        self._prerouted = None  # a decode stash never matches a prefill call
+        m = x.shape[0]
+        fused = _route_fuses_prologue()
+        ids = token_selected_experts.to(torch.int32)
+        weights = token_final_scales.to(torch.float32)
+        if not fused:
+            ids = self.local_ids(ids)
+        pairs = ids.numel()
+        sf1_shape, n_q1, n_sf1, off_sf1, off_out, nbytes = self._buf_layout(m, pairs)
+        ws = make_ws(x, ids, self.num_experts)
+        if fused:
+            buf = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
+            offsets, token_map, route_weights, a_q, a_sf = route(
+                x, ids, weights, self.num_experts, workspace=ws, enable_pdl=self.enable_pdl,
+                expert_offset=self.slot_start, zero_buf=buf,
+            )
+        else:
+            buf = torch.zeros(nbytes, dtype=torch.uint8, device=x.device)
+            offsets, token_map, route_weights, a_q, a_sf = route(
+                x, ids, weights, self.num_experts, workspace=ws, enable_pdl=self.enable_pdl
+            )
+        q1 = buf[:n_q1].view(torch.float8_e4m3fn).view(pairs, self.inter)
+        sf1 = buf[off_sf1:off_sf1 + n_sf1].view(torch.int32).view(sf1_shape)
+        out = buf[off_out:].view(torch.bfloat16).view(m, self.hidden)
+        bm1, bm2 = prefill_tiles(m)
+        kw1, kw2 = {}, {}
+        if bm1 is not None:
+            from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_mxfp8_mxfp4_fc1_act_q1 as _fc1m
+
+            tile = (bm1, 128, _fc1m.BK)
+            tactics = _fc1m.epi_tactics(tile)
+            kw1 = {"tile": tile,
+                   "epi": _fc1m.DEFAULT_EPI if _fc1m.DEFAULT_EPI in tactics else tactics[0]}
+        if bm2 is not None:
+            from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_mxfp8_mxfp4_fc2_finalize as _fc2m
+
+            kw2 = {"tile": (bm2, 128, _fc2m.BK)}
+        fc1(a_q, a_sf, self.w1, self.w1_sf, offsets, tune=False, enable_pdl=self.enable_pdl,
+            out_q=q1, out_sf=sf1, activation=fi_act.Swiglu, swiglu_limit=self.swiglu_limit, **kw1)
+        fc2(q1, sf1, self.w2, self.w2_sf, offsets, token_map, route_weights, m, tune=False,
+            enable_pdl=self.enable_pdl, out=out, **kw2)
+        return out
+
+    def warmup_prefill(self, top_k: int) -> None:
+        """JIT every prefill tile and Triton route specialization (prefill_warm_tokens), outside any
+        capture, so neither a graph capture nor an eager request compiles anything."""
+        ms = prefill_warm_tokens()
+        if not ms:
+            return
+        key = ("prefill", self.hidden, self.inter, self.num_experts, top_k, self.enable_pdl,
+               self.swiglu_limit, self.slot_start, tuple(ms), _PREFILL_TILE_TABLE)
+        with _LOCK:
+            if key in _WARMED:
+                return
+            dev = self.w1.device
+            for m in ms:
+                x = torch.zeros(m, self.hidden, dtype=torch.bfloat16, device=dev)
+                ids = (torch.arange(m * top_k, device=dev, dtype=torch.int32)
+                       % self.num_experts + self.slot_start).view(m, top_k)
+                w = torch.full((m, top_k), 1.0 / top_k, dtype=torch.float32, device=dev)
+                self._run_prefill(x, ids, w)
+                del x, ids, w
+            torch.cuda.synchronize(dev)
+            _WARMED.add(key)
+            logger.info(
+                f"SM12x W4A8 MXFP4xMXFP8 FlashInfer PREFILL chain warmed up for {len(ms)} token counts in "
+                f"{ms[0]}..{ms[-1]} (mode={FI_PREFILL_MODE}, tiles={_PREFILL_TILE_TABLE}, hidden={self.hidden}, "
+                f"inter={self.inter}, experts={self.num_experts})"
+            )
 
     def warmup(self, top_k: int) -> None:
         """JIT every kernel and Triton specialization decode can hit, outside any graph capture.
