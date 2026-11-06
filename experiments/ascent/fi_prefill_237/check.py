@@ -121,6 +121,7 @@ def main():
     torch.cuda.synchronize()
     pool = torch.cuda.graph_pool_handle()
     cs = torch.cuda.Stream()
+    keep = []
     for m, d in cases:
         key = f"M{m}_D{d}"
         x, sel, sc, n_act, n_loc = p.inputs(m, d)
@@ -174,8 +175,9 @@ def main():
                        "cutlass_vs_ref": cut_err, "eager_band": band, "band_tol": tol, "inputs_unchanged": inputs_ok,
                        "ok": ok}
         S.log(key, json.dumps(report[key]))
-        del g, out
-        torch.cuda.empty_cache()
+        # Keep every graph alive, as the tail MoE graph module does: torch 2.14 asserts
+        # (CachingHostAllocator use_count) when a shared pool is reused after all its graphs died.
+        keep.append((g, out))
     print(json.dumps({"passed": bool(passed), "compared": "FI SM12x prefill chain (leaf _run_prefill, tile table) "
                       "every eager call + 43 graph replays (tail-graph style capture) vs FP32 dequantized reference, "
                       "vs main's CUTLASS fused_moe on the same inputs, and vs its own 5-call eager band; gate default "
