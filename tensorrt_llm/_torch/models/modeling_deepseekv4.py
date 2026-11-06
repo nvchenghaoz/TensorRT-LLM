@@ -2992,9 +2992,14 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         *,
         hidden_states_normalized: bool = False,
         image_mask: Optional[torch.Tensor] = None,
+        defer_final_allreduce: bool = False,
     ) -> torch.Tensor:
+        """``defer_final_allreduce`` (V4.1 eager prefill AR pipeline only): return the rank-local partial sum;
+        the caller reduces it (mhc/ar_pipeline.py)."""
         if hidden_states_normalized and self.fusion_config.PRE_MOE_FUSION:
             raise ValueError("Pre-normalized MoE input cannot use pre-MoE allreduce fusion")
+        if defer_final_allreduce and self.fusion_config.POST_MOE_FUSION:
+            raise ValueError("A deferred MoE all-reduce cannot use post-MoE allreduce fusion")
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize, input_ids):
             return self.mlp(
@@ -3003,7 +3008,9 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (
-                        self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
+                        self.fusion_config.POST_MOE_FUSION
+                        or self.mapping.tp_size == 1
+                        or defer_final_allreduce
                     ),
                     # Per call: decode M <= 8 triggers early (idea 208); the 128-row tail-MoE
                     # replay and prefill keep the end trigger.

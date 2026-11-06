@@ -631,6 +631,35 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             if self._mhc_split_stream is not None
             else None
         )
+        # Prefill AR -> fused boundary row-chunk pipeline (mhc/ar_pipeline.py, design D). Set by
+        # DeepseekV41ForCausalLM.post_load_weights: the shared pipeline (one comm stream per model) and
+        # whether this layer's attention-side / MoE-side boundary may use it (layers below the replay split).
+        self._v41_ar_pipe = None
+        self._v41_ar_pipe_attn = False
+        self._v41_ar_pipe_moe = False
+
+    def _ar_pipe_bounds(self, rows: torch.Tensor, spec_metadata, image_mask):
+        """Chunk bounds for a pipelined prefill boundary over ``rows`` [T, hidden], or None (unpipelined)."""
+        from tensorrt_llm._torch.modules.mhc import ar_pipeline as _arp
+
+        if self._v41_ar_pipe is None or not _arp.PIPELINE_ON or image_mask is not None:
+            return None
+        if rows.dim() != 2 or rows.shape[0] < max(_arp.PIPELINE_MIN_ROWS, 2 * _arp.MIN_CHUNK_ROWS):
+            return None
+        if self.mapping.tp_size != 4 or self.mapping.enable_attention_dp:
+            return None
+        if spec_metadata is not None and (
+            spec_metadata.is_layer_capture(self.layer_idx)
+            or spec_metadata.is_layer_capture(self.layer_idx + 1)
+        ):
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        from ..autotuner import AutoTuner
+
+        if AutoTuner.get().is_tuning_mode:
+            return None
+        return _arp.plan(rows.shape[0])
 
     def _mhc_boundary(
         self, mhc: mHC, which: int, x_prev, residual, post_mix, comb_mix, pre, norm, defer_k1=False
@@ -737,7 +766,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         )
         if deferred and needs_resolved:
             residual = self.hc_attn.post_mapping(
-                x=hc_state.x_prev,
+                x=hc_state.reduced_x_prev(),
                 residual=residual,
                 post_layer_mix=hc_state.post_mix,
                 comb_res_mix=hc_state.comb_mix,
@@ -773,7 +802,32 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         # C++ fused boundary (GEMM + bigfuse with the lagged pre-mix and the input RMSNorm
         # folded in); the GEMM backend (FMA / tcgen05 TF32) is the autotuner's per-M choice.
         attn_join = None
-        if deferred:
+        entry_piped = False
+        if deferred and hc_state.x_prev_allreduce is not None:
+            # The previous layer deferred its MoE all-reduce (prefill AR pipeline): reduce x_prev in row
+            # chunks on the comm stream, overlapped with this fused boundary; or in full when not eligible.
+            entry_bounds = self._ar_pipe_bounds(hc_state.x_prev, spec_metadata, image_mask)
+            if entry_bounds is not None:
+                pending_ar, x_part = hc_state.x_prev_allreduce, hc_state.x_prev
+                hc_state.x_prev_allreduce = None
+                residual, attn_pre, post_mix, comb_mix, layer_input = self._v41_ar_pipe.run(
+                    pending_ar,
+                    self.hc_attn,
+                    x_part,
+                    residual,
+                    hc_state.post_mix,
+                    hc_state.comb_mix,
+                    pre_mix,
+                    self.input_layernorm.weight,
+                    self.input_layernorm.variance_epsilon,
+                    entry_bounds,
+                )
+                entry_piped = True
+            else:
+                hc_state.reduced_x_prev()
+        if entry_piped:
+            pass
+        elif deferred:
             # Previous layer's post update + this boundary in one fused pair; `residual`
             # becomes the materialized stream that this layer's post_mapping needs.
             # Split (decode): residual/attn_pre/post_mix/comb_mix are valid only after
@@ -795,17 +849,42 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 norm_weight=self.input_layernorm.weight,
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
-        x_attn = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=layer_input,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=not self.disable_attn_allreduce),
-            **kwargs,
-        )
+        # Prefill AR pipeline, attention side: o_b_proj returns its partial sum and the hc_ffn boundary
+        # below reduces it in row chunks (mhc/ar_pipeline.py).
+        attn_bounds = None
+        o_b = self.self_attn.o_b_proj
+        if self._v41_ar_pipe_attn and not self.disable_attn_allreduce:
+            attn_bounds = self._ar_pipe_bounds(layer_input, spec_metadata, image_mask)
+            if attn_bounds is not None and (
+                not o_b.reduce_output
+                or o_b.all_reduce is None
+                or getattr(o_b, "use_fused_gemm_allreduce", False)
+            ):
+                attn_bounds = None
+        if attn_bounds is not None:
+            o_b.reduce_output = False
+            try:
+                x_attn = self.self_attn(
+                    position_ids=position_ids,
+                    hidden_states=layer_input,
+                    attn_metadata=attn_metadata,
+                    all_reduce_params=AllReduceParams(enable_allreduce=False),
+                    **kwargs,
+                )
+            finally:
+                o_b.reduce_output = True
+        else:
+            x_attn = self.self_attn(
+                position_ids=position_ids,
+                hidden_states=layer_input,
+                attn_metadata=attn_metadata,
+                all_reduce_params=AllReduceParams(enable_allreduce=not self.disable_attn_allreduce),
+                **kwargs,
+            )
         if attn_join is not None:
             attn_join.join()
             attn_join = None
-        if _TAIL_MOE_GRAPH and _tail_moe_graph.eligible(
+        if attn_bounds is None and _TAIL_MOE_GRAPH and _tail_moe_graph.eligible(
             self, x_attn, attn_metadata, spec_metadata, image_mask
         ):
             # 128-row eager replay tail: replay this layer's captured MoE window.
@@ -821,21 +900,48 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         # Attention's post update + FFN boundary + post_attention RMSNorm in one fused pair.
         # Split (decode): its residual/ffn_pre/post_mix/comb_mix join right after the MoE.
         # K1 fold (decode M <= 4): the MoE's fused router launch computes this boundary's layer_input itself.
-        defer_k1 = self._k1_fold_eligible(x_attn, image_mask)
-        (residual, ffn_pre, post_mix, comb_mix, layer_input), ffn_join = self._mhc_boundary(
-            self.hc_ffn,
-            1,
-            x_attn,
-            residual,
-            post_mix,
-            comb_mix,
-            attn_pre,
-            self.post_attention_layernorm,
-            defer_k1=defer_k1,
-        )
+        if attn_bounds is not None:
+            residual, ffn_pre, post_mix, comb_mix, layer_input = self._v41_ar_pipe.run(
+                o_b.all_reduce,
+                self.hc_ffn,
+                x_attn,
+                residual,
+                post_mix,
+                comb_mix,
+                attn_pre,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                attn_bounds,
+            )
+            ffn_join = None
+        else:
+            defer_k1 = self._k1_fold_eligible(x_attn, image_mask)
+            (residual, ffn_pre, post_mix, comb_mix, layer_input), ffn_join = self._mhc_boundary(
+                self.hc_ffn,
+                1,
+                x_attn,
+                residual,
+                post_mix,
+                comb_mix,
+                attn_pre,
+                self.post_attention_layernorm,
+                defer_k1=defer_k1,
+            )
         k1_fold = ffn_join.k1_fold if ffn_join is not None else None
         if k1_fold is not None:
             self.mlp.stash_k1_fold(k1_fold)
+        # Prefill AR pipeline, MoE side: the MoE returns its partial sum and the next layer's fused entry
+        # reduces it in row chunks (HCState.x_prev_allreduce).
+        moe_ar = getattr(self.mlp, "allreduce", None)
+        moe_defer = bool(
+            self._v41_ar_pipe_moe
+            and self._v41_defer_post_mapping
+            and k1_fold is None
+            and ffn_join is None
+            and moe_ar is not None
+            and not self.fusion_config.POST_MOE_FUSION
+            and self._ar_pipe_bounds(layer_input, spec_metadata, image_mask) is not None
+        )
         x_ffn = self.forward_MoE(
             hidden_states=layer_input,
             attn_metadata=attn_metadata,
@@ -843,7 +949,12 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             input_ids=input_ids,
             hidden_states_normalized=True,
             **({"image_mask": image_mask} if image_mask is not None else {}),
+            **({"defer_final_allreduce": True} if moe_defer else {}),
         )
+        if moe_defer:
+            return HCState.deferred(
+                residual, post_mix, comb_mix, x_ffn, pre_mix=ffn_pre, x_prev_allreduce=moe_ar
+            )
         if k1_fold is not None and not k1_fold.done:
             raise RuntimeError("K1 fold: the MoE did not produce the deferred layer_input")
         if ffn_join is not None:
@@ -1351,7 +1462,7 @@ class DeepseekV41Model(DeepseekV4Model):
         if not hc_state.is_deferred:
             return hc_state
         residual = self.layers[0].hc_attn.post_mapping(
-            x=hc_state.x_prev,
+            x=hc_state.reduced_x_prev(),
             residual=hc_state.residual,
             post_layer_mix=hc_state.post_mix,
             comb_res_mix=hc_state.comb_mix,
@@ -2538,6 +2649,20 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
                     self.model.ced_kv_precompute and idx + 1 == self.model.decoder_replay_split
                 )
             )
+        # Prefill AR -> fused boundary row-chunk pipeline (mhc/ar_pipeline.py): layers below the decoder
+        # replay split only; the MoE side also needs the next layer below the split (L19's MoE AR feeds the
+        # bounded-replay entry and stays unsplit) and a deferred post update (no Engram entry next).
+        from tensorrt_llm._torch.modules.mhc import ar_pipeline as _arp
+
+        split = self.model.decoder_replay_split
+        if _arp.PIPELINE_ON and split is not None and not self.model_config.mapping.has_pp():
+            pipe = _arp.ArFusedHcPipeline()
+            for idx, layer in enumerate(layers):
+                if not isinstance(layer, DeepseekV41DecoderLayer) or idx >= split:
+                    continue
+                layer._v41_ar_pipe = pipe
+                layer._v41_ar_pipe_attn = True
+                layer._v41_ar_pipe_moe = bool(layer._v41_defer_post_mapping and idx + 1 < split)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         # Both of these are refusals rather than silent degradations: each one
