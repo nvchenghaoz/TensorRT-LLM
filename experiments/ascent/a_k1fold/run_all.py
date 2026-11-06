@@ -56,6 +56,12 @@ def main():
         out["chain"] = run("chain", [py, os.path.join(HERE, "..", "moe_ar_trigger", "chain.py"), "--mode", "check352",
                                      "--ckpt", args.ckpt, "--batches", "1", "2", "4", "--ws", "2", "5", "--iters", "8"],
                            3000)
+    if "bench" in args.parts:
+        # Diagnostic timing in this tree only (the evidence is the base/head pair): tree / tree_k1 / ideal.
+        out["bench"] = run("bench", [py, os.path.join(HERE, "..", "moe_ar_trigger", "chain.py"), "--mode", "bench",
+                                     "--ckpt", args.ckpt, "--batches", "1", "2", "4", "--arms", "tree", "tree_k1",
+                                     "ideal", "--ws", "2", "--reps", "20", "--inner", "5"], 3000)
+        out["bench"]["passed"] = True
     passed = all(v.get("passed") for k, v in out.items() if k != "sass")
     slim = {k: {kk: vv for kk, vv in v.items() if kk not in ("stats", "hashes", "report", "summary", "bitwise")}
             for k, v in out.items()}
