@@ -248,6 +248,228 @@ def _mhc_lagged_layer_input_kernel(
             tl.store(obase + offs, _k1_norm(lik, nwk, rstd3, DEBUG), mask=m3)
 
 
+# ---------------------------------------------------------------------------------------------
+# Fast K1 (TRTLLM_MHC_K1_FAST, default on): the same values, the same adds in the same order as
+# _mhc_lagged_layer_input_kernel, but the lane-0 butterfly and the warp sum run in registers
+# (reshape / permute / tl.split are pure data movement, every add is an explicit elementwise
+# fp32 add), so there is no global scratch round trip and no debug_barrier; and the constant
+# norm weight is loaded before the PDL wait.
+# ---------------------------------------------------------------------------------------------
+
+
+@triton.jit
+def _halves(v, R: tl.constexpr, H: tl.constexpr):
+    """v [R, 2H] -> (v[:, :H], v[:, H:]) by data movement only."""
+    return tl.split(tl.permute(tl.reshape(v, [R, 2, H]), (0, 2, 1)))
+
+
+@triton.jit
+def _evod(v, N: tl.constexpr):
+    """v [N] -> (v[0::2], v[1::2]) by data movement only."""
+    return tl.split(tl.reshape(v, [N // 2, 2]))
+
+
+@triton.jit
+def _reg_lane0_butterfly(s, W_PAD: tl.constexpr):
+    """[P_PAD] partials -> [W_PAD] lane-0 values, in _lane0_butterfly's exact pairing."""
+    s2 = tl.reshape(s, [W_PAD, 32])  # [w, k] = lane k of warp w
+    lo, hi = _halves(s2, W_PAD, 16)
+    a = lo + hi  # a_k = lane k + lane k+16
+    lo, hi = _halves(a, W_PAD, 8)
+    b = lo + hi  # b_k = a_k + a_{k+8}
+    lo, hi = _halves(b, W_PAD, 4)
+    c = lo + hi  # c_k = b_k + b_{k+4}
+    lo, hi = _halves(c, W_PAD, 2)
+    d = lo + hi  # d_k = c_k + c_{k+2}
+    d0, d1 = tl.split(d)
+    return d0 + d1
+
+
+@triton.jit
+def _seq_add(t, wk, k: tl.constexpr, W: tl.constexpr):
+    if k < W:
+        t = t + wk
+    return t
+
+
+@triton.jit
+def _warp_sum(wv, W: tl.constexpr, W_PAD: tl.constexpr):
+    """total = w_0 + w_1 + ... + w_{W-1}, sequential scalar adds (shape [1])."""
+    if W_PAD == 4:
+        e, o = _evod(wv, 4)
+        w0, w2 = _evod(e, 2)
+        w1, w3 = _evod(o, 2)
+        t = w0
+        t = _seq_add(t, w1, 1, W)
+        t = _seq_add(t, w2, 2, W)
+        t = _seq_add(t, w3, 3, W)
+    elif W_PAD == 8:
+        e, o = _evod(wv, 8)  # [0,2,4,6], [1,3,5,7]
+        ee, eo = _evod(e, 4)  # [0,4], [2,6]
+        oe, oo = _evod(o, 4)  # [1,5], [3,7]
+        w0, w4 = _evod(ee, 2)
+        w2, w6 = _evod(eo, 2)
+        w1, w5 = _evod(oe, 2)
+        w3, w7 = _evod(oo, 2)
+        t = w0
+        t = _seq_add(t, w1, 1, W)
+        t = _seq_add(t, w2, 2, W)
+        t = _seq_add(t, w3, 3, W)
+        t = _seq_add(t, w4, 4, W)
+        t = _seq_add(t, w5, 5, W)
+        t = _seq_add(t, w6, 6, W)
+        t = _seq_add(t, w7, 7, W)
+    else:
+        tl.static_assert(W_PAD == 16)
+        e, o = _evod(wv, 16)  # [0,2,..,14], [1,3,..,15]
+        ee, eo = _evod(e, 8)  # [0,4,8,12], [2,6,10,14]
+        oe, oo = _evod(o, 8)  # [1,5,9,13], [3,7,11,15]
+        eee, eeo = _evod(ee, 4)  # [0,8], [4,12]
+        eoe, eoo = _evod(eo, 4)  # [2,10], [6,14]
+        oee, oeo = _evod(oe, 4)  # [1,9], [5,13]
+        ooe, ooo = _evod(oo, 4)  # [3,11], [7,15]
+        w0, w8 = _evod(eee, 2)
+        w4, w12 = _evod(eeo, 2)
+        w2, w10 = _evod(eoe, 2)
+        w6, w14 = _evod(eoo, 2)
+        w1, w9 = _evod(oee, 2)
+        w5, w13 = _evod(oeo, 2)
+        w3, w11 = _evod(ooe, 2)
+        w7, w15 = _evod(ooo, 2)
+        t = w0
+        t = _seq_add(t, w1, 1, W)
+        t = _seq_add(t, w2, 2, W)
+        t = _seq_add(t, w3, 3, W)
+        t = _seq_add(t, w4, 4, W)
+        t = _seq_add(t, w5, 5, W)
+        t = _seq_add(t, w6, 6, W)
+        t = _seq_add(t, w7, 7, W)
+        t = _seq_add(t, w8, 8, W)
+        t = _seq_add(t, w9, 9, W)
+        t = _seq_add(t, w10, 10, W)
+        t = _seq_add(t, w11, 11, W)
+        t = _seq_add(t, w12, 12, W)
+        t = _seq_add(t, w13, 13, W)
+        t = _seq_add(t, w14, 14, W)
+        t = _seq_add(t, w15, 15, W)
+    return t
+
+
+@triton.jit
+def _nw_offs(i: tl.constexpr, t, v4, h2, P: tl.constexpr, NCHUNK: tl.constexpr):
+    chunk = i * P + t
+    cm = (t < P) & (chunk < NCHUNK)
+    offs = chunk[:, None, None] * 8 + v4[None, :, None] * 2 + h2[None, None, :]
+    m3 = cm[:, None, None] & (v4[None, :, None] < 4) & (h2[None, None, :] < 2)
+    return offs, m3
+
+
+@triton.jit
+def _mhc_lagged_layer_input_fast_kernel(
+    x_ptr,
+    res_ptr,
+    post_ptr,
+    comb_ptr,
+    pre_ptr,
+    nw_ptr,
+    out_ptr,
+    dbg_ptr,
+    norm_eps,
+    HIDDEN: tl.constexpr,
+    P: tl.constexpr,
+    P_PAD: tl.constexpr,
+    NI: tl.constexpr,
+    W: tl.constexpr,
+    W_PAD: tl.constexpr,
+    DEBUG: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    TRIGGER_FIRST: tl.constexpr,
+):
+    NCHUNK: tl.constexpr = HIDDEN // 8
+    t = tl.arange(0, P_PAD)
+    v4 = tl.arange(0, 4)
+    h2 = tl.arange(0, 2)
+    if LAUNCH_WITH_PDL:
+        if TRIGGER_FIRST != 0:
+            # Trigger first (idea 208; 2 = test-only negative control that also skips the wait).
+            tl.extra.cuda.gdc_launch_dependents()
+    # The norm weight is a constant module weight that no preceding kernel writes: it is the
+    # only load issued before the PDL wait.
+    n0o, n0m = _nw_offs(0, t, v4, h2, P, NCHUNK)
+    nw0 = tl.load(nw_ptr + n0o, mask=n0m, other=0.0)
+    if NI > 1:
+        n1o, n1m = _nw_offs(1, t, v4, h2, P, NCHUNK)
+        nw1 = tl.load(nw_ptr + n1o, mask=n1m, other=0.0)
+    if NI > 2:
+        n2o, n2m = _nw_offs(2, t, v4, h2, P, NCHUNK)
+        nw2 = tl.load(nw_ptr + n2o, mask=n2m, other=0.0)
+    if LAUNCH_WITH_PDL:
+        if TRIGGER_FIRST == 0:
+            # Every input other than the norm weight is read after the wait (memory clobber).
+            gdc_wait_with_memory_clobber()
+            tl.extra.cuda.gdc_launch_dependents()
+        elif TRIGGER_FIRST == 1:
+            gdc_wait_with_memory_clobber()
+    tok = tl.program_id(0).to(tl.int64)
+
+    obase = out_ptr + tok * HIDDEN
+    xbase = x_ptr + tok * HIDDEN
+    rbase = res_ptr + tok * (4 * HIDDEN)
+    s = tl.zeros([P_PAD], dtype=tl.float32)
+    li0, o0, m0 = _k1_chunk(0, t, v4, h2, xbase, rbase, post_ptr, comb_ptr, pre_ptr, tok, P, NCHUNK, HIDDEN, P_PAD)
+    s = _k1_sumsq(li0, s, P_PAD)
+    if NI > 1:
+        li1, o1, m1 = _k1_chunk(1, t, v4, h2, xbase, rbase, post_ptr, comb_ptr, pre_ptr, tok, P, NCHUNK,
+                                HIDDEN, P_PAD)
+        s = _k1_sumsq(li1, s, P_PAD)
+    if NI > 2:
+        li2, o2, m2 = _k1_chunk(2, t, v4, h2, xbase, rbase, post_ptr, comb_ptr, pre_ptr, tok, P, NCHUNK,
+                                HIDDEN, P_PAD)
+        s = _k1_sumsq(li2, s, P_PAD)
+    if NI > 3:
+        for i in tl.static_range(3, NI):
+            lik, ok, mk = _k1_chunk(i, t, v4, h2, xbase, rbase, post_ptr, comb_ptr, pre_ptr, tok, P, NCHUNK,
+                                    HIDDEN, P_PAD)
+            s = _k1_sumsq(lik, s, P_PAD)
+            tl.store(obase + ok, lik, mask=mk)
+
+    if DEBUG == 3:
+        # Test-only floor probe (wrong numerics): no reduction at all.
+        total = tl.full([1], 1.0, tl.float32)
+    else:
+        # Lane-0 butterfly (16, 8, 4, 2, 1), then total = w_0 + ... + w_{W-1}, in registers.
+        total = _warp_sum(_reg_lane0_butterfly(s, W_PAD), W, W_PAD)
+    hidden_f = tl.full([1], HIDDEN, tl.float32)
+    rcp = tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", "=f,f", [hidden_f],
+                                    dtype=tl.float32, is_pure=True, pack=1)
+    total1 = tl.full([1], 0.0, tl.float32) + total
+    arg = tl.fma(total1, rcp, tl.full([1], 0.0, tl.float32) + norm_eps)
+    rstd = tl.math.rsqrt(arg)  # [1]
+    if DEBUG == 1 or DEBUG == 2:
+        z = tl.arange(0, 1)
+        tl.store(dbg_ptr + tok * 2 + z, total1)
+        tl.store(dbg_ptr + tok * 2 + 1 + z, rstd)
+
+    rstd3 = tl.reshape(rstd, [1, 1, 1])
+    tl.store(obase + o0, _k1_norm(li0, nw0, rstd3, DEBUG), mask=m0)
+    if NI > 1:
+        tl.store(obase + o1, _k1_norm(li1, nw1, rstd3, DEBUG), mask=m1)
+    if NI > 2:
+        tl.store(obase + o2, _k1_norm(li2, nw2, rstd3, DEBUG), mask=m2)
+    if NI > 3:
+        for i in tl.static_range(3, NI):
+            offs, m3 = _nw_offs(i, t, v4, h2, P, NCHUNK)
+            lik = tl.load(obase + offs, mask=m3, other=0.0)
+            nwk = tl.load(nw_ptr + offs, mask=m3, other=0.0)
+            tl.store(obase + offs, _k1_norm(lik, nwk, rstd3, DEBUG), mask=m3)
+
+
+# TRTLLM_MHC_K1_FAST=0 selects _mhc_lagged_layer_input_kernel (main's K1, unchanged compile key).
+K1_FAST = os.environ.get("TRTLLM_MHC_K1_FAST", "1") != "0"
+# Fast-K1 num_warps per P (graph replays at M=1..8); P not listed -> _DEFAULT_NUM_WARPS.
+_FAST_NUM_WARPS = {}
+
+
 _SPLIT_ENV_ON = os.environ.get("TRTLLM_MHC_SPLIT_LAGGED", "1") != "0"
 _SPLIT_MAX_TOKENS = 8
 # K1 trigger-first (idea 208), used only where the caller asks for it (the hc_attn boundary, whose
@@ -401,6 +623,8 @@ def mhc_lagged_layer_input(
     num_warps: Optional[int] = None,
     trigger_first: bool = False,
     _test_skip_wait: bool = False,
+    fast: Optional[bool] = None,
+    test_floor: bool = False,
 ) -> torch.Tensor:
     """K1: post update + lagged collapse + RMSNorm -> layer_input [M, hidden] bf16.
 
@@ -413,6 +637,8 @@ def mhc_lagged_layer_input(
     the PDL dependents before this kernel's own wait; its successor must read nothing produced
     upstream before its own griddepcontrol.wait. ``_test_skip_wait`` is a test-only negative
     control (trigger, no wait).
+    ``fast`` (default ``K1_FAST``) picks the register K1 (same bits, no scratch round trip);
+    ``test_floor`` (test-only, fast K1, wrong numerics) skips the reduction.
     """
     M, hidden = x_prev.shape
     assert residual_prev.shape == (M, 4, hidden) and residual_prev.is_contiguous()
@@ -436,6 +662,39 @@ def mhc_lagged_layer_input(
     if out is None:
         out = torch.empty_like(x_prev)
     if M == 0:
+        return out
+    if fast is None:
+        fast = K1_FAST
+    if fast and W_PAD in (4, 8, 16):
+        if enable_pdl and _test_skip_wait:
+            tf = 2
+        elif enable_pdl and trigger_first and K1_TRIGGER_FIRST_ENV and M >= K1_TRIGGER_FIRST_MIN_TOKENS:
+            tf = 1
+        else:
+            tf = 0
+        _mhc_lagged_layer_input_fast_kernel[(M,)](
+            x_prev,
+            residual_prev,
+            post_mix_prev,
+            comb_mix_prev,
+            pre_mix_ext,
+            norm_weight,
+            out,
+            debug if debug is not None else out,
+            float(norm_eps),
+            HIDDEN=hidden,
+            P=P,
+            P_PAD=P_PAD,
+            NI=NI,
+            W=W,
+            W_PAD=W_PAD,
+            DEBUG=3 if test_floor else (0 if debug is None else (2 if debug_li else 1)),
+            LAUNCH_WITH_PDL=bool(enable_pdl),
+            TRIGGER_FIRST=tf,
+            num_warps=num_warps if num_warps is not None else _FAST_NUM_WARPS.get(P, _DEFAULT_NUM_WARPS),
+            enable_fp_fusion=False,
+            launch_pdl=bool(enable_pdl),
+        )
         return out
     scratch = torch.empty((M, SCR), dtype=torch.float32, device=x_prev.device)
     extra = {}

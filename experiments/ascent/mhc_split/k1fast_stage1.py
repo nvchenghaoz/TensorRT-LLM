@@ -51,17 +51,28 @@ def bitwise():
             dbg_m = torch.zeros(M, 2, device=dev)
             main = mhc_lagged_layer_input(x, res, post, comb, pre, nw, EPS, P, debug=dbg_m, fast=False)
             main_nd = mhc_lagged_layer_input(x, res, post, comb, pre, nw, EPS, P, fast=False)
+            main_tf = mhc_lagged_layer_input(x, res, post, comb, pre, nw, EPS, P, fast=False, enable_pdl=True,
+                                             trigger_first=True)
             torch.cuda.synchronize()
-            row = {"main_vs_ref_bad": int((main.view(torch.int16) != ref_out.view(torch.int16)).sum().item())}
+            row = {"main_vs_ref_bad": int((main.view(torch.int16) != ref_out.view(torch.int16)).sum().item()),
+                   "main_tf_vs_main": int((main_tf.view(torch.int16) != main_nd.view(torch.int16)).sum().item())}
             for nwp in NWS:
                 dbg = torch.zeros(M, 2, device=dev)
                 out_d = mhc_lagged_layer_input(x, res, post, comb, pre, nw, EPS, P, debug=dbg, fast=True,
                                                num_warps=nwp)
                 out = torch.full_like(x, float("nan"))
                 mhc_lagged_layer_input(x, res, post, comb, pre, nw, EPS, P, fast=True, num_warps=nwp, out=out)
+                out_tf = torch.full_like(x, float("nan"))
+                mhc_lagged_layer_input(x, res, post, comb, pre, nw, EPS, P, fast=True, num_warps=nwp, out=out_tf,
+                                       enable_pdl=True, trigger_first=True)
+                out_np = torch.full_like(x, float("nan"))
+                mhc_lagged_layer_input(x, res, post, comb, pre, nw, EPS, P, fast=True, num_warps=nwp, out=out_np,
+                                       enable_pdl=False)
                 torch.cuda.synchronize()
                 r = {
                     "vs_main": int((out.view(torch.int16) != main_nd.view(torch.int16)).sum().item()),
+                    "tf_vs_main": int((out_tf.view(torch.int16) != main_nd.view(torch.int16)).sum().item()),
+                    "nopdl_vs_main": int((out_np.view(torch.int16) != main_nd.view(torch.int16)).sum().item()),
                     "vs_ref": int((out.view(torch.int16) != ref_out.view(torch.int16)).sum().item()),
                     "dbg_vs_main": int((out_d.view(torch.int16) != main.view(torch.int16)).sum().item()),
                     "tot_vs_emu": int((dbg[:, 0] != emu).sum().item()),
@@ -71,7 +82,7 @@ def bitwise():
                 if any(r.values()):
                     ok = False
                 row[f"w{nwp}"] = r
-            if row["main_vs_ref_bad"]:
+            if row["main_vs_ref_bad"] or row["main_tf_vs_main"]:
                 ok = False
             rows[f"seed{seed}/P{P}"] = row
             log(f"seed {seed} P={P}: {json.dumps(row)}")
