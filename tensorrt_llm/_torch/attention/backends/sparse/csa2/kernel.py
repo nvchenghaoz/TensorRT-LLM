@@ -108,6 +108,21 @@ def _glue_kernels():
     def bitcast_f32_i32(value, *, loc=None, ip=None):
         return Int32(llvm.bitcast(T.i32(), Float32(value).ir_value(loc=loc, ip=ip)))
 
+    @dsl_user_op
+    def match_any_i32(value, *, loc=None, ip=None):
+        """``__match_any_sync(0xffffffff, value)``: lanes holding the same value."""
+        return Int32(
+            llvm.inline_asm(
+                T.i32(),
+                [Int32(value).ir_value(loc=loc, ip=ip)],
+                "match.any.sync.b32 $0, $1, -1;",
+                "=r,r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+        )
+
     @cute.jit
     def floor_div(a: Int64, b: Int64) -> Int64:
         """PyTorch ``//`` for signed integers (round toward negative infinity)."""
@@ -1029,15 +1044,18 @@ def _glue_kernels():
 
         @cute.jit
         def _select_wide(
-            self, score_t, keys, ids, partial, q, width, blocks, selected_blocks, latest, tid
+            self, score_t, keys, ids, partial, hist, q, width, blocks, selected_blocks, latest, tid
         ):
             """Top-K blocks in ascending id order into ``ids`` (``INT32_MAX`` tail).
 
             ``keys`` holds an order-preserving Int32 image of each block maximum
-            (``-0.0`` folded into ``+0.0``; padding below ``-inf``). The K-th
-            largest key ``T`` is found 2 bits per round; blocks above ``T`` and
-            the first ``K - #above`` blocks equal to ``T`` (ascending id) are
-            selected, and unreachable ``-inf`` blocks are dropped.
+            (``-0.0`` folded into ``+0.0``; padding below ``-inf``), stored
+            transposed (block ``t * per_thread + i`` at ``i * threads + t``) so each
+            thread loads its contiguous chunk of keys into registers bank-conflict
+            free. The K-th largest key ``T`` is found 8 bits per round from a
+            256-bin shared histogram (``hist``, one zeroed buffer per round);
+            blocks above ``T`` and the first ``K - #above`` blocks equal to ``T``
+            (ascending id) are selected, and unreachable ``-inf`` blocks are dropped.
             """
             lane = tid % 32
             warp = tid // 32
@@ -1045,12 +1063,14 @@ def _glue_kernels():
             per_thread = self.padded // self.threads
             bs = self.block_size
             pad_key = Int32(-(2**31))
-            bias = Int64(2**31)
-            neg_inf_u = Int64(0x007FFFFF)  # key of -inf, biased to [0, 2**32)
+            sign = Int32(-(2**31))
+            neg_inf_key = Int32(-(2**31) + 0x007FFFFF)  # key of -inf
             for b in cutlass.range(tid, self.padded, self.threads):
                 ids[b] = Int32(_INT32_MAX)
+            for b in cutlass.range(tid, 4 * 256, self.threads):
+                hist[b] = Int32(0)
             for b in cutlass.range(blocks + tid, self.padded, self.threads):
-                keys[b] = pad_key
+                keys[(b % per_thread) * self.threads + b // per_thread] = pad_key
             if cutlass.const_expr(self.coalesced):
                 unroll = 8
                 span = blocks * Int32(bs)
@@ -1081,7 +1101,7 @@ def _glue_kernels():
                             bits = bitcast_f32_i32(value + Float32(0.0))
                             if bits < 0:
                                 bits = bits ^ Int32(0x7FFFFFFF)
-                            keys[b] = bits
+                            keys[(b % per_thread) * self.threads + b // per_thread] = bits
             else:
                 for b in cutlass.range(tid, blocks, self.threads):
                     value = Float32(float("-inf"))
@@ -1096,40 +1116,90 @@ def _glue_kernels():
                     bits = bitcast_f32_i32(value + Float32(0.0))
                     if bits < 0:
                         bits = bits ^ Int32(0x7FFFFFFF)
-                    keys[b] = bits
+                    keys[(b % per_thread) * self.threads + b // per_thread] = bits
             cute.arch.barrier()
-            # T = K-th largest biased key; every block is selected when K >= blocks.
-            threshold = neg_inf_u
+            # This thread's contiguous chunk (blocks tid * per_thread + i), in registers.
+            mine = []
+            for i in cutlass.range_constexpr(per_thread):
+                mine.append(keys[i * self.threads + tid])
+            # T = K-th largest key; every block is selected when K >= blocks.
+            threshold = neg_inf_key
+            radix_prefix = Int32(0)  # sign-flipped (unsigned-ordered) bits of T fixed so far
+            remaining = selected_blocks  # rank of T among keys matching the prefix
             if selected_blocks < blocks:
-                threshold = Int64(0)
-                for r in cutlass.range_constexpr(16):
-                    shift = 30 - 2 * r
-                    c1 = threshold + Int64(1 << shift)
-                    c2 = threshold + Int64(2 << shift)
-                    c3 = threshold + Int64(3 << shift)
-                    n12 = Int32(0)
-                    n3 = Int32(0)
+                below = (Int32(1) << lane) - Int32(1)
+                for r in cutlass.range_constexpr(4):
+                    shift = 24 - 8 * r
+                    hbase = r * 256
                     for i in cutlass.range_constexpr(per_thread):
-                        key = Int64(keys[tid + i * self.threads]) + bias
-                        if key >= c1:
-                            n12 = n12 + 1
-                        if key >= c2:
-                            n12 = n12 + 65536
-                        if key >= c3:
-                            n3 = n3 + 1
-                    t12, t3 = self._block_sum2(n12, n3, partial, (r % 2) * 2 * warps, lane, warp)
-                    chosen = threshold
-                    if (t12 & 65535) >= selected_blocks:
-                        chosen = c1
-                    if (t12 >> 16) >= selected_blocks:
-                        chosen = c2
-                    if t3 >= selected_blocks:
-                        chosen = c3
-                    threshold = chosen
+                        flipped = mine[i] ^ sign
+                        digit = (flipped >> shift) & Int32(255)
+                        if cutlass.const_expr(r == 0):
+                            peers = match_any_i32(digit)
+                            if (peers & below) == Int32(0):
+                                cute.arch.atomic_add(
+                                    ptr=(hist.iterator + (hbase + digit)).llvm_ptr,
+                                    val=cute.arch.popc(peers),
+                                    sem="relaxed",
+                                    scope="cta",
+                                )
+                        else:
+                            hit = ((flipped ^ radix_prefix) >> (shift + 8)) == Int32(0)
+                            if cute.arch.vote_any_sync(hit):
+                                tag = Int32(256)
+                                if hit:
+                                    tag = digit
+                                peers = match_any_i32(tag)
+                                if hit & ((peers & below) == Int32(0)):
+                                    cute.arch.atomic_add(
+                                        ptr=(hist.iterator + (hbase + digit)).llvm_ptr,
+                                        val=cute.arch.popc(peers),
+                                        sem="relaxed",
+                                        scope="cta",
+                                    )
+                    cute.arch.barrier()
+                    # Every warp finds the same digit: lane l holds bins l + 32 j.
+                    cols = []
+                    for j in cutlass.range_constexpr(8):
+                        cols.append(hist[hbase + j * 32 + lane])
+                    totals = []
+                    for j in cutlass.range_constexpr(4):
+                        packed = cols[2 * j] | (cols[2 * j + 1] << 16)
+                        for s in cutlass.range_constexpr(5):
+                            packed = packed + cute.arch.shuffle_sync_bfly(packed, offset=1 << s)
+                        totals.append(packed & Int32(65535))
+                        totals.append(packed >> 16)  # two totals <= 8192 per word: no carry
+                    hcol = Int32(0)
+                    above_columns = Int32(0)
+                    found = Int32(0)
+                    running = Int32(0)
+                    for jj in cutlass.range_constexpr(8):
+                        if (found == Int32(0)) & (running + totals[7 - jj] >= remaining):
+                            hcol = Int32(7 - jj)
+                            above_columns = running
+                            found = Int32(1)
+                        running = running + totals[7 - jj]
+                    count_bin = cols[0]
+                    for j in cutlass.range_constexpr(1, 8):
+                        if hcol == Int32(j):
+                            count_bin = cols[j]
+                    suffix = count_bin  # suffix sums over higher lanes = higher digits
+                    for s in cutlass.range_constexpr(5):
+                        upper = cute.arch.shuffle_sync(suffix, lane + Int32(1 << s))
+                        if lane + Int32(1 << s) < Int32(32):
+                            suffix = suffix + upper
+                    beyond = above_columns + suffix - count_bin
+                    crossing = (beyond < remaining) & (beyond + count_bin >= remaining)
+                    ballot = Int32(cute.arch.vote_ballot_sync(crossing))
+                    winner = cute.arch.popc((ballot & (Int32(0) - ballot)) - Int32(1))
+                    bin_above = cute.arch.shuffle_sync(beyond, winner)
+                    radix_prefix = radix_prefix | ((hcol * Int32(32) + winner) << shift)
+                    remaining = remaining - bin_above
+                threshold = radix_prefix ^ sign
             # One scan of packed (above, equal) counts over contiguous chunks.
             local = Int32(0)
             for i in cutlass.range_constexpr(per_thread):
-                key = Int64(keys[tid * per_thread + i]) + bias
+                key = mine[i]
                 if key > threshold:
                     local = local + 1
                 if key == threshold:
@@ -1161,11 +1231,11 @@ def _glue_kernels():
             above = prefix & 65535
             equal = prefix >> 16
             take = selected_blocks - (total & 65535)
-            if threshold == neg_inf_u:
+            if threshold == neg_inf_key:
                 take = Int32(0)  # ties at -inf are unreachable
             for i in cutlass.range_constexpr(per_thread):
                 b = tid * per_thread + i
-                key = Int64(keys[b]) + bias
+                key = mine[i]
                 taken = equal
                 if taken > take:
                     taken = take
@@ -1208,8 +1278,19 @@ def _glue_kernels():
                 partial = smem.allocate_tensor(
                     Int32, cute.make_layout(5 * max(self.threads // 32, 1)), 16
                 )
+                hist = smem.allocate_tensor(Int32, cute.make_layout(4 * 256), 16)
                 self._select_wide(
-                    score_t, keys, ids, partial, q, width, blocks, selected_blocks, latest, tid
+                    score_t,
+                    keys,
+                    ids,
+                    partial,
+                    hist,
+                    q,
+                    width,
+                    blocks,
+                    selected_blocks,
+                    latest,
+                    tid,
                 )
             else:
                 values = smem.allocate_tensor(Float32, cute.make_layout(self.padded), 16)
