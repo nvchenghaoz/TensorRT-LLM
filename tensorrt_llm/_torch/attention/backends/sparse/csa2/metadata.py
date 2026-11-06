@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from math import prod
@@ -25,9 +24,6 @@ if TYPE_CHECKING:
 _SWA_TILE = 128
 _HEAD_DIM = 512
 _TMA_MIN_BACKING_BYTES = 128 * 1024
-# Pack the coalesced metadata upload straight into pinned staging with NumPy
-# (TRTLLM_CSA2_FAST_PREPARE=0 restores the pageable pack + torch CPU copy).
-_FAST_PREPARE = os.environ.get("TRTLLM_CSA2_FAST_PREPARE", "1") != "0"
 
 
 def _allocate_staging_pool(
@@ -97,32 +93,16 @@ class _CoalescedUploads:
         if not self._pending:
             return
         metadata = self._metadata
+        packed = np.empty(self._bytes, dtype=np.uint8)
+        for _, value, offset in self._pending:
+            packed[offset : offset + value.nbytes] = value.reshape(-1).view(np.uint8)
         device = self._pending[0][0].device
         slab = getattr(metadata, "_csa2_upload_slab", None)
         if slab is None or slab.device != device or slab.numel() < self._bytes:
             # Only the scatter below reads the slab, so graphs never see it.
             size = max(self._bytes, 2 * slab.numel() if slab is not None else 0)
             slab = metadata._csa2_upload_slab = torch.empty(size, dtype=torch.uint8, device=device)
-        if _FAST_PREPARE:
-            from tensorrt_llm._torch.host_staging import copy_packed_host_to_device
-
-            pending = self._pending
-
-            def fill(packed: np.ndarray) -> None:
-                for _, value, offset in pending:
-                    packed[offset : offset + value.nbytes] = value.reshape(-1).view(np.uint8)
-
-            staging = getattr(metadata, "_csa2_host_staging", None)
-            if staging is None:
-                staging = metadata._csa2_host_staging = {}
-            copy_packed_host_to_device(
-                staging, "coalesced_upload", slab[: self._bytes], self._bytes, fill
-            )
-        else:
-            packed = np.empty(self._bytes, dtype=np.uint8)
-            for _, value, offset in self._pending:
-                packed[offset : offset + value.nbytes] = value.reshape(-1).view(np.uint8)
-            metadata._copy_host("coalesced_upload", slab[: self._bytes], torch.from_numpy(packed))
+        metadata._copy_host("coalesced_upload", slab[: self._bytes], torch.from_numpy(packed))
         groups = {}
         for result, value, offset in self._pending:
             source = slab[offset : offset + value.nbytes].view(result.dtype).view(result.shape)
