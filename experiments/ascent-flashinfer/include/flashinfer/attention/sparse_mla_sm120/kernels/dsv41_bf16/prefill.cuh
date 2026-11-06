@@ -12,6 +12,14 @@
 
 namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16 {
 
+// ascent: software-pipelined gather. Each thread issues all of its global loads for
+// chunk c+1 (16 items of 8 packed channels plus their scale bytes) into registers right
+// after chunk c's tile is in shared memory, so they are in flight while chunk c's QK,
+// softmax and PV run; they are decoded into shared memory at the top of the next
+// iteration. Chunk c+2's candidate index is read one chunk ahead as well, and the
+// candidate validity lists alternate between two shared buffers. The task -> thread
+// mapping, the decode and every arithmetic step are unchanged, so shared memory and
+// the output receive identical values.
 template <bool EXTRA_FP4>
 __device__ __forceinline__ void run_bf16_tiles(
     Dsv41Bf16Smem& sm, const uint8_t* __restrict__ KV_cache, const int32_t* __restrict__ indices,
@@ -24,114 +32,141 @@ __device__ __forceinline__ void run_bf16_tiles(
   using Geometry = R::Geometry;
   const int tidx = threadIdx.x, warp = tidx / R::WARP_THREADS, lane = tidx % R::WARP_THREADS;
   const int gid = lane / 4, tid = lane % 4;
-  for (int chunk = lo; chunk < hi; ++chunk) {
+  constexpr int ITEMS = (R::CANDIDATES * R::QK_VECTORS) / R::BLOCK_THREADS;
+  static_assert((R::CANDIDATES * R::QK_VECTORS) % (2 * R::BLOCK_THREADS) == 0);
+  constexpr int fp4_scale_shift = []() constexpr {
+    int shift = 0;
+    for (int group = Dsv41Fp4Layout::SCALE_GROUP; group > 1; group >>= 1) ++shift;
+    return shift;
+  }();
+  constexpr int fp8_scale_shift = []() constexpr {
+    int shift = 0;
+    for (int group = Dsv41Fp8Layout::QUANT_TILE; group > 1; group >>= 1) ++shift;
+    return shift;
+  }();
+  static_assert((1u << fp4_scale_shift) == Dsv41Fp4Layout::SCALE_GROUP);
+  static_assert((1u << fp8_scale_shift) == Dsv41Fp8Layout::QUANT_TILE);
+
+  // Candidate index of this thread's column (threads < CANDIDATES) in a chunk.
+  auto index_of = [&](int chunk) __attribute__((always_inline)) -> int {
     const bool extra = chunk >= main_chunks;
-    const bool fp4 = EXTRA_FP4 && extra;
     const int start = (extra ? chunk - main_chunks : chunk) * R::CANDIDATES;
-    const int n = extra ? elen : len, pbs = extra ? pbs_extra : main_page_block_size;
-    const size_t stride = extra ? extra_page_stride_bytes : page_stride_bytes;
-    const uint8_t* cache = extra ? extra_KV_cache : KV_cache;
+    const int n = extra ? elen : len;
     const int32_t* ix = extra ? extra_indices + (size_t)t * extra_indices_stride_elems
                               : indices + (size_t)t * indices_stride_elems;
-    if (tidx < R::CANDIDATES) sm.valid[tidx] = start + tidx < n ? ix[start + tidx] : -1;
-    __syncthreads();
-    auto gather = [&](bool power_of_two) __attribute__((always_inline)) {
-      // ascent: issue every load of the chunk before decoding any of them (one memory
-      // round trip per chunk instead of one per pair of items). Same task -> thread
-      // mapping and the same decode, so shared memory receives identical bytes.
-      constexpr int ITEMS = (R::CANDIDATES * R::QK_VECTORS) / R::BLOCK_THREADS;
-      static_assert((R::CANDIDATES * R::QK_VECTORS) % (2 * R::BLOCK_THREADS) == 0);
-      uint64_t raw_all[ITEMS];
-      uint32_t scale_all[ITEMS];
-      bool valid_all[ITEMS];
+    return start + tidx < n ? ix[start + tidx] : -1;
+  };
+
+  uint64_t raw_all[ITEMS];
+  uint32_t scale_all[ITEMS];
+  bool valid_all[ITEMS];
+
+  // Issue every global load of one chunk into registers (no decode).
+  auto issue = [&](int chunk, const int* vrow) __attribute__((always_inline)) {
+    const bool extra = chunk >= main_chunks;
+    const bool fp4 = EXTRA_FP4 && extra;
+    const int pbs = extra ? pbs_extra : main_page_block_size;
+    const size_t stride = extra ? extra_page_stride_bytes : page_stride_bytes;
+    const uint8_t* cache = extra ? extra_KV_cache : KV_cache;
+    const bool power_of_two = (pbs & (pbs - 1)) == 0;
+    const int pbs_shift = __ffs(pbs) - 1;
 #pragma unroll
-      for (int pair = 0; pair < ITEMS / 2; ++pair) {
-        const int first = tidx + pair * 2 * R::BLOCK_THREADS;
-        uint64_t raw[2];
-        uint32_t scale_code[2];
-        const uint8_t *data_addr[2] = {}, *scale_addr[2] = {};
-        bool valid[2];
+    for (int pair = 0; pair < ITEMS / 2; ++pair) {
+      const int first = tidx + pair * 2 * R::BLOCK_THREADS;
+      uint64_t raw[2];
+      uint32_t scale_code[2];
+      const uint8_t *data_addr[2] = {}, *scale_addr[2] = {};
+      bool valid[2];
 #pragma unroll
-        for (int item = 0; item < 2; ++item) {
-          const int task = first + item * R::BLOCK_THREADS;
-          const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
-          const int index = sm.valid[row];
-          valid[item] = index >= 0;
-          if (valid[item]) {
-            const int page = power_of_two ? (index >> (__ffs(pbs) - 1)) : (index / pbs);
-            const int slot = index - page * pbs;
-            const uint8_t* base = cache + (size_t)page * stride;
-            const auto data_offset =
-                Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(fp4, size_t(slot));
-            data_addr[item] = base + data_offset + (fp4 ? d / 2 : d);
-            const auto scale_offset =
-                Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(fp4, size_t(pbs), slot);
-            constexpr int fp4_scale_shift = []() constexpr {
-              int shift = 0;
-              for (int group = Dsv41Fp4Layout::SCALE_GROUP; group > 1; group >>= 1) ++shift;
-              return shift;
-            }();
-            constexpr int fp8_scale_shift = []() constexpr {
-              int shift = 0;
-              for (int group = Dsv41Fp8Layout::QUANT_TILE; group > 1; group >>= 1) ++shift;
-              return shift;
-            }();
-            static_assert((1u << fp4_scale_shift) == Dsv41Fp4Layout::SCALE_GROUP);
-            static_assert((1u << fp8_scale_shift) == Dsv41Fp8Layout::QUANT_TILE);
-            scale_addr[item] =
-                base + scale_offset + (unsigned(d) >> (fp4 ? fp4_scale_shift : fp8_scale_shift));
-          }
-        }
-        asm volatile(
-            "{\n"
-            ".reg .pred v0, v1, f, p;\n"
-            ".reg .b64 a0, a1;\n"
-            ".reg .b32 lo0, hi0, lo1, hi1, s0, s1;\n"
-            "mov.b32 lo0, 0; mov.b32 hi0, 0; mov.b32 lo1, 0; mov.b32 hi1, 0;\n"
-            "mov.u32 s0, 0; mov.u32 s1, 0;\n"
-            "setp.ne.u32 v0, %8, 0; setp.ne.u32 v1, %9, 0; setp.ne.u32 f, %10, "
-            "0;\n"
-            "and.pred p, v0, f; @p ld.global.u32 lo0, [%4];\n"
-            "and.pred p, v1, f; @p ld.global.u32 lo1, [%6];\n"
-            "not.pred f, f;\n"
-            "and.pred p, v0, f; @p ld.global.v2.u32 {lo0, hi0}, [%4];\n"
-            "and.pred p, v1, f; @p ld.global.v2.u32 {lo1, hi1}, [%6];\n"
-            "@v0 ld.global.u8 s0, [%5]; @v1 ld.global.u8 s1, [%7];\n"
-            "mov.b64 a0, {lo0, hi0}; mov.b64 a1, {lo1, hi1};\n"
-            "mov.b64 %0, a0; mov.b64 %1, a1; mov.u32 %2, s0; mov.u32 %3, s1;\n"
-            "}\n"
-            : "=l"(raw[0]), "=l"(raw[1]), "=r"(scale_code[0]), "=r"(scale_code[1])
-            : "l"(data_addr[0]), "l"(scale_addr[0]), "l"(data_addr[1]), "l"(scale_addr[1]),
-              "r"(int(valid[0])), "r"(int(valid[1])), "r"(int(fp4))
-            : "memory");
-#pragma unroll
-        for (int item = 0; item < 2; ++item) {
-          raw_all[pair * 2 + item] = raw[item];
-          scale_all[pair * 2 + item] = scale_code[item];
-          valid_all[pair * 2 + item] = valid[item];
-        }
-      }
-#pragma unroll
-      for (int i = 0; i < ITEMS; ++i) {
-        const int task = tidx + i * R::BLOCK_THREADS;
+      for (int item = 0; item < 2; ++item) {
+        const int task = first + item * R::BLOCK_THREADS;
         const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
-        const __nv_bfloat162 scale = valid_all[i]
-                                         ? decode_e4m3_or_ue8m0_scale_bf16(scale_all[i], fp4)
-                                         : __floats2bfloat162_rn(0.f, 0.f);
-        __nv_bfloat162 pairs[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-          pairs[j] = __hmul2(
-              decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw_all[i] >> (j * (fp4 ? 8 : 16))), fp4),
-              scale);
-        *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
+        const int index = vrow[row];
+        valid[item] = index >= 0;
+        if (valid[item]) {
+          const int page = power_of_two ? (index >> pbs_shift) : (index / pbs);
+          const int slot = index - page * pbs;
+          const uint8_t* base = cache + (size_t)page * stride;
+          const auto data_offset =
+              Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(fp4, size_t(slot));
+          data_addr[item] = base + data_offset + (fp4 ? d / 2 : d);
+          const auto scale_offset =
+              Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(fp4, size_t(pbs), slot);
+          scale_addr[item] =
+              base + scale_offset + (unsigned(d) >> (fp4 ? fp4_scale_shift : fp8_scale_shift));
+        }
       }
-    };
-    if ((pbs & (pbs - 1)) == 0)
-      gather(true);
-    else
-      gather(false);
+      asm volatile(
+          "{\n"
+          ".reg .pred v0, v1, f, p;\n"
+          ".reg .b64 a0, a1;\n"
+          ".reg .b32 lo0, hi0, lo1, hi1, s0, s1;\n"
+          "mov.b32 lo0, 0; mov.b32 hi0, 0; mov.b32 lo1, 0; mov.b32 hi1, 0;\n"
+          "mov.u32 s0, 0; mov.u32 s1, 0;\n"
+          "setp.ne.u32 v0, %8, 0; setp.ne.u32 v1, %9, 0; setp.ne.u32 f, %10, "
+          "0;\n"
+          "and.pred p, v0, f; @p ld.global.u32 lo0, [%4];\n"
+          "and.pred p, v1, f; @p ld.global.u32 lo1, [%6];\n"
+          "not.pred f, f;\n"
+          "and.pred p, v0, f; @p ld.global.v2.u32 {lo0, hi0}, [%4];\n"
+          "and.pred p, v1, f; @p ld.global.v2.u32 {lo1, hi1}, [%6];\n"
+          "@v0 ld.global.u8 s0, [%5]; @v1 ld.global.u8 s1, [%7];\n"
+          "mov.b64 a0, {lo0, hi0}; mov.b64 a1, {lo1, hi1};\n"
+          "mov.b64 %0, a0; mov.b64 %1, a1; mov.u32 %2, s0; mov.u32 %3, s1;\n"
+          "}\n"
+          : "=l"(raw[0]), "=l"(raw[1]), "=r"(scale_code[0]), "=r"(scale_code[1])
+          : "l"(data_addr[0]), "l"(scale_addr[0]), "l"(data_addr[1]), "l"(scale_addr[1]),
+            "r"(int(valid[0])), "r"(int(valid[1])), "r"(int(fp4))
+          : "memory");
+#pragma unroll
+      for (int item = 0; item < 2; ++item) {
+        raw_all[pair * 2 + item] = raw[item];
+        scale_all[pair * 2 + item] = scale_code[item];
+        valid_all[pair * 2 + item] = valid[item];
+      }
+    }
+  };
+
+  // Decode the registers of one chunk into the shared KV tile (exact BF16).
+  auto decode = [&](int chunk) __attribute__((always_inline)) {
+    const bool fp4 = EXTRA_FP4 && chunk >= main_chunks;
+#pragma unroll
+    for (int i = 0; i < ITEMS; ++i) {
+      const int task = tidx + i * R::BLOCK_THREADS;
+      const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
+      const __nv_bfloat162 scale = valid_all[i]
+                                       ? decode_e4m3_or_ue8m0_scale_bf16(scale_all[i], fp4)
+                                       : __floats2bfloat162_rn(0.f, 0.f);
+      __nv_bfloat162 pairs[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        pairs[j] = __hmul2(
+            decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw_all[i] >> (j * (fp4 ? 8 : 16))), fp4),
+            scale);
+      *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
+    }
+  };
+
+  int next_index = -1;
+  if (lo < hi) {
+    if (tidx < R::CANDIDATES) {
+      sm.valid[tidx] = index_of(lo);
+      next_index = lo + 1 < hi ? index_of(lo + 1) : -1;
+    }
     __syncthreads();
+    issue(lo, sm.valid);
+  }
+  for (int chunk = lo; chunk < hi; ++chunk) {
+    const bool odd = ((chunk - lo) & 1) != 0;
+    const int* vcur = odd ? sm.valid_next : sm.valid;
+    int* vnext = odd ? sm.valid : sm.valid_next;
+    decode(chunk);
+    if (tidx < R::CANDIDATES && chunk + 1 < hi) vnext[tidx] = next_index;
+    __syncthreads();
+    if (chunk + 1 < hi) {
+      issue(chunk + 1, vnext);
+      if (tidx < R::CANDIDATES) next_index = chunk + 2 < hi ? index_of(chunk + 2) : -1;
+    }
     float qk[4] = {};
 #pragma unroll
     for (int k = 0; k < Geometry::D_QK; k += R::MMA_K) {
@@ -147,7 +182,7 @@ __device__ __forceinline__ void run_bf16_tiles(
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j)
-      qk[j] = sm.valid[warp * 8 + tid * 2 + (j & 1)] >= 0 ? qk[j] * (sm_scale * LOG2E) : -1e30f;
+      qk[j] = vcur[warp * 8 + tid * 2 + (j & 1)] >= 0 ? qk[j] * (sm_scale * LOG2E) : -1e30f;
     float mx[2] = {fmaxf(qk[0], qk[1]), fmaxf(qk[2], qk[3])};
 #pragma unroll
     for (int s = 1; s <= 2; s *= 2) {
@@ -171,7 +206,7 @@ __device__ __forceinline__ void run_bf16_tiles(
     float p[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      p[j] = sm.valid[warp * 8 + tid * 2 + (j & 1)] >= 0 ? exp2f(qk[j] - m[j / 2]) : 0.f;
+      p[j] = vcur[warp * 8 + tid * 2 + (j & 1)] >= 0 ? exp2f(qk[j] - m[j / 2]) : 0.f;
       sm.p[gid + j / 2 * 8][warp * 8 + tid * 2 + (j & 1)] = __float2bfloat16_rn(p[j]);
     }
     float ps[2] = {p[0] + p[1], p[2] + p[3]};

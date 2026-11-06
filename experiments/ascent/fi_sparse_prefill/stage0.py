@@ -92,6 +92,7 @@ class Scenario:
         self.swa_starts = (first - W + 1).clamp_min(0).to(torch.int64)
         swa_counts = [per_request + W - 1] * requests
         main_count = CTX // RATIO
+        self.main_count, self.main_psz = main_count, MAIN_PSZ
         main_counts = [main_count if has_main else 0] * requests
         offs, total = [1], 1
         for c in swa_counts:
