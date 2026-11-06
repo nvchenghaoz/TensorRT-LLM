@@ -641,6 +641,7 @@ static FmaMtileFn pickFhcFmaMtile(int tile_n, int tile_m)
     return &fused_fma_kernels::fused_pmap_gemm_fma_mtile_v2<TN, TM, true, 1, true>
 
     FHCFMA_MT2_CASE(24, 4);
+    FHCFMA_MT2_CASE(12, 2);
 #undef FHCFMA_MT2_CASE
 
     // tile_m = 64 + TM selects fused_pmap_gemm_fma_mtile_v3<TM, NG, MIN_BLOCKS=1> (same math,
