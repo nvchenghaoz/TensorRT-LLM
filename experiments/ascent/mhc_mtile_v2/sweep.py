@@ -75,6 +75,36 @@ try:
     print("[gpu]", os.uname().nodename, sm, flush=True)
 except Exception as e:  # noqa: BLE001
     print("[gpu] nvidia-smi failed:", e, flush=True)
+
+# WAIT-ONLY dirty-slot guard (top lead rulings 20:5x/21:0x, pitfall 3067/3072): never kill anything.
+import time  # noqa: E402
+
+_vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+_t0 = time.time()
+while True:
+    q = ["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu,power.draw", "--format=csv,noheader,nounits"]
+    if _vis:
+        q[1:1] = ["-i", _vis]
+    try:
+        out = subprocess.run(q, capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception as e:  # noqa: BLE001
+        print("[guard] nvidia-smi failed:", e, flush=True)
+        break
+    used = []
+    for ln in out.splitlines():
+        parts = [x.strip() for x in ln.split(",")]
+        try:
+            used.append(float(parts[1]) / 1024.0)
+        except Exception:  # noqa: BLE001
+            pass
+    print(f"[guard] t={time.time() - _t0:.0f}s {out.replace(chr(10), ' | ')}", flush=True)
+    if not used or max(used) <= 4.0:
+        break
+    if time.time() - _t0 > 180:
+        print("DIRTY SLOT " + " ".join(f"{u:.1f}GiB" for u in used), flush=True)
+        print(json.dumps({"passed": False, "error": "DIRTY SLOT"}))
+        sys.exit(3)
+    time.sleep(15)
 p = subprocess.Popen([exe, Ms, iters], stdout=subprocess.PIPE, text=True)
 rows = []
 passed = False
