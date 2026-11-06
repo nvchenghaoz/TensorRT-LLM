@@ -63,17 +63,77 @@ for f in ([cp] if cache_info["exists"] else []) + [c for c in cands if c != cp]:
 report["cache"] = cache_info
 print("[cache]", json.dumps(cache_info)[:4000], flush=True)
 
-libs = {}
-for p in sorted(set(glob.glob(os.path.join(os.path.dirname(tensorrt_llm.__file__), "libs", "libth_common*.so*")))):
+import mmap  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+
+
+def lib_info(p):
     try:
-        b = open(p, "rb").read()
-        libs[p] = {"mtime": time.ctime(os.path.getmtime(p)), "size": len(b),
-                   "has_mtile_v3": b.count(b"fused_pmap_gemm_fma_mtile_v3"),
-                   "has_mtile_v2": b.count(b"fused_pmap_gemm_fma_mtile_v2")}
+        with open(p, "rb") as fh:
+            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+
+            def cnt(pat):
+                n, i = 0, mm.find(pat)
+                while i != -1:
+                    n += 1
+                    i = mm.find(pat, i + 1)
+                return n
+
+            d = {"mtime": time.ctime(os.path.getmtime(p)), "mtime_epoch": os.path.getmtime(p), "size": mm.size(),
+                 "strings_mtile_v3": cnt(b"fused_pmap_gemm_fma_mtile_v3"),
+                 "strings_mtile_v2": cnt(b"fused_pmap_gemm_fma_mtile_v2"),
+                 "unsupported_check": cnt(b"mhcFusedHcFmaMtileLaunch: unsupported")}
+            mm.close()
+            return d
     except Exception as e:  # noqa: BLE001
-        libs[p] = {"err": str(e)}
-report["libth_common"] = libs
-print("[lib]", json.dumps(libs), flush=True)
+        return {"err": str(e)}
+
+
+libdir = os.path.join(os.path.dirname(tensorrt_llm.__file__), "libs")
+libs = {}
+for p in sorted(set(glob.glob(os.path.join(libdir, "libth_common*.so*")) +
+                    glob.glob(os.path.join(libdir, "libtensorrt_llm.so*")))):
+    libs[os.path.realpath(p)] = lib_info(p)
+report["host"] = socket.gethostname()
+report["cuda_visible_devices"] = os.environ.get("CUDA_VISIBLE_DEVICES")
+report["cwd"] = os.getcwd()
+report["tensorrt_llm_path"] = tensorrt_llm.__file__
+report["libs_this_job"] = libs
+print("[host]", report["host"], "CVD", report["cuda_visible_devices"], "cwd", report["cwd"], flush=True)
+print("[lib this job]", json.dumps(libs), flush=True)
+try:
+    gl = subprocess.run(["git", "log", "-1", "--format=%H %ci %ct", "146d3e13"], capture_output=True, text=True,
+                        timeout=30)
+    report["landing61_commit"] = (gl.stdout.strip() or gl.stderr.strip())[:300]
+except Exception as e:  # noqa: BLE001
+    report["landing61_commit"] = f"git failed: {e}"
+print("[landing 61 commit 146d3e13]", report["landing61_commit"], flush=True)
+# Every slot's build copy (scratch is shared): runner/slots/*/native/{build/*,trtllm}/.../libtensorrt_llm.so
+other = {}
+m = re.search(r"^(.*?/runner)/slots/", os.path.realpath(tensorrt_llm.__file__)) or re.search(
+    r"^(.*?/runner)/slots/", os.getcwd())
+if m:
+    root = m.group(1)
+    pats = [f"{root}/slots/*/native/build/*/libtensorrt_llm.so", f"{root}/slots/*/native/build/*/*/libtensorrt_llm.so",
+            f"{root}/slots/*/native/build/*/venv/lib/python3*/site-packages/tensorrt_llm/libs/libtensorrt_llm.so",
+            f"{root}/slots/*/native/trtllm/tensorrt_llm/libs/libtensorrt_llm.so",
+            f"{root}/slots/*/native/build/*/cpp/build/tensorrt_llm/libtensorrt_llm.so",
+            f"{root}/slots/*/native/build/*/build/tensorrt_llm/libtensorrt_llm.so"]
+    seen_real = set()
+    for pat in pats:
+        for p in sorted(glob.glob(pat)):
+            rp = os.path.realpath(p)
+            if rp in seen_real:
+                other.setdefault(rp, {}).setdefault("aliases", []).append(p)
+                continue
+            seen_real.add(rp)
+            other[rp] = lib_info(rp)
+            other[rp]["aliases"] = [p]
+    report["runner_root"] = root
+report["libs_all_slots"] = other
+for k, v in other.items():
+    print("[lib slot]", k, json.dumps(v), flush=True)
 
 HC, HID = 4, 5120
 ARGS = (HC, HID, 1e-6, 1e-6, 1e-6, 2.0, 20)
