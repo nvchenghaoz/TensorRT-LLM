@@ -1039,6 +1039,20 @@ __device__ __forceinline__ int csa2_sf_offset(int m, int kb, int sf_k_tiles)
 // (blocks i0 .. i0 + nb - 1). Its running sum enters from the previous rank (DSMEM carry, aliased into the receiver's
 // xq_s, which is free until it quantizes) and leaves to the next one, or, at the chain's end, is reduced by the warp
 // butterfly and the warp value is sent to every rank. Every rank then sums the warp values in K1's order.
+constexpr int kK1Hidden = 5120;
+constexpr int kK1Chunks = kK1Hidden / 8;
+constexpr int kK1MaxM = 2;
+constexpr int kK1MaxRanks = 4;
+constexpr int kK1MaxWarps = 8;
+constexpr int kK1MaxSlots = 4; // 32-chunk blocks per hardware warp (the 4-warp instance uses 2)
+// Two mbarriers (carries, warp values) + the warp values [kK1MaxM][16] behind the regular dynamic smem.
+constexpr int kK1ExtraSmem = 16 + kK1MaxM * 16 * 4;
+
+// One block of a hardware warp's list (host-built plan, see csa2K1FoldPlan): the K1 warp w of token m, chunks
+// [c0, c0 + 32) of this rank; units (consecutive slots of one (m, w)) start with s = 0 or the carry, and end by sending
+// the carry to rank dst (local chunk dst_off) or with the butterfly.
+//   bits 0-9 c0 | 10-13 w | 14 m | 15 valid | 16 unit start | 17 carry in | 18-19 end (0 next slot, 1 carry,
+//   2 butterfly) | 20-21 dst rank | 22-31 dst local chunk
 struct K1foldArgs
 {
     __nv_bfloat16 const* x_prev;   // [M, 5120] boundary input (the producer's output): read after griddepcontrol.wait
@@ -1050,15 +1064,9 @@ struct K1foldArgs
     float eps;
     int P;                  // K1 reducer threads
     __nv_bfloat16* li_out;  // [M, 5120] layer_input, written by the cluster of tile 0
+    int carry_blocks[kK1MaxRanks];                          // carry-in blocks per token, per rank
+    uint32_t plan[kK1MaxRanks * kK1MaxWarps * kK1MaxSlots]; // [rank][warp][slot]
 };
-
-constexpr int kK1Hidden = 5120;
-constexpr int kK1Chunks = kK1Hidden / 8;
-constexpr int kK1MaxM = 2;
-constexpr int kK1MaxUnits = 3;  // units per hardware warp
-constexpr int kK1MaxBlocks = 2; // blocks per unit inside one rank
-// Two mbarriers (carries, warp values) + the warp values [kK1MaxM][16] behind the regular dynamic smem.
-constexpr int kK1ExtraSmem = 16 + kK1MaxM * 16 * 4;
 
 __host__ __device__ __forceinline__ int csa2_k1_first_block(int w, int P, int c_lo)
 {
@@ -1074,6 +1082,90 @@ __host__ __device__ __forceinline__ int csa2_k1_blocks_in(int w, int P, int c_lo
         ++n;
     }
     return n;
+}
+
+// The kernel's per-warp block list (K1foldArgs::plan, carry_blocks) for (warps, clusterK, m, P); false when it does not
+// fit (more than 2 blocks per warp in the 4-warp instance, kK1MaxSlots in the 8-warp one). Units (token, K1 warp with
+// blocks in the rank) are numbered token-major and dealt round-robin to the hardware warps.
+bool csa2K1FoldPlan(int warps, int clusterK, int m, int P, K1foldArgs* k1)
+{
+    int const slotsMax = warps == 4 ? 2 : kK1MaxSlots;
+    if (m < 1 || m > kK1MaxM || P <= 0 || P % 32 != 0 || P / 32 > 16 || P > kK1Chunks || clusterK < 2
+        || clusterK > kK1MaxRanks || warps > kK1MaxWarps || kK1Chunks % clusterK != 0)
+    {
+        return false;
+    }
+    int const cpr = kK1Chunks / clusterK;
+    if (cpr % 32 != 0)
+    {
+        return false;
+    }
+    int const W = P / 32;
+    uint32_t plan[kK1MaxRanks * kK1MaxWarps * kK1MaxSlots] = {};
+    int carryBlocks[kK1MaxRanks] = {};
+    for (int r = 0; r < clusterK; ++r)
+    {
+        int const clo = r * cpr;
+        int ws[16];
+        int nw = 0;
+        for (int w = 0; w < W; ++w)
+        {
+            if (csa2_k1_blocks_in(w, P, clo, cpr) > 0)
+            {
+                ws[nw++] = w;
+                carryBlocks[r] += csa2_k1_first_block(w, P, clo) > 0 ? 1 : 0;
+            }
+        }
+        int nslots[kK1MaxWarps] = {};
+        for (int u = 0; u < m * nw; ++u)
+        {
+            int const mm = u / nw;
+            int const w = ws[u % nw];
+            int const warp = u % warps;
+            int const i0 = csa2_k1_first_block(w, P, clo);
+            int const n = csa2_k1_blocks_in(w, P, clo, cpr);
+            for (int ii = 0; ii < n; ++ii)
+            {
+                if (nslots[warp] >= slotsMax)
+                {
+                    return false;
+                }
+                uint32_t const c0 = static_cast<uint32_t>(32 * w + (i0 + ii) * P);
+                uint32_t word = c0 | (static_cast<uint32_t>(w) << 10) | (static_cast<uint32_t>(mm) << 14) | (1u << 15);
+                if (ii == 0)
+                {
+                    word |= 1u << 16;
+                    word |= i0 > 0 ? (1u << 17) : 0u;
+                }
+                if (ii == n - 1)
+                {
+                    uint32_t const next = c0 + static_cast<uint32_t>(P);
+                    if (next < static_cast<uint32_t>(kK1Chunks))
+                    {
+                        uint32_t const dst = next / static_cast<uint32_t>(cpr);
+                        word |= (1u << 18) | (dst << 20) | ((next - dst * static_cast<uint32_t>(cpr)) << 22);
+                    }
+                    else
+                    {
+                        word |= 2u << 18;
+                    }
+                }
+                plan[(r * kK1MaxWarps + warp) * kK1MaxSlots + nslots[warp]++] = word;
+            }
+        }
+    }
+    if (k1 != nullptr)
+    {
+        for (int i = 0; i < kK1MaxRanks * kK1MaxWarps * kK1MaxSlots; ++i)
+        {
+            k1->plan[i] = plan[i];
+        }
+        for (int r = 0; r < kK1MaxRanks; ++r)
+        {
+            k1->carry_blocks[r] = carryBlocks[r];
+        }
+    }
+    return true;
 }
 
 __device__ __forceinline__ void csa2_mbar_wait_cluster(uint64_t* bar)
@@ -1169,6 +1261,42 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     [[maybe_unused]] int const k1_cpr = kc / 8;          // K1FOLD: chunks of this rank
     [[maybe_unused]] int const k1_clo = rank * k1_cpr;   // its first chunk
     [[maybe_unused]] int const k1_W = K1FOLD ? k1.P / 32 : 0;
+    // K1FOLD: this warp's blocks (host plan) and lane's chunk of the constant norm weight for each. Before anything
+    // else (in particular before this CTA's weight bulk copies flood DRAM), the residual rows and mHC coefficients
+    // the blocks will read are L2-prefetched: a hint (L2 is the coherence point), the data is read after the wait.
+    constexpr int kK1Slots = WARPS == 4 ? 2 : kK1MaxSlots;
+    [[maybe_unused]] uint32_t k1sw[kK1Slots];
+    [[maybe_unused]] uint4 k1nw[kK1Slots];
+    if constexpr (K1FOLD)
+    {
+#pragma unroll
+        for (int j = 0; j < kK1Slots; ++j)
+        {
+            k1sw[j] = k1.plan[(rank * kK1MaxWarps + warp) * kK1MaxSlots + j];
+            k1nw[j] = make_uint4(0u, 0u, 0u, 0u);
+            if (k1sw[j] & (1u << 15))
+            {
+                int const c = static_cast<int>(k1sw[j] & 0x3FFu) + lane;
+                int const m = static_cast<int>((k1sw[j] >> 14) & 1u);
+                if ((lane & 7) == 0)
+                {
+                    __nv_bfloat16 const* r = k1.residual + static_cast<int64_t>(m) * 4 * kK1Hidden + c * 8;
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk)
+                    {
+                        asm volatile("prefetch.global.L2 [%0];" ::"l"(r + kk * kK1Hidden));
+                    }
+                }
+                k1nw[j] = __ldg(reinterpret_cast<uint4 const*>(k1.norm_w + c * 8));
+            }
+        }
+        if (threadIdx.x < M)
+        {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(k1.post + threadIdx.x * 4));
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(k1.comb + threadIdx.x * 16));
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(k1.pre + threadIdx.x * 4));
+        }
+    }
 
     int const kcs = kc / STAGES;         // columns per stage
     int const kcbs = kc_blocks / STAGES; // 32-blocks per stage
@@ -1189,14 +1317,7 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
         {
             // Carries this rank receives: one 32-float block per (token, K1 warp) whose first block here is not its
             // chain's first. Warp values: all of them (M x W floats), from every rank including this one.
-            int carries = 0;
-            for (int ww = 0; ww < k1_W; ++ww)
-            {
-                if (csa2_k1_blocks_in(ww, k1.P, k1_clo, k1_cpr) > 0 && csa2_k1_first_block(ww, k1.P, k1_clo) > 0)
-                {
-                    ++carries;
-                }
-            }
+            int const carries = k1.carry_blocks[rank];
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(&k1_bar[0])));
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(&k1_bar[1])));
             asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(&k1_bar[0])),
@@ -1270,65 +1391,6 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
             norm_w[b] = __ldg(reinterpret_cast<uint4 const*>(nrm.norm_w + 8 * lane + 256 * b));
         }
     }
-    // K1FOLD: this warp's units (token, K1 warp, first block, blocks here) and, for each of its blocks, lane's chunk of
-    // the constant norm weight (loaded before the PDL wait). Units are numbered token-major over the K1 warps that
-    // have blocks in this rank and dealt round-robin to the hardware warps. All warp-uniform.
-    [[maybe_unused]] int k1u_m[kK1MaxUnits];
-    [[maybe_unused]] int k1u_w[kK1MaxUnits];
-    [[maybe_unused]] int k1u_first[kK1MaxUnits]; // first chunk of the unit's first block
-    [[maybe_unused]] int k1u_i0[kK1MaxUnits];
-    [[maybe_unused]] int k1u_nb[kK1MaxUnits];
-    [[maybe_unused]] uint4 k1nw[kK1MaxUnits][kK1MaxBlocks];
-    if constexpr (K1FOLD)
-    {
-        int const P = k1.P;
-        int wr = 0;
-        for (int ww = 0; ww < k1_W; ++ww)
-        {
-            wr += csa2_k1_blocks_in(ww, P, k1_clo, k1_cpr) > 0 ? 1 : 0;
-        }
-#pragma unroll
-        for (int uu = 0; uu < kK1MaxUnits; ++uu)
-        {
-            int const u = warp + uu * WARPS;
-            int um = 0, uw = 0, ui0 = 0, unb = 0;
-            if (u < M * wr)
-            {
-                um = u / wr;
-                int kk = u - um * wr;
-                for (int ww = 0; ww < k1_W; ++ww)
-                {
-                    int const n = csa2_k1_blocks_in(ww, P, k1_clo, k1_cpr);
-                    if (n > 0)
-                    {
-                        if (kk == 0)
-                        {
-                            uw = ww;
-                            unb = n;
-                            ui0 = csa2_k1_first_block(ww, P, k1_clo);
-                            break;
-                        }
-                        --kk;
-                    }
-                }
-            }
-            k1u_m[uu] = um;
-            k1u_w[uu] = uw;
-            k1u_i0[uu] = ui0;
-            k1u_nb[uu] = unb;
-            k1u_first[uu] = 32 * uw + ui0 * P;
-#pragma unroll
-            for (int ii = 0; ii < kK1MaxBlocks; ++ii)
-            {
-                k1nw[uu][ii] = make_uint4(0u, 0u, 0u, 0u);
-                if (ii < unb)
-                {
-                    int const c = k1u_first[uu] + ii * P + lane;
-                    k1nw[uu][ii] = __ldg(reinterpret_cast<uint4 const*>(k1.norm_w + c * 8));
-                }
-            }
-        }
-    }
     if ((qout.flags & 1) == 0)
     {
         asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -1339,128 +1401,135 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     }
     if constexpr (K1FOLD)
     {
-        int const P = k1.P;
-        // ---- pass A: lane's chunk of every block of this warp's units: post update + lagged collapse -> raw bf16 li
+        // ---- pass A: lane's chunk of every block of this warp: post update + lagged collapse -> raw bf16 li
         // (_k1_chunk's expressions: nr = post[j] * x, nr = fma(comb[k][j], r[k], nr) for k = 0..3, nr = bf16(nr),
-        // li = fma(pre[j], nr, li) from 0 for j = 0..3, li = bf16(li)).
-        uint4 k1li[kK1MaxUnits][kK1MaxBlocks];
+        // li = fma(pre[j], nr, li) from 0 for j = 0..3, li = bf16(li)). Every load is issued before any math.
+        uint4 k1xv[kK1Slots];
+        uint4 k1rv[kK1Slots][4];
 #pragma unroll
-        for (int uu = 0; uu < kK1MaxUnits; ++uu)
+        for (int j = 0; j < kK1Slots; ++j)
         {
+            k1xv[j] = make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
-            for (int ii = 0; ii < kK1MaxBlocks; ++ii)
+            for (int kk = 0; kk < 4; ++kk)
             {
-                k1li[uu][ii] = make_uint4(0u, 0u, 0u, 0u);
+                k1rv[j][kk] = make_uint4(0u, 0u, 0u, 0u);
             }
-            if (k1u_nb[uu] == 0)
+            if (k1sw[j] & (1u << 15))
             {
-                continue;
+                int const c = static_cast<int>(k1sw[j] & 0x3FFu) + lane;
+                int const m = static_cast<int>((k1sw[j] >> 14) & 1u);
+                k1xv[j] = *reinterpret_cast<uint4 const*>(k1.x_prev + static_cast<int64_t>(m) * kK1Hidden + c * 8);
+                __nv_bfloat16 const* r_base = k1.residual + static_cast<int64_t>(m) * 4 * kK1Hidden + c * 8;
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk)
+                {
+                    k1rv[j][kk] = *reinterpret_cast<uint4 const*>(r_base + kk * kK1Hidden);
+                }
             }
-            int const m = k1u_m[uu];
-            float post[4];
-            float pre[4];
-            float comb[16];
+        }
+        float k1coef[kK1MaxM][24]; // post[4], pre[4], comb[16] per token
+#pragma unroll
+        for (int mm = 0; mm < kK1MaxM; ++mm)
+        {
+            int const ms = mm < M ? mm : 0;
 #pragma unroll
             for (int j = 0; j < 4; ++j)
             {
-                post[j] = k1.post[m * 4 + j];
-                pre[j] = k1.pre[m * 4 + j];
+                k1coef[mm][j] = k1.post[ms * 4 + j];
+                k1coef[mm][4 + j] = k1.pre[ms * 4 + j];
             }
 #pragma unroll
             for (int j = 0; j < 16; ++j)
             {
-                comb[j] = k1.comb[m * 16 + j];
+                k1coef[mm][8 + j] = k1.comb[ms * 16 + j];
             }
+        }
+        uint4 k1li[kK1Slots];
 #pragma unroll
-            for (int ii = 0; ii < kK1MaxBlocks; ++ii)
+        for (int j = 0; j < kK1Slots; ++j)
+        {
+            k1li[j] = make_uint4(0u, 0u, 0u, 0u);
+            if (!(k1sw[j] & (1u << 15)))
             {
-                if (ii >= k1u_nb[uu])
-                {
-                    continue;
-                }
-                int const c = k1u_first[uu] + ii * P + lane;
-                int64_t const off = static_cast<int64_t>(m) * kK1Hidden + c * 8;
-                uint4 const xv = *reinterpret_cast<uint4 const*>(k1.x_prev + off);
-                __nv_bfloat16 const* r_base = k1.residual + static_cast<int64_t>(m) * 4 * kK1Hidden + c * 8;
-                uint4 rv[4];
+                continue;
+            }
+            bool const m1 = ((k1sw[j] >> 14) & 1u) != 0;
+            float coef[24];
+#pragma unroll
+            for (int q = 0; q < 24; ++q)
+            {
+                coef[q] = m1 ? k1coef[kK1MaxM - 1][q] : k1coef[0][q];
+            }
+            __nv_bfloat16 const* xe = reinterpret_cast<__nv_bfloat16 const*>(&k1xv[j]);
+            uint4 outv;
+            __nv_bfloat16* oe = reinterpret_cast<__nv_bfloat16*>(&outv);
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+            {
+                float const xf = __bfloat162float(xe[e]);
+                float rf[4];
 #pragma unroll
                 for (int kk = 0; kk < 4; ++kk)
                 {
-                    rv[kk] = *reinterpret_cast<uint4 const*>(r_base + kk * kK1Hidden);
+                    rf[kk] = __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&k1rv[j][kk])[e]);
                 }
-                __nv_bfloat16 const* xe = reinterpret_cast<__nv_bfloat16 const*>(&xv);
-                uint4 outv;
-                __nv_bfloat16* oe = reinterpret_cast<__nv_bfloat16*>(&outv);
+                float li = 0.0f;
 #pragma unroll
-                for (int e = 0; e < 8; ++e)
+                for (int jj = 0; jj < 4; ++jj)
                 {
-                    float const xf = __bfloat162float(xe[e]);
-                    float rf[4];
+                    float nr = __fmul_rn(coef[jj], xf);
 #pragma unroll
                     for (int kk = 0; kk < 4; ++kk)
                     {
-                        rf[kk] = __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&rv[kk])[e]);
+                        nr = __fmaf_rn(coef[8 + kk * 4 + jj], rf[kk], nr);
                     }
-                    float li = 0.0f;
-#pragma unroll
-                    for (int j = 0; j < 4; ++j)
-                    {
-                        float nr = __fmul_rn(post[j], xf);
-#pragma unroll
-                        for (int kk = 0; kk < 4; ++kk)
-                        {
-                            nr = __fmaf_rn(comb[kk * 4 + j], rf[kk], nr);
-                        }
-                        nr = csa2_bf16_round(nr);
-                        li = __fmaf_rn(pre[j], nr, li);
-                    }
-                    oe[e] = __float2bfloat16_rn(li);
+                    nr = csa2_bf16_round(nr);
+                    li = __fmaf_rn(coef[4 + jj], nr, li);
                 }
-                k1li[uu][ii] = outv;
+                oe[e] = __float2bfloat16_rn(li);
             }
+            k1li[j] = outv;
         }
         // ---- pass B: K1's per-thread sums. Every rank's mbarriers are initialized (cluster barrier); re-arm it for
-        // the split-K reduction's wait below. Then the incoming carries, the unit chains, and the outgoing carries or
-        // the warp butterflies (lane 0 broadcasts the warp value to every rank).
+        // the split-K reduction's wait below. Then the incoming carries, the unit chains (consecutive slots), and the
+        // outgoing carries or the warp butterflies (lane 0 broadcasts the warp value to every rank).
         float* const k1_carry = reinterpret_cast<float*>(xq_s); // [M][cpr] floats <= M * kc bytes
         asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory");
         asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
         csa2_mbar_wait_cluster(&k1_bar[0]);
+        float s = 0.0f;
 #pragma unroll
-        for (int uu = 0; uu < kK1MaxUnits; ++uu)
+        for (int j = 0; j < kK1Slots; ++j)
         {
-            if (k1u_nb[uu] == 0)
+            uint32_t const sw = k1sw[j];
+            if (!(sw & (1u << 15)))
             {
                 continue;
             }
-            int const m = k1u_m[uu];
-            int const first = k1u_first[uu];
-            float s = k1u_i0[uu] > 0 ? k1_carry[m * k1_cpr + (first - k1_clo) + lane] : 0.0f;
-#pragma unroll
-            for (int ii = 0; ii < kK1MaxBlocks; ++ii)
+            int const c0 = static_cast<int>(sw & 0x3FFu);
+            int const m = static_cast<int>((sw >> 14) & 1u);
+            if (sw & (1u << 16))
             {
-                if (ii >= k1u_nb[uu])
-                {
-                    continue;
-                }
-                __nv_bfloat162 const* hv = reinterpret_cast<__nv_bfloat162 const*>(&k1li[uu][ii]);
+                s = (sw & (1u << 17)) ? k1_carry[m * k1_cpr + (c0 - k1_clo) + lane] : 0.0f;
+            }
+            __nv_bfloat162 const* hv = reinterpret_cast<__nv_bfloat162 const*>(&k1li[j]);
 #pragma unroll
-                for (int j = 0; j < 4; ++j)
-                {
-                    float const lx = __low2float(hv[j]);
-                    float const ly = __high2float(hv[j]);
-                    s = __fadd_rn(s, __fmaf_rn(lx, lx, __fmul_rn(ly, ly)));
-                }
-            }
-            int const next = first + k1u_nb[uu] * P;
-            if (next < kK1Chunks)
+            for (int q = 0; q < 4; ++q)
             {
-                int const dst = next / k1_cpr;
-                csa2_st_async_f32(mapa_shared(smem_u32(k1_carry + m * k1_cpr + (next - dst * k1_cpr) + lane),
-                                      static_cast<uint32_t>(dst)),
-                    s, mapa_shared(smem_u32(&k1_bar[0]), static_cast<uint32_t>(dst)));
+                float const lx = __low2float(hv[q]);
+                float const ly = __high2float(hv[q]);
+                s = __fadd_rn(s, __fmaf_rn(lx, lx, __fmul_rn(ly, ly)));
             }
-            else
+            uint32_t const end = (sw >> 18) & 3u;
+            if (end == 1u)
+            {
+                uint32_t const dst = (sw >> 20) & 3u;
+                int const doff = static_cast<int>(sw >> 22);
+                csa2_st_async_f32(mapa_shared(smem_u32(k1_carry + m * k1_cpr + doff + lane), dst), s,
+                    mapa_shared(smem_u32(&k1_bar[0]), dst));
+            }
+            else if (end == 2u)
             {
 #pragma unroll
                 for (int off = 16; off >= 1; off /= 2)
@@ -1469,11 +1538,11 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
                 }
                 if (lane == 0)
                 {
+                    int const w = static_cast<int>((sw >> 10) & 0xFu);
 #pragma unroll
                     for (int rr = 0; rr < CLUSTER_K; ++rr)
                     {
-                        csa2_st_async_f32(
-                            mapa_shared(smem_u32(k1_wv + m * 16 + k1u_w[uu]), static_cast<uint32_t>(rr)), s,
+                        csa2_st_async_f32(mapa_shared(smem_u32(k1_wv + m * 16 + w), static_cast<uint32_t>(rr)), s,
                             mapa_shared(smem_u32(&k1_bar[1]), static_cast<uint32_t>(rr)));
                     }
                 }
@@ -1499,24 +1568,18 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
         // ---- pass D: layer_input = bf16((li * rstd) * w) (_k1_norm), then this kernel's MXFP8 quantization of it:
         // each lane quad holds one 32-element block (amax by quad max: order-free), same expressions as below.
 #pragma unroll
-        for (int uu = 0; uu < kK1MaxUnits; ++uu)
+        for (int j = 0; j < kK1Slots; ++j)
         {
-            if (k1u_nb[uu] == 0)
+            if (!(k1sw[j] & (1u << 15)))
             {
                 continue;
             }
-            int const m = k1u_m[uu];
+            int const m = static_cast<int>((k1sw[j] >> 14) & 1u);
             float const rstd = m == 0 ? k1_rstd[0] : k1_rstd[kK1MaxM - 1];
-#pragma unroll
-            for (int ii = 0; ii < kK1MaxBlocks; ++ii)
             {
-                if (ii >= k1u_nb[uu])
-                {
-                    continue;
-                }
-                int const c = k1u_first[uu] + ii * P + lane;
-                __nv_bfloat162 const* lh = reinterpret_cast<__nv_bfloat162 const*>(&k1li[uu][ii]);
-                __nv_bfloat162 const* wh = reinterpret_cast<__nv_bfloat162 const*>(&k1nw[uu][ii]);
+                int const c = static_cast<int>(k1sw[j] & 0x3FFu) + lane;
+                __nv_bfloat162 const* lh = reinterpret_cast<__nv_bfloat162 const*>(&k1li[j]);
+                __nv_bfloat162 const* wh = reinterpret_cast<__nv_bfloat162 const*>(&k1nw[j]);
                 float v[8];
                 uint32_t yb[4];
 #pragma unroll
@@ -2084,30 +2147,7 @@ bool isCsa2K1FoldSupported(
     {
         return false;
     }
-    int const cpr = kK1Chunks / clusterK;
-    if (cpr % 32 != 0)
-    {
-        return false;
-    }
-    // The kernel's register plan: at most kK1MaxUnits units per hardware warp, kK1MaxBlocks blocks per unit.
-    for (int r = 0; r < clusterK; ++r)
-    {
-        int wr = 0;
-        for (int w = 0; w < P / 32; ++w)
-        {
-            int const n = csa2_k1_blocks_in(w, P, r * cpr, cpr);
-            if (n > kK1MaxBlocks)
-            {
-                return false;
-            }
-            wr += n > 0 ? 1 : 0;
-        }
-        if ((m * wr + warps - 1) / warps > kK1MaxUnits)
-        {
-            return false;
-        }
-    }
-    return true;
+    return csa2K1FoldPlan(warps, clusterK, m, P, nullptr);
 }
 
 void invokeCsa2Mxfp8LowMGemmK1Fold(__nv_bfloat16 const* xPrev, __nv_bfloat16 const* residual, float const* post,
@@ -2130,7 +2170,8 @@ void invokeCsa2Mxfp8LowMGemmK1Fold(__nv_bfloat16 const* xPrev, __nv_bfloat16 con
     L2pfArgs const pf{pfP0, pfP0 == nullptr ? 0 : pfN0, pfP1, pfP1 == nullptr ? 0 : pfN1,
         pfFrac < 0 ? 0 : (pfFrac > 256 ? 256 : pfFrac)};
     QoutArgs const qout{xqOut, xsfOut, sfKTiles, nullptr, debugFlags};
-    K1foldArgs const k1{xPrev, residual, post, comb, pre, normW, eps, reducerThreads, layerInput};
+    K1foldArgs k1{xPrev, residual, post, comb, pre, normW, eps, reducerThreads, layerInput, {}, {}};
+    csa2K1FoldPlan(warps, clusterK, m, reducerThreads, &k1);
     bool const pfOn = (debugFlags & 4) != 0;
 #define CSA2_K1FOLD_DISPATCH(W, C, R)                                                                                  \
     if (warps == W && clusterK == C && rowTiles == R)                                                                  \

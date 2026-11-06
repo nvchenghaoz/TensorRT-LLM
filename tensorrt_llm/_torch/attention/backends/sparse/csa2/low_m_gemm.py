@@ -166,7 +166,6 @@ A_K1_FOLD_ENV_ON = os.environ.get("TRTLLM_CSA2_A_K1_FOLD", "1") != "0"
 A_K1_FOLD_MAX_M = max(0, min(2, int(os.environ.get("TRTLLM_CSA2_A_K1_FOLD_MAX_M", "2"))))
 _K1_HIDDEN = 5120
 _K1FOLD_CONFIGS = ((4, 4, 2), (8, 2, 2))  # chain-A configurations with a K1FOLD kernel instance
-_K1_MAX_UNITS, _K1_MAX_BLOCKS = 3, 2  # the kernel's register plan (kK1MaxUnits / kK1MaxBlocks)
 
 
 def _k1_first_block(w: int, p: int, c_lo: int) -> int:
@@ -184,21 +183,24 @@ def _k1_blocks_in(w: int, p: int, c_lo: int, cpr: int) -> int:
 
 
 def k1fold_plan_ok(warps: int, cluster_k: int, m: int, p: int) -> bool:
-    """Mirror of isCsa2K1FoldSupported (mxfp8LowMGemm.cu) for one chain-A configuration."""
+    """Mirror of csa2K1FoldPlan / isCsa2K1FoldSupported (mxfp8LowMGemm.cu) for one chain-A configuration: units
+    (token, K1 warp with blocks in the rank), token-major, dealt round-robin to the hardware warps; each warp holds at
+    most 2 (4-warp instance) or 4 (8-warp instance) 32-chunk blocks."""
     chunks = _K1_HIDDEN // 8
-    if not 1 <= m <= 2 or p <= 0 or p % 32 or p // 32 > 16 or p > chunks or chunks % cluster_k:
+    if not 1 <= m <= 2 or p <= 0 or p % 32 or p // 32 > 16 or p > chunks or not 2 <= cluster_k <= 4:
+        return False
+    if chunks % cluster_k or warps > 8:
         return False
     cpr = chunks // cluster_k
     if cpr % 32:
         return False
+    slots_max = 2 if warps == 4 else 4
     for r in range(cluster_k):
-        wr = 0
-        for w in range(p // 32):
-            n = _k1_blocks_in(w, p, r * cpr, cpr)
-            if n > _K1_MAX_BLOCKS:
-                return False
-            wr += 1 if n else 0
-        if (m * wr + warps - 1) // warps > _K1_MAX_UNITS:
+        ws = [w for w in range(p // 32) if _k1_blocks_in(w, p, r * cpr, cpr) > 0]
+        nslots = [0] * warps
+        for u in range(m * len(ws)):
+            nslots[u % warps] += _k1_blocks_in(ws[u % len(ws)], p, r * cpr, cpr)
+        if max(nslots) > slots_max:
             return False
     return True
 
