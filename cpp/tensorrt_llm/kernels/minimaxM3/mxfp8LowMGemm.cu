@@ -1027,18 +1027,202 @@ __device__ __forceinline__ int csa2_sf_offset(int m, int kb, int sf_k_tiles)
     return (m / 128) * sf_k_tiles * 512 + (kb / 4) * 512 + (m % 32) * 16 + ((m % 128) / 32) * 4 + kb % 4;
 }
 
+// ---- K1 fold (K1FOLD instances: the hc_attn mHC lagged K1 computed inside the attention-input wq_a||wkv GEMM) ----
+// K1 (tensorrt_llm/_torch/modules/mhc/mhc_lagged_split.py, _mhc_lagged_layer_input_fast_kernel) computes, per token,
+//   li = bf16(fma_j(pre[j], bf16(fma_k(comb[k][j], r[k], post[j] * x)), 0))       (8-element chunks c = 0..639)
+//   layer_input = bf16((li * rstd) * w), rstd = rsqrt(fma(sumsq, rcp(5120), eps))
+// where K1 thread t (of P) sums the chunks t, t + P, ... in order (s += fma(lx, lx, ly * ly) per pair), lane 0 of
+// every K1 warp holds the xor butterfly (16, 8, 4, 2, 1) and the warps are summed sequentially from warp 0.
+// In the fold each CTA (rank r of the K cluster) computes li only for its own K slice (chunks [c_lo, c_lo + cpr)).
+// K1 warp w walks the 32-chunk blocks starting at 32w + iP; P and cpr are multiples of 32, so a block never straddles
+// two ranks and one hardware warp replays one K1 warp's lanes on it. A unit = (token, K1 warp) restricted to one rank
+// (blocks i0 .. i0 + nb - 1). Its running sum enters from the previous rank (DSMEM carry, aliased into the receiver's
+// xq_s, which is free until it quantizes) and leaves to the next one, or, at the chain's end, is reduced by the warp
+// butterfly and the warp value is sent to every rank. Every rank then sums the warp values in K1's order.
+constexpr int kK1Hidden = 5120;
+constexpr int kK1Chunks = kK1Hidden / 8;
+constexpr int kK1MaxM = 2;
+constexpr int kK1MaxRanks = 4;
+constexpr int kK1MaxWarps = 8;
+constexpr int kK1MaxSlots = 4; // 32-chunk blocks per hardware warp (the 4-warp instance uses 2)
+// Two mbarriers (carries, warp values) + the warp values [kK1MaxM][16] behind the regular dynamic smem.
+constexpr int kK1ExtraSmem = 16 + kK1MaxM * 16 * 4;
+
+// One block of a hardware warp's list (host-built plan, see csa2K1FoldPlan): the K1 warp w of token m, chunks
+// [c0, c0 + 32) of this rank; units (consecutive slots of one (m, w)) start with s = 0 or the carry, and end by sending
+// the carry to rank dst (local chunk dst_off) or with the butterfly.
+//   bits 0-9 c0 | 10-13 w | 14 m | 15 valid | 16 unit start | 17 carry in | 18-19 end (0 next slot, 1 carry,
+//   2 butterfly) | 20-21 dst rank | 22-31 dst local chunk
+struct K1foldArgs
+{
+    __nv_bfloat16 const* x_prev;   // [M, 5120] boundary input (the producer's output): read after griddepcontrol.wait
+    __nv_bfloat16 const* residual; // [M, 4, 5120]
+    float const* post;             // [M, 4]
+    float const* comb;             // [M, 16]
+    float const* pre;              // [M, 4]
+    __nv_bfloat16 const* norm_w;   // [5120] constant: read before the wait
+    float eps;
+    int P;                  // K1 reducer threads
+    __nv_bfloat16* li_out;  // [M, 5120] layer_input, written by the cluster of tile 0
+    int carry_blocks[kK1MaxRanks];                          // carry-in blocks per token, per rank
+    uint32_t plan[kK1MaxRanks * kK1MaxWarps * kK1MaxSlots]; // [rank][warp][slot]
+};
+
+__host__ __device__ __forceinline__ int csa2_k1_first_block(int w, int P, int c_lo)
+{
+    int const s = 32 * w;
+    return s >= c_lo ? 0 : (c_lo - s + P - 1) / P;
+}
+
+__host__ __device__ __forceinline__ int csa2_k1_blocks_in(int w, int P, int c_lo, int cpr)
+{
+    int n = 0;
+    for (int s = 32 * w + csa2_k1_first_block(w, P, c_lo) * P; s < c_lo + cpr; s += P)
+    {
+        ++n;
+    }
+    return n;
+}
+
+// The kernel's per-warp block list (K1foldArgs::plan, carry_blocks) for (warps, clusterK, m, P); false when it does not
+// fit (more than 2 blocks per warp in the 4-warp instance, kK1MaxSlots in the 8-warp one). Units (token, K1 warp with
+// blocks in the rank) are numbered token-major and dealt round-robin to the hardware warps.
+bool csa2K1FoldPlan(int warps, int clusterK, int m, int P, K1foldArgs* k1)
+{
+    int const slotsMax = warps == 4 ? 2 : kK1MaxSlots;
+    if (m < 1 || m > kK1MaxM || P <= 0 || P % 32 != 0 || P / 32 > 16 || P > kK1Chunks || clusterK < 2
+        || clusterK > kK1MaxRanks || warps > kK1MaxWarps || kK1Chunks % clusterK != 0)
+    {
+        return false;
+    }
+    int const cpr = kK1Chunks / clusterK;
+    if (cpr % 32 != 0)
+    {
+        return false;
+    }
+    int const W = P / 32;
+    uint32_t plan[kK1MaxRanks * kK1MaxWarps * kK1MaxSlots] = {};
+    int carryBlocks[kK1MaxRanks] = {};
+    for (int r = 0; r < clusterK; ++r)
+    {
+        int const clo = r * cpr;
+        int ws[16];
+        int nw = 0;
+        for (int w = 0; w < W; ++w)
+        {
+            if (csa2_k1_blocks_in(w, P, clo, cpr) > 0)
+            {
+                ws[nw++] = w;
+                carryBlocks[r] += csa2_k1_first_block(w, P, clo) > 0 ? 1 : 0;
+            }
+        }
+        int nslots[kK1MaxWarps] = {};
+        for (int u = 0; u < m * nw; ++u)
+        {
+            int const mm = u / nw;
+            int const w = ws[u % nw];
+            int const warp = u % warps;
+            int const i0 = csa2_k1_first_block(w, P, clo);
+            int const n = csa2_k1_blocks_in(w, P, clo, cpr);
+            for (int ii = 0; ii < n; ++ii)
+            {
+                if (nslots[warp] >= slotsMax)
+                {
+                    return false;
+                }
+                uint32_t const c0 = static_cast<uint32_t>(32 * w + (i0 + ii) * P);
+                uint32_t word = c0 | (static_cast<uint32_t>(w) << 10) | (static_cast<uint32_t>(mm) << 14) | (1u << 15);
+                if (ii == 0)
+                {
+                    word |= 1u << 16;
+                    word |= i0 > 0 ? (1u << 17) : 0u;
+                }
+                if (ii == n - 1)
+                {
+                    uint32_t const next = c0 + static_cast<uint32_t>(P);
+                    if (next < static_cast<uint32_t>(kK1Chunks))
+                    {
+                        uint32_t const dst = next / static_cast<uint32_t>(cpr);
+                        word |= (1u << 18) | (dst << 20) | ((next - dst * static_cast<uint32_t>(cpr)) << 22);
+                    }
+                    else
+                    {
+                        word |= 2u << 18;
+                    }
+                }
+                plan[(r * kK1MaxWarps + warp) * kK1MaxSlots + nslots[warp]++] = word;
+            }
+        }
+    }
+    if (k1 != nullptr)
+    {
+        for (int i = 0; i < kK1MaxRanks * kK1MaxWarps * kK1MaxSlots; ++i)
+        {
+            k1->plan[i] = plan[i];
+        }
+        for (int r = 0; r < kK1MaxRanks; ++r)
+        {
+            k1->carry_blocks[r] = carryBlocks[r];
+        }
+    }
+    return true;
+}
+
+__device__ __forceinline__ void csa2_mbar_wait_cluster(uint64_t* bar)
+{
+    uint32_t ready = 0;
+    while (!ready)
+    {
+        asm volatile(
+            "{\n .reg .pred p;\n mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], 0;\n"
+            " selp.u32 %0, 1, 0, p;\n}\n"
+            : "=r"(ready)
+            : "r"(smem_u32(bar))
+            : "memory");
+    }
+}
+
+__device__ __forceinline__ void csa2_st_async_f32(uint32_t remote_addr, float v, uint32_t remote_bar)
+{
+    asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];\n" ::"r"(remote_addr),
+                 "r"(__float_as_uint(v)), "r"(remote_bar)
+                 : "memory");
+}
+
+__device__ __forceinline__ float csa2_rsqrt_approx_ftz(float x)
+{
+    float r;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+__device__ __forceinline__ float csa2_k1_rcp_approx_ftz(float x)
+{
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+__device__ __forceinline__ float csa2_bf16_round(float x)
+{
+    return __bfloat162float(__float2bfloat16_rn(x));
+}
+
 // STAGES: the CTA's K slice is split into STAGES consecutive sub-slices, each bulk-copied (in order) onto its own
 // mbarrier; all warps consume stage s while later stages are still arriving.
 // NORM: x is the raw (un-normalized) K = 1280 row view; the CTA applies q_norm in-kernel (csa2_qnorm_quant_row).
 // PF: the instance carries the L2 prefetch (flag bit 2); PF = false instances compile it out entirely, so the
 // gate-off path runs the same code as before the prefetch existed.
-template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false, bool PF = false>
+// K1FOLD: the activation is not read from x; the CTA computes its K slice of the hc_attn mHC K1 layer_input itself
+// after the PDL wait (K1foldArgs, see above), bitwise K1's, and quantizes it in registers. K = 5120, M <= 2.
+template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false, bool PF = false, bool K1FOLD = false>
 __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_bfloat16 const* __restrict__ x,
     int ldx, int M, int N, int K, uint8_t const* __restrict__ w, uint8_t const* __restrict__ wsf, int num_k_tiles,
     __nv_bfloat16* __restrict__ out, int ldo, __nv_bfloat16* __restrict__ out2, int ldo2, int n_split,
-    int red_aliased, PreqArgs preq, QoutArgs qout, NormArgs nrm, L2pfArgs pf)
+    int red_aliased, PreqArgs preq, QoutArgs qout, NormArgs nrm, L2pfArgs pf, K1foldArgs k1)
 {
 #if CSA2_SM120_LOW_M_GEMM_ENABLED
+    static_assert(!K1FOLD || (CLUSTER_K > 1 && !NORM && STAGES == 1), "K1 fold: split-K cluster, one stage");
     constexpr int kThreads = WARPS * 32;
     constexpr int kRows = 16 * RT;
     constexpr int kTile = kRows * 8;
@@ -1069,6 +1253,50 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     uint8_t* xc_s = xq_s + M * kc;                     // [M][kc_blocks]
     float* cluster_red = reinterpret_cast<float*>(xc_s + ((M * kc_blocks + 15) / 16) * 16); // [CK-1][kRows*M]
     float* red = red_aliased ? reinterpret_cast<float*>(w_s) : cluster_red + (CLUSTER_K - 1) * live;
+    // K1FOLD only: [2] mbarriers (carries, warp values), then the warp values [kK1MaxM][16] (kK1ExtraSmem bytes).
+    [[maybe_unused]] uint8_t* const k1_ext = reinterpret_cast<uint8_t*>(cluster_red + (CLUSTER_K - 1) * live)
+        + (red_aliased ? 0 : WARPS * kTile * 4);
+    [[maybe_unused]] uint64_t* const k1_bar = reinterpret_cast<uint64_t*>(k1_ext);
+    [[maybe_unused]] float* const k1_wv = reinterpret_cast<float*>(k1_ext + 16);
+    [[maybe_unused]] int const k1_cpr = kc / 8;          // K1FOLD: chunks of this rank
+    [[maybe_unused]] int const k1_clo = rank * k1_cpr;   // its first chunk
+    [[maybe_unused]] int const k1_W = K1FOLD ? k1.P / 32 : 0;
+    // K1FOLD: this warp's blocks (host plan) and lane's chunk of the constant norm weight for each. Before anything
+    // else (in particular before this CTA's weight bulk copies flood DRAM), the residual rows and mHC coefficients
+    // the blocks will read are L2-prefetched: a hint (L2 is the coherence point), the data is read after the wait.
+    constexpr int kK1Slots = WARPS == 4 ? 2 : kK1MaxSlots;
+    [[maybe_unused]] uint32_t k1sw[kK1Slots];
+    [[maybe_unused]] uint4 k1nw[kK1Slots];
+    if constexpr (K1FOLD)
+    {
+#pragma unroll
+        for (int j = 0; j < kK1Slots; ++j)
+        {
+            k1sw[j] = k1.plan[(rank * kK1MaxWarps + warp) * kK1MaxSlots + j];
+            k1nw[j] = make_uint4(0u, 0u, 0u, 0u);
+            if (k1sw[j] & (1u << 15))
+            {
+                int const c = static_cast<int>(k1sw[j] & 0x3FFu) + lane;
+                int const m = static_cast<int>((k1sw[j] >> 14) & 1u);
+                if ((lane & 7) == 0)
+                {
+                    __nv_bfloat16 const* r = k1.residual + static_cast<int64_t>(m) * 4 * kK1Hidden + c * 8;
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk)
+                    {
+                        asm volatile("prefetch.global.L2 [%0];" ::"l"(r + kk * kK1Hidden));
+                    }
+                }
+                k1nw[j] = __ldg(reinterpret_cast<uint4 const*>(k1.norm_w + c * 8));
+            }
+        }
+        if (threadIdx.x < M)
+        {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(k1.post + threadIdx.x * 4));
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(k1.comb + threadIdx.x * 16));
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(k1.pre + threadIdx.x * 4));
+        }
+    }
 
     int const kcs = kc / STAGES;         // columns per stage
     int const kcbs = kc_blocks / STAGES; // 32-blocks per stage
@@ -1084,6 +1312,20 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
         if (CLUSTER_K > 1 && rank == 0)
         {
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(&red_bar)));
+        }
+        if constexpr (K1FOLD)
+        {
+            // Carries this rank receives: one 32-float block per (token, K1 warp) whose first block here is not its
+            // chain's first. Warp values: all of them (M x W floats), from every rank including this one.
+            int const carries = k1.carry_blocks[rank];
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(&k1_bar[0])));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(&k1_bar[1])));
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(&k1_bar[0])),
+                         "r"(static_cast<uint32_t>(M * carries * 32 * 4))
+                         : "memory");
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(&k1_bar[1])),
+                         "r"(static_cast<uint32_t>(M * k1_W * 4))
+                         : "memory");
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
 #pragma unroll
@@ -1157,7 +1399,239 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
     {
         csa2_l2_prefetch(pf, lane, pf_last);
     }
-    if constexpr (NORM)
+    if constexpr (K1FOLD)
+    {
+        // ---- pass A: lane's chunk of every block of this warp: post update + lagged collapse -> raw bf16 li
+        // (_k1_chunk's expressions: nr = post[j] * x, nr = fma(comb[k][j], r[k], nr) for k = 0..3, nr = bf16(nr),
+        // li = fma(pre[j], nr, li) from 0 for j = 0..3, li = bf16(li)). Every load is issued before any math.
+        uint4 k1xv[kK1Slots];
+        uint4 k1rv[kK1Slots][4];
+#pragma unroll
+        for (int j = 0; j < kK1Slots; ++j)
+        {
+            k1xv[j] = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk)
+            {
+                k1rv[j][kk] = make_uint4(0u, 0u, 0u, 0u);
+            }
+            if (k1sw[j] & (1u << 15))
+            {
+                int const c = static_cast<int>(k1sw[j] & 0x3FFu) + lane;
+                int const m = static_cast<int>((k1sw[j] >> 14) & 1u);
+                k1xv[j] = *reinterpret_cast<uint4 const*>(k1.x_prev + static_cast<int64_t>(m) * kK1Hidden + c * 8);
+                __nv_bfloat16 const* r_base = k1.residual + static_cast<int64_t>(m) * 4 * kK1Hidden + c * 8;
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk)
+                {
+                    k1rv[j][kk] = *reinterpret_cast<uint4 const*>(r_base + kk * kK1Hidden);
+                }
+            }
+        }
+        float k1coef[kK1MaxM][24]; // post[4], pre[4], comb[16] per token
+#pragma unroll
+        for (int mm = 0; mm < kK1MaxM; ++mm)
+        {
+            int const ms = mm < M ? mm : 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                k1coef[mm][j] = k1.post[ms * 4 + j];
+                k1coef[mm][4 + j] = k1.pre[ms * 4 + j];
+            }
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+            {
+                k1coef[mm][8 + j] = k1.comb[ms * 16 + j];
+            }
+        }
+        uint4 k1li[kK1Slots];
+#pragma unroll
+        for (int j = 0; j < kK1Slots; ++j)
+        {
+            k1li[j] = make_uint4(0u, 0u, 0u, 0u);
+            if (!(k1sw[j] & (1u << 15)))
+            {
+                continue;
+            }
+            bool const m1 = ((k1sw[j] >> 14) & 1u) != 0;
+            float coef[24];
+#pragma unroll
+            for (int q = 0; q < 24; ++q)
+            {
+                coef[q] = m1 ? k1coef[kK1MaxM - 1][q] : k1coef[0][q];
+            }
+            __nv_bfloat16 const* xe = reinterpret_cast<__nv_bfloat16 const*>(&k1xv[j]);
+            uint4 outv;
+            __nv_bfloat16* oe = reinterpret_cast<__nv_bfloat16*>(&outv);
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+            {
+                float const xf = __bfloat162float(xe[e]);
+                float rf[4];
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk)
+                {
+                    rf[kk] = __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&k1rv[j][kk])[e]);
+                }
+                float li = 0.0f;
+#pragma unroll
+                for (int jj = 0; jj < 4; ++jj)
+                {
+                    float nr = __fmul_rn(coef[jj], xf);
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk)
+                    {
+                        nr = __fmaf_rn(coef[8 + kk * 4 + jj], rf[kk], nr);
+                    }
+                    nr = csa2_bf16_round(nr);
+                    li = __fmaf_rn(coef[4 + jj], nr, li);
+                }
+                oe[e] = __float2bfloat16_rn(li);
+            }
+            k1li[j] = outv;
+        }
+        // ---- pass B: K1's per-thread sums. Every rank's mbarriers are initialized (cluster barrier); re-arm it for
+        // the split-K reduction's wait below. Then the incoming carries, the unit chains (consecutive slots), and the
+        // outgoing carries or the warp butterflies (lane 0 broadcasts the warp value to every rank).
+        float* const k1_carry = reinterpret_cast<float*>(xq_s); // [M][cpr] floats <= M * kc bytes
+        asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory");
+        asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
+        csa2_mbar_wait_cluster(&k1_bar[0]);
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kK1Slots; ++j)
+        {
+            uint32_t const sw = k1sw[j];
+            if (!(sw & (1u << 15)))
+            {
+                continue;
+            }
+            int const c0 = static_cast<int>(sw & 0x3FFu);
+            int const m = static_cast<int>((sw >> 14) & 1u);
+            if (sw & (1u << 16))
+            {
+                s = (sw & (1u << 17)) ? k1_carry[m * k1_cpr + (c0 - k1_clo) + lane] : 0.0f;
+            }
+            __nv_bfloat162 const* hv = reinterpret_cast<__nv_bfloat162 const*>(&k1li[j]);
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+            {
+                float const lx = __low2float(hv[q]);
+                float const ly = __high2float(hv[q]);
+                s = __fadd_rn(s, __fmaf_rn(lx, lx, __fmul_rn(ly, ly)));
+            }
+            uint32_t const end = (sw >> 18) & 3u;
+            if (end == 1u)
+            {
+                uint32_t const dst = (sw >> 20) & 3u;
+                int const doff = static_cast<int>(sw >> 22);
+                csa2_st_async_f32(mapa_shared(smem_u32(k1_carry + m * k1_cpr + doff + lane), dst), s,
+                    mapa_shared(smem_u32(&k1_bar[0]), dst));
+            }
+            else if (end == 2u)
+            {
+#pragma unroll
+                for (int off = 16; off >= 1; off /= 2)
+                {
+                    s = __fadd_rn(s, __shfl_xor_sync(0xffffffffu, s, off));
+                }
+                if (lane == 0)
+                {
+                    int const w = static_cast<int>((sw >> 10) & 0xFu);
+#pragma unroll
+                    for (int rr = 0; rr < CLUSTER_K; ++rr)
+                    {
+                        csa2_st_async_f32(mapa_shared(smem_u32(k1_wv + m * 16 + w), static_cast<uint32_t>(rr)), s,
+                            mapa_shared(smem_u32(&k1_bar[1]), static_cast<uint32_t>(rr)));
+                    }
+                }
+            }
+        }
+        csa2_mbar_wait_cluster(&k1_bar[1]);
+        // Every carry this CTA received was read before its chain's warp value existed; the quantized slice below
+        // overwrites them (xq_s), so no warp may still be reading one.
+        __syncthreads();
+        // ---- pass C: total = warp 0 + warp 1 + ... in order; rstd = rsqrt(fma(total, rcp(5120), eps)).
+        float k1_rstd[kK1MaxM];
+        float const rcp = csa2_k1_rcp_approx_ftz(static_cast<float>(kK1Hidden));
+#pragma unroll
+        for (int mm = 0; mm < kK1MaxM; ++mm)
+        {
+            float total = k1_wv[mm * 16];
+            for (int ww = 1; ww < k1_W; ++ww)
+            {
+                total = __fadd_rn(total, k1_wv[mm * 16 + ww]);
+            }
+            k1_rstd[mm] = csa2_rsqrt_approx_ftz(__fmaf_rn(total, rcp, k1.eps));
+        }
+        // ---- pass D: layer_input = bf16((li * rstd) * w) (_k1_norm), then this kernel's MXFP8 quantization of it:
+        // each lane quad holds one 32-element block (amax by quad max: order-free), same expressions as below.
+#pragma unroll
+        for (int j = 0; j < kK1Slots; ++j)
+        {
+            if (!(k1sw[j] & (1u << 15)))
+            {
+                continue;
+            }
+            int const m = static_cast<int>((k1sw[j] >> 14) & 1u);
+            float const rstd = m == 0 ? k1_rstd[0] : k1_rstd[kK1MaxM - 1];
+            {
+                int const c = static_cast<int>(k1sw[j] & 0x3FFu) + lane;
+                __nv_bfloat162 const* lh = reinterpret_cast<__nv_bfloat162 const*>(&k1li[j]);
+                __nv_bfloat162 const* wh = reinterpret_cast<__nv_bfloat162 const*>(&k1nw[j]);
+                float v[8];
+                uint32_t yb[4];
+#pragma unroll
+                for (int e2 = 0; e2 < 4; ++e2)
+                {
+                    float2 const lf = __bfloat1622float2(lh[e2]);
+                    float2 const wf = __bfloat1622float2(wh[e2]);
+                    __nv_bfloat16 const lo = __float2bfloat16_rn(__fmul_rn(__fmul_rn(lf.x, rstd), wf.x));
+                    __nv_bfloat16 const hi = __float2bfloat16_rn(__fmul_rn(__fmul_rn(lf.y, rstd), wf.y));
+                    v[2 * e2] = __bfloat162float(lo);
+                    v[2 * e2 + 1] = __bfloat162float(hi);
+                    yb[e2] = static_cast<uint32_t>(__bfloat16_as_ushort(lo))
+                        | (static_cast<uint32_t>(__bfloat16_as_ushort(hi)) << 16);
+                }
+                float amax = 0.f;
+#pragma unroll
+                for (int e = 0; e < 8; ++e)
+                {
+                    amax = fmaxf(amax, fabsf(v[e]));
+                }
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+                float const sf = amax * rcp_approx_ftz(448.0f);
+                __nv_fp8_e8m0 code;
+                code.__x = __nv_cvt_float_to_e8m0(sf, __NV_SATFINITE, cudaRoundPosInf);
+                // quantization.cuh exp2f_rcp: exact reciprocal of the UE8M0 scale, no subnormal flush.
+                float const out_scale = amax != 0.f
+                    ? (code.__x == 0 ? 1.0f : exp2f(127.0f - static_cast<float>(code.__x)))
+                    : 0.0f;
+                uint32_t packed[2];
+#pragma unroll
+                for (int t = 0; t < 2; ++t)
+                {
+                    __nv_fp8x2_e4m3 const lo(make_float2(v[4 * t] * out_scale, v[4 * t + 1] * out_scale));
+                    __nv_fp8x2_e4m3 const hi(make_float2(v[4 * t + 2] * out_scale, v[4 * t + 3] * out_scale));
+                    packed[t] = static_cast<uint32_t>(lo.__x) | (static_cast<uint32_t>(hi.__x) << 16);
+                }
+                int const cl = c - k1_clo;
+                *reinterpret_cast<uint2*>(xq_s + m * kc + cl * 8) = make_uint2(packed[0], packed[1]);
+                if ((lane & 3) == 0)
+                {
+                    xc_s[m * kc_blocks + cl / 4] = code.__x;
+                }
+                if (tile == 0)
+                {
+                    *reinterpret_cast<uint4*>(k1.li_out + static_cast<int64_t>(m) * kK1Hidden + c * 8)
+                        = make_uint4(yb[0], yb[1], yb[2], yb[3]);
+                }
+            }
+        }
+    }
+    else if constexpr (NORM)
     {
         for (int m = warp; m < M; m += WARPS)
         {
@@ -1422,10 +1896,10 @@ size_t csa2SmemBytes(int warps, int clusterK, int rowTiles, int m, int k)
         + (aliased ? 0 : red_bytes);
 }
 
-template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false, bool PF = false>
+template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false, bool PF = false, bool K1FOLD = false>
 void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t const* w, uint8_t const* wsf,
     __nv_bfloat16* out, int ldo, __nv_bfloat16* out2, int ldo2, int nSplit, PreqArgs preq, QoutArgs qout, bool pdl,
-    cudaStream_t stream, NormArgs nrm = NormArgs{}, L2pfArgs pf = L2pfArgs{})
+    cudaStream_t stream, NormArgs nrm = NormArgs{}, L2pfArgs pf = L2pfArgs{}, K1foldArgs k1 = K1foldArgs{})
 {
     int const kc = K / CLUSTER_K;
     int const kc_blocks = kc / 32;
@@ -1436,8 +1910,8 @@ void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t co
     size_t const w_bytes = 16 * RT * (kc + kRowPad);
     size_t const red_bytes = static_cast<size_t>(WARPS) * 16 * RT * 8 * sizeof(float);
     int const red_aliased = red_bytes <= w_bytes ? 1 : 0;
-    size_t const smem = csa2SmemBytes(WARPS, CLUSTER_K, RT, M, K);
-    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, STAGES, NORM, PF>;
+    size_t const smem = csa2SmemBytes(WARPS, CLUSTER_K, RT, M, K) + (K1FOLD ? kK1ExtraSmem : 0);
+    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, STAGES, NORM, PF, K1FOLD>;
     static bool const configured = [&]()
     {
         int device = 0, max_optin = 0;
@@ -1484,7 +1958,7 @@ void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t co
     cfg.attrs = attr;
     cfg.numAttrs = 2;
     cudaError_t const err = cudaLaunchKernelEx(&cfg, kernel, x, ldx, M, N, K, w, wsf, (K / 32 + 3) / 4, out, ldo,
-        out2, ldo2, nSplit, red_aliased, preq, qout, nrm, pf);
+        out2, ldo2, nSplit, red_aliased, preq, qout, nrm, pf, k1);
     if (err != cudaSuccess)
     {
         cudaGetLastError();
@@ -1594,6 +2068,129 @@ void invokeCsa2QnormLowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int
     }
     CSA2_QNORM_CONFIGS(CSA2_QNORM_DISPATCH)
 #undef CSA2_QNORM_DISPATCH
+}
+
+namespace
+{
+template <int WARPS, int CLUSTER_K, int RT, bool NORM, bool PF, bool K1FOLD>
+void csa2InstanceStats(int m, int k, int64_t* outStats)
+{
+    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, 1, NORM, PF, K1FOLD>;
+    size_t const smem = csa2SmemBytes(WARPS, CLUSTER_K, RT, m, k) + (K1FOLD ? kK1ExtraSmem : 0);
+    int device = 0, maxOptin = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&maxOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    cudaFuncAttributes attrs = {};
+    TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attrs, kernel));
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        maxOptin - static_cast<int>(attrs.sharedSizeBytes)));
+    TLLM_CUDA_CHECK(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+    int blocksPerSm = 0;
+    TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSm, kernel, WARPS * 32, smem));
+    int clusters = 0;
+    if (CLUSTER_K > 1)
+    {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(1792 / (16 * RT) * CLUSTER_K);
+        cfg.blockDim = dim3(WARPS * 32);
+        cfg.dynamicSmemBytes = smem;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeClusterDimension;
+        attr[0].val.clusterDim.x = CLUSTER_K;
+        attr[0].val.clusterDim.y = 1;
+        attr[0].val.clusterDim.z = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+        TLLM_CUDA_CHECK(cudaOccupancyMaxActiveClusters(&clusters, kernel, &cfg));
+    }
+    outStats[0] = clusters;
+    outStats[1] = blocksPerSm;
+    outStats[2] = static_cast<int64_t>(smem);
+    outStats[3] = attrs.numRegs;
+    outStats[4] = static_cast<int64_t>(attrs.localSizeBytes);
+    outStats[5] = static_cast<int64_t>(attrs.sharedSizeBytes);
+    outStats[6] = attrs.maxThreadsPerBlock;
+}
+} // namespace
+
+void csa2Mxfp8LowMGemmInstanceStats(int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t k, bool norm,
+    bool pf, bool k1fold, int64_t* outStats)
+{
+#define CSA2_STATS(W, C, R, N, F, K1)                                                                                  \
+    if (warps == W && clusterK == C && rowTiles == R && norm == N && pf == F && k1fold == K1)                         \
+    {                                                                                                                  \
+        csa2InstanceStats<W, C, R, N, F, K1>(m, k, outStats);                                                          \
+        return;                                                                                                        \
+    }
+    CSA2_STATS(4, 4, 2, false, false, false)
+    CSA2_STATS(4, 4, 2, false, true, false)
+    CSA2_STATS(8, 2, 2, false, false, false)
+    CSA2_STATS(8, 2, 2, false, true, false)
+    CSA2_STATS(4, 4, 2, false, false, true)
+    CSA2_STATS(4, 4, 2, false, true, true)
+    CSA2_STATS(8, 2, 2, false, false, true)
+    CSA2_STATS(8, 2, 2, false, true, true)
+    CSA2_STATS(4, 1, 2, true, false, false)
+    CSA2_STATS(4, 1, 4, true, false, false)
+    CSA2_STATS(8, 1, 2, true, false, false)
+#undef CSA2_STATS
+    TLLM_CHECK_WITH_INFO(false, "csa2 instance stats: instance not listed");
+}
+
+bool isCsa2K1FoldSupported(
+    int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t k, int32_t reducerThreads)
+{
+    bool const built = (warps == 4 && clusterK == 4 && rowTiles == 2) || (warps == 8 && clusterK == 2 && rowTiles == 2);
+    int const P = reducerThreads;
+    if (!built || k != kK1Hidden || m < 1 || m > kK1MaxM || P <= 0 || P % 32 != 0 || P / 32 > 16 || P > kK1Chunks)
+    {
+        return false;
+    }
+    return csa2K1FoldPlan(warps, clusterK, m, P, nullptr);
+}
+
+void invokeCsa2Mxfp8LowMGemmK1Fold(__nv_bfloat16 const* xPrev, __nv_bfloat16 const* residual, float const* post,
+    float const* comb, float const* pre, __nv_bfloat16 const* normW, float eps, int32_t reducerThreads,
+    __nv_bfloat16* layerInput, int32_t m, int32_t n, int32_t k, uint8_t const* w, uint8_t const* wsf,
+    __nv_bfloat16* out, int32_t ldo, uint8_t* xqOut, uint8_t* xsfOut, int32_t warps, int32_t clusterK,
+    int32_t rowTiles, bool pdl, cudaStream_t stream, int32_t debugFlags, uint8_t const* pfP0, int64_t pfN0,
+    uint8_t const* pfP1, int64_t pfN1, int32_t pfFrac)
+{
+    TLLM_CHECK_WITH_INFO(isCsa2K1FoldSupported(warps, clusterK, rowTiles, m, k, reducerThreads),
+        "csa2_mxfp8_low_m_gemm_k1fold: unsupported configuration (warps %d, cluster_k %d, row_tiles %d) at M=%d K=%d "
+        "P=%d",
+        warps, clusterK, rowTiles, m, k, reducerThreads);
+    int const sfKTiles = (k / 32 + 3) / 4;
+    PreqArgs const preq{nullptr, nullptr, sfKTiles};
+    if (pfP0 == nullptr && pfP1 == nullptr)
+    {
+        debugFlags &= ~4;
+    }
+    L2pfArgs const pf{pfP0, pfP0 == nullptr ? 0 : pfN0, pfP1, pfP1 == nullptr ? 0 : pfN1,
+        pfFrac < 0 ? 0 : (pfFrac > 256 ? 256 : pfFrac)};
+    QoutArgs const qout{xqOut, xsfOut, sfKTiles, nullptr, debugFlags};
+    K1foldArgs k1{xPrev, residual, post, comb, pre, normW, eps, reducerThreads, layerInput, {}, {}};
+    csa2K1FoldPlan(warps, clusterK, m, reducerThreads, &k1);
+    bool const pfOn = (debugFlags & 4) != 0;
+#define CSA2_K1FOLD_DISPATCH(W, C, R)                                                                                  \
+    if (warps == W && clusterK == C && rowTiles == R)                                                                  \
+    {                                                                                                                  \
+        if (pfOn)                                                                                                      \
+        {                                                                                                              \
+            launchCsa2<W, C, R, 1, false, true, true>(                                                                 \
+                layerInput, k, m, n, k, w, wsf, out, ldo, nullptr, 0, n, preq, qout, pdl, stream, NormArgs{}, pf, k1); \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            launchCsa2<W, C, R, 1, false, false, true>(                                                                \
+                layerInput, k, m, n, k, w, wsf, out, ldo, nullptr, 0, n, preq, qout, pdl, stream, NormArgs{}, pf, k1); \
+        }                                                                                                              \
+        return;                                                                                                        \
+    }
+    CSA2_K1FOLD_DISPATCH(4, 4, 2)
+    CSA2_K1FOLD_DISPATCH(8, 2, 2)
+#undef CSA2_K1FOLD_DISPATCH
 }
 
 } // namespace kernels

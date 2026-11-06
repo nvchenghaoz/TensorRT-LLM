@@ -50,6 +50,12 @@ try:
     from tensorrt_llm._torch.models.modeling_deepseekv4 import _moe_ar_trigger_at_end as _TREE_AR_END
 except Exception:  # noqa: BLE001  (branch base: the MoE AR always triggers at its end)
     _TREE_AR_END = None
+try:  # idea 386: hc_attn K1 folded into A (csa2_mxfp8_low_m_gemm_k1fold); absent on the branch base
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import low_m_gemm as LMG
+
+    HAS_FOLD = hasattr(LMG, "low_m_mm_k1fold")
+except Exception:  # noqa: BLE001
+    LMG, HAS_FOLD = None, False
 
 
 def arm_params(arm, M):
@@ -58,11 +64,19 @@ def arm_params(arm, M):
     base / a / ab are forced arms (ab = trigger-first at every M, gate off); tree = what the tree's model runs
     at the hc_attn boundary: the MoE AR rule of modeling_deepseekv4 and trigger_first=True with the tree's own
     per-M gate (branch base: END trigger, wait-first K1)."""
-    if arm == "tree":
+    if arm in ("tree", "tree_fast0", "fold", "tree_k1"):
         early = _TREE_AR_END is not None and not _TREE_AR_END(M)
         return early, HAS_TF, TREE_MIN
+    if arm == "ideal":  # idea 352: producer EARLY, no K1 (A is the producer's direct PDL dependent)
+        return True, False, TREE_MIN
     early, tf = ARMS[arm]
     return early, tf, 1
+
+
+def arm_k1(arm):
+    """tree = the tree's production hc_attn boundary ('auto': the K1 fold where the tree's low_m_gemm admits it,
+    else K1 -> A); fold / tree_k1 force one of the two (head tree only)."""
+    return {"tree_fast0": "fast0", "ideal": "none", "tree": "auto", "fold": "fold", "tree_k1": "k1"}.get(arm, "k1")
 
 
 def set_gate(v):
@@ -110,6 +124,8 @@ class Chain:
         self.n = n_bnd
         self.P = P
         self.scratch = torch.empty((8, 8), dtype=torch.bfloat16, device="cuda")
+        if HAS_FOLD:
+            LMG.k1fold_warmup(*self.probes[0]._wq_a_wkv)  # eager, before any capture
         log(f"chain: {n_bnd} boundaries ({ni} with index_wq_b), checkpoint split {n_index}/{n_swa}, P={P}, "
             f"trigger_first in tree: {HAS_TF}")
 
@@ -134,8 +150,20 @@ class Chain:
             b["comb"][i].copy_(torch.rand(b["comb"][i].shape, generator=g, device="cuda") * 0.5)
             b["pre"][i].copy_(torch.rand(b["pre"][i].shape, generator=g, device="cuda") + 0.05)
 
-    def run(self, b, M, w_us, early, tf, k1_skip_wait=False, direct_x=False):
-        """One step. direct_x: eager reference (x_prev = src copied by torch, no producer overlap)."""
+    def precompute(self, b):
+        """Idea 352 arm 'ideal': main's K1 (tree default) run eagerly on x_prev = src into per-boundary buffers,
+        outside any capture; the ideal graph's A reads these instead of a K1 output."""
+        if "li_pre" not in b:
+            b["li_pre"] = [torch.empty_like(s) for s in b["src"]]
+        for i in range(self.n):
+            S.mhc_lagged_layer_input(b["src"][i], b["res"][i], b["post"][i], b["comb"][i], b["pre"][i],
+                                     self.nw[i], 1e-6, self.P, out=b["li_pre"][i])
+        torch.cuda.synchronize()
+
+    def run(self, b, M, w_us, early, tf, k1_skip_wait=False, direct_x=False, k1="k1"):
+        """One step. direct_x: eager reference (x_prev = src copied by torch, no producer overlap).
+        k1: 'k1' (tree default K1), 'fast0' (main's pre-206 K1, fast=False), 'none' (idea 352 'ideal': no K1, A on
+        b['li_pre'] from precompute())."""
         ext = pdl_ext.ext()
         outs = []
         for i in range(self.n):
@@ -148,8 +176,28 @@ class Chain:
                 kw["trigger_first"] = bool(tf)
                 if k1_skip_wait:
                     kw["_test_skip_wait"] = True
-            li = S.mhc_lagged_layer_input(b["x"][i], b["res"][i], b["post"][i], b["comb"][i], b["pre"][i],
-                                          self.nw[i], 1e-6, self.P, **kw)
+            if k1 == "fast0":
+                kw["fast"] = False
+            # 'fold' and 'auto' both fold exactly where the tree's gate admits it (M <= 2); elsewhere K1 -> A.
+            use_fold = k1 in ("fold", "auto") and HAS_FOLD and LMG.k1fold_applies(
+                M, self.P, self.probes[i]._wq_a_wkv[0])
+            if use_fold:
+                # Idea 386: no K1; A computes layer_input (pend.out) after its PDL wait on the producer.
+                pend = S.K1FoldPending(torch.empty_like(b["x"][i]),
+                                       (b["x"][i], b["res"][i], b["post"][i], b["comb"][i], b["pre"][i], self.nw[i]),
+                                       1e-6, self.P)
+                p = self.probes[i]
+                qr, q, swa, idx = p._project_inputs(pend.out, k1_fold=pend)
+                if p.with_index and idx is None:
+                    idx = p.index_wq_b(qr)
+                self.scratch[:M].copy_(q[:, :8])
+                outs.append((pend.out, qr, q, swa, idx))
+                continue
+            if k1 == "none":
+                li = b["li_pre"][i]
+            else:
+                li = S.mhc_lagged_layer_input(b["x"][i], b["res"][i], b["post"][i], b["comb"][i], b["pre"][i],
+                                              self.nw[i], 1e-6, self.P, **kw)
             qr, q, swa, idx = PB.branch(self.probes[i], li)
             self.scratch[:M].copy_(q[:, :8])  # non-PDL separator: the rest of the layer
             outs.append((li, qr, q, swa, idx))
@@ -174,11 +222,12 @@ def capture(fn):
 
 def k1_cache_size():
     n = 0
-    for c in getattr(S._mhc_lagged_layer_input_kernel, "device_caches", {}).values():
-        try:
-            n += len(c[0])
-        except Exception:  # noqa: BLE001
-            pass
+    for kern in (S._mhc_lagged_layer_input_kernel, getattr(S, "_mhc_lagged_layer_input_fast_kernel", None)):
+        for c in getattr(kern, "device_caches", {}).values():
+            try:
+                n += len(c[0])
+            except Exception:  # noqa: BLE001
+                pass
     return n
 
 
@@ -208,18 +257,26 @@ def bench(args):
         "beyond noise at W_crit p50 AND ab is not worse than a beyond noise at W_crit p10. Pair point: arm 'tree' "
         f"at W_crit p50 per M. Tree gate in force: K1 trigger-first from M >= {TREE_MIN} (HAS_GATE {HAS_GATE}).")
     ch = Chain(args.boundaries, args.ckpt, args.P)
-    arms = [a for a in ("base", "a", "ab") if HAS_TF or a != "ab"] + ["tree"]
+    if args.arms:
+        arms = list(args.arms)
+    else:
+        arms = [a for a in ("base", "a", "ab") if HAS_TF or a != "ab"] + ["tree"]
     table = {}
     for M in args.batches:
         b = ch.bufs(M)
         Chain.fill(b, 1)
+        ch.precompute(b)
+        P = ch.P
+        W_ = P // 32
+        log(f"M={M}: K1 P={P} W={W_} W_PAD={max(1 << (W_ - 1).bit_length(), 1)} K1_FAST={S.K1_FAST} "
+            f"trigger-first min tokens {TREE_MIN} -> hc_attn K1 {'trigger-first' if M >= TREE_MIN else 'wait-first'}")
         graphs = {}
         ws = sorted(set([float(w) for w in args.ws] + [wtab[M]["W_crit_p10"], wtab[M]["W_crit_p50"]]))
         for w in ws:
             for arm in arms:
                 early, tf, gate = arm_params(arm, M)
                 set_gate(gate)
-                graphs[(w, arm)] = capture(lambda: ch.run(b, M, w, early, tf))
+                graphs[(w, arm)] = capture(lambda: ch.run(b, M, w, early, tf, k1=arm_k1(arm)))
         set_gate(TREE_MIN)
         jit = {f"W{k[0]:g}_{k[1]}": v[2] for k, v in graphs.items() if v[2]}
         log(f"M={M}: captured {len(graphs)} graphs, ws {ws}, arm params "
@@ -262,14 +319,28 @@ def bench(args):
         pw = w50 if args.wcrit else args.pair_w
         pair_w[str(M)] = pw
         e = table[f"M{M}_W{pw:g}_{pair_arm}"]
-        eb = table[f"M{M}_W{pw:g}_base"]
         batch[str(M)] = {"kernel_ms": e["step_ms"], "noise_floor": e["noise"],
-                         "us_per_boundary": e["us_per_boundary"], "W_us": pw,
-                         "in_job_base_us_per_boundary": eb["us_per_boundary"],
-                         "in_job_gain_vs_base": (eb["us_per_boundary"] - e["us_per_boundary"]) / eb["us_per_boundary"]}
+                         "us_per_boundary": e["us_per_boundary"], "W_us": pw}
         g = {}
-        g["a_on"], g["a_gain_vs_base_p50"] = beyond("a", "base", table, f"M{M}_W{w50:g}")
-        if "ab" in arms:
+        if "base" in arms:
+            eb = table[f"M{M}_W{pw:g}_base"]
+            batch[str(M)]["in_job_base_us_per_boundary"] = eb["us_per_boundary"]
+            batch[str(M)]["in_job_gain_vs_base"] = (eb["us_per_boundary"] - e["us_per_boundary"]) / eb["us_per_boundary"]
+        if "a" in arms and "base" in arms:
+            g["a_on"], g["a_gain_vs_base_p50"] = beyond("a", "base", table, f"M{M}_W{w50:g}")
+        for wl, wv in (("p50", w50), ("p10", w10)):
+            key = f"M{M}_W{wv:g}"
+            t = table.get(f"{key}_tree")
+            for other in ("ideal", "tree_fast0", "fold", "tree_k1"):
+                o = table.get(f"{key}_{other}")
+                if t and o:
+                    d = t["us_per_boundary"] - o["us_per_boundary"]
+                    g[f"tree_minus_{other}_us_{wl}"] = round(d, 3)
+                    g[f"tree_minus_{other}_us_{wl}_p10p90"] = [
+                        round(t["p10_us_per_boundary"] - o["p90_us_per_boundary"], 3),
+                        round(t["p90_us_per_boundary"] - o["p10_us_per_boundary"], 3)]
+                    g[f"tree_vs_{other}_beyond_noise_{wl}"] = abs(d) / t["us_per_boundary"] > max(t["noise"], o["noise"])
+        if "ab" in arms and "a" in arms:
             b50, g["ab_gain_vs_a_p50"] = beyond("ab", "a", table, f"M{M}_W{w50:g}")
             worse10, g["a_gain_vs_ab_p10"] = beyond("a", "ab", table, f"M{M}_W{w10:g}")
             g["b_on"] = bool(b50 and not worse10)
@@ -404,6 +475,82 @@ def check(args):
                       "report": report}))
 
 
+def check352(args):
+    """Idea 352: arms tree / tree_fast0 / ideal, NaN-poisoned, >= args.iters replays per M and W, new inputs every
+    iteration. Compares bitwise: each arm's A/B outputs (qr, q, swa, index_q) with the eager no-overlap reference
+    (main's default K1 -> A -> B on x_prev = src) and with the tree graph of the same iteration; the K1 layer_input
+    of tree and tree_fast0 with the reference; ideal's precomputed layer_input with the reference."""
+    ch = Chain(args.boundaries, args.ckpt, args.P)
+    arms = ("tree", "tree_fast0", "ideal") + (("fold", "tree_k1") if HAS_FOLD else ())
+    failures, report = [], {}
+    for M in args.batches:
+        b = ch.bufs(M)
+        Chain.fill(b, 1)
+        ch.precompute(b)
+        graphs, jit = {}, {}
+        for w in args.ws:
+            for arm in arms:
+                early, tf, gate = arm_params(arm, M)
+                set_gate(gate)
+                ch.run(b, M, w, early, tf, k1=arm_k1(arm))  # eager warm (JIT) first
+                torch.cuda.synchronize()
+                g, outs, grew = capture(lambda: ch.run(b, M, w, early, tf, k1=arm_k1(arm)))
+                graphs[(w, arm)] = (g, outs)
+                jit[f"W{w:g}_{arm}"] = grew
+        set_gate(TREE_MIN)
+        bad_jit = {k: v for k, v in jit.items() if v}
+        if bad_jit:
+            failures.append(f"M={M} K1 JIT during capture {bad_jit}")
+        mism = {}
+        for it in range(args.iters):
+            seed = 500 + it
+            Chain.fill(b, seed)
+            ref_t = ch.run(b, M, 0, False, False, direct_x=True)
+            ref_li = [t[0].clone() for t in ref_t]
+            ref_ab = [x.clone() for t in ref_t for x in t[1:] if x is not None]
+            torch.cuda.synchronize()
+            Chain.fill(b, seed)
+            ch.precompute(b)
+            mism.setdefault("li_pre_vs_ref", []).append(nbad(b["li_pre"], ref_li))
+            for w in args.ws:
+                tree_ab = None
+                for arm in arms:
+                    g, outs = graphs[(w, arm)]
+                    Chain.fill(b, seed)
+                    for x in b["x"]:
+                        x.fill_(float("nan"))
+                    for t in outs:
+                        for k, x in enumerate(t):
+                            if x is not None and not (k == 0 and arm == "ideal"):  # ideal's li is the input
+                                x.fill_(float("nan"))
+                    g.replay()
+                    torch.cuda.synchronize()
+                    ab = [x for t in outs for x in t[1:] if x is not None]
+                    if tree_ab is None:
+                        tree_ab = [x.clone() for x in ab]
+                    r = {"ab_vs_ref": nbad(ab, ref_ab), "ab_vs_tree": nbad(ab, tree_ab), "nonfinite": nonfinite(ab)}
+                    if arm != "ideal":
+                        r["li_vs_ref"] = nbad([t[0] for t in outs], ref_li)
+                    for k, v in r.items():
+                        mism.setdefault(f"W{w:g}_{arm}_{k}", []).append(v)
+                    if any(r.values()):
+                        failures.append(f"M={M} W={w:g} {arm} iter {it}: {r}")
+        report[f"M{M}"] = {"iters": args.iters, "max_mismatch_over_iters": {k: max(v) for k, v in mism.items()},
+                           "jit_in_capture": jit, "tensors_ab_per_replay": len(ref_ab),
+                           "arm_params": {a: arm_params(a, M) for a in arms},
+                           "tree_runs_fold": bool(HAS_FOLD and LMG.k1fold_applies(
+                               M, ch.P, ch.probes[0]._wq_a_wkv[0]))}
+        log(f"M={M}: {json.dumps(report[f'M{M}'])}")
+        del graphs
+        torch.cuda.empty_cache()
+    print(json.dumps({"passed": not failures, "failures": failures[:20],
+                      "compared": "idea 352 arms tree (fast K1) / tree_fast0 (TRTLLM_MHC_K1_FAST=0 kernel) / ideal "
+                                  "(no K1, A on precomputed layer_input): A/B outputs qr,q,swa,index_q of every "
+                                  "boundary bitwise vs eager no-overlap reference and vs tree, K1 layer_input vs "
+                                  "reference, NaN-poisoned x_prev and outputs, new inputs every iteration",
+                      "report": report}))
+
+
 def negctl(args):
     """A control that must be CAUGHT: K1 triggers first and skips its wait, or A (low-M) skips its wait."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import low_m_gemm as LM
@@ -453,6 +600,7 @@ def main():
     p.add_argument("--pair-w", type=float, default=5)
     p.add_argument("--wcrit", type=int, default=1, help="1: judge/pair at the W_crit table (wcrit.py)")
     p.add_argument("--ctl", default="k1nowait")
+    p.add_argument("--arms", nargs="+", default=None, help="bench arms (default base a ab tree)")
     args = p.parse_args()
     torch.cuda.set_device(0)
     pdl_ext.ext()
@@ -460,6 +608,11 @@ def main():
         bench(args)
     elif args.mode == "check":
         check(args)
+    elif args.mode == "check352":
+        check352(args)
+    elif args.mode == "both352":
+        check352(args)
+        bench(args)
     else:
         negctl(args)
 

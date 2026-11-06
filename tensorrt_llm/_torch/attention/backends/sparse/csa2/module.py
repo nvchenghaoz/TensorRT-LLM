@@ -434,19 +434,64 @@ class DeepseekV41Attention(nn.Module):
         )
         return weight, weight_scale, n_split
 
-    def _project_inputs(self, hidden_states: torch.Tensor):
+    def stash_k1_fold(self, pending) -> None:
+        """The next forward() of exactly ``pending.out`` (the hc_attn boundary's layer_input, not produced yet)
+        produces it inside the attention-input chain's A (K1 fold, low_m_gemm.low_m_mm_k1fold), or runs the
+        boundary's K1 first when it cannot (``pending.materialize()``)."""
+        self._k1_fold_pending = pending
+
+    def _take_k1_fold(self, hidden_states, attn_metadata, global_hidden_states):
+        """The stashed K1 fold if A will take it, else None (after materializing it: K1 on this stream, now)."""
+        pending = getattr(self, "_k1_fold_pending", None)
+        if pending is None:
+            return None
+        self._k1_fold_pending = None
+        if pending.out is not hidden_states or not self._k1_fold_applies(
+            hidden_states, pending, attn_metadata, global_hidden_states
+        ):
+            pending.materialize()
+            return None
+        return pending
+
+    def _k1_fold_applies(self, hidden_states, pending, attn_metadata, global_hidden_states) -> bool:
+        # Every reader of hidden_states before A (the replay source selection, an external global source) must not
+        # exist: A writes it, and the aux stream reads its own K1 copy.
+        if global_hidden_states is not None or getattr(attn_metadata, "csa2_replay_mode", None) is not None:
+            return False
+        if hidden_states.dim() != 2 or not self._shared_mxfp8_active(hidden_states):
+            return False
+        if self._qb_fused_route(hidden_states) is None:
+            return False
+        from .low_m_gemm import k1fold_applies, k1fold_warmup
+
+        a_weight, a_weight_scale = self._wq_a_wkv
+        k1fold_warmup(a_weight, a_weight_scale)
+        return k1fold_applies(hidden_states.shape[0], pending.reducer_threads, a_weight)
+
+    def _project_inputs(self, hidden_states: torch.Tensor, k1_fold=None):
         """Return ``(qr, q [tokens, heads*dim], swa, index_query or None)``.
 
         ``index_query`` is the raw ``index_wq_b(qr)`` when it was computed with
         the shared quantized ``qr``; ``None`` leaves it to ``_project_index_q``.
+        ``k1_fold`` (from ``_take_k1_fold``): ``hidden_states`` is not produced yet; A computes it (K1 fold).
         """
+        if k1_fold is not None and (
+            not self._shared_mxfp8_active(hidden_states) or self._qb_fused_route(hidden_states) is None
+        ):
+            k1_fold.materialize()
+            k1_fold = None
         if not self._shared_mxfp8_active(hidden_states):
             qr = self.q_norm(self.wq_a(hidden_states))
             return qr, self.wq_b(qr), self.wkv(hidden_states), None
         q_rank = self.wq_a.weight.shape[0]
         chain = self._qb_fused_route(hidden_states)
         rows = None
-        if chain is not None:
+        if chain is not None and k1_fold is not None:
+            # K1 fold: A computes the hc_attn boundary's layer_input (= hidden_states) after its PDL wait.
+            from .low_m_gemm import low_m_mm_k1fold
+
+            rows = low_m_mm_k1fold(k1_fold, *self._wq_a_wkv, l2_prefetch=chain[:2])
+        elif chain is not None:
             # SM120 decode attention-input chain: wq_a||wkv triggers its dependents at start, so the fused
             # q_norm + MXFP8 quant + wq_b(||index_wq_b) kernel, launched right after it, stages its weights while
             # wq_a||wkv streams. It reads the rows only after its PDL wait.
@@ -728,6 +773,8 @@ class DeepseekV41Attention(nn.Module):
         completed group. ``global_hidden_states`` is the encoder output when
         decoder global KV is prepared from more rows than its SWA replay.
         """
+        # hc_attn K1 fold (decode M <= 2): hidden_states is produced by A below; nothing reads it before.
+        k1_fold = self._take_k1_fold(hidden_states, attn_metadata, global_hidden_states)
         precomputed = self.layer.layer_idx in attn_metadata.csa2_precomputed_kv_layers
         compression = attn_metadata.get_compression_batch(self.layer.layer_idx)
         compressed_positions = (
@@ -756,15 +803,22 @@ class DeepseekV41Attention(nn.Module):
                 for tensor in (hidden_states, global_source, compressed_positions):
                     if tensor is not None:
                         tensor.record_stream(self.aux_stream)
+                aux_hidden, aux_global = hidden_states, global_source
+                if k1_fold is not None:
+                    # K1 fold: the main stream's hidden_states is written by A, concurrently; the auxiliary
+                    # readers take their own K1 copy (same kernel, same bits) on this stream.
+                    aux_hidden = k1_fold.run_copy()
+                    if global_source is hidden_states:
+                        aux_global = aux_hidden
                 auxiliary = self._prepare_auxiliary(
-                    hidden_states,
-                    global_source,
+                    aux_hidden,
+                    aux_global,
                     compression,
                     compressed_positions,
                     skip_global=precomputed,
                 )
                 self._prepare_done.record()
-        qr, q, swa, index_query = self._project_inputs(hidden_states)
+        qr, q, swa, index_query = self._project_inputs(hidden_states, k1_fold=k1_fold)
         # CSA2 never applies V4's projected-Q per-head normalization.
         q = self._rope(
             q.reshape(-1, self.num_heads_tp, self.qk_head_dim),
