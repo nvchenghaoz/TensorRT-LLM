@@ -60,11 +60,25 @@
   - LP IPC allocation per GPU 75,497,472 B (workspace 34,670,592 x 2 + barrier 6,688 B x 2, 2 MiB pages): the
     barrier grows 4128 -> 6688 B inside the same 2 MiB page, so the per-GPU memory delta is 0.
 - kernel pair 1995 (base 9ac8398e) / 1996 (head a44f6195): `bash experiments/ascent/lp_push/run.sh {python} pair`,
-  gpus=4, queued 08:50 PST.
+  gpus=4, queued 08:50 PST. Baseline arm ran (smc521ge-0043 austin:0-3); candidate arm cancelled at session end.
+- KERNEL PAIR 2005 (base 9ac8398e) / 2006 (head 71b4c280), session 12, NEW LEASE node smc521ge-0046 half austin:0-3
+  (NUMA 0), same slot, consecutive. us/call, max over 4 ranks (median of 3 x 100), base pull -> push:
+  | M x 5120 | pull | push | delta | noise base/cand | rank dispersion cand |
+  | 1024 | 246.6 | 214.6 | -13.0% | 1.8% / 1.9% | 0.01% |
+  | 2048 | 478.1 | 433.8 | -9.3% | 1.5% / 4.7% | 0.01% |
+  | 4096 | 942.8 | 903.7 | -4.1% | 1.3% / 5.9% | 0.23% |
+  | 6144 | 1437.4 | 1362.5 | -5.2% | 1.5% / 5.2% | 0.00% |
+  16 CTAs/peer. Workspace memory delta per GPU: 0 B (allocated_per_gpu 75,497,472 in both arms; barrier 4128 -> 6688 B).
+  Candidate arm's noise is higher (one GPU sampled at SM 1530 MHz, host load avg rose to 65 from the neighbour
+  window job), so 4096/6144 gains are at the noise edge; 1024/2048 clearly beat it. Dev job 1983 (0043) put push at
+  -8.6..-10.8% at all four shapes with 1.2-2.8% noise.
+- Served sizing from the kernel pair alone (idea 365 Q4(a) not consulted): c-case T=2048 boundaries ~44 us x 40 =
+  ~1.8 ms/req kernel time; served gain depends on barrier wait (fact 3520).
 
 ## DONE / UNTESTED / NEXT
 - DONE: kernel, switch, flag sizing, dev/pair script, dev job 1983 (all checks pass).
-- NEXT: kernel pair 1995/1996 -> submit kernel_time EXACT. If it cannot run this session, re-queue exactly
+- DONE: kernel pair 2005/2006 -> submitted kernel_time EXACT.
+- (old) NEXT: kernel pair 1995/1996 -> submit kernel_time EXACT. If it cannot run this session, re-queue exactly
   run_gpu_pair(baseline=candidate=["bash","experiments/ascent/lp_push/run.sh","{python}","pair"], gpus=4).
 - Measured push is ~432 us at 2048, not the ~380 predicted: each phase is ~2x 8.1 MB per rank, so effective
   ~37.5 GB/s. Possible follow-up (not in this branch): overlap the scatter and reduce phases per warp-group
