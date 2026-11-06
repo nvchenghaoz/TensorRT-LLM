@@ -101,6 +101,22 @@ from .modeling_utils import (
     register_auto_model,
 )
 
+# Decode MoE all-reduce early trigger (idea 208). At decode M <= 8 the MoE output all-reduce
+# (DeepseekV4MoE.forward -> self.allreduce) triggers its PDL dependents right after its own
+# griddepcontrol.wait instead of at its end, so the next boundary's kernels (the hc_attn mHC K1
+# and the wq_a||wkv / q_norm+wq_b low-M GEMMs behind it) launch and stage their constant weights
+# while the lamport all-reduce polls its peers. Every consumer still reads the all-reduce output
+# only after its own griddepcontrol.wait (or is a plain, fully ordered launch), so the output is
+# unchanged. Row counts above 8 (prefill, the 128-row tail-MoE replay) keep the end trigger.
+# TRTLLM_DSV4_MOE_AR_EARLY_TRIGGER=0 restores the end trigger everywhere.
+_MOE_AR_EARLY_TRIGGER = os.environ.get("TRTLLM_DSV4_MOE_AR_EARLY_TRIGGER", "1") != "0"
+_MOE_AR_EARLY_TRIGGER_MAX_TOKENS = 8
+
+
+def _moe_ar_trigger_at_end(num_tokens: int) -> bool:
+    """``trigger_completion_at_end`` of the MoE output all-reduce for ``num_tokens`` rows."""
+    return not (_MOE_AR_EARLY_TRIGGER and 0 < num_tokens <= _MOE_AR_EARLY_TRIGGER_MAX_TOKENS)
+
 
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -2988,7 +3004,10 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (
                         self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
-                    )
+                    ),
+                    # Per call: decode M <= 8 triggers early (idea 208); the 128-row tail-MoE
+                    # replay and prefill keep the end trigger.
+                    trigger_completion_at_end=_moe_ar_trigger_at_end(hidden_states.shape[0]),
                 ),
                 do_finalize=do_finalize,
                 input_ids=input_ids,

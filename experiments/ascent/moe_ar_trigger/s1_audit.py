@@ -101,11 +101,25 @@ AUDIT = [
     ("A kernel: wait before reading activations", LOWM, r"griddepcontrol.wait;", None, 2),
     ("A fallback: mxfp8_quantize wait first", "cpp/tensorrt_llm/kernels/quantization.cuh",
      r"cudaGridDependencySynchronize\(\);", None, 1),
-    # --- untouched ---
-    ("o-proj AR site 1 untouched (default params)", WO, r"self.o_b_proj.all_reduce\(result, all_reduce_params=None\)",
+    ("K1 plain call (not the fold) carries trigger_first", "tensorrt_llm/_torch/modules/mhc/hyper_connection.py",
+     r"trigger_first=k1_trigger_first,", None, 1),
+    ("K1 fold returns before the plain K1 (175 path first)", "tensorrt_llm/_torch/modules/mhc/hyper_connection.py",
+     r"return k1_fold.out", None, 1),
+    ("K1 M-gate: trigger-first only at M >= K1_TRIGGER_FIRST_MIN_TOKENS", SPLIT,
+     r"M >= K1_TRIGGER_FIRST_MIN_TOKENS", None, 1),
+    # --- other x_ffn consumer (Engram/DSpark resolve at entry): plain post_mapping launch ---
+    ("C3b V4.1 entry resolve (needs_resolved) post_mapping", V41, r"residual = self.hc_attn.post_mapping\(", None, 1),
+    # --- landing 55 (branch 175) paths: consumers of the ATTENTION AR / x_attn, untouched by 177 ---
+    ("175 attn AR early trigger M<=4 (main, untouched)", WO, r"_ATTN_AR_EARLY_TRIGGER_MAX_M = 4", None, 1),
+    ("o-proj AR site 1 (main's 175 params, untouched)", WO, r"all_reduce_params=_attn_all_reduce_params\(m\)",
      None, 1),
-    ("o-proj AR site 2 untouched (default params)", WO, r"self.o_b_proj.all_reduce\(result, all_reduce_params=None\)",
-     None, 2),
+    ("o-proj AR site 2 (main's 175 params, untouched)", WO,
+     r"all_reduce_params=_attn_all_reduce_params\(output.shape\[0\]\)", None, 1),
+    ("175 K1 fold only at hc_ffn (which=1)", V41, r"defer_k1 = self._k1_fold_eligible\(x_attn, image_mask\)", None, 1),
+    ("175 fold consumer dsv4FusedRouterKernel: wait before reading activations",
+     "cpp/tensorrt_llm/kernels/moe/routing/dsv4FusedRouter.cu", r"griddepcontrol.wait;", None, 1),
+    ("175 shared-expert K1 on aux (run_copy): default wait-first, no trigger_first", SPLIT,
+     r"return mhc_lagged_layer_input\(\*self.args, self.norm_eps, self.reducer_threads\)$", r"def run_copy", 1),
 ]
 
 
@@ -117,8 +131,9 @@ def static_audit():
         log(f"  {role:72s} {path}:{ln}: {txt}")
         ok &= ln is not None
     with open(os.path.join(ROOT, WO)) as f:
-        wo_clean = "trigger_completion_at_end" not in f.read()
-    log(f"  b12x_wo.py passes no trigger override: {wo_clean}")
+        # Main (landing 55) owns the only override: _attn_all_reduce_params' trigger_completion_at_end=False.
+        wo_clean = f.read().count("trigger_completion_at_end=False") == 1
+    log(f"  b12x_wo.py has only main's single (175) trigger override: {wo_clean}")
     return bool(ok and wo_clean), rows
 
 
@@ -144,6 +159,9 @@ def rule(env_off):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
+    p.add_argument("--sequence", type=int, default=0, help="1: also run the job-1683 chain.py check")
+    p.add_argument("--ws", type=float, nargs="+", default=[1.84, 2.37, 2.9, 5])
+    p.add_argument("--iters", type=int, default=6)
     args = p.parse_args()
     log("== S1 audit (static) ==")
     audit_ok, rows = static_audit()
@@ -172,13 +190,47 @@ def main():
     lc_ok = bool(rc == 0 and lc.get("passed"))
     k1 = lc.get("k1_calls") or {}
     hcffn_plain = k1.get("plain", 0) > 0  # hc_ffn K1 still launched wait-first
-    passed = bool(audit_ok and rule_ok and lc_ok and hcffn_plain)
+
+    seq = None
+    seq_ok = True
+    if args.sequence:
+        # Job-1683 equivalent: chain.py --mode check (untimed sequence at the timed harness's W points, NaN-poisoned
+        # outputs before every replay, bitwise every iteration, PDL0 arms, 1000-replay runs, both negative controls).
+        log("== sequence check (chain.py --mode check, as job 1683) ==")
+        cmd = [sys.executable, os.path.join(HERE, "chain.py"), "--mode", "check", "--ckpt", args.ckpt,
+               "--batches", "1", "2", "4", "8", "--ws", *[str(w) for w in args.ws], "--iters", str(args.iters)]
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, text=True)
+        last = ""
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if line.strip():
+                last = line.strip()
+        src = proc.wait()
+        try:
+            seq = json.loads(last)
+        except Exception:
+            seq = {"passed": False, "error": f"no JSON (rc {src})"}
+        seq_ok = bool(src == 0 and seq.get("passed"))
+        rep = seq.get("report") or {}
+        seq = {"passed": seq_ok, "failures": seq.get("failures"),
+               "per_M": {k: {"max_mismatch_bytes": max((v.get("max_mismatch_bytes_over_iters") or {0: 0}).values()),
+                             "jit_in_capture": sum((v.get("jit_in_capture") or {}).values()),
+                             "tree_k1_trigger_first": v.get("tree_k1_trigger_first"),
+                             "iters": v.get("iters"),
+                             **{x: v[x] for x in ("long_replays_ab", "long_replays_tree") if x in v}}
+                         for k, v in rep.items() if k.startswith("M")},
+               "negative_controls": rep.get("negative_controls")}
+
+    passed = bool(audit_ok and rule_ok and lc_ok and hcffn_plain and seq_ok)
     print(json.dumps({
+        "sequence_check": seq,
         "passed": passed,
         "compared": "S1 static audit of every MoE-AR-output and hc_attn-K1 consumer (file:line); trigger rule at "
                     "M=0..512 default and env=0; real-layer graphs SPLIT/SLEEP/NOPDL vs REF bitwise every replay",
         "audit_ok": audit_ok, "audit": rows, "rule_default": on, "rule_env0": off, "rule_ok": rule_ok,
         "layer_check": {k: lc.get(k) for k in ("passed", "summary", "moe_ar_trigger_calls", "k1_calls",
+                                                "k1_order_per_m", "k1_order_ok",
                                                 "k1_launches_m16", "k1_launches_eager", "sleep_cycles", "error")},
         "hc_ffn_k1_wait_first_launches": k1.get("plain", 0),
     }))

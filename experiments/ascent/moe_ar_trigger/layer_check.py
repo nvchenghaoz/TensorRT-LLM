@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import sys
+import types
 
 import torch
 
@@ -81,6 +82,11 @@ def build_chain(cfg, n_layers, dev, gen):
         assert PB.attach_branch(probe)
         layer.self_attn = AttnStandIn(layer.self_attn, probe)
         layer.forward_MoE = moe_with_ar(layer._moe_standin)
+        # Main's landing-55 hc_ffn K1-fold gate (_k1_fold_eligible) reads self.mapping and self.mlp; the
+        # __new__-built layer has neither. A stand-in MoE has no fused router, so like any MoE without
+        # k1_fold_supported the gate returns False and hc_ffn keeps its plain (wait-first) K1, as in job 1697.
+        layer.mapping = types.SimpleNamespace(enable_attention_dp=False)
+        layer.mlp = types.SimpleNamespace()
     log(f"patched {len(layers)} layers: real _project_inputs attention stand-in, MoE stand-in + stand-in AR "
         f"(trigger fn in tree: {TRIGGER_FN is not None})")
     return layers, model, hidden
@@ -112,8 +118,17 @@ def main():
     split = MC._split
     orig_k1 = split.mhc_lagged_layer_input
 
+    # Per-M effective K1 ordering (what mhc_lagged_layer_input compiles): trigger-first only when asked for
+    # (hc_attn), the env is on and M >= K1_TRIGGER_FIRST_MIN_TOKENS; everything else wait-first.
+    k1_order_per_m = {}
+
     def k1(*a, **k):
         k1_tf_calls["tf" if k.get("trigger_first") else "plain"] += 1
+        m = int(a[0].shape[0])
+        eff = bool(k.get("trigger_first") and getattr(split, "K1_TRIGGER_FIRST_ENV", False)
+                   and m >= getattr(split, "K1_TRIGGER_FIRST_MIN_TOKENS", 1 << 30))
+        d = k1_order_per_m.setdefault(str(m), {"trigger_first": 0, "wait_first": 0})
+        d["trigger_first" if eff else "wait_first"] += 1
         return orig_k1(*a, **k)
 
     split.mhc_lagged_layer_input = k1
@@ -138,9 +153,14 @@ def main():
     res = json.loads(last)
     res["moe_ar_trigger_calls"] = STATS
     res["k1_calls"] = k1_tf_calls
+    res["k1_order_per_m"] = k1_order_per_m
     # In the candidate tree, decode M<=8 must take the early AR trigger and hc_attn K1 trigger-first.
     if TRIGGER_FN is not None:
-        res["passed"] = bool(res["passed"] and STATS["early"] > 0 and k1_tf_calls["tf"] > 0)
+        gate = getattr(split, "K1_TRIGGER_FIRST_MIN_TOKENS", 4)
+        order_ok = all((v["trigger_first"] > 0) == (int(m) >= gate) and v["wait_first"] > 0
+                       for m, v in k1_order_per_m.items())
+        res["k1_order_ok"] = order_ok
+        res["passed"] = bool(res["passed"] and STATS["early"] > 0 and k1_tf_calls["tf"] > 0 and order_ok)
     res["compared"] = ("real DeepseekV41DecoderLayer chain (stand-in MoE AR early trigger, real A/B): "
                        + res.get("compared", ""))
     print(json.dumps(res))
