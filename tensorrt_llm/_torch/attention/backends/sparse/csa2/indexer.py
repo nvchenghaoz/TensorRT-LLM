@@ -73,6 +73,8 @@ from .kernel import (
     publish_candidates_,
 )
 from .metadata import CSA2TrtllmMetadata
+from .split_decode_replicate import replicate_split_queries
+from .split_decode_replicate import warm as replicate_split_queries_warm
 from .params import CSA2ForwardState, CSA2Layout, CSA2Mode, CSA2Params
 from .quantization import (
     INDEX_DATA_BYTES,
@@ -328,12 +330,20 @@ class CSA2Indexer(Indexer):
         reps = splits * block
         bounds = self._split_decode_bounds(rows, width, splits, q_data.device)
         # Materialized replicas: with one row, reshape of the expand is a stride-0 view.
-        q = q_data.view(torch.int8)
-        q = q[:, None].expand(rows, reps, heads, q.shape[2]).contiguous()
-        q = q.view(rows * reps, heads, q.shape[3])
         scale = q_scale.contiguous().view(torch.int32).reshape(rows, heads)
-        scale = scale[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
-        w = weights[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+        # CUDA-graph decode: one Triton launch writes the three replica buffers
+        # (raw-bit copies, the same bytes). Eager calls keep the ATen copies and
+        # only compile the kernel once per head count.
+        replicas = replicate_split_queries(q_data, scale, weights, reps)
+        if replicas is not None:
+            q, scale, w = replicas
+        else:
+            replicate_split_queries_warm(q_data, scale, weights, reps)
+            q = q_data.view(torch.int8)
+            q = q[:, None].expand(rows, reps, heads, q.shape[2]).contiguous()
+            q = q.view(rows * reps, heads, q.shape[3])
+            scale = scale[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+            w = weights[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
         out = _fp8_fp4_mqa_logits(
             (q, scale),
             (k_data.view(torch.int8), k_scale.contiguous().view(torch.int32).reshape(-1)),
