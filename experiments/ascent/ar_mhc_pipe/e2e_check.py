@@ -128,8 +128,24 @@ def reduce_rank(path):
                 j += 1
             overlap[s] = {"kernels": len(lst_s), "overlap_with_main_us": round(tot, 1),
                           "top": sorted({e["name"][:50] for e in lst_s})[:6]}
+        mhc_k = {}
+        for e in lst:
+            if "fused_pmap" in e["name"] or "mhcBigFuse" in e["name"]:
+                mhc_k[e["name"][:70]] = mhc_k.get(e["name"][:70], 0) + 1
+        comm_streams = [s for s in by_stream if s != main_stream and any("lowPrecision" in e["name"]
+                                                                         for e in by_stream[s])]
+        exposed = None
+        if comm_streams:
+            # exposed AR on the comm stream: its kernels minus their overlap with main-stream kernels (one stream,
+            # so the per-kernel intersections with main kernels sum to the intersection with their union)
+            cs = comm_streams[0]
+            tot = sum(e.get("dur", 0) for e in by_stream[cs])
+            exposed = {"comm_stream": cs, "main_stream": main_stream, "comm_kernel_us": round(tot, 1),
+                       "exposed_us": round(tot - overlap.get(cs, {}).get("overlap_with_main_us", 0.0), 1)}
+        main_lp_us = sum(e.get("dur", 0) for e in mains if "lowPrecision" in e["name"])
         steps.append({
-            "label": lab[1], "kernels": len(lst), "main_stream": main_stream,
+            "label": lab[1], "kernels": len(lst), "main_stream": main_stream, "mhc_kernels": mhc_k,
+            "comm_exposed": exposed, "main_stream_lp_us": round(main_lp_us, 1),
             "lp_twoshot": len(lp2), "lp_twoshot_by_stream": {s: sum(1 for e in lp2 if str(stream_of(e)) == s)
                                                              for s in by_stream},
             "lp_twoshot_us_median": sorted(e["dur"] for e in lp2)[len(lp2) // 2] if lp2 else None,
@@ -328,9 +344,10 @@ def main():
             if "error" in d:
                 census[rk] = d
                 continue
-            census[rk] = {"extend": [{k: s[k] for k in ("label", "lp_twoshot", "lp_twoshot_by_stream", "nccl_ar",
-                                                       "lamport", "comm_lp_preprocess_predecessor", "other_streams",
-                                                       "lp_twoshot_us_median", "main_stream")}
+            census[rk] = {"extend": [{k: s.get(k) for k in ("label", "lp_twoshot", "lp_twoshot_by_stream", "nccl_ar",
+                                                           "lamport", "comm_lp_preprocess_predecessor",
+                                                           "other_streams", "lp_twoshot_us_median", "main_stream",
+                                                           "mhc_kernels", "comm_exposed", "main_stream_lp_us")}
                                      for s in d["extend"]], "decode": d["decode"]}
         out["trace_on"] = census
         dec_ok = bool(census) and all(c.get("decode", {}).get("lp", 1) == 0 and c.get("decode", {}).get("lamport", 0) > 0

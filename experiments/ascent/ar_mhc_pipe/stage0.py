@@ -26,8 +26,8 @@ import bench  # noqa: E402
 
 HIDDEN = 5120
 WORLD = 4
-TS = [2048, 4096, 6144]
-KS = [1, 2, 3, 4]
+TS = [2048, 4096, 6144, 8192]
+KS_T = {2048: [2, 3, 4], 4096: [2, 3, 4], 6144: [2, 3, 4, 6], 8192: [2, 4, 8]}
 WARMUP, ITERS, SEQS = 20, 100, 3
 CKPT = os.environ.get("STAGE0_CKPT", "")
 
@@ -97,6 +97,57 @@ def _timeit(torch, fn, refill, sync_each=False):
     return {"us": med * 1e3, "seq_us": [v * 1e3 for v in seq_meds], "p10_us": flat[n // 10] * 1e3,
             "p90_us": flat[(9 * n) // 10] * 1e3, "noise_floor": (flat[(9 * n) // 10] - flat[n // 10]) / med,
             "host_us": sorted(host_meds)[SEQS // 2]}
+
+
+AR_KERNEL_RE = ("lowPrecision", "ncclDevKernel_AllReduce", "ncclKernel_AllReduce")
+
+
+def _exposed_ar(torch, fn, iters=6):
+    """exposed_ar_us per boundary call from a torch-profiler chain trace: every AR kernel interval (LP preprocess +
+    two-shot, or NCCL) minus its intersection with the UNION of the non-AR kernel intervals on the main stream."""
+    import tempfile
+
+    from torch.profiler import ProfilerActivity, profile
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as p:
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+    with tempfile.NamedTemporaryFile("r", suffix=".json", delete=True) as f:
+        p.export_chrome_trace(f.name)
+        evs = json.load(open(f.name)).get("traceEvents", [])
+    ks = [e for e in evs if isinstance(e, dict) and e.get("ph") == "X" and e.get("cat") == "kernel"]
+    if not ks:
+        return {"exposed_ar_us": None}
+    sid = lambda e: str((e.get("args") or {}).get("stream", e.get("tid")))  # noqa: E731
+    is_ar = lambda e: any(s in e.get("name", "") for s in AR_KERNEL_RE)  # noqa: E731
+    main_sid = str(torch.cuda.current_stream().stream_id)
+    comp = sorted([(e["ts"], e["ts"] + e["dur"]) for e in ks if not is_ar(e)])
+    by_stream = {}
+    for e in ks:
+        by_stream.setdefault(sid(e), []).append(e)
+    # main stream = the stream that runs the non-AR (mHC) kernels
+    comp_streams = {sid(e) for e in ks if not is_ar(e)}
+    union = []
+    for a, b in comp:
+        if union and a <= union[-1][1]:
+            union[-1][1] = max(union[-1][1], b)
+        else:
+            union.append([a, b])
+    ar_total, exposed = 0.0, 0.0
+    ar_streams = set()
+    for e in ks:
+        if not is_ar(e):
+            continue
+        ar_streams.add(sid(e))
+        a, b = e["ts"], e["ts"] + e["dur"]
+        ar_total += b - a
+        inter = sum(max(0.0, min(b, ub) - max(a, ua)) for ua, ub in union if ub > a and ua < b)
+        exposed += (b - a) - inter
+    return {"exposed_ar_us": exposed / iters, "ar_kernel_us": ar_total / iters, "ar_streams": sorted(ar_streams),
+            "main_streams": sorted(comp_streams), "torch_main_stream_id": main_sid, "iters": iters}
 
 
 def rank_stage0(env):
@@ -172,12 +223,14 @@ def rank_stage0(env):
             row = {}
             row["serial"] = _timeit(torch, lambda: mhc.fused_hc_lagged(ar(st.x), st.res, st.post, st.comb, st.pre,
                                                                          norm_weight=nw, norm_eps=neps), st.refill)
+            row["serial_exposed"] = _exposed_ar(torch, lambda: mhc.fused_hc_lagged(
+                ar(st.x), st.res, st.post, st.comb, st.pre, norm_weight=nw, norm_eps=neps))
             row["ar_full"] = _timeit(torch, lambda: ar(st.x), st.refill)
             y_full_keep = ar(st.x)
             row["mhc_full"] = _timeit(torch, lambda: mhc.fused_hc_lagged(y_full_keep, st.res, st.post, st.comb,
                                                                            st.pre, norm_weight=nw, norm_eps=neps),
                                       st.refill)
-            for k in KS[1:]:
+            for k in KS_T[T]:
                 bounds = arp.chunk_bounds(T, k)
                 if bounds is None or len(bounds) != k:
                     row[f"k{k}"] = {"not_evaluated": f"bounds={bounds}"}
@@ -185,6 +238,8 @@ def rank_stage0(env):
                 kr = {"bounds": bounds}
                 kr["pipelined"] = _timeit(torch, lambda: pipe.run(ar, mhc, st.x, st.res, st.post, st.comb, st.pre,
                                                                     nw, neps, bounds), st.refill)
+                kr["exposed"] = _exposed_ar(torch, lambda: pipe.run(ar, mhc, st.x, st.res, st.post, st.comb,
+                                                                      st.pre, nw, neps, bounds))
                 a0, b0 = bounds[0]
                 m = b0 - a0
                 kr["ar_chunk"] = _timeit(torch, lambda: ar(st.x[a0:b0]), st.refill)
@@ -221,7 +276,7 @@ def rank_stage0(env):
             if rank == 0:
                 s = row["serial"]
                 ks_txt = " ".join(f"k{k}={row[f'k{k}']['pipelined']['us']:.1f}(h{row[f'k{k}']['host_delta_us']:+.0f})"
-                                  for k in KS[1:] if "pipelined" in row[f"k{k}"])
+                                  for k in KS_T[T] if "pipelined" in row[f"k{k}"])
                 log(f"[stage0] {key} serial={s['us']:.1f}us host={s['host_us']:.0f} ar={row['ar_full']['us']:.1f} "
                     f"mhc={row['mhc_full']['us']:.1f} {ks_txt}")
             # ---- correctness (untimed): chunked-vs-full AR rows, mHC bitwise per row, pipelined vs serial
@@ -245,7 +300,7 @@ def rank_stage0(env):
                 d = li.float() - ref_out[4].float()
                 return (d.square().sum().sqrt() / ref_out[4].float().square().sum().sqrt()).item()
             ck["serial_layer_input_rel_rms_vs_fp32ar"] = li_err(full_out[4])
-            for k in KS[1:]:
+            for k in KS_T[T]:
                 bounds = arp.chunk_bounds(T, k)
                 if bounds is None or len(bounds) != k:
                     continue
@@ -316,7 +371,12 @@ def main():
             row[part + "_us"] = round(max(r["timing"][key][part]["us"] for r in rs), 1)
         row["serial_host_us_per_rank"] = [round(r["timing"][key]["serial"]["host_us"], 1) for r in rs]
         row["serial_noise"] = round(max(r["timing"][key]["serial"]["noise_floor"] for r in rs), 4)
-        for k in KS[1:]:
+        T = int(key.split("_")[-1])
+        se = [r["timing"][key]["serial_exposed"] for r in rs]
+        row["serial_exposed_ar_us_per_rank"] = [None if s["exposed_ar_us"] is None else round(s["exposed_ar_us"], 1)
+                                                for s in se]
+        row["exposed_streams_rank0"] = {"ar": se[0].get("ar_streams"), "main": se[0].get("main_streams")}
+        for k in KS_T[T]:
             kk = f"k{k}"
             if "pipelined" not in r0[kk]:
                 row[kk] = r0[kk]
@@ -332,7 +392,15 @@ def main():
                        "residual_vs_ideal_us": round(max(r["timing"][key][kk]["residual_vs_ideal_us"] for r in rs), 1),
                        "host_delta_us_per_rank": [round(r["timing"][key][kk]["host_delta_us"], 1) for r in rs],
                        "pipelined_host_us_per_rank": [round(r["timing"][key][kk]["pipelined"]["host_us"], 1)
-                                                      for r in rs]}
+                                                      for r in rs],
+                       "exposed_ar_us_per_rank": [
+                           None if r["timing"][key][kk]["exposed"]["exposed_ar_us"] is None
+                           else round(r["timing"][key][kk]["exposed"]["exposed_ar_us"], 1) for r in rs],
+                       "ar_kernel_us_per_rank": [
+                           None if r["timing"][key][kk]["exposed"].get("ar_kernel_us") is None
+                           else round(r["timing"][key][kk]["exposed"]["ar_kernel_us"], 1) for r in rs],
+                       "exposed_streams_rank0": {"ar": r0[kk]["exposed"].get("ar_streams"),
+                                                 "main": r0[kk]["exposed"].get("main_streams")}}
         row["check_rank0"] = rs[0]["check"][key]
         row["check_all_ranks_mhc_bitwise"] = all(
             all(v for v in r["check"][key][kk]["mhc_chunked_bitwise"].values())
@@ -352,9 +420,27 @@ def main():
     with open(os.path.join(art, "stage0_raw.json"), "w") as f:
         json.dump(rs, f, default=str)
     summ = {k: {kk: (v[kk]["pipelined_us"] if isinstance(v.get(kk), dict) and "pipelined_us" in v[kk] else None)
-                for kk in ("k2", "k3", "k4")} | {"serial_us": v["serial_us"]} for k, v in table["rows"].items()}
+                for kk in v if kk.startswith("k") and kk[1:].isdigit()} | {"serial_us": v["serial_us"]}
+            for k, v in table["rows"].items()}
+    # 4-rank synthetic chain bench estimate (ruling 3372 B1): L0-19 exposed AR per c1 request at T=2048 =
+    # 37 x pipelined exposed (best k, max over ranks; min-wait rank = the rank with the least exposed) + 3 x serial.
+    try:
+        r2 = table["rows"]["LP_2048"]
+        ks = [kk for kk in r2 if kk.startswith("k") and kk[1:].isdigit() and "exposed_ar_us_per_rank" in r2[kk]]
+        best = min(ks, key=lambda kk: max(r2[kk]["exposed_ar_us_per_rank"]))
+        ser_max, ser_min = max(r2["serial_exposed_ar_us_per_rank"]), min(r2["serial_exposed_ar_us_per_rank"])
+        table["per_request_T2048"] = {
+            "label": "4-rank synthetic chain bench estimate", "best_k": best,
+            "exposed_ar_ms_per_req_max_rank": round((37 * max(r2[best]["exposed_ar_us_per_rank"]) + 3 * ser_max) / 1e3, 2),
+            "exposed_ar_ms_per_req_min_rank": round((37 * min(r2[best]["exposed_ar_us_per_rank"]) + 3 * ser_min) / 1e3, 2),
+            "serial_exposed_ar_ms_per_req_max_rank": round(40 * ser_max / 1e3, 2)}
+    except Exception as exc:  # noqa: BLE001
+        table["per_request_T2048"] = {"error": repr(exc)[:200]}
+    with open(os.path.join(art, "stage0_table.json"), "w") as f:
+        json.dump(table, f, indent=1)
     wd.cancel()
-    print(json.dumps({"passed": passed, "head": head, "summary_us": summ}))
+    print(json.dumps({"passed": passed, "head": head, "summary_us": summ,
+                      "per_request_T2048": table.get("per_request_T2048")}))
 
 
 if __name__ == "__main__":
