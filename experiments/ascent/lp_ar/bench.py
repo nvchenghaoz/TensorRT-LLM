@@ -580,11 +580,131 @@ def main_pair():
                       "applied": res[0]["applied"]}))
 
 
+PAIR2_M = [16, 128, 2048, 4096, 6144]  # idea 345: 16/128 routing rows (AUTO/lamport), 2048-6144 prefill rows
+
+
+def rank_pair2(env):
+    """Idea 345 kernel_time pair: the served strategy of this tree through the real tensorrt_llm AllReduce op."""
+    wd = _watchdog("rank-pair2", 1500)
+    torch, rank, mapping, applied = _setup(env)
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+    dev = torch.device("cuda", rank)
+    strat = getattr(AllReduceStrategy, env["_strategy"])
+    AutoTuner.get().setup_distributed_state(mapping)
+    ar = AllReduce(mapping=mapping, strategy=strat, dtype=torch.bfloat16)
+    with autotune():
+        for m in PAIR2_M:
+            ar(torch.randn((m, HIDDEN), dtype=torch.bfloat16, device=dev))
+    torch.cuda.synchronize()
+    _barrier()
+    res = {"rank": rank, "applied": applied, "strategy": env["_strategy"], "timing": {}, "err": {}, "kernels": {}}
+    for m in PAIR2_M:
+        graph = m <= 16
+        run = Runner(torch, mapping, strat, m, graph=graph)
+        t = _time(torch, run, m, rank, dev)
+        res["timing"][str(m)] = t
+        # untimed: every one of WARMUP+ITERS calls checked against the fp32 sum (fresh seeded input each call)
+        worst = {"e": 0.0, "rel_rms": 0.0, "nonfinite": 0}
+        for it in range(WARMUP + ITERS):
+            run.x.copy_(_gen(torch, m, it + 1, rank, dev))
+            out = run().clone()
+            ref, absum = _ref(torch, m, it + 1, dev)
+            r = _err(torch, out, ref, absum)
+            worst["e"] = max(worst["e"], r["e"])
+            worst["rel_rms"] = max(worst["rel_rms"], r["rel_rms"])
+            worst["nonfinite"] += int(not r["finite"])
+        run.x.copy_(_gen(torch, m, 1, rank, dev))
+        a = run().clone()
+        b = run().clone()
+        torch.cuda.synchronize()
+        worst["deterministic"] = bool(torch.equal(a, b))
+        res["err"][str(m)] = worst
+        er = Runner(torch, mapping, strat, m, graph=False)
+        if rank == 0:
+            res["kernels"][str(m)] = _kernel_names(torch, er)
+        else:
+            er()
+        torch.cuda.synchronize()
+        if rank == 0:
+            log(f"[pair2:{env['_strategy']}] m={m} graph={graph} med={t['median_ms']*1e3:.1f}us "
+                f"nf={t['noise_floor']:.3f} seqs={[round(v*1e3,1) for v in t['seq_medians_ms']]} "
+                f"rel_rms={worst['rel_rms']:.3g} e={worst['e']:.3g} det={worst['deterministic']} "
+                f"kernels={res['kernels'][str(m)]}")
+        del run, er
+        _barrier()
+    _barrier()
+    wd.cancel()
+    return res
+
+
+def _clock_sampler(stop, samples):
+    while not stop.is_set():
+        out = sh(["nvidia-smi", "--query-gpu=uuid,clocks.sm,temperature.gpu,power.draw,utilization.gpu,"
+                  "clocks_throttle_reasons.active", "--format=csv,noheader,nounits"])
+        for line in out.strip().splitlines():
+            p = [x.strip() for x in line.split(",")]
+            if len(p) >= 6:
+                samples.append(p)
+        stop.wait(2.0)
+
+
+def main_pair2():
+    wd = _watchdog("driver", 1700)
+    log(_gpu_state())
+    log(sh(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory", "--format=csv"]))
+    log(f"[pair2] host={sh(['hostname']).strip()} CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
+        f"load={os.getloadavg()}")
+    tree = os.getcwd()
+    strategy = _served_strategy(tree)
+    head = sh(["git", "-C", tree, "rev-parse", "HEAD"]).strip()
+    log(f"[pair2] tree={tree} head={head} served allreduce_strategy={strategy}")
+    stop, samples = threading.Event(), []
+    th = threading.Thread(target=_clock_sampler, args=(stop, samples), daemon=True)
+    th.start()
+    res = run_ranks(rank_pair2, {"_name": "pair2", "_apply_nccl_tuning": "1", "_strategy": strategy})
+    stop.set()
+    th.join(timeout=10)
+    log(_gpu_state())
+    clocks = {}
+    for p in samples:
+        try:
+            c, util = int(float(p[1])), int(float(p[4]))
+        except ValueError:
+            continue
+        d = clocks.setdefault(p[0], {"sm_min_busy": None, "sm_max": 0, "n": 0, "throttle": set()})
+        d["n"] += 1
+        d["sm_max"] = max(d["sm_max"], c)
+        if util > 0:
+            d["sm_min_busy"] = c if d["sm_min_busy"] is None else min(d["sm_min_busy"], c)
+        d["throttle"].add(p[5])
+    for d in clocks.values():
+        d["throttle"] = sorted(d["throttle"])
+    batch = {}
+    for m in res[0]["timing"]:
+        batch[m] = {"kernel_ms": max(r["timing"][m]["median_ms"] for r in res),
+                    "noise_floor": max(r["timing"][m]["noise_floor"] for r in res),
+                    "seq_dispersion": max(r["timing"][m]["seq_dispersion"] for r in res),
+                    "per_rank_median_ms": [r["timing"][m]["median_ms"] for r in res],
+                    "graph": int(m) <= 16}
+    err = {m: {"rel_rms": max(r["err"][m]["rel_rms"] for r in res), "e": max(r["err"][m]["e"] for r in res),
+               "nonfinite_calls": sum(r["err"][m]["nonfinite"] for r in res),
+               "deterministic": all(r["err"][m]["deterministic"] for r in res),
+               "calls_checked_per_rank": WARMUP + ITERS} for m in res[0]["err"]}
+    cls = "precision" if strategy == "LOWPRECISION" else "exact"
+    wd.cancel()
+    print(json.dumps({"batch": batch, "output": {"class": cls, "error_vs_fp32_sum": err},
+                      "strategy": strategy, "head": head, "kernels_rank0": res[0]["kernels"],
+                      "sm_clocks_by_uuid": clocks, "applied": res[0]["applied"]}))
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "sweep"
     if mode == "sweep":
         main_sweep()
     elif mode == "pair":
         main_pair()
+    elif mode == "pair2":
+        main_pair2()
     else:
         raise SystemExit(f"unknown mode {mode}")
