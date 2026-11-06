@@ -232,6 +232,8 @@ def arm_list():
     if sel:
         keep = set(sel.split(";"))
         arms = [a for a in arms if a[0] in keep or a[0] == "base"]
+    if os.environ.get("L2PF_WITH_DEFAULT") == "1":
+        arms.append(("default", "1"))
     return arms
 
 
@@ -318,6 +320,20 @@ def stamp_summary(dbg, grid):
 def mode_arms(ch, gen):
     table = {}
     for m in MS:
+        try:
+            table[str(m)] = _arms_one_m(ch, gen, m)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            log(f"M={m} arms FAILED: {traceback.format_exc()}")
+            table[str(m)] = {"error": repr(e)[:500]}
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    os.environ["TRTLLM_CSA2_QB_L2PF"] = "1"
+    return {"arms": table}
+
+
+def _arms_one_m(ch, gen, m):
+    if True:
         inp = ch.inputs(m, gen)
         graphs, kin, stamps = {}, {}, {}
         cfg = ch.L.chain_a_config_for(A_N, HIDDEN, m)
@@ -345,11 +361,9 @@ def mode_arms(ch, gen):
             log(f"M={m} {name:16s} {times[name]['us']:7.3f} us/layer ({row[name]['delta_us_layer']:+.3f}) "
                 f"p10 {times[name]['p10']:.3f} p90 {times[name]['p90']:.3f} kin {json.dumps(kin[name])} "
                 f"stamps {json.dumps(stamps[name])}")
-        table[str(m)] = row
         del graphs
         torch.cuda.empty_cache()
-    os.environ["TRTLLM_CSA2_QB_L2PF"] = "1"
-    return {"arms": table}
+        return row
 
 
 def mode_pair(ch, gen):
@@ -426,6 +440,25 @@ def main():
         log(f"{'indexer' if ix else 'plain'}: A+B weight+SF {wb / 1e6:.2f} MB floor {wb / (DRAM_GBPS * 1e3):.2f} us")
     if mode == "arms":
         out = mode_arms(ch, gen)
+    elif mode == "s1check":
+        # one job: S0 table, S1 arms table (incl. the shipped per-M default), then the untimed bitwise checks in
+        # a child (PDL on, plus its TRTLLM_ENABLE_PDL=0 grandchild). passed = the checks.
+        occ = occupancy_table(ch.L)
+        log(f"S0 occupancy {json.dumps(occ)}")
+        arms = mode_arms(ch, gen)
+        env = dict(os.environ, L2PF_MS=os.environ.get("L2PF_CHECK_MS", "1,2,3,4,8"), L2PF_ARMS="PF0_f256_pl")
+        env.pop("TRTLLM_CSA2_QB_L2PF", None)
+        env.pop("L2PF_WITH_DEFAULT", None)
+        log("child: check (PDL on, then its TRTLLM_ENABLE_PDL=0 child)")
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), "check"], env=env, capture_output=True,
+                           text=True, timeout=2400)
+        sys.stdout.write(p.stdout[-8000:])
+        sys.stdout.flush()
+        try:
+            child = json.loads(p.stdout.strip().splitlines()[-1])
+        except Exception:  # noqa: BLE001
+            child = {"passed": False, "rc": p.returncode, "stderr": p.stderr[-3000:]}
+        out = {"passed": bool(child.get("passed")), "check": child, "s0_occupancy": occ, "s1": arms}
     elif mode == "pairchk":
         # candidate arm of the final pair, one job: S0 table, the timing (tree default), then the untimed bitwise
         # checks in children (PDL on with its own TRTLLM_ENABLE_PDL=0 grandchild), so a check failure cannot hide
