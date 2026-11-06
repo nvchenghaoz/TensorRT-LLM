@@ -42,6 +42,21 @@ class CustomAllReduceHelper:
 
     POINTERS_PER_RANK = 7
     POINTERS_OF_COUNTER = 3
+    # Max grid of lowPrecisionTwoShotAllReduceKernel; mirrors LP_TWOSHOT_MAX_CTAS in
+    # cpp/tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h.
+    LP_TWOSHOT_MAX_CTAS = 128
+
+    @staticmethod
+    def lowprecision_barrier_bytes(tp_size: int) -> int:
+        """Bytes of each LOWPRECISION barrier IPC buffer (ipc_barriers_in/out) per rank.
+
+        The two-shot kernel uses uint64 flags [0, tp) for its entry barrier and tp + b * tp + r for block b's
+        inter-stage barrier, so it needs tp * (1 + LP_TWOSHOT_MAX_CTAS) uint64 flags. Never below the old size.
+        """
+        return max(
+            IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * tp_size * 2,
+            (1 + CustomAllReduceHelper.LP_TWOSHOT_MAX_CTAS) * tp_size * 8,
+        )
 
     @staticmethod
     def max_workspace_size_auto(tp_size: int, support_deterministic=True) -> int:
@@ -100,12 +115,9 @@ class CustomAllReduceHelper:
         ipc_buffers_size = size
         ipc_buffers_ping = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported)
         ipc_buffers_pong = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported)
-        ipc_barriers_in = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2, is_p2p_supported
-        )
-        ipc_barriers_out = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2, is_p2p_supported
-        )
+        barrier_bytes = CustomAllReduceHelper.lowprecision_barrier_bytes(mapping.tp_size)
+        ipc_barriers_in = IpcMemory(mapping, barrier_bytes, is_p2p_supported)
+        ipc_barriers_out = IpcMemory(mapping, barrier_bytes, is_p2p_supported)
         buffers = [ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in, ipc_barriers_out]
 
         return buffers, torch.tensor(

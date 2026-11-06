@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include <cooperative_groups.h>
+#include <cstdlib>
 #include <tuple>
 #include <type_traits>
 
@@ -1252,6 +1253,24 @@ static __global__ __launch_bounds__(512, 1) void lowPrecisionTwoShotHierAllReduc
     }
 }
 
+// CTAs of lowPrecisionTwoShotAllReduceKernel. TRTLLM_LP_AR_TWOSHOT_CTAS (read on every call, so a sweep can change it
+// between calls; it must be the same on every rank) overrides LP_TWOSHOT_DEFAULT_CTAS, clamped to
+// [1, LP_TWOSHOT_MAX_CTAS].
+static int lowPrecisionTwoShotCtas()
+{
+    int ctas = LP_TWOSHOT_DEFAULT_CTAS;
+    char const* env = std::getenv("TRTLLM_LP_AR_TWOSHOT_CTAS");
+    if (env != nullptr && env[0] != '\0')
+    {
+        int const v = std::atoi(env);
+        if (v >= 1)
+        {
+            ctas = v;
+        }
+    }
+    return ctas < LP_TWOSHOT_MAX_CTAS ? ctas : LP_TWOSHOT_MAX_CTAS;
+}
+
 template <typename T, typename QUANT_T, int RANKS_PER_NODE>
 void lowPrecisionAllReduceDispatchRanksPerNode(kernels::LowPrecisionAllReduceParams& params, cudaStream_t stream)
 {
@@ -1261,7 +1280,7 @@ void lowPrecisionAllReduceDispatchRanksPerNode(kernels::LowPrecisionAllReducePar
     if (RANKS_PER_NODE <= 4)
     {
 
-        int blocks_per_grid = LP_ALLREDUCE_MAX_BLOCKS * 2, threads_per_block = LP_ALLREDUCE_DEFAULT_BLOCK_SIZE;
+        int blocks_per_grid = lowPrecisionTwoShotCtas(), threads_per_block = LP_ALLREDUCE_DEFAULT_BLOCK_SIZE;
 
         params.elts_per_rank = params.elts_total / RANKS_PER_NODE;
         params.rank_offset = params.rank * params.elts_per_rank;
@@ -1272,6 +1291,11 @@ void lowPrecisionAllReduceDispatchRanksPerNode(kernels::LowPrecisionAllReducePar
 
         params.buffer_offset = my_rank * elts_per_block_with_scale * num_rounds_per_rank;
         params.buffer_elts_per_rank = elts_per_block_with_scale * num_rounds_per_rank;
+        // A block covers elts_per_block per pass; more blocks than passes would only add barrier traffic.
+        if (static_cast<size_t>(blocks_per_grid) > num_rounds_per_rank)
+        {
+            blocks_per_grid = static_cast<int>(num_rounds_per_rank);
+        }
         lowPrecisionPreprocessKernel<RANKS_PER_NODE, T, QUANT_T>
             <<<num_rounds_per_rank * RANKS_PER_NODE, threads_per_block, 0, stream>>>(
                 (T const*) params.local_input_buffer_ptr, params.elts_per_rank, params.buffer_elts_per_rank,

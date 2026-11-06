@@ -57,6 +57,9 @@ if _MNNVL_ONE_SHOT_THRESHOLD_BYTES < 0:
         "TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES must be a non-negative integer, got "
         f"{_MNNVL_ONE_SHOT_THRESHOLD_BYTES}")
 
+# LOWPRECISION's minimum message size; mirrors LowPrecisionMinMessageSize in thop/allreduceOp.cpp.
+_LOWPRECISION_MIN_MESSAGE_BYTES = 2 * 1024 * 1024
+
 _thread_local = threading.local()
 
 # Mirrored by the autotune context so Dynamo can guard this branch without
@@ -1417,8 +1420,9 @@ class AllReduce(nn.Module):
 
             # Initialize MNNVL if using AUTO or MNNVL strategy
             if self.strategy in (AllReduceStrategy.AUTO,
-                                 AllReduceStrategy.MNNVL):
-                # Try to initialize MNNVL
+                                 AllReduceStrategy.MNNVL,
+                                 AllReduceStrategy.LOWPRECISION):
+                # Try to initialize MNNVL (LOWPRECISION keeps AUTO's paths below its size threshold)
                 if MNNVLAllReduce.is_mnnvl(self.mapping,
                                            dtype,
                                            explicitly_requested=self.strategy ==
@@ -1470,7 +1474,8 @@ class AllReduce(nn.Module):
         """
         return (_NCCL_SYMMETRIC_ZERO_COPY and self.strategy
                 in (AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL,
-                    AllReduceStrategy.AUTO) and self.mapping.tp_size > 1
+                    AllReduceStrategy.AUTO, AllReduceStrategy.LOWPRECISION)
+                and self.mapping.tp_size > 1
                 and not self._disable_mpi)
 
     @property
@@ -1586,6 +1591,12 @@ class AllReduce(nn.Module):
         if (allreduce_strategy == AllReduceStrategy.NCCL_SYMMETRIC
                 and exclude_nccl_symmetric):
             allreduce_strategy = AllReduceStrategy.NCCL
+        # LOWPRECISION runs only at or above its message-size threshold (allreduceOp.cpp isUsingLowPrecision);
+        # smaller messages (decode, replay-window rows) keep AUTO's tactic selection exactly as without it.
+        if (allreduce_strategy == AllReduceStrategy.LOWPRECISION
+                and input.numel() * input.element_size()
+                < _LOWPRECISION_MIN_MESSAGE_BYTES):
+            allreduce_strategy = AllReduceStrategy.AUTO
 
         additional_args = {}
         if self._disable_mpi:
