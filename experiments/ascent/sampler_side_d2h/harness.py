@@ -146,6 +146,14 @@ class Rig:
         self.ev1 = torch.cuda.Event()
         log(f"rig: dummy {self.n_dummy} x mul_ ({per * self.n_dummy:.2f} ms)")
 
+    def reset(self):
+        """Reset point: rewind the logits-bank position so every sequence sees the
+        same logits from step 0 (device counter and host mirror)."""
+        torch.cuda.synchronize()
+        self.pos.zero_()
+        self.pos_host = 0
+        torch.cuda.synchronize()
+
     def forward(self, sampler, B, slots_dev, start_ev, end_ev):
         """_forward_step ordering: event0 on current -> exe waits -> prep + replay -> event1."""
         new_tokens_flat = sampler.store.new_tokens[0, :, 0]
@@ -285,6 +293,7 @@ def check():
         log(f"env={env}: side-stream flag on sampler = "
             f"{getattr(sampler, '_side_stream_new_tokens_d2h', None)}")
         for name, phases in [(f"B{B}", seq_for(B)) for B in BATCHES] + [("batch_change", change)]:
+            rig.reset()
             _, st = run_sequence(rig, sampler, phases, check=True)
             toks[(env, name)] = st.pop("tokens")
             want_side = st["steps"] if env == "1" else 0
