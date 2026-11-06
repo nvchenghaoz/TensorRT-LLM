@@ -180,9 +180,61 @@ def mode_time(args):
         del graphs, chain
         torch.cuda.empty_cache()
     (C.ART / "table332.json").write_text(json.dumps(table, indent=1))
+    hashes = hash_children(args) if args.hash_children else None
     print(json.dumps({"batch": batch, "entry_tree": ENTRY, "reported_arm": "A1" if ENTRY else "A0",
+                      "output_sha256": hashes,
                       "default_counts": sorted(CD._BODY_TRIGGER_ENTRY_COUNTS) if ENTRY else None,
                       "layers": len(C.LAYERS), "lease": C.lease_info(), "output": {"class": "exact"}}))
+
+
+HASH_ENVS = (("default", {}), ("f32_partials0", {"TRTLLM_CSA2_CAKE_F32_PARTIALS": "0"}),
+             ("enable_pdl0", {"TRTLLM_ENABLE_PDL": "0"}), ("attn_pdl0", {"TRTLLM_CSA2_ATTN_PDL": "0"}))
+
+
+def mode_hash(args):
+    """sha256 of every output of one graph replay per arm (seeded inputs): equal across trees == bitwise."""
+    import hashlib
+    world = C.World(args.ckpt)
+    arms = ["A0", "A1", "A2"] if ENTRY else ["A0"]
+    out = {}
+    for count in [int(c) for c in args.counts.split(",")]:
+        chain = C.Chain(world, count, seed=count)
+        row = {}
+        for arm in arms:
+            g, outs = capture_arm(chain, arm)
+            hs = []
+            for _ in range(2):
+                chain.poison(outs)
+                C.flush()
+                g.replay()
+                torch.cuda.synchronize()
+                h = hashlib.sha256()
+                for o, L in zip(outs, chain.layers):
+                    h.update(L["out"].contiguous().view(torch.uint8).cpu().numpy().tobytes())
+                    h.update(o.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+                hs.append(h.hexdigest()[:16])
+            row[arm] = hs[0] if hs[0] == hs[1] else f"NONDET {hs}"
+            del g, outs
+        out[str(count)] = row
+        del chain
+        torch.cuda.empty_cache()
+    print(json.dumps({"passed": True, "hash": out}))
+
+
+def hash_children(args):
+    import subprocess
+    import sys
+    res = {}
+    for tag, env in HASH_ENVS:
+        cmd = [sys.executable, os.path.abspath(__file__), "hash", args.ckpt, "--counts", args.counts]
+        p = subprocess.run(cmd, env={**os.environ, **env}, capture_output=True, text=True)
+        lines = [ln for ln in p.stdout.splitlines() if ln.startswith("{")]
+        try:
+            res[tag] = json.loads(lines[-1])["hash"]
+        except Exception:  # noqa: BLE001
+            res[tag] = {"error": p.returncode, "stderr_tail": p.stderr[-1500:]}
+        log(f"hash {tag} {env}: {json.dumps(res[tag])}")
+    return res
 
 
 def compare(chain, outs, ref_res, ref_att):
@@ -381,7 +433,7 @@ def mode_check(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["time", "check"])
+    ap.add_argument("mode", choices=["time", "check", "hash"])
     ap.add_argument("ckpt", nargs="?", default="")
     ap.add_argument("--counts", default="1,2,4,8")
     ap.add_argument("--warmup", type=int, default=10)
@@ -391,5 +443,6 @@ if __name__ == "__main__":
     ap.add_argument("--with-a2", action="store_true")
     ap.add_argument("--arms", default="")
     ap.add_argument("--children", action="store_true")
+    ap.add_argument("--hash-children", action="store_true")
     a = ap.parse_args()
-    {"time": mode_time, "check": mode_check}[a.mode](a)
+    {"time": mode_time, "check": mode_check, "hash": mode_hash}[a.mode](a)

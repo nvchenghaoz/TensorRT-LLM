@@ -37,6 +37,24 @@ _HEAD_DIM = 512
 # counts above the last bucket keep the plain `default` body.
 _F32_FOLD_BUCKETS = ((16, "sa+pw+lq+el"),)
 
+# Decode counts whose fp32-partials Cake decode body (`default`, or the h16 `sa+lq+el` / `sa+pw+lq+el`
+# fold render) fires its PDL trigger on entry (binding ``enable_pdl`` bit 2), so the PDL merge and
+# csa2_lowm_wo_a behind it launch while the body runs. Launch timing only (every dependent waits for
+# the whole body grid before it reads or writes global memory). TRTLLM_CSA2_CAKE_BODY_TRIGGER_ENTRY=1 / =0
+# forces it on / off for every count.
+_BODY_TRIGGER_ENTRY_COUNTS: frozenset[int] = frozenset(range(1, 9))
+_BODY_TRIGGER_ENTRY_VARIANTS = frozenset(("default", "sa+lq+el", "sa+pw+lq+el"))
+
+
+def _body_trigger_entry_mode(value: bool | None) -> bool | None:
+    """None = per-count default (``_BODY_TRIGGER_ENTRY_COUNTS``), True/False = forced."""
+    if value is not None:
+        return bool(value)
+    env = os.environ.get("TRTLLM_CSA2_CAKE_BODY_TRIGGER_ENTRY", "")
+    if env == "":
+        return None
+    return env != "0"
+
 
 # Every runtime argument stays unspecialized: eager mixed steps see new batch shapes
 # (page-table rows, slice offsets), and a value/alignment specialization would JIT a
@@ -297,7 +315,12 @@ class CakeDecode:
     split sink path. Off, the stock BF16 partials and dispatched variant run.
     """
 
-    def __init__(self, f32_partials: bool | None = None, f32_variant: str | None = None) -> None:
+    def __init__(
+        self,
+        f32_partials: bool | None = None,
+        f32_variant: str | None = None,
+        body_trigger_entry: bool | None = None,
+    ) -> None:
         self._buffers: dict[tuple, dict[str, torch.Tensor]] = {}
         if f32_partials is None:
             f32_partials = os.environ.get("TRTLLM_CSA2_CAKE_F32_PARTIALS", "1") != "0"
@@ -305,6 +328,15 @@ class CakeDecode:
         if f32_variant is None:
             f32_variant = os.environ.get("TRTLLM_CSA2_CAKE_F32_VARIANT", "auto")
         self.f32_variant = str(f32_variant)
+        self.body_trigger_entry = _body_trigger_entry_mode(body_trigger_entry)
+
+    def _entry_trigger_bit(self, count: int, heads: int, plan, enable_pdl) -> int:
+        """Binding enable_pdl bit 2: only fp32-partials calls on the bodies that take it, PDL on."""
+        if not enable_pdl or not self._use_f32(heads) or plan.variant not in _BODY_TRIGGER_ENTRY_VARIANTS:
+            return 0
+        mode = self.body_trigger_entry
+        on = (count in _BODY_TRIGGER_ENTRY_COUNTS) if mode is None else mode
+        return 4 if on else 0
 
     def _f32_variant_for(self, count: int, has_main: bool) -> str:
         """The exact Cake render that writes the fp32 partials for one 16-head call.
@@ -427,7 +459,9 @@ class CakeDecode:
                 plan.hb_major,
                 float(scale),
                 1.0,
-                int(bool(enable_pdl)) | (2 if pdl_consumer else 0),
+                int(bool(enable_pdl))
+                | (2 if pdl_consumer else 0)
+                | self._entry_trigger_bit(count, heads, plan, enable_pdl),
             )
             return out
         variant = self._f32_variant_for(count, has_main) if self._use_f32(heads) else None
