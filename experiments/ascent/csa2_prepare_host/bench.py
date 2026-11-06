@@ -352,6 +352,21 @@ def run_diag(rig):
                         idle, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
 
     hs.copy_host_to_device = timed
+    orig_packed = getattr(hs, "copy_packed_host_to_device", None)
+    if orig_packed is not None:
+        def timed_packed(store, key, destination, nbytes, fill):
+            idle = torch.cuda.current_stream().query()
+            ring = store.get((key, torch.uint8))
+            event = None if ring is None else ring["events"][ring["next"]]
+            t0 = time.perf_counter()
+            if event is not None:
+                event.synchronize()
+            t1 = time.perf_counter()
+            orig_packed(store, key, destination, nbytes, fill)
+            t2 = time.perf_counter()
+            records.append((f"{key}(packed)", nbytes, True, idle, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
+
+        hs.copy_packed_host_to_device = timed_packed
     orig_flush = mdmod._CoalescedUploads.flush
 
     def flush(self):
@@ -385,6 +400,8 @@ def run_diag(rig):
                         f"wait {wait_ms:.3f} copy {copy_ms:.3f}")
             out[f"{shape}_{i}"] = {"a_ms": ta, "b_ms": tb}
     hs.copy_host_to_device = orig
+    if orig_packed is not None:
+        hs.copy_packed_host_to_device = orig_packed
     return out
 
 
