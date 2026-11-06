@@ -48,12 +48,28 @@ def tree_flag():
 def model_dims(ckpt):
     V, H, dt = 129280, 4096, torch.bfloat16
     hc = 4
+    def find(d, key):
+        if isinstance(d, dict):
+            if key in d and isinstance(d[key], int):
+                return d[key]
+            for v in d.values():
+                r = find(v, key)
+                if r is not None:
+                    return r
+        return None
+
     try:
         with open(os.path.join(ckpt, "config.json")) as f:
             cfg = json.load(f)
-        V = int(cfg["vocab_size"])
-        H = int(cfg["hidden_size"])
-        hc = int(cfg.get("hc_mult", 4))
+        log("config.json top-level keys:", sorted(cfg.keys())[:60])
+        v, h, m = find(cfg, "vocab_size"), find(cfg, "hidden_size"), find(cfg, "hc_mult")
+        if v is None:
+            v = find(cfg, "n_vocab") or find(cfg, "vocab")
+        if h is None:
+            h = find(cfg, "dim") or find(cfg, "d_model")
+        log(f"config.json: vocab_size={v} hidden_size={h} hc_mult={m}")
+        V, H = int(v or V), int(h or H)
+        hc = int(m or hc)
     except Exception as e:  # noqa: BLE001
         log("config.json not read, using defaults:", repr(e))
     return V, H, hc, dt

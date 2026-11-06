@@ -2,12 +2,14 @@
 main's masked lookup (get_masked_input_and_mask + F.embedding + masked_fill_) and an
 independent torch reference, for ids in range and out of range (-1, V, V+7, INT32_MIN,
 INT32_MAX, and for int64 also +-2^40, INT64_MIN/MAX), int32 and int64 ids,
-M = 1/2/4/8/2048, PDL on and off, eager and CUDA-graph replay.
+M = 1/2/4/8/2048, PDL on and off, eager and CUDA-graph replay, at the checkpoint's
+vocab_size x hidden_size and at the bench's 129280 x 4096.
 
-Every iteration is checked, not only the first. Eager: before each call the caching
-allocator is seeded with a NaN block of the output's size (poison). Graph: before each
-replay the captured output buffers (embedding and mHC seed) are filled with NaN and new
-ids are copied into the static id buffer. The table is checked unchanged at the end.
+Every iteration is checked, not only the first (WARMUP + ITERS, all compared). Poison
+alternates a finite sentinel (-7.25) and NaN. Eager: before each call the caching
+allocator is seeded with a poisoned block of the output's size. Graph: before each replay
+the captured output buffers (embedding and mHC seed) are filled with the poison and new ids
+are copied into the static id buffer. The table is checked unchanged at the end.
 Usage: check.py <checkpoint>
 """
 import json
@@ -22,6 +24,7 @@ from common import ckpt_arg, log, make_embedding, model_dims, nvsmi, tree_flag  
 I32_MIN, I32_MAX = -2**31, 2**31 - 1
 I64_MIN, I64_MAX = -2**63, 2**63 - 1
 WARMUP, ITERS = 3, 12
+POISONS = (-7.25, float("nan"))
 
 
 def specials(V, dtype):
@@ -75,21 +78,8 @@ def compare(name, got, want, fails, errs):
         fails.append(f"{name}: {n_bad} differing bf16 words, max abs err {err}")
 
 
-def main():
-    nvsmi()
-    flag, path, call = tree_flag()
-    V, H, hc, dt = model_dims(ckpt_arg())
-    log(f"tree file {path}; ctor Embedding{call}; use_gather_kernel={flag}")
-    log(f"V={V} H={H} hc_mult={hc} dtype={dt}")
-    fails = []
-    if not flag:
-        fails.append("DeepseekV4Model.__init__ does not pass use_gather_kernel=True")
-    os.environ["TRTLLM_DSV4_EMBED_GATHER"] = "0"
-    flag_off = tree_flag()[0]
-    os.environ.pop("TRTLLM_DSV4_EMBED_GATHER")
-    log(f"kill switch TRTLLM_DSV4_EMBED_GATHER=0 -> use_gather_kernel={flag_off}")
-    if flag_off:
-        fails.append("TRTLLM_DSV4_EMBED_GATHER=0 does not restore the masked lookup")
+def run_dims(V, H, hc, dt, fails, stats):
+    log(f"=== V={V} H={H} hc_mult={hc} dtype={dt} ===")
     torch.manual_seed(0)
     w = torch.randn(V, H, dtype=dt, device="cuda")
     w_sum = bits(w).to(torch.int64).sum().item()
@@ -98,8 +88,8 @@ def main():
     gath = make_embedding(V, H, dt, True, weight=w)  # this branch's path
     mask = make_embedding(V, H, dt, False, weight=w)  # main's masked path
     gen = torch.Generator().manual_seed(1234)
-    stats = {}
     n_cmp = 0
+    pre = f"V{V}_H{H}_"
 
     # ---- eager, every iteration poisoned and compared ----
     for pdl in ("1", "0"):
@@ -111,18 +101,19 @@ def main():
                     ids = make_ids(M, V, idt, it, gen)
                     if it == WARMUP + ITERS - 1 and M == 8:
                         ids = ids.view(2, 4)  # [batch, seq] shaped input too
-                    poison = torch.full((ids.numel(), H), float("nan"), dtype=dt, device="cuda")
+                    poison = torch.full((ids.numel(), H), POISONS[it % 2], dtype=dt,
+                                        device="cuda")
                     del poison
                     got = gath(ids)
                     base = mask(ids)
                     ref = reference(ids, w)
                     torch.cuda.synchronize()
-                    tag = f"eager pdl={pdl} M={M} {str(idt)[6:]} it={it}"
+                    tag = f"{pre}eager pdl={pdl} M={M} {str(idt)[6:]} it={it}"
                     compare(tag + " gather~ref", got, ref, fails, errs)
                     compare(tag + " gather~masked", got, base, fails, errs)
                     compare(tag + " masked~ref", base, ref, fails, [])
                     n_cmp += 1
-                key = f"eager_pdl{pdl}_M{M}_{str(idt)[6:]}"
+                key = f"{pre}eager_pdl{pdl}_M{M}_{str(idt)[6:]}"
                 stats[key] = max(errs)
                 log(f"{key}: {WARMUP + ITERS} iterations, max abs err per iteration "
                     f"{[round(e, 6) for e in errs[::2]]}")
@@ -150,13 +141,13 @@ def main():
             for it in range(WARMUP + ITERS):
                 static_ids.copy_(make_ids(M, V, idt, it, gen))
                 for name, (g, e, seed) in graphs.items():
-                    e.fill_(float("nan"))
-                    seed.fill_(float("nan"))
+                    e.fill_(POISONS[it % 2])
+                    seed.fill_(POISONS[(it + 1) % 2])
                     g.replay()
                 torch.cuda.synchronize()
                 ref = reference(static_ids, w)
                 ref_seed = ref.unsqueeze(1).repeat(1, hc, 1)
-                tag = f"graph M={M} {str(idt)[6:]} it={it}"
+                tag = f"{pre}graph M={M} {str(idt)[6:]} it={it}"
                 ge, gs = graphs["gather"][1], graphs["gather"][2]
                 me, ms = graphs["masked"][1], graphs["masked"][2]
                 compare(tag + " gather~ref", ge, ref, fails, errs)
@@ -164,24 +155,51 @@ def main():
                 compare(tag + " seed gather~ref", gs, ref_seed, fails, errs)
                 compare(tag + " seed gather~masked", gs, ms, fails, errs)
                 n_cmp += 1
-            key = f"graph_M{M}_{str(idt)[6:]}"
+            key = f"{pre}graph_M{M}_{str(idt)[6:]}"
             stats[key] = max(errs)
-            log(f"{key}: captured+replayed {WARMUP + ITERS}x, max abs err "
-                f"{max(errs)}")
+            log(f"{key}: captured+replayed {WARMUP + ITERS}x, max abs err {max(errs)}")
             del graphs
             torch.cuda.synchronize()
 
     # ---- the table must be untouched ----
     if (bits(w).to(torch.int64).sum().item() != w_sum or not torch.equal(w[:4], w_head)
             or not torch.equal(w[-4:], w_tail)):
-        fails.append("embedding table changed")
+        fails.append(f"{pre}embedding table changed")
+    del gath, mask, w
+    torch.cuda.empty_cache()
+    return n_cmp
+
+
+def main():
+    nvsmi()
+    flag, path, call = tree_flag()
+    V, H, hc, dt = model_dims(ckpt_arg())
+    log(f"tree file {path}; ctor Embedding{call}; use_gather_kernel={flag}")
+    fails = []
+    if not flag:
+        fails.append("DeepseekV4Model.__init__ does not pass use_gather_kernel=True")
+    os.environ["TRTLLM_DSV4_EMBED_GATHER"] = "0"
+    flag_off = tree_flag()[0]
+    os.environ.pop("TRTLLM_DSV4_EMBED_GATHER")
+    log(f"kill switch TRTLLM_DSV4_EMBED_GATHER=0 -> use_gather_kernel={flag_off}")
+    if flag_off:
+        fails.append("TRTLLM_DSV4_EMBED_GATHER=0 does not restore the masked lookup")
+    dims = [(V, H)]
+    if (V, H) != (129280, 4096):
+        dims.append((129280, 4096))
+    stats = {}
+    n_cmp = 0
+    for v, h in dims:
+        n_cmp += run_dims(v, h, hc, dt, fails, stats)
 
     for f in fails[:20]:
         log("FAIL", f)
-    res = {"passed": not fails, "use_gather_kernel": flag, "comparisons": n_cmp,
-           "failures": len(fails), "max_abs_err": stats,
+    res = {"passed": not fails, "use_gather_kernel": flag, "kill_switch_off": not flag_off,
+           "dims": dims, "comparisons": n_cmp, "failures": len(fails),
+           "max_abs_err": max(stats.values()) if stats else None, "cases": len(stats),
            "compared": "Embedding(use_gather_kernel=True) vs main masked path and an "
-                       "independent torch index_select+where reference, bitwise bf16"}
+                       "independent torch index_select+where reference, bitwise bf16, "
+                       "every iteration poisoned (finite sentinel / NaN)"}
     print(json.dumps(res))
 
 
