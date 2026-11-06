@@ -31,8 +31,11 @@ class Clock:
             import pynvml
 
             pynvml.nvmlInit()
-            idx = int((os.environ.get("CUDA_VISIBLE_DEVICES") or "0").split(",")[0])
-            self.h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            dev = (os.environ.get("CUDA_VISIBLE_DEVICES") or "0").split(",")[0]
+            if dev.startswith("GPU-"):
+                self.h = pynvml.nvmlDeviceGetHandleByUUID(dev)
+            else:
+                self.h = pynvml.nvmlDeviceGetHandleByIndex(int(dev))
             self.nv = pynvml
         except Exception as exc:  # noqa: BLE001
             print(f"nvml unavailable: {exc}", flush=True)
