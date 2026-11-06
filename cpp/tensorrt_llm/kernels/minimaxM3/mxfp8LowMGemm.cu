@@ -1030,7 +1030,9 @@ __device__ __forceinline__ int csa2_sf_offset(int m, int kb, int sf_k_tiles)
 // STAGES: the CTA's K slice is split into STAGES consecutive sub-slices, each bulk-copied (in order) onto its own
 // mbarrier; all warps consume stage s while later stages are still arriving.
 // NORM: x is the raw (un-normalized) K = 1280 row view; the CTA applies q_norm in-kernel (csa2_qnorm_quant_row).
-template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false>
+// PF: the instance carries the L2 prefetch (flag bit 2); PF = false instances compile it out entirely, so the
+// gate-off path runs the same code as before the prefetch existed.
+template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false, bool PF = false>
 __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_bfloat16 const* __restrict__ x,
     int ldx, int M, int N, int K, uint8_t const* __restrict__ w, uint8_t const* __restrict__ wsf, int num_k_tiles,
     __nv_bfloat16* __restrict__ out, int ldo, __nv_bfloat16* __restrict__ out2, int ldo2, int n_split,
@@ -1126,7 +1128,7 @@ __global__ void __launch_bounds__(WARPS * 32) csa2_mxfp8_low_m_gemm_kernel(__nv_
             }
         }
     }
-    bool const pf_on = (qout.flags & 4) != 0;
+    bool const pf_on = PF && (qout.flags & 4) != 0;
     int const pf_pos = (qout.flags >> 3) & 3;
     bool const pf_last = (qout.flags & 32) != 0;
     if (pf_on && pf_pos == 0 && warp == 0)
@@ -1420,7 +1422,7 @@ size_t csa2SmemBytes(int warps, int clusterK, int rowTiles, int m, int k)
         + (aliased ? 0 : red_bytes);
 }
 
-template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false>
+template <int WARPS, int CLUSTER_K, int RT, int STAGES, bool NORM = false, bool PF = false>
 void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t const* w, uint8_t const* wsf,
     __nv_bfloat16* out, int ldo, __nv_bfloat16* out2, int ldo2, int nSplit, PreqArgs preq, QoutArgs qout, bool pdl,
     cudaStream_t stream, NormArgs nrm = NormArgs{}, L2pfArgs pf = L2pfArgs{})
@@ -1435,7 +1437,7 @@ void launchCsa2(__nv_bfloat16 const* x, int ldx, int M, int N, int K, uint8_t co
     size_t const red_bytes = static_cast<size_t>(WARPS) * 16 * RT * 8 * sizeof(float);
     int const red_aliased = red_bytes <= w_bytes ? 1 : 0;
     size_t const smem = csa2SmemBytes(WARPS, CLUSTER_K, RT, M, K);
-    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, STAGES, NORM>;
+    auto kernel = csa2_mxfp8_low_m_gemm_kernel<WARPS, CLUSTER_K, RT, STAGES, NORM, PF>;
     static bool const configured = [&]()
     {
         int device = 0, max_optin = 0;
@@ -1528,9 +1530,26 @@ void invokeCsa2Mxfp8LowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int
     {
         debugFlags &= ~4;
     }
-    QoutArgs const qout{xqOut, xsfOut, sfKTiles, dbgTs, debugFlags};
     L2pfArgs const pf{pfP0, pfP0 == nullptr ? 0 : pfN0, pfP1, pfP1 == nullptr ? 0 : pfN1,
         pfFrac < 0 ? 0 : (pfFrac > 256 ? 256 : pfFrac)};
+    if (debugFlags & 4)
+    {
+        // Only the attention-input chain's wq_a||wkv configurations carry a prefetch instance (PF = true).
+        QoutArgs const qoutPf{xqOut, xsfOut, sfKTiles, dbgTs, debugFlags};
+#define CSA2_PF_DISPATCH(W, C, R, S)                                                                                   \
+    if (warps == W && clusterK == C && rowTiles == R && stages == S)                                                   \
+    {                                                                                                                  \
+        launchCsa2<W, C, R, S, false, true>(                                                                           \
+            x, ldx, m, n, k, w, wsf, out, ldo, out2, ldo2, nSplit, preq, qoutPf, pdl, stream, NormArgs{}, pf);         \
+        return;                                                                                                        \
+    }
+        CSA2_PF_DISPATCH(4, 4, 2, 1)
+        CSA2_PF_DISPATCH(8, 2, 2, 1)
+        CSA2_PF_DISPATCH(8, 4, 1, 1)
+#undef CSA2_PF_DISPATCH
+        debugFlags &= ~4; // no prefetch instance for this configuration: the prefetch is a hint, drop it
+    }
+    QoutArgs const qout{xqOut, xsfOut, sfKTiles, dbgTs, debugFlags};
 #define CSA2_DISPATCH(W, C, R, S)                                                                                      \
     if (warps == W && clusterK == C && rowTiles == R && stages == S)                                                   \
     {                                                                                                                  \
