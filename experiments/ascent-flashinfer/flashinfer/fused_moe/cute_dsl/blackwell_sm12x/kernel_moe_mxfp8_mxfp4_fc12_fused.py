@@ -555,7 +555,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
             ("sSFA", cute.cosize(sfb_smem1) * sfw // 8),
             ("sC", cute.cosize(epi_smem1) * c1.epi.out_dtype.width // 8 if c1.owns_epi_smem else 0),
         ]
-        if self.early_w2:
+        if cutlass.const_expr(self.early_w2):
             # fc1's epilogue sC first: it then lies under fc2's sA (q1), which the q1 loader
             # fills only after the phase barrier, and clear of sB/sSFB that EARLY_W2 fills
             # during that epilogue.  Every region stays 1024-aligned.
@@ -592,7 +592,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc12Fused:
               f"{rng2['sB'][1]}) sSFB2=[{rng2['sSFB'][0]},{rng2['sSFB'][1]}) "
               f"overlap={overlap} kacq={self.kacq} early_w2={self.early_w2} "
               f"acqrel={self.acqrel}", flush=True)
-        if self.early_w2:
+        if cutlass.const_expr(self.early_w2):
             assert not overlap, "EARLY_W2 needs sB/sSFB (fc2) disjoint from sC (fc1)"
             assert c1.owns_epi_smem, "EARLY_W2 needs the fc1 epilogue's own sC region"
         pool_bytes = _align(max(end1, end2), 1024)
