@@ -168,7 +168,7 @@ __global__ void floor_lamport_k(Ptr4 R, int rank, const uint4* in, uint4* out, i
             uint4* q = mine + ((size_t)(buf * 4 + p)) * vecs + idx;
             uint4 r = ld_vol4(q);
             while (r.x == SENT || r.y == SENT || r.z == SENT || r.w == SENT) {
-                if (clock64() - t0 > TIMEOUT_CYC) { *err = 3; break; }
+                if (clock64() - t0 > TIMEOUT_CYC) { *err = 3; return; }
                 r = ld_vol4(q);
             }
             acc8(a, r);
@@ -202,7 +202,7 @@ __global__ void floor_flag_k(Ptr4 R, Flag4 F, int rank, const uint4* in, uint4* 
         if (t < 4 && t != rank) {
             st_vol(F.p[t] + tok * 4 + rank, i);
             long long t0 = clock64();
-            while (ld_vol(F.p[rank] + tok * 4 + t) < i) { if (clock64() - t0 > TIMEOUT_CYC) { *err = 4; break; } }
+            while (ld_vol(F.p[rank] + tok * 4 + t) < i) { if (clock64() - t0 > TIMEOUT_CYC) { *err = 4; return; } }
         }
         __syncthreads();
         float a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -770,7 +770,8 @@ def rank_served(env):
     WARMUP, ITERS, SEQS, CH = 20, 100, 3, 8
     res = {"rank": rank, "env": {k: v for k, v in os.environ.items() if k.startswith(("NCCL_", "TLLM_", "TRTLLM_"))},
            "timing": {}, "dispatch": {}, "check": {},
-           "sm_clock_query": B.sh(["nvidia-smi", "--query-gpu=uuid,clocks.sm", "--format=csv,noheader"])
+           "sm_clock_query": B.sh(["nvidia-smi", "-i", os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3"),
+                                   "--query-gpu=uuid,clocks.sm", "--format=csv,noheader"])
            if rank == 0 else None}
     AutoTuner.get().setup_distributed_state(mapping)
     ar_tune = AllReduce(mapping=mapping, strategy=AllReduceStrategy.LOWPRECISION, dtype=torch.bfloat16)
@@ -862,6 +863,9 @@ def rank_served(env):
                      if k.startswith(strat_name + f"|M{mm}|") or k == f"PRED_ONLY|M{mm}"}))
             del ar
             B._barrier()
+        if env.get("_art"):  # partial per-rank receipt, in case a later step hangs
+            with open(os.path.join(env["_art"], f"served_rank{rank}_partial.json"), "w") as f:
+                json.dump(res, f, default=str)
     # dispatch: kernel names of eager calls per M (after all timing: first CUPTI use in this process)
     from torch.profiler import ProfilerActivity, profile
     for mm in MS:
@@ -892,7 +896,7 @@ def part_served():
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
     cloudpickle.register_pickle_by_value(B)
     MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
-    env = {"_wd": "700", "_here": HERE}
+    env = {"_wd": "700", "_here": HERE, "_art": os.environ.get("AUTO_DEV_ARTIFACTS", "")}
     for k in ("PCIE_PROBE_EXT_DIR", "PCIE_PROBE_PREBUILT"):
         if os.environ.get(k):
             env[k] = os.environ[k]
