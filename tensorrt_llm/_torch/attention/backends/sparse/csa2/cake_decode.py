@@ -41,8 +41,9 @@ _F32_FOLD_BUCKETS = ((16, "sa+pw+lq+el"),)
 # fold render) fires its PDL trigger on entry (binding ``enable_pdl`` bit 2), so the PDL merge and
 # csa2_lowm_wo_a behind it launch while the body runs. Launch timing only (every dependent waits for
 # the whole body grid before it reads or writes global memory). TRTLLM_CSA2_CAKE_BODY_TRIGGER_ENTRY=1 / =0
-# forces it on / off for every count.
-_BODY_TRIGGER_ENTRY_COUNTS: frozenset[int] = frozenset(range(1, 9))
+# forces it on / off for every count. Default ON only at the counts with a measured same-slot win
+# (cold-L2 40-layer chain, experiments/ascent/cake_q1/chain_332.py); other counts launch as before.
+_BODY_TRIGGER_ENTRY_COUNTS: frozenset[int] = frozenset((1, 2, 3, 4))
 _BODY_TRIGGER_ENTRY_VARIANTS = frozenset(("default", "sa+lq+el", "sa+pw+lq+el"))
 
 
