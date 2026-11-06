@@ -339,4 +339,5 @@ if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "bench"
     with torch.inference_mode():
         bench() if mode == "bench" else check()
-    log(f"done in {time.time() - t0:.1f}s")
+    # stderr, so the evidence JSON stays the last stdout line
+    print(f"done in {time.time() - t0:.1f}s", file=sys.stderr, flush=True)
