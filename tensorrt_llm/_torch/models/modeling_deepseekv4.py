@@ -1777,6 +1777,20 @@ class DeepseekV4Gate(nn.Module):
 # (M <= 32) never reach it.
 SHARED_ROW_SPLIT_MIN_TOKENS = int(os.environ.get("TRTLLM_DSV4_SHARED_ROW_SPLIT_MIN_TOKENS", "256"))
 
+# Eager prefill fork/join of the shared expert. maybe_execute_in_parallel runs
+# routed and shared serially on the calling stream whenever do_multi_stream()
+# is False, which it always is in eager prefill. On the row-split path at
+# M >= this threshold, DeepseekV4MoE.forward instead launches the routed MoE
+# first on the calling stream and this rank's shared rows on the MoeShared aux
+# stream (forked before the routed work), joining before the in-place slice
+# add. Same kernels on the same inputs: output is bitwise unchanged. The
+# global do_multi_stream() flag is NOT touched, so no other
+# maybe_execute_in_parallel site changes. M < threshold (L20-39 at M=128 are
+# host-bound) and decode CUDA graphs keep the serial / captured paths.
+# TRTLLM_DSV4_SHARED_OVERLAP=0 turns it off.
+SHARED_OVERLAP_MIN_TOKENS = int(os.environ.get("TRTLLM_DSV4_SHARED_OVERLAP_MIN_TOKENS", "1024"))
+SHARED_OVERLAP_ENABLED = os.environ.get("TRTLLM_DSV4_SHARED_OVERLAP", "1") != "0"
+
 
 def shared_expert_row_split_layout(tp_rank: int, tp_size: int, shared_tp_size: int):
     """Return (parts, part_index, column_shard) of a TP rank.
@@ -2034,6 +2048,47 @@ class DeepseekV4MoE(nn.Module):
             and not torch.compiler.is_compiling()
             and not torch.cuda.is_current_stream_capturing()
         )
+
+    def _use_shared_overlap(self, hidden_states, use_row_split: bool) -> bool:
+        """Fork/join the row-split shared expert onto the aux stream (eager, M >= T)."""
+        use = (
+            SHARED_OVERLAP_ENABLED
+            and use_row_split
+            and getattr(self, "aux_stream", None) is not None
+            and hidden_states.shape[0] >= SHARED_OVERLAP_MIN_TOKENS
+            and not do_multi_stream()
+        )
+        if use:
+            logger.info_once(
+                f"DeepseekV4MoE shared-expert eager overlap on: M >= {SHARED_OVERLAP_MIN_TOKENS} "
+                "(row-split path only, eager, not capturing): routed MoE on the calling "
+                "stream, shared rows on the MoeShared aux stream, joined before the slice add",
+                key="dsv4_shared_overlap_on",
+            )
+        return use
+
+    def _run_routed_main_shared_aux(self, fn_routed, fn_shared):
+        """Routed on the calling stream, shared on aux_stream; join before return.
+
+        Launch order (i): the fork event is recorded first, the routed work is
+        enqueued on the calling stream, then the shared work on aux_stream after
+        it waits on the fork event. The calling stream waits on the shared event
+        before anything reads shared_output. Unlike maybe_execute_in_parallel,
+        this does not read or set the global do_multi_stream() flag.
+        """
+        fork_event = self.event_dict[EventType.Main]
+        join_event = self.event_dict[EventType.MoeShared]
+        fork_event.record()
+        routed_output = fn_routed()
+        with torch.cuda.stream(self.aux_stream):
+            fork_event.wait()
+            shared_output = fn_shared()
+            join_event.record()
+        if shared_output is not None:
+            # Allocated in aux_stream order, read on the calling stream.
+            shared_output.record_stream(torch.cuda.current_stream())
+        join_event.wait()
+        return routed_output, shared_output
 
     def _setup_shared_decode_split(self) -> None:
         """Gate the decode shared-expert block split (see SHARED_DECODE_SPLIT_MAX_TOKENS).
@@ -2475,6 +2530,10 @@ class DeepseekV4MoE(nn.Module):
             if "out" not in _shared_box:
                 _shared_box["out"] = _compute_shared_output()
             shared_output = _shared_box["out"]
+        elif self._use_shared_overlap(hidden_states, use_row_split):
+            routed_output, shared_output = self._run_routed_main_shared_aux(
+                _compute_routed_output, _compute_shared_output
+            )
         else:
             routed_output, shared_output = maybe_execute_in_parallel(
                 _compute_routed_output,

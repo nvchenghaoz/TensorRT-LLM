@@ -1,12 +1,13 @@
 """Branch 118 (idea 129): eager-prefill fork/join of the DSV4 shared expert.
 
 One TP4 rank (rank 0) of DeepSeek-V4.1-Flash under the live MoE layout
-(engine.json at main 2fa8e034 has no moe_* keys -> EP4: 96 of 384 routed
-experts, inter 2304, top-6, hidden 5120). The REAL DeepseekV4MoE.forward of
-whichever tree runs it drives:
+(engine.json at main 8e291e60: moe_tensor_parallel_size 2, moe_expert_parallel_size 2
+-> EP2xTP2: 192 of 384 routed experts x inter 1152, top-6, hidden 5120). The REAL
+DeepseekV4MoE.forward of whichever tree runs it drives:
   routed: torch.ops.trtllm.fused_moe W4A8 MXFP4 x MXFP8 (synthetic weights,
-          fixed routing; the gate is not run), via mxfp8_fold/moe_fold_bench.Problem
-          (MXFP8 quant fold on at M >= _MXFP8_FOLD_MIN_TOKENS, as the leaf does)
+          fixed uniform routing; the gate is not run), tp_size=2 ep_size=2 rank 0
+          (class Routed, copied from b100_moe_prefill/bench.py Rank), MXFP8 quant
+          fold on at M >= _MXFP8_FOLD_MIN_TOKENS, as the leaf does
   shared: the checkpoint-configured shared GatedMLP (shared_tp 2, row split)
   all-reduce: identity.
 BASE tree: serial routed -> shared on one stream. CAND tree: at M >= 1024 the
@@ -33,20 +34,119 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "shared_row_split"))
-sys.path.insert(0, os.path.join(HERE, "..", "mxfp8_fold"))
+
+os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
 
 import torch  # noqa: E402
 
-import moe_fold_bench as mfb  # noqa: E402  (sets TRTLLM_ENABLE_PDL default, imports trtllm)
+import tensorrt_llm  # noqa: E402,F401
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune  # noqa: E402
+
 import common as srs  # noqa: E402
 
-LAYOUT = "EP4"
+LAYOUT = "EP2xTP2"
 WARMUP, ITERS, REPEATS = 5, 30, 5
+ALIGN = 128
+try:
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import w4a8_mxfp4_mxfp8 as _leaf
+
+    FOLD_MIN = getattr(_leaf, "_MXFP8_FOLD_MIN_TOKENS", 1024)
+    FOLD_MAX = getattr(_leaf, "_MXFP8_FOLD_MAX_TOKENS", -1)
+except Exception:  # pragma: no cover
+    FOLD_MIN, FOLD_MAX = 1024, -1
+if FOLD_MAX < 0:
+    FOLD_MAX = 1 << 30
+
+
+def read_dims(ckpt):
+    cfg = json.load(open(os.path.join(ckpt, "config.json")))
+    if "text_config" in cfg:
+        cfg = {**cfg, **cfg["text_config"]}
+    return cfg["hidden_size"], cfg["moe_intermediate_size"], cfg["n_routed_experts"], cfg["num_experts_per_tok"]
+
+
+class Routed:
+    """EP2xTP2 rank 0 (moe_ep_rank 0, moe_tp_rank 0) of the routed W4A8 MXFP4 x MXFP8 fused_moe, as
+    experiments/ascent/b100_moe_prefill/bench.py Rank (192 local experts x inter 1152, tp_size=2,
+    ep_size=2, uniform top-k over all experts, production MXFP8 quant fold at FOLD_MIN <= M), plus a
+    finalize-mode flag (ff) switched only through phase()."""
+
+    def __init__(self, hidden, inter, n_exp, topk, tp=2, ep=2):
+        self.hidden, self.n_exp, self.topk, self.tp, self.ep = hidden, n_exp, topk, tp, ep
+        E, H, I = n_exp // ep, hidden, inter // tp
+        assert I % ALIGN == 0
+        self.e_local, self.inter_local = E, I
+        g = torch.Generator(device="cuda").manual_seed(1234)
+        dev = "cuda"
+        self.w31 = torch.randint(0, 256, (E, 2 * I, H // 2), dtype=torch.uint8, device=dev,
+                                 generator=g).view(torch.int64)
+        self.w2 = torch.randint(0, 256, (E, H, I // 2), dtype=torch.uint8, device=dev,
+                                generator=g).view(torch.int64)
+        sf31 = torch.randint(117, 125, (E, 2 * I, H // 32), dtype=torch.uint8, device=dev, generator=g)
+        sf2 = torch.randint(117, 125, (E, H, I // 32), dtype=torch.uint8, device=dev, generator=g)
+        ones = torch.ones(E, dtype=torch.float32, device=dev)
+        self.quant_scales = [sf31.view(torch.int32).contiguous(), ones, sf2.view(torch.int32).contiguous(),
+                             ones.clone()]
+        self.ff = True
+
+    def inputs(self, m, seed=0):
+        g = torch.Generator(device="cuda").manual_seed(99 + 7 * m + 1000 * seed)
+        x = torch.randn(m, self.hidden, device="cuda", dtype=torch.float32, generator=g).to(torch.bfloat16)
+        gc = torch.Generator().manual_seed(5 + 13 * m + 1000 * seed)
+        sel = torch.stack([torch.randperm(self.n_exp, generator=gc)[: self.topk] for _ in range(m)]).to(torch.int32)
+        scales = torch.softmax(torch.randn(m, self.topk, generator=gc), dim=-1).float()
+        return x.contiguous(), sel.cuda(), scales.cuda()
+
+    def run(self, x, sel, scales):
+        if FOLD_MIN <= x.shape[0] <= FOLD_MAX:  # production: BF16 in, MXFP8 quant folded into expandInputRows
+            xin, xsf = x, None
+        else:
+            xin, xsf = torch.ops.trtllm.mxfp8_quantize(x, True, alignment=ALIGN)
+        return torch.ops.trtllm.fused_moe(
+            xin, sel, scales, self.w31, None, self.w2, None, torch.bfloat16,
+            quant_scales=self.quant_scales, input_sf=xsf, swizzled_input_sf=True,
+            tp_size=self.tp, tp_rank=0, ep_size=self.ep, ep_rank=0,
+            use_mxfp8_act_scaling=True, use_fused_finalize=self.ff,
+        )[0]
+
+
+def phase(p, ms, ff, tune):
+    """New finalize-mode phase: MoERunner.runner_dict's key omits use_fused_finalize (pitfall 1332), so clear
+    it (and the tuning cache). tune=False keeps the default tactic, identical in both arms' processes, so the
+    deterministic-finalize sha compares across arms independent of autotuner picks."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+    torch.cuda.synchronize()
+    MoERunner.runner_dict.clear()
+    AutoTuner.get().profiling_cache.cache.clear()
+    p.ff = ff
+    log(f"layout={LAYOUT} phase fused_finalize={ff} tune={tune}")
+    if tune:
+        x, sel, sc = p.inputs(max(ms))
+        with autotune():
+            p.run(x, sel, sc)
+        torch.cuda.synchronize()
+    picks = []
+    for k, v in AutoTuner.get().profiling_cache.cache.items():
+        if str(k[0]).startswith("trtllm::fused_moe"):
+            try:
+                picks.append((str(k[0]).rsplit(":", 1)[-1], str(k[3][0][0]), str(v[1])))
+            except Exception:  # noqa: BLE001
+                picks.append((str(k)[:160], "?", str(v)[:80]))
+    picks.sort()
+    log(f"layout={LAYOUT} tuned tactics (gemm, M bucket, tactic): {picks}")
+
+
 SLEEP_CYCLES = 6_000_000  # ~2.5 ms at 2.4 GHz: lets the host enqueue the whole forward
 
 
+ARM = "?"
+
+
 def log(*a):
-    print(*a, flush=True)
+    s = " ".join(str(x) for x in a)
+    if not s.startswith("ARM="):
+        s = f"ARM={ARM} layout={LAYOUT} " + s
+    print(s, flush=True)
 
 
 def sha(t):
@@ -60,7 +160,7 @@ class Rig:
         from tensorrt_llm._torch.models import modeling_deepseekv4 as m4
 
         self.m4 = m4
-        self.p = mfb.Problem(*mfb.read_dims(ckpt), ep=4)
+        self.p = Routed(*read_dims(ckpt), tp=2, ep=2)
         mlp, shared_tp, scale, info = srs.build_shared_mlp(0)
         moe, _stub, has_split = srs.build_moe(0, mlp, shared_tp, scale, top_k=self.p.topk)
         assert has_split and moe._shared_row_split_parts == 2, "row split must be on (rank 0)"
@@ -68,6 +168,10 @@ class Rig:
         self.moe, self.info = moe, info
         self.has_overlap = hasattr(m4.DeepseekV4MoE, "_run_routed_main_shared_aux")
         self.arm = "CAND" if self.has_overlap else "BASE"
+        global ARM
+        ARM = self.arm
+        if not hasattr(moe, "_shared_decode_split"):
+            moe._shared_decode_split = False  # decode split not set up here (bench covers M >= 256 eager)
         self.cur = None
         self.calls = {"overlap": 0}
         moe.compute_routed_output = self._routed
@@ -82,8 +186,7 @@ class Rig:
 
     def _routed(self, *a, **k):
         x, sel, sc = self.cur
-        fold = mfb.FOLD_MIN <= x.shape[0] <= mfb.FOLD_MAX
-        return self.p.run(x, sel, sc, fold)
+        return self.p.run(x, sel, sc)
 
     def set_m(self, m, seed=0):
         self.cur = self.p.inputs(m, seed=seed)
@@ -111,7 +214,7 @@ def time_m(rig, hs):
         ts.sort()
         rep_meds.append(ts[len(ts) // 2])
         all_t += ts
-        log(f"{rig.arm} layout={LAYOUT} M={hs.shape[0]} rep={rep} median_ms={rep_meds[-1]:.5f} "
+        log(f"ARM={rig.arm} layout={LAYOUT} M={hs.shape[0]} rep={rep} median_ms={rep_meds[-1]:.5f} "
             f"p10={ts[int(0.1 * (len(ts) - 1))]:.5f} p90={ts[int(0.9 * (len(ts) - 1))]:.5f}")
     all_t.sort()
     n = len(all_t)
@@ -132,9 +235,10 @@ def warm_shared(rig, ms):
 
 
 def mode_bench(rig, ms):
-    log(f"{rig.arm} layout={LAYOUT} info={json.dumps(rig.info)} fold_min={mfb.FOLD_MIN} "
+    log(f"ARM={rig.arm} layout={LAYOUT} info={json.dumps(rig.info)} fold_min={FOLD_MIN} "
+        f"local_experts={rig.p.e_local} inter_local={rig.p.inter_local} "
         f"overlap_min={getattr(rig.m4, 'SHARED_OVERLAP_MIN_TOKENS', None)}")
-    mfb.phase(rig.p, ms, False)
+    phase(rig.p, ms, False, tune=False)
     warm_shared(rig, ms)
     shas = {}
     for m in ms:
@@ -144,8 +248,8 @@ def mode_bench(rig, ms):
         assert torch.equal(a, b), f"deterministic finalize: repeated forward differs at M={m}"
         assert torch.isfinite(a.float()).all()
         shas[str(m)] = sha(a)
-        log(f"{rig.arm} layout={LAYOUT} M={m} det_sha={shas[str(m)]}")
-    mfb.phase(rig.p, ms, True)
+        log(f"ARM={rig.arm} layout={LAYOUT} M={m} det_sha={shas[str(m)]}")
+    phase(rig.p, ms, True, tune=True)
     warm_shared(rig, ms)
     res = {}
     for m in ms:
@@ -153,7 +257,7 @@ def mode_bench(rig, ms):
         before = rig.calls["overlap"]
         res[str(m)] = time_m(rig, hs)
         res[str(m)]["overlap_calls"] = rig.calls["overlap"] - before
-        log(f"{rig.arm} layout={LAYOUT} M={m} RESULT kernel_ms={res[str(m)]['kernel_ms']:.5f} "
+        log(f"ARM={rig.arm} layout={LAYOUT} M={m} RESULT kernel_ms={res[str(m)]['kernel_ms']:.5f} "
             f"noise={res[str(m)]['noise_floor']:.4f} spread={res[str(m)]['repeat_spread']:.4f} "
             f"overlap_calls={res[str(m)]['overlap_calls']} sm_clock={res[str(m)]['sm_clock_mhz']}")
         torch.cuda.empty_cache()
@@ -166,7 +270,9 @@ def mode_check(rig, ms):
         print(json.dumps({"passed": False, "error": "tree has no shared overlap"}))
         sys.exit(1)
     m4 = rig.m4
-    mfb.phase(rig.p, ms, False)
+    from tensorrt_llm.logger import logger as trt_logger
+    trt_logger.set_level("info")  # the overlap's info_once receipt (names the threshold T)
+    phase(rig.p, ms, False, tune=False)
     warm_shared(rig, ms)
     passed, results = True, {}
     thr = m4.SHARED_OVERLAP_MIN_TOKENS
@@ -209,9 +315,51 @@ def mode_check(rig, ms):
                             "path_ok": path_ok, "serial_ref_ok": serial_ok, "indep_compose_equal": indep_ok,
                             "inputs_unchanged": inputs_ok, "finite": finite, "nonzero_frac": nz,
                             "sha": sha(ref), "ok": ok}
-            log(f"CAND layout={LAYOUT} {key}", json.dumps(results[key]))
+            log(f"ARM=CAND layout={LAYOUT} {key}", json.dumps(results[key]))
             torch.cuda.empty_cache()
-    print(json.dumps({"passed": passed, "layout": LAYOUT, "threshold": thr,
+    # CUDA-graph capture (decode graphs, and any captured window): the row split and so the overlap are
+    # unreachable while capturing; the captured graph replays bitwise equal to the same tree's eager path.
+    from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+    graph = {}
+    for m in (4, 2048):
+        hs = rig.set_m(m)
+        before = rig.calls["overlap"]
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                rig.forward(hs)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        before_cap = rig.calls["overlap"]
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            gout = rig.forward(hs)
+        cap_calls = rig.calls["overlap"] - before_cap
+        outs_ok, n_rep = True, 10
+        ref_cap = None
+        for _ in range(n_rep):
+            g.replay()
+            torch.cuda.synchronize()
+            if ref_cap is None:
+                ref_cap = gout.clone()
+            outs_ok &= torch.equal(gout, ref_cap)
+        if m < thr:
+            eager = rig.forward(hs)
+            eager_eq = torch.equal(eager, ref_cap)
+        else:
+            eager_eq = None  # eager at M>=256 takes the row split (different, reordered sum) by design
+        ok = cap_calls == 0 and outs_ok and (eager_eq is not False) and bool(torch.isfinite(ref_cap.float()).all())
+        passed &= ok
+        graph[f"M{m}"] = {"capture_overlap_calls": cap_calls, "warm_overlap_calls_side_stream": before_cap - before,
+                          "replays": n_rep, "replays_equal": outs_ok, "replay_eq_eager": eager_eq, "ok": ok}
+        log(f"ARM=CAND layout={LAYOUT} graph_M{m}", json.dumps(graph[f"M{m}"]))
+        del g, gout
+        torch.cuda.empty_cache()
+    dms = bool(do_multi_stream())
+    passed &= not dms
+    print(json.dumps({"passed": passed, "layout": LAYOUT, "threshold": thr, "do_multi_stream_after": dms,
+                      "graph_capture": graph,
                       "compared": "DeepseekV4MoE.forward fork/join (routed main, shared rows on MoeShared aux) "
                                   "vs the serial path (same process, TRTLLM shared overlap disabled) and vs "
                                   "routed + shared_experts(rows) composed by hand; torch.equal on every one of "
@@ -228,7 +376,7 @@ def main():
     ms = [int(v) for v in args.ms.split(",")]
     torch.manual_seed(0)
     rig = Rig(args.ckpt)
-    log(f"arm={rig.arm} layout={LAYOUT} gpu={torch.cuda.get_device_name()} ms={ms}")
+    log(f"ARM={rig.arm} layout={LAYOUT} gpu={torch.cuda.get_device_name()} ms={ms}")
     if args.mode == "bench":
         mode_bench(rig, ms)
     else:
