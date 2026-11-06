@@ -23,6 +23,7 @@ seeds) lives in its own module and is held here as a handler, driven through
 ``setup_sampler_step`` / ``sample_async`` / ``update_requests``.
 """
 
+import os
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Iterable
@@ -757,6 +758,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._stable_greedy_seq_slots: list[int] = []
         self._stable_greedy_seq_slots_host: Optional[torch.Tensor] = None
         self._stable_greedy_seq_slots_cuda: Optional[torch.Tensor] = None
+        # Stable-greedy new-token D2H on the private side stream: the next
+        # forward's input prep (recorded on the current stream) then no longer
+        # waits for the copy; only update_requests does, host-side, through
+        # SamplerEvent.side_stream_event. TRTLLM_SAMPLER_SIDE_STREAM_D2H=0
+        # keeps the copy on the current stream.
+        self._side_stream_new_tokens_d2h: bool = (
+            os.environ.get("TRTLLM_SAMPLER_SIDE_STREAM_D2H", "1") != "0"
+        )
+        self._new_tokens_side_stream_event: Optional[torch.cuda.Event] = None
 
         # BeamSearchHandler owns the lagged first_finish_reasons snapshots the
         # speculative predictor reads, so no separate host mirror is kept here.
@@ -1707,6 +1717,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # seq_slots_cuda / seq_lens_cuda are cast once inside
         # _process_requests and shared with the beam-search metadata builder.
+        self._new_tokens_side_stream_event = None
         (
             requests,
             seq_slots_host,
@@ -1788,6 +1799,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 sampled_rank=host_sampled_rank,
             )
 
+        new_tokens_side_stream_event = self._new_tokens_side_stream_event
+        self._new_tokens_side_stream_event = None
+        if side_stream_event is None:
+            side_stream_event = new_tokens_side_stream_event
+        # Otherwise both were recorded on the same private side stream
+        # (_d2h_side_stream) and the beam-history event, recorded later, already
+        # covers the new-token copy.
         sampler_event = self._record_sampler_event(side_stream_event=side_stream_event)
         return SampleStateTorch(
             requests=requests,
@@ -2537,7 +2555,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     seq_slots_cuda,
                     self.max_beam_width,
                 )
-            new_tokens_host = self._copy_to_host(next_tokens)
+            # fast_greedy_sample_kernel returns a fresh allocation that the main
+            # stream never rewrites, so its D2H may run on the side stream
+            # (record_stream keeps the allocator from reusing it early). The
+            # greedy_tokens slice may alias a forward output buffer, so it keeps
+            # the main-stream copy.
+            if (
+                greedy_tokens is None
+                and self._side_stream_new_tokens_d2h
+                and not self._async_worker_active()
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                with self._make_side_stream_copier() as copier:
+                    new_tokens_host = copier.stage_copy_to_host(next_tokens)
+                self._new_tokens_side_stream_event = copier.event
+            else:
+                new_tokens_host = self._copy_to_host(next_tokens)
             return (
                 generation_requests,
                 seq_slots_host,
