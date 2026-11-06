@@ -20,7 +20,14 @@
 - Pair 1702/1703 cancelled while queued (top lead 20:1x: hold Stage 0 until landing 57 = branch 184 fold
   render lands; post-57 main routes count<=16 dual calls to the fold render, so the trigger must go there too).
 
-## NEXT
+## 21:1x PST
+- Branch base = d4372068 (landing 57 in); fold render (both h16 sa+lq+el / sa+pw+lq+el namespaces, both
+  kF32Mid instantiations via fold::launch_one) takes trigger_entry. Pair 1708/1709 cancelled before start.
+- chain_332.py: DIRTY SLOT guard (exit 3 if > 4 GiB used at start; children skip it via CHAIN332_CHILD).
+- Queued: ONE check job (check --children, incl. F32_PARTIALS=0 child) + ONE same-slot pair
+  (time --spans --hash-children, counts 1,2,4,8) vs base d4372068.
+
+## NEXT (original)
 1. When 57 lands: sync_main, add trigger_entry to the fold render's entry/signature/launch (both kF32Mid
    instantiations), extend the binding check + cake_decode.py gating to the fold render body.
 2. ONE pair: chain_332.py time --spans (counts 1,2,4,8), then ONE check job: chain_332.py check --children.

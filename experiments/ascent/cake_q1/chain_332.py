@@ -445,4 +445,14 @@ if __name__ == "__main__":
     ap.add_argument("--children", action="store_true")
     ap.add_argument("--hash-children", action="store_true")
     a = ap.parse_args()
+    if os.environ.get("CHAIN332_CHILD") != "1":
+        # Top-lead rule (b), pitfall 3067/3072: refuse a slot that another process already holds.
+        free, total = torch.cuda.mem_get_info()
+        used_gib = (total - free) / 2**30
+        print(f"slot memory: used {used_gib:.2f} GiB of {total / 2**30:.2f} GiB "
+              f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')})", flush=True)
+        if used_gib > 4.0:
+            print(f"DIRTY SLOT {used_gib:.2f}", flush=True)
+            raise SystemExit(3)
+    os.environ["CHAIN332_CHILD"] = "1"  # inherited by the hash / check child processes
     {"time": mode_time, "check": mode_check, "hash": mode_hash}[a.mode](a)
