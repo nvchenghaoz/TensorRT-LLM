@@ -199,7 +199,8 @@ def check():
     import sweep
 
     rec = receipt()
-    mod = sweep.build("A")
+    mod = sweep.build("PROD")
+    assert mod is not None, "reference harness (production tiles) failed to build"
     nsm = torch.cuda.get_device_properties(0).multi_processor_count
     allok = True
     detail = {}

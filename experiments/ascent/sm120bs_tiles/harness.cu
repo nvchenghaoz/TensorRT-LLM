@@ -55,7 +55,12 @@ int smem_of()
     return sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>::kSmemSize;
 }
 
-#if defined(TILESET_A)
+#if defined(TILESET_PROD)
+// The unmodified production tiles only (compiles on trees without the TileN 32/64 builder variants).
+#define TILE_LIST(X)                                                                                                   \
+    X(32, 128, 4)                                                                                                      \
+    X(64, 128, 4)
+#elif defined(TILESET_A)
 #define TILE_LIST(X)                                                                                                   \
     X(32, 128, 4)                                                                                                      \
     X(32, 64, 4)                                                                                                       \
