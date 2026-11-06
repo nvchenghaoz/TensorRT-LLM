@@ -28,6 +28,24 @@ end-to-end guard (plan 3610 (6)). Class REORDERED (chunked LP, same as landing 7
   swap 2.2125 GiB (+4.4%; inside-torch profiling peak 2.21 -> 2.16 GiB, outside-torch 8.53 -> 8.41 GiB,
   the env-0 arm ran first with the 251 s JIT warm-up). The swap arm's capacity is not lower.
 
+- Gate (plan 15f): design B only for T > SWAP_ABOVE_ROWS = 6144 (module constant); T <= 6144 runs landing 77's
+  run() unchanged. Receipts job 2102 (head 790201cb, austin:0): 4096/6144 chunk ARs on the comm stream (pri -1),
+  mHC on the caller stream, 48/48 bitwise vs main's run(); 8192 B (ARs on caller, mHC on side pri 0) 48/48 bitwise
+  vs 77's run() forced to 8192 rows; env 0 => plan None for T in 1..16384; plan == main's for T <= 6144; chain
+  1000 x {4096, 4099, 8192} PASSED.
+- KV capacity (2085, 2090): NOT EQUAL, jitter. Rank-synced KV v2 quota 2085 off/on 2.1192/2.2125 GiB; 2090
+  warm(env0)/off(env0)/on 2.4158/2.2793/2.2125 GiB. Two env-0 arms on the same commit differ by 0.137 GiB, more
+  than off-vs-on. Inside-torch profiling peak is 2.21 GiB (env0) vs 2.16 GiB (swap) in every arm: the change does
+  not add torch memory; the spread is outside-torch (NCCL/graphs/JIT) startup memory.
+
+## METRIC DECLARATION (ruling 12550, before the pairs)
+- Kernel pair (pair2.py): PRIMARY T=6145 (served c4 follower step = 3 x 2048 ctx + 1 gen; bounds 5 x 1152 + 385),
+  secondary 8192/6144/4096, 2048 no-change. Claim per c4 follower step = 37 eligible boundaries x mean delta at 6145.
+- In-job ABAB D (77's run() forced, MAX_ROWS 6400) vs B at 6145, 4+4 blocks. If D is faster beyond B's block spread,
+  the final head moves the B gate to T > 6400 (D covers 4096..6400); otherwise B covers 6145.
+- Then ONE same-slot run_serving_pair, base 06efaf15 vs final head; submit metric = c4 TTFT (serving_latency), with
+  c1/c2/c4 TTFT/TPOT reported; pass = c4 TTFT, c4 TPOT, c2 TTFT not worse beyond the floor.
+
 ## UNTESTED / NEXT
 - Kernel pair 2053 (base 06efaf15) / 2054 (head), pair.py T in {2048, 4096, 6144, 8192}.
 - Untimed checks: chain_check.py (1000 calls x {4096, 4099, 8192}, IPC flags) + e2e_check.py off,on with E2E_BATCH=4

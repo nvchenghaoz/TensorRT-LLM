@@ -25,7 +25,7 @@ import stage0  # noqa: E402
 
 HIDDEN = 5120
 WORLD = 4
-TS = [4096, 6144, 8192]
+TS = [4096, 6144, 6145, 8192]
 ITERS = 12
 
 
