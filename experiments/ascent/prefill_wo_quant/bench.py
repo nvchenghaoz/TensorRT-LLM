@@ -241,6 +241,86 @@ def stage0(d, dev, ms):
     log(json.dumps({"stage0": rows}))
 
 
+def graph_time(fn, n_calls, reps=7):
+    """GPU-only us/call: capture n_calls of fn(i) in one CUDA graph, replay, median."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for i in range(3):
+            fn(i)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s):
+        with torch.cuda.graph(g, stream=s):
+            for i in range(n_calls):
+                fn(i)
+    torch.cuda.synchronize()
+    g.replay()
+    torch.cuda.synchronize()
+    res = []
+    for _ in range(reps):
+        a, b = torch.cuda.Event(True), torch.cuda.Event(True)
+        a.record()
+        g.replay()
+        b.record()
+        torch.cuda.synchronize()
+        res.append(a.elapsed_time(b) * 1000 / n_calls)
+    res.sort()
+    del g
+    return res[len(res) // 2]
+
+
+def sweep(d, dev, ms, configs):
+    from tensorrt_llm.quantization.utils import fp8_utils
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import prefill_wo_quant as pwq
+
+    gen = torch.Generator(device=dev).manual_seed(0)
+    cos_sin = make_cos_sin(dev)
+    g = d["groups"]
+    L = 40
+    rows = []
+    for m in ms:
+        xs = [make_input(d, m, dev, gen) for _ in range(L)]
+        x0, p0 = xs[0]
+        x0 = x0.clone()  # pristine: the timed rope mutates xs in place
+        xr = x0.clone()
+        torch.ops.trtllm.mla_rope_inplace(xr, p0, cos_sin, d["heads"], d["nope"], d["rope"], True, False)
+        a_ref, s_ref = fp8_utils.per_token_quant_and_transform(xr.view(m, g, -1), need_permute102=True)
+        for mode, nbuf in (("warm", 1), ("cold", L)):
+            def rope(i):
+                x, p = xs[i % nbuf]
+                torch.ops.trtllm.mla_rope_inplace(x, p, cos_sin, d["heads"], d["nope"], d["rope"], True, False)
+
+            def ptq(i):
+                x, _ = xs[i % nbuf]
+                fp8_utils.per_token_quant_and_transform(x.view(m, g, -1), need_permute102=True)
+
+            def both(i):
+                rope(i)
+                ptq(i)
+
+            for name, fn in (("rope", rope), ("ptq", ptq), ("rope+ptq", both)):
+                us = graph_time(fn, L)
+                rows.append(dict(m=m, l2=mode, op=name, us=round(us, 2)))
+                log(f"M={m:5d} {mode} {name:22s} {us:8.2f} us (graph)")
+            for full, bm, nw in configs:
+                pwq._FULL_TILE, pwq._BLOCK_M, pwq._NUM_WARPS = bool(full), bm, nw
+                a, s = pwq.inv_rope_quant_permute102(x0, p0, cos_sin, g, d["nope"], d["rope"])
+                exact = _bits_equal(a, a_ref) and _bits_equal(s, s_ref)
+
+                def fz(i):
+                    x, p = xs[i % nbuf]
+                    pwq.inv_rope_quant_permute102(x, p, cos_sin, g, d["nope"], d["rope"])
+
+                us = graph_time(fz, L)
+                name = f"fused full={full} bm={bm} w={nw}"
+                rows.append(dict(m=m, l2=mode, op=name, us=round(us, 2), exact=exact))
+                log(f"M={m:5d} {mode} {name:22s} {us:8.2f} us (graph) exact={exact}")
+        del xs
+        torch.cuda.empty_cache()
+    log(json.dumps({"sweep": rows}))
+
+
 def pair(d, dev, ms, iters, warmup):
     gen = torch.Generator(device=dev).manual_seed(0)
     cos_sin = make_cos_sin(dev)
@@ -444,7 +524,8 @@ def check(d, dev, iters, warmup):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["stage0", "pair", "check"])
+    ap.add_argument("mode", choices=["stage0", "pair", "check", "sweep"])
+    ap.add_argument("--configs", default="1:8:4,1:16:4,1:16:8,1:32:8,0:16:4,0:32:4,0:8:2")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--ms", default="2048,128,16,512")
     ap.add_argument("--iters", type=int, default=30)
@@ -458,6 +539,9 @@ def main():
     ms = [int(v) for v in a.ms.split(",")]
     if a.mode == "stage0":
         stage0(d, dev, ms)
+    elif a.mode == "sweep":
+        cfgs = [tuple(int(v) for v in c.split(":")) for c in a.configs.split(",")]
+        sweep(d, dev, ms, cfgs)
     elif a.mode == "pair":
         pair(d, dev, ms, a.iters, a.warmup)
     else:
