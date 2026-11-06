@@ -39,7 +39,9 @@ def log(*a):
 def _cfg():
     with open(os.path.join(os.environ.get("STAGE0_CKPT") or CKPT, "config.json")) as f:
         c = json.load(f)
-    return {k: c.get(k) for k in ("hc_mult", "hc_sinkhorn_iters", "hc_eps", "rms_norm_eps", "hidden_size")}
+    # Defaults as tensorrt_llm/_torch/configs/deepseek_v41.py (hc_mult 4, hc_sinkhorn_iters 20, hc_eps 1e-6).
+    defaults = {"hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-6, "rms_norm_eps": 1e-6, "hidden_size": 5120}
+    return {k: (c.get(k) if c.get(k) is not None else d) for k, d in defaults.items()}
 
 
 class St:
