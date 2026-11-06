@@ -68,7 +68,7 @@ from ..distributed import (
 from ..mmap_utils import pageout_file_backed_regions
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
+from ..modules.embedding import Embedding, embedding_gather_hc
 from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
@@ -3276,6 +3276,14 @@ class DeepseekV4Model(DecoderModel):
             # TRTLLM_DSV4_HC_SEED_FAST=0). TRTLLM_DSV4_EMBED_GATHER=0 restores the masked path.
             use_gather_kernel=os.environ.get("TRTLLM_DSV4_EMBED_GATHER", "1") == "1",
         )
+        # Fused mHC stream seed: the gather kernel stores each embedding row hc_mult times
+        # ([T, hc_mult, hidden], bitwise the unsqueeze(1).repeat seed) and, for V4.1, the one-hot
+        # pre_mix in the same launch. TRTLLM_DSV4_HC_SEED_FAST=0 restores the separate repeat.
+        self._hc_seed_fast = (
+            self.embed_tokens.use_gather_kernel
+            and self.embed_tokens.tp_size == 1
+            and os.environ.get("TRTLLM_DSV4_HC_SEED_FAST", "1") == "1"
+        )
 
         self.hc_head = HCHead(config.hc_mult, config.hidden_size) if self.uses_hc_head else None
 
@@ -3351,8 +3359,29 @@ class DeepseekV4Model(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
+        mapping = self.model_config.mapping
+        hc_seed = None
+        hc_seed_pre_mix = None
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            embed_weight = self.embed_tokens.weight
+            if (
+                self._hc_seed_fast
+                and input_ids.is_cuda
+                and input_ids.dim() == 1
+                and embed_weight.dim() == 2
+                and embed_weight.is_contiguous()
+                and not (mapping.has_pp() and not mapping.is_first_pp_rank())
+            ):
+                hc_seed, hc_seed_pre_mix = embedding_gather_hc(
+                    input_ids,
+                    embed_weight,
+                    self.hc_mult,
+                    with_pre_mix=self._hc_seed_writes_pre_mix,
+                )
+                # A view of stream 0; until the seed below it is read only for shape/dtype/device.
+                inputs_embeds = hc_seed[:, 0]
+            else:
+                inputs_embeds = self.embed_tokens(input_ids)
 
         # Engram and token-dependent routing still need IDs after embedding fusion.
         if input_ids is None:
@@ -3405,7 +3434,6 @@ class DeepseekV4Model(DecoderModel):
                     )
                     engram_events[layer_id] = engram_mod.sync_event
 
-        mapping = self.model_config.mapping
         if mapping.has_pp() and not mapping.is_first_pp_rank():
             hidden_states = torch.empty(
                 inputs_embeds.shape[0],
@@ -3414,6 +3442,8 @@ class DeepseekV4Model(DecoderModel):
                 dtype=inputs_embeds.dtype,
                 device=inputs_embeds.device,
             )
+        elif hc_seed is not None:
+            hidden_states = hc_seed
         else:
             hidden_states = inputs_embeds
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
@@ -3426,7 +3456,10 @@ class DeepseekV4Model(DecoderModel):
         # in unfused mode the state is "resolved" (residual already
         # post-mapped). After the last layer, a deferred state is closed with
         # a standalone hc_post; a resolved state feeds hc_head directly.
-        hc_state = self._init_hc_state(hidden_states)
+        if hc_seed_pre_mix is not None:
+            hc_state = self._init_hc_state(hidden_states, pre_mix=hc_seed_pre_mix)
+        else:
+            hc_state = self._init_hc_state(hidden_states)
 
         replay_at, replay_plan = self._plan_bounded_replay(
             attn_metadata,
@@ -3580,7 +3613,10 @@ class DeepseekV4Model(DecoderModel):
     # event waits, the PP-rank branch, the layer loop) is identical. Factoring
     # them out keeps V4.1 from having to copy ~90 lines that would then drift.
 
-    def _init_hc_state(self, hidden_states: torch.Tensor):
+    # Whether the fused seed also writes the one-hot pre_mix (V4.1 consumes it; V4 has none).
+    _hc_seed_writes_pre_mix = False
+
+    def _init_hc_state(self, hidden_states: torch.Tensor, pre_mix: Optional[torch.Tensor] = None):
         """Seed the inter-layer mHC state from the ``[N, mult, hidden]`` stream.
 
         V4 hands layer 0 the raw tensor: its ``is_first_layer`` branch in
@@ -3588,6 +3624,7 @@ class DeepseekV4Model(DecoderModel):
         and there is no lagged coefficient to carry in. Overridden by V4.1,
         which must supply an identity ``pre_mix`` because *every* one of its
         sublayers collapses with a ``pre`` computed by its predecessor.
+        ``pre_mix`` (from the fused seed) is ignored here.
         """
         return hidden_states
 
