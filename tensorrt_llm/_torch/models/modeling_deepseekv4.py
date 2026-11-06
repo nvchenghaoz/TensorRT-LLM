@@ -3251,12 +3251,13 @@ class DeepseekV4Model(DecoderModel):
         # Full (non-parallel) table on every rank: one gather launch instead of
         # the 9-launch masked lookup, bitwise the same values (ids outside
         # [0, vocab) give zeros). The first consumer, the mHC seed repeat in
-        # forward(), is a plain (non-PDL) ATen launch.
+        # forward(), is a plain (non-PDL) ATen launch. Kill switch:
+        # TRTLLM_DSV4_EMBED_GATHER=0 restores the masked lookup.
         self.embed_tokens = Embedding(
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-            use_gather_kernel=True,
+            use_gather_kernel=os.environ.get("TRTLLM_DSV4_EMBED_GATHER", "1") == "1",
         )
 
         self.hc_head = HCHead(config.hc_mult, config.hidden_size) if self.uses_hc_head else None

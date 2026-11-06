@@ -84,6 +84,12 @@ def main():
     fails = []
     if not flag:
         fails.append("DeepseekV4Model.__init__ does not pass use_gather_kernel=True")
+    os.environ["TRTLLM_DSV4_EMBED_GATHER"] = "0"
+    flag_off = tree_flag()[0]
+    os.environ.pop("TRTLLM_DSV4_EMBED_GATHER")
+    log(f"kill switch TRTLLM_DSV4_EMBED_GATHER=0 -> use_gather_kernel={flag_off}")
+    if flag_off:
+        fails.append("TRTLLM_DSV4_EMBED_GATHER=0 does not restore the masked lookup")
     torch.manual_seed(0)
     w = torch.randn(V, H, dtype=dt, device="cuda")
     w_sum = bits(w).to(torch.int64).sum().item()

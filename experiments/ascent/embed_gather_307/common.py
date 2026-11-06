@@ -38,9 +38,11 @@ def tree_flag():
             if depth == 0:
                 break
         j += 1
-    call = src[i:j + 1]
-    flag = bool(re.search(r"use_gather_kernel\s*=\s*True", call))
-    return flag, path, " ".join(call.split())
+    call = " ".join(src[i:j + 1].split())
+    m = re.search(r"use_gather_kernel\s*=\s*(.*?),?\s*\)$", call)
+    # evaluated as the model would at construction time (env kill switch included)
+    flag = bool(eval(m.group(1), {"os": os})) if m else False  # noqa: S307
+    return flag, path, call
 
 
 def model_dims(ckpt):

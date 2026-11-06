@@ -72,7 +72,8 @@ def main():
     w = torch.randn(V, H, dtype=dt, device="cuda")
     emb = make_embedding(V, H, dt, flag, weight=w)
     out = {"batch": {}, "output": {"class": "exact"},
-           "use_gather_kernel": flag, "V": V, "H": H, "embed_only_ms": {}}
+           "use_gather_kernel": flag, "V": V, "H": H, "embed_only_ms": {}, "cold": {}}
+    flush = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     for M in (1, 2, 4, 8, 2048):
         ids = torch.randint(0, V, (M, ), dtype=torch.int32, device="cuda")
         chains = K if M <= 8 else 4
@@ -88,6 +89,23 @@ def main():
         del g
         med_e, noise_e, g2, _ = time_graph(only, chains)
         del g2
+        # cold variant: one chain per replay after a 256 MB L2 flush (ids and table rows cold)
+        _, _, g3, _ = time_graph(chain, 1)
+        cold = []
+        for _ in range(60):
+            flush.zero_()
+            a = torch.cuda.Event(enable_timing=True)
+            b = torch.cuda.Event(enable_timing=True)
+            a.record()
+            g3.replay()
+            b.record()
+            b.synchronize()
+            cold.append(a.elapsed_time(b))
+        del g3
+        cmed = statistics.median(cold)
+        out["cold"][str(M)] = {"kernel_ms": round(cmed, 6),
+                               "noise_floor": round((pct(cold, 0.9) - pct(cold, 0.1)) / cmed, 4)}
+        log(f"M={M}: cold single replay {cmed * 1e3:.2f} us")
         out["batch"][str(M)] = {"kernel_ms": round(med, 6), "noise_floor": round(noise, 4)}
         out["embed_only_ms"][str(M)] = {"kernel_ms": round(med_e, 6),
                                         "noise_floor": round(noise_e, 4)}
