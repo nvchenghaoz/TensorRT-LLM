@@ -26,7 +26,7 @@ import stage0  # noqa: E402
 
 HIDDEN = 5120
 WORLD = 4
-SHAPES = [4096, 4099, 8192]
+SHAPES = [int(s) for s in os.environ.get("CHAIN_SHAPES", "4096,4099,8192").split(",")]
 CALLS = int(os.environ.get("CHAIN_CALLS", "1000"))
 CHUNK = 250
 # Pipelined vs fp32-sum reference must be no worse than the serial (full-T LP) chain beyond this factor.
