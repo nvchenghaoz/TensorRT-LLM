@@ -50,6 +50,90 @@ def allocs():
     return torch.cuda.memory_stats().get("allocation.all.allocated", 0)
 
 
+# Allocation attribution: device allocations inside FISharedPrefill.__call__ and inside the
+# index prep alone (the rest of a Case call is the harness's fake attention / backend glue).
+ALLOC = {"on": False, "fi_call": 0, "prep": 0}
+_orig_call = fsp.FISharedPrefill.__call__
+_orig_prep = fsp.prepare_shared_prefill_indices
+
+
+def _counted_call(self, *a, **k):
+    if not ALLOC["on"]:
+        return _orig_call(self, *a, **k)
+    b = allocs()
+    try:
+        return _orig_call(self, *a, **k)
+    finally:
+        ALLOC["fi_call"] += allocs() - b
+
+
+def _counted_prep(*a, **k):
+    if not ALLOC["on"]:
+        return _orig_prep(*a, **k)
+    b = allocs()
+    try:
+        return _orig_prep(*a, **k)
+    finally:
+        ALLOC["prep"] += allocs() - b
+
+
+fsp.FISharedPrefill.__call__ = _counted_call
+fsp.prepare_shared_prefill_indices = _counted_prep
+
+
+def count_allocs(case, n):
+    """Steady device allocations over n calls: whole Case call, FI call, index prep."""
+    torch.cuda.synchronize()
+    ALLOC.update(fi_call=0, prep=0)
+    ALLOC["on"] = True
+    total = 0
+    for _ in range(n):
+        b = allocs()
+        case()
+        total += allocs() - b
+    ALLOC["on"] = False
+    torch.cuda.synchronize()
+    return {"case_call": total, "fi_call": ALLOC["fi_call"], "index_prep": ALLOC["prep"]}
+
+
+def mismatch(a, b):
+    d = a != b
+    n = int(d.sum())
+    out = {"count": n, "numel": a.numel()}
+    if n:
+        idx = d.nonzero()[:6].tolist()
+        out["first"] = [[i, int(a[tuple(i)]), int(b[tuple(i)])] for i in idx]
+        out["rows"] = int(d.any(-1).sum())
+    return out
+
+
+def index_diag(s, bb, rb, hm):
+    """Index scratch: JIT vs cached-handle launch into fresh buffers, and whether the
+    FI attention writes the scratch in place (post-call state vs a fresh re-prep)."""
+    count = s.count
+    res = {}
+    mp = s.main_pool if hm else None
+    ml = s.main_logical if hm else None
+    mw = ml.shape[1] if hm else 1
+    fresh = {}
+    for direct in (False, True):
+        swa = torch.full((count, s.swa_slots.shape[1]), -7, dtype=torch.int32, device=s.q.device)
+        main = torch.full((count, mw), -7, dtype=torch.int32, device=s.q.device)
+        _orig_prep(s.swa_pool, s.swa_slots, mp, ml, s.mapping, s.plan, swa, main if hm else None,
+                   direct=direct)
+        fresh[direct] = (swa, main)
+    torch.cuda.synchronize()
+    res["fresh_jit_vs_cached_launch_swa"] = mismatch(fresh[False][0], fresh[True][0])
+    if hm:
+        res["fresh_jit_vs_cached_launch_main"] = mismatch(fresh[False][1], fresh[True][1])
+    res["fresh_jit_vs_branch_scratch_after_calls_swa"] = mismatch(fresh[False][0], bb["swa"])
+    res["fresh_jit_vs_base_scratch_after_calls_swa"] = mismatch(fresh[False][0], rb["swa"])
+    if hm:
+        res["fresh_jit_vs_branch_scratch_after_calls_main"] = mismatch(fresh[False][1], bb["main"])
+        res["fresh_jit_vs_base_scratch_after_calls_main"] = mismatch(fresh[False][1], rb["main"])
+    return res
+
+
 def plans(fi):
     return {str(k): len(w._prepared_calls) for k, w in fi._wrappers.items()}
 
@@ -99,27 +183,43 @@ def main():
         fi = br.helper._fi_prefill
         first_equal = bool(torch.equal(br.out, ref))
         per_iter, steady_direct = [], True
-        p0 = a0 = d0 = None
+        p0 = d0 = None
+        new_allocs = 0
         for it in range(WARMUP + ITERS):
             br.out.fill_(float("nan"))
             if it == WARMUP:
                 torch.cuda.synchronize()
-                p0, a0, d0 = plans(fi), allocs(), fi.direct_calls
+                p0, d0 = plans(fi), fi.direct_calls
+            # Allocations counted around the production call only (not the harness's
+            # fill_/torch.equal).
+            a_before = allocs()
             if it >= WARMUP:
                 torch.cuda.set_sync_debug_mode("error")
             res = br()
             if it >= WARMUP:
                 torch.cuda.set_sync_debug_mode("default")
+                new_allocs += allocs() - a_before
             torch.cuda.synchronize()
             per_iter.append(bool(torch.equal(br.out, ref)) and res is br.out)
-        a1, p1, d1 = allocs(), plans(fi), fi.direct_calls
+        p1, d1 = plans(fi), fi.direct_calls
+        a0, a1 = 0, new_allocs
         steady_direct = (d1 - d0) == ITERS
         bkey = next(iter(br.helper._fi_prefill._buffers))
         bb, rb = br.helper._fi_prefill._buffers[bkey], base.helper._fi_prefill._buffers[bkey]
-        index_equal = bool(torch.equal(bb["swa"], rb["swa"])) and bool(torch.equal(bb["main"], rb["main"]))
+        # The main scratch is written only on dual (SWA+main) tiles.
+        idiag = index_diag(s, bb, rb, hm)
+        # The cached-handle launch must write exactly what the JIT launch writes.
+        index_equal = idiag["fresh_jit_vs_cached_launch_swa"]["count"] == 0 and (
+            not hm or idiag["fresh_jit_vs_cached_launch_main"]["count"] == 0
+        )
         empty_zero = bool((br.out.view_as(s.q)[s.empty] == 0).all())
+        alloc_branch = count_allocs(br, ITERS)
+        alloc_base = count_allocs(base, ITERS)
+        # No new allocations: the branch's FI call allocates nothing in steady state, and the
+        # whole production call allocates no more than the wrapper.run route.
+        alloc_ok = alloc_branch["fi_call"] == 0 and alloc_branch["case_call"] <= alloc_base["case_call"]
         case_ok = (
-            all(per_iter) and first_equal and eager_repeat and p0 == p1 and a1 == a0
+            all(per_iter) and first_equal and eager_repeat and p0 == p1 and alloc_ok
             and steady_direct and index_equal and empty_zero
             and base.helper._fi_prefill.direct_calls == 0
         )
@@ -131,9 +231,13 @@ def main():
             "first_call_bitwise": first_equal,
             "reference_eager_repeat_bitwise": eager_repeat,
             "steady_plans_before_after": [p0, p1],
-            "steady_new_allocations": a1 - a0,
+            "steady_new_allocations_whole_case_call_in_loop": a1 - a0,
+            "steady_allocations_30_calls_branch": alloc_branch,
+            "steady_allocations_30_calls_wrapper_route": alloc_base,
+            "allocations_ok": alloc_ok,
             "steady_calls_direct": d1 - d0,
             "index_scratch_bitwise_vs_jit_launch": index_equal,
+            "index_diag": idiag,
             "empty_rows_zero": empty_zero,
             "kill_switch_direct_calls": base.helper._fi_prefill.direct_calls,
             "kill_switch_wrapper_calls": base.helper._fi_prefill.wrapper_calls,
