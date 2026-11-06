@@ -73,6 +73,10 @@ def main():
         (1, 2048, False),
         (1, 128, True),
         (1, 128, False),
+        (2, 2048, True),
+        (2, 2048, False),
+        (2, 128, True),
+        (2, 128, False),
         (3, 2048, True),
         (3, 2048, False),
         (3, 128, True),
@@ -82,7 +86,7 @@ def main():
     for i, (r, t, hm) in enumerate(shapes):
         s = Scenario(r, t, hm, seed=1000 + i)
         cases[s.name] = Case(s)
-    batch, errs = {}, {}
+    per_shape, errs = {}, {}
     for name, c in cases.items():
         c()
         torch.cuda.synchronize()
@@ -90,24 +94,30 @@ def main():
         errs[name] = errors(c.out.view_as(c.s.q), ref)
         del ref
         torch.cuda.empty_cache()
-        batch[name] = timed(c, ITERS, WARMUP)
-        log(f"{name}: {batch[name]['kernel_ms']:.4f} ms (noise {batch[name]['noise_floor']:.3f}) err {errs[name]}")
+        per_shape[name] = timed(c, ITERS, WARMUP)
+        log(f"{name}: {per_shape[name]['kernel_ms']:.4f} ms (noise {per_shape[name]['noise_floor']:.3f}) err {errs[name]}")
+    # One prefill step's 40 CSA2 attention calls per serving concurrency: c1 = one request
+    # (L0-19 2048 rows, L20-39 128 rows, widths 640/128); c2 / c4 = the 2- / 3-request
+    # follower steps (4096/256 and 6144/384 rows).
     seqs = {
-        "c1_request_40": ["2048x640", "2048x128"] * 10 + ["128x640", "128x128"] * 10,
-        "c4_follower_40": ["6144x640", "6144x128"] * 10 + ["384x640", "384x128"] * 10,
+        "1": ["2048x640", "2048x128"] * 10 + ["128x640", "128x128"] * 10,
+        "2": ["4096x640", "4096x128"] * 10 + ["256x640", "256x128"] * 10,
+        "4": ["6144x640", "6144x128"] * 10 + ["384x640", "384x128"] * 10,
     }
+    batch = {}
     for label, names in seqs.items():
         def run(names=names):
             for nm in names:
                 cases[nm]()
         batch[label] = timed(run, 15, 2)
-        log(f"{label}: {batch[label]['kernel_ms']:.3f} ms (noise {batch[label]['noise_floor']:.3f})")
+        log(f"step c{label} (40 calls): {batch[label]['kernel_ms']:.3f} ms (noise {batch[label]['noise_floor']:.3f})")
     worst = max(e["max_abs"] for e in errs.values())
     print(
         json.dumps(
             {
                 "batch": batch,
                 "output": {"class": "reordered", "max_abs_vs_fp64": worst, "per_case_vs_fp64": errs},
+                "per_shape": per_shape,
                 "tree": tree,
             }
         )
