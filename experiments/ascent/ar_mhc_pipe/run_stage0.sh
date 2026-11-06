@@ -50,7 +50,7 @@ if [ "$WHAT" = "checks" ] || [ "$WHAT" = "all" ]; then
   CRC=${PIPESTATUS[0]}
   CHAIN=$(tail -n 1 "${AUTO_DEV_ARTIFACTS:-.}/chain_stdout.log")
   echo "=== E2E CHECK $(date -Is) (chain rc=$CRC)" 1>&2
-  "$PY" "$HERE/e2e_check.py" "$CKPT" off,on 8 2>&1 | tee "${AUTO_DEV_ARTIFACTS:-.}/e2e_stdout.log" | cut -c1-1500 1>&2
+  "$PY" "$HERE/e2e_check.py" "$CKPT" "${E2E_ARMS:-off,on}" 8 2>&1 | tee "${AUTO_DEV_ARTIFACTS:-.}/e2e_stdout.log" | cut -c1-1500 1>&2
   ERC=${PIPESTATUS[0]}
   E2E=$(tail -n 1 "${AUTO_DEV_ARTIFACTS:-.}/e2e_stdout.log")
   exec "$PY" -c '

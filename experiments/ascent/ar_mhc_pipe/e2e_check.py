@@ -45,7 +45,10 @@ FAIL_RE = re.compile(r"\[TAIL_MOE_GRAPH\][^\n]*capture failed")
 STEP_RE = re.compile(r"^(step\[(EXTEND|DECODE)[^\]]*\])")
 # KV-cache capacity at startup (idea 374 acceptance 2): the memory-profiling summary and the per-window block counts.
 KV_RE = re.compile(r"(Peak memory during memory usage profiling.*|\[KVCacheManager\] blocks_per_window.*"
-                   r"|max_tokens=\d+.*|[Mm]ax (KV )?tokens.*\d+.*)")
+                   r"|max_tokens=\d+.*|max_tokens \d+ is provided.*|KV cache manager v2 device quota set to.*"
+                   r"|[Mm]ax (KV )?tokens.*\d+.*)")
+QUOTA_RE = re.compile(r"KV cache manager v2 device quota set to ([\d.]+) ?GiB")
+MAXTOK_RE = re.compile(r"max_tokens (\d+) is provided")
 PREPOP_RE = re.compile(r"memory_pool_prepop|after_memory_pool_prepop")
 
 
@@ -291,6 +294,7 @@ def main():
     head = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     log(f"head={head} arms={arms} reps={reps}")
     results, caps, kvs = {}, {}, {}
+    warm_info = None
     for arm in arms:
         env = dict(os.environ)
         env.setdefault("TLLM_LOG_LEVEL", "INFO")
@@ -298,9 +302,10 @@ def main():
             if k.startswith(("TRTLLM_DSV41_PREFILL_AR_PIPELINE", "NCCL_", "TRTLLM_DSV4_SHARED_OVERLAP",
                              "TRTLLM_DSV4_TAIL_MOE_GRAPH")):
                 env.pop(k)
-        if arm == "off":
+        if arm in ("off", "warm"):
             env["TRTLLM_DSV41_PREFILL_AR_PIPELINE"] = "0"
-        argv = [sys.executable, os.path.abspath(__file__), "--arm", arm, ckpt, str(reps), outdir]
+        argv = [sys.executable, os.path.abspath(__file__), "--arm", arm, ckpt, str(0 if arm == "warm" else reps),
+                outdir]
         log(f"start arm {arm}")
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                              env=env, start_new_session=True)
@@ -341,17 +346,28 @@ def main():
                     "blocks_per_window": sorted({ln for ln in kv_lines if "blocks_per_window" in ln}),
                     "available_kv_GiB": sorted({m.group(1) for ln in kv_lines
                                                 for m in [re.search(r"available KV cache memory[^:]*: ([\d.]+) GiB",
-                                                                    ln)] if m})}
+                                                                    ln)] if m}),
+                    "device_quota_GiB": sorted({m.group(1) for ln in kv_lines for m in [QUOTA_RE.search(ln)] if m}),
+                    "max_tokens_estimate": sorted({int(m.group(1)) for ln in kv_lines
+                                                   for m in [MAXTOK_RE.search(ln)] if m})}
+        if arm == "warm":
+            # JIT/cache warm-up arm (env 0): runs first so the compared arms start under the same conditions;
+            # it is not compared and gates nothing.
+            warm_info = {"rc": p.returncode, "tail_graph": caps.pop(arm), "kv": {k: v for k, v in kvs.pop(arm).items()
+                                                                                 if k != "lines"}}
+            continue
         f = Path(outdir) / f"arm_{arm}.json"
         results[arm] = json.loads(f.read_text()) if f.exists() else {"records": {}, "errors": ["no output"]}
         log(f"arm {arm} rc={p.returncode} records={len(results[arm]['records'])} tail_graph={caps[arm]}")
     out = {"head": head, "tail_graph": caps, "sha256": {a: results[a].get("sha256") for a in results},
            "errors": {a: results[a].get("errors") for a in results}, "batch": BATCH,
-           "kv_capacity": {a: {k: v for k, v in kvs[a].items() if k != "lines"} for a in kvs}}
+           "kv_capacity": {a: {k: v for k, v in kvs[a].items() if k != "lines"} for a in kvs},
+           "arm_order": arms, "warm_arm": warm_info}
     if "off" in kvs and "on" in kvs:
-        out["kv_capacity_equal"] = (kvs["off"]["blocks_per_window"] == kvs["on"]["blocks_per_window"]
-                                    and kvs["off"]["available_kv_GiB"] == kvs["on"]["available_kv_GiB"]
-                                    and bool(kvs["on"]["blocks_per_window"]))
+        # The capacity the engine runs with: the KV v2 device quota after the cross-rank MIN sync of max tokens
+        # (one value on every rank). Per-rank pre-sync estimates are reported, not gated.
+        out["kv_capacity_equal"] = (kvs["off"]["device_quota_GiB"] == kvs["on"]["device_quota_GiB"]
+                                    and len(kvs["on"]["device_quota_GiB"]) >= 1)
     Path(outdir).mkdir(parents=True, exist_ok=True)
     Path(outdir, "kv_lines.json").write_text(json.dumps(kvs, indent=1))
     passed = all(not results[a].get("errors") and len(results[a]["records"]) == (BATCH + 1) * reps for a in results)
