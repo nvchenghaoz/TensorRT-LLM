@@ -36,6 +36,29 @@ sleep 2
 echo "LP-STEP1 rc=${RC}" 1>&2
 if [ "$RC" -ne 0 ]; then echo "{\"passed\": false, \"error\": \"lp_check STEP 1 failed or hung\", \"rc\": ${RC}}"; exit 3; fi
 WHAT="${1:-stage0}"; [ $# -gt 0 ] && shift
+if [ "$WHAT" = "checks" ]; then
+  # acceptance 2-4: 4-rank chain check (1000 calls/shape, IPC flags) then the end-to-end LLM check (off vs on)
+  echo "=== CHAIN CHECK $(date -Is)" 1>&2
+  mkdir -p "${AUTO_DEV_ARTIFACTS:-.}"
+  "$PY" "$HERE/chain_check.py" "$CKPT" 2>&1 | tee "${AUTO_DEV_ARTIFACTS:-.}/chain_stdout.log" | cut -c1-1500 1>&2
+  CRC=${PIPESTATUS[0]}
+  CHAIN=$(tail -n 1 "${AUTO_DEV_ARTIFACTS:-.}/chain_stdout.log")
+  echo "=== E2E CHECK $(date -Is) (chain rc=$CRC)" 1>&2
+  "$PY" "$HERE/e2e_check.py" "$CKPT" off,on 8 2>&1 | tee "${AUTO_DEV_ARTIFACTS:-.}/e2e_stdout.log" | cut -c1-1500 1>&2
+  ERC=${PIPESTATUS[0]}
+  E2E=$(tail -n 1 "${AUTO_DEV_ARTIFACTS:-.}/e2e_stdout.log")
+  exec "$PY" -c '
+import json, sys
+def parse(s):
+    try:
+        return json.loads(s)
+    except Exception:
+        return {"passed": False, "unparsed": s[:500]}
+c, e = parse(sys.argv[1]), parse(sys.argv[2])
+print(json.dumps({"passed": bool(c.get("passed")) and bool(e.get("passed")), "chain": c, "e2e": e,
+                  "chain_rc": int(sys.argv[3]), "e2e_rc": int(sys.argv[4])}))
+' "$CHAIN" "$E2E" "$CRC" "$ERC"
+fi
 if [ "$WHAT" = "stage0" ]; then
   echo "=== STAGE 0 $(date -Is)" 1>&2
   exec "$PY" "$HERE/stage0.py" "$CKPT"

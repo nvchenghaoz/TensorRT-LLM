@@ -642,7 +642,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         """Chunk bounds for a pipelined prefill boundary over ``rows`` [T, hidden], or None (unpipelined)."""
         from tensorrt_llm._torch.modules.mhc import ar_pipeline as _arp
 
-        if self._v41_ar_pipe is None or _arp.PIPELINE_K <= 1 or image_mask is not None:
+        if self._v41_ar_pipe is None or not _arp.PIPELINE_ON or image_mask is not None:
             return None
         if rows.dim() != 2 or rows.shape[0] < max(_arp.PIPELINE_MIN_ROWS, 2 * _arp.MIN_CHUNK_ROWS):
             return None
@@ -659,7 +659,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
 
         if AutoTuner.get().is_tuning_mode:
             return None
-        return _arp.chunk_bounds(rows.shape[0], _arp.PIPELINE_K)
+        return _arp.plan(rows.shape[0])
 
     def _mhc_boundary(
         self, mhc: mHC, which: int, x_prev, residual, post_mix, comb_mix, pre, norm, defer_k1=False
@@ -2655,7 +2655,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         from tensorrt_llm._torch.modules.mhc import ar_pipeline as _arp
 
         split = self.model.decoder_replay_split
-        if _arp.PIPELINE_K > 1 and split is not None and not self.model_config.mapping.has_pp():
+        if _arp.PIPELINE_ON and split is not None and not self.model_config.mapping.has_pp():
             pipe = _arp.ArFusedHcPipeline()
             for idx, layer in enumerate(layers):
                 if not isinstance(layer, DeepseekV41DecoderLayer) or idx >= split:

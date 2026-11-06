@@ -74,15 +74,14 @@ def rank_pair(env):
     torch.cuda.synchronize()
 
     def plan(T):  # the model's decision (DeepseekV41DecoderLayer._ar_pipe_bounds, shape part)
-        if arp is None or arp.PIPELINE_K <= 1 or T < max(arp.PIPELINE_MIN_ROWS, 2 * arp.MIN_CHUNK_ROWS):
-            return None
-        return arp.chunk_bounds(T, arp.PIPELINE_K)
+        return None if arp is None else arp.plan(T)
 
     def serial(st):
         return mhc.fused_hc_lagged(ar(st.x), st.res, st.post, st.comb, st.pre, norm_weight=nw, norm_eps=neps)
 
     res = {"rank": rank, "timing": {}, "err": {}, "plan": {},
-           "k": None if arp is None else arp.PIPELINE_K, "min_rows": None if arp is None else arp.PIPELINE_MIN_ROWS}
+           "k": None if arp is None else (arp.PIPELINE_K or f"auto/{arp.PIPELINE_CHUNK_ROWS}"),
+           "min_rows": None if arp is None else arp.PIPELINE_MIN_ROWS}
     for T in TS:
         st = sts[T]
         bounds = plan(T)

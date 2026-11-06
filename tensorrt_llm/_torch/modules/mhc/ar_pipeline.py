@@ -10,8 +10,16 @@ Every chunk writes its rows of preallocated full-size outputs with the FULL-M ta
 row-local, so the chunked mHC is bitwise equal per row to the full-M call on the same inputs). The main stream waits
 on the last chunk's event before returning, so no comm work outlives the call.
 
-Env: ``TRTLLM_DSV41_PREFILL_AR_PIPELINE`` = number of chunks k (``0``/``1`` = off, bitwise main);
-``TRTLLM_DSV41_PREFILL_AR_PIPELINE_MIN_ROWS`` = smallest boundary T that is pipelined.
+Chunk size: ~1024 rows. On SM120 (188 SMs) the M=1024 fused_hc tactic (mtile_v3, 8 tokens per CTA) launches 128
+CTAs, which leaves SMs for the 16-CTA two-shot all-reduce; 2048-row chunks fill every SM and the AR and mHC chunks
+then serialize (branch 199 Stage 0, job 1840).
+
+Env:
+  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE``: ``0``/``1``/``off`` = off (bitwise main); unset/``auto`` = k(T) =
+      max(2, round(T / CHUNK_ROWS)); an integer N >= 2 = always N chunks.
+  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_CHUNK_ROWS`` (default 1024).
+  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_MIN_ROWS``: smallest boundary T that is pipelined (default 4096: each pipelined
+      boundary adds ~0.1-0.3 ms of host launch work, which the host-paced c1 prefill (T=2048) would pay 1:1).
 """
 
 import os
@@ -38,8 +46,19 @@ def _env_int(name: str, default: int) -> int:
     return int(v)
 
 
-PIPELINE_K = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE", 2)
+_RAW = os.environ.get("TRTLLM_DSV41_PREFILL_AR_PIPELINE", "auto").strip().lower()
+PIPELINE_ON = _RAW not in ("0", "1", "off", "false", "no")
+PIPELINE_K = 0 if _RAW in ("", "auto") or not PIPELINE_ON else int(_RAW)  # 0 = k(T)
+PIPELINE_CHUNK_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_CHUNK_ROWS", 1024)
 PIPELINE_MIN_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_MIN_ROWS", 4096)
+
+
+def k_for(T: int) -> int:
+    if not PIPELINE_ON:
+        return 1
+    if PIPELINE_K >= 2:
+        return PIPELINE_K
+    return max(2, int(round(T / max(1, PIPELINE_CHUNK_ROWS))))
 
 
 def chunk_bounds(T: int, k: int, min_chunk_rows: int = MIN_CHUNK_ROWS, align: int = ROW_ALIGN):
@@ -63,18 +82,33 @@ def chunk_bounds(T: int, k: int, min_chunk_rows: int = MIN_CHUNK_ROWS, align: in
     return bounds if len(bounds) >= 2 else None
 
 
+def plan(T: int):
+    """The shape part of the pipelining decision: chunk bounds for a T-row boundary, or None (unpipelined)."""
+    if not PIPELINE_ON or T < max(PIPELINE_MIN_ROWS, 2 * MIN_CHUNK_ROWS):
+        return None
+    return chunk_bounds(T, k_for(T))
+
+
 class ArFusedHcPipeline:
     """One per model: owns the comm stream that every pipelined boundary's chunk all-reduces run on."""
 
     def __init__(self, priority: int = -1):
         self._priority = priority
         self._stream = None
+        self._events = []
+        self._tactics = {}
 
     @property
     def stream(self) -> torch.cuda.Stream:
         if self._stream is None:
             self._stream = torch.cuda.Stream(priority=self._priority)
         return self._stream
+
+    def _event(self, i: int) -> torch.cuda.Event:
+        # Reused across calls: each is recorded and then waited on within one call, in order.
+        while len(self._events) <= i:
+            self._events.append(torch.cuda.Event())
+        return self._events[i]
 
     def run(self, allreduce_fn, mhc, x_partial, residual_prev, post_mix_prev, comb_mix_prev, pre_mix, norm_weight,
             norm_eps, bounds, tactic=None):
@@ -104,22 +138,25 @@ class ArFusedHcPipeline:
         main = torch.cuda.current_stream()
         comm = self.stream
         comm.wait_stream(main)
-        ys, events = [], []
+        ys = []
         with torch.cuda.stream(comm):
-            for a, b in bounds:
-                y = allreduce_fn(x2[a:b])
-                ev = torch.cuda.Event()
-                ev.record(comm)
-                ys.append(y)
-                events.append(ev)
+            for i, (a, b) in enumerate(bounds):
+                ys.append(allreduce_fn(x2[a:b]))
+                self._event(i).record(comm)
         x2.record_stream(comm)
 
         if tactic is None:
-            # The full-M tactic, pinned for every chunk (the autotuner's choice at this boundary's M).
-            tactic = mhc_fused_hc_tactic(
-                x2, res_flat, post_f, comb_f, fn, scale, base, n, hidden, mhc.norm_eps, mhc.eps,
-                mhc.sinkhorn_eps, mhc.post_mult_value, mhc.sinkhorn_iters, norm_weight=nw, norm_eps=norm_eps,
-                pre_mix_ext=pre_f)
+            # The full-M tactic, pinned for every chunk (the autotuner's choice at this boundary's M; fixed once
+            # warm-up has tuned, so it is looked up once per M).
+            key = (n, hidden, B, nw is None, float(norm_eps), mhc.norm_eps, mhc.eps, mhc.sinkhorn_eps,
+                   mhc.post_mult_value, mhc.sinkhorn_iters)
+            tactic = self._tactics.get(key)
+            if tactic is None:
+                tactic = mhc_fused_hc_tactic(
+                    x2, res_flat, post_f, comb_f, fn, scale, base, n, hidden, mhc.norm_eps, mhc.eps,
+                    mhc.sinkhorn_eps, mhc.post_mult_value, mhc.sinkhorn_iters, norm_weight=nw, norm_eps=norm_eps,
+                    pre_mix_ext=pre_f)
+                self._tactics[key] = tactic
         backend, tile_n, num_k_splits, bigfuse_bs, tile_m = tactic
         code = _FUSED_HC_BACKEND_CODE[backend]
 
@@ -128,11 +165,21 @@ class ArFusedHcPipeline:
         comb_cur = torch.empty((B, n * n), dtype=torch.float32, device=x2.device)
         layer_input = torch.empty((B, hidden), dtype=x2.dtype, device=x2.device)
         pre_cur = torch.empty((B, n), dtype=torch.float32, device=x2.device)
-        for (a, b), y, ev in zip(bounds, ys, events):
-            main.wait_event(ev)
+        # Half-fused scratch is per row (y_acc [ks?, B, 24], r_acc [ks?, B]) and its done counter unused: one
+        # full-size allocation, sliced per chunk. The all-in-one backends keep per-tile counters: per-chunk scratch.
+        shared_ws = backend in ("fused_half_fma", "fused_half_mma") and not (
+            backend == "fused_half_fma" and num_k_splits > 1)
+        if shared_ws:
+            y_ws, r_ws, d_ws = _alloc_fused_hc_scratch(backend, B, n, num_k_splits, tile_m, x2.device)
+        for i, ((a, b), y) in enumerate(zip(bounds, ys)):
+            main.wait_event(self._event(i))
             y.record_stream(main)
             m = b - a
-            y_acc_ws, r_acc_ws, done_ws = _alloc_fused_hc_scratch(backend, m, n, num_k_splits, tile_m, x2.device)
+            if shared_ws:
+                y_acc_ws, r_acc_ws, done_ws = y_ws[a:b], r_ws[a:b], d_ws
+            else:
+                y_acc_ws, r_acc_ws, done_ws = _alloc_fused_hc_scratch(backend, m, n, num_k_splits, tile_m,
+                                                                      x2.device)
             _fused_hc_call(code, tile_n, num_k_splits, bigfuse_bs, tile_m, y, res_flat[a:b], post_f[a:b],
                            comb_f[a:b], fn, scale, base, residual_cur[a:b], post_cur[a:b], comb_cur[a:b],
                            layer_input[a:b], y_acc_ws, r_acc_ws, done_ws, m, hidden, n, mhc.norm_eps, mhc.eps,

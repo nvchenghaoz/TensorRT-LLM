@@ -65,8 +65,7 @@ def rank_chain(env):
     with autotune():
         mhc.fused_hc_lagged(st_big.x, st_big.res, st_big.post, st_big.comb, st_big.pre, norm_weight=nw, norm_eps=neps)
     torch.cuda.synchronize()
-    k = arp.PIPELINE_K
-    res = {"rank": rank, "k": k, "shapes": {}}
+    res = {"rank": rank, "k": arp.PIPELINE_K or f"auto/{arp.PIPELINE_CHUNK_ROWS}", "shapes": {}}
 
     def rr_dev(a, b):  # device scalar, no host sync
         d = a.float() - b.float()
@@ -79,7 +78,8 @@ def rank_chain(env):
             v.shape[0], device=v.device, dtype=torch.int64) % 9973)).sum()])
 
     for T in SHAPES:
-        bounds = arp.chunk_bounds(T, k)
+        k = arp.k_for(T)
+        bounds = arp.chunk_bounds(T, k)  # the k(T) the model uses, also below MIN_ROWS
         st = stage0.St(torch, T, n, rank, dev)
         out = {"T": T, "bounds": bounds, "calls": 0, "max_li_rel_vs_serial": 0.0, "max_res_rel_vs_serial": 0.0,
                "max_li_rel_vs_ref_piped": 0.0, "max_li_rel_vs_ref_serial": 0.0, "worse_than_serial_calls": 0,
