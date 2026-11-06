@@ -97,6 +97,10 @@ def build_chain(cfg, n_layers, dev, gen):
         layer.layer_idx = i
         layer.engram = None
         layer.disable_attn_allreduce = False
+        # Read by _k1_fold_eligible / the ADP check on main (landing 55): no attention DP, and a stand-in MoE
+        # with no fused router, so the hc_ffn K1 is never folded here (it runs on the main stream).
+        layer.mapping = types.SimpleNamespace(enable_attention_dp=False)
+        layer.mlp = None
         for name in ("hc_attn", "hc_ffn"):
             m = mHC(4, hidden, iters, dtype=torch.float32, eps=hc_eps, norm_eps=rms_eps,
                     sinkhorn_eps=hc_eps, post_mult_value=2.0).to(dev)
