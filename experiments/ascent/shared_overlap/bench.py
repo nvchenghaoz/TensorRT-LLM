@@ -367,6 +367,26 @@ def mode_check(rig, ms):
                       "cases": results}))
 
 
+def slot_guard(limit_gib=4.0, wait_s=180, poll_s=10):
+    """Top-lead rule (pitfall 3067/3072): wait-only guard. If another process still holds > limit_gib on a
+    visible GPU after wait_s, print DIRTY SLOT and exit 3 before allocating. Never kills anything."""
+    import time
+    t0 = time.time()
+    while True:
+        used = []
+        for d in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(d)
+            used.append((total - free) / 2**30)
+        print(f"slot_guard used_gib={[round(u, 2) for u in used]} t={time.time() - t0:.0f}s", flush=True)
+        if all(u <= limit_gib for u in used):
+            return
+        if time.time() - t0 >= wait_s:
+            print(f"DIRTY SLOT {[round(u, 2) for u in used]}", flush=True)
+            print(json.dumps({"passed": False, "error": "DIRTY SLOT", "used_gib": used}))
+            sys.exit(3)
+        time.sleep(poll_s)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
@@ -374,6 +394,7 @@ def main():
     ap.add_argument("--ms", default="512,2048,6144")
     args = ap.parse_args()
     ms = [int(v) for v in args.ms.split(",")]
+    slot_guard()
     torch.manual_seed(0)
     rig = Rig(args.ckpt)
     log(f"ARM={rig.arm} layout={LAYOUT} gpu={torch.cuda.get_device_name()} ms={ms}")
