@@ -305,7 +305,12 @@ def bench(args):
         "sm_clock_mhz": clk,
         "batch": {k: {"kernel_ms": v["median_us"] / 1e3, "noise_floor": v["noise_floor"],
                       "p10_ms": v["p10_us"] / 1e3, "p90_ms": v["p90_us"] / 1e3}
-                  for k, v in res.items()},
+                  for k, v in res.items() if k.isdigit()},
+        # Context only (not a batch size): T=2048 span with the concurrent engram lookup background.
+        "context": {k: {"span_ms": v["median_us"] / 1e3, "noise_floor": v["noise_floor"],
+                        "p10_ms": v["p10_us"] / 1e3, "p90_ms": v["p90_us"] / 1e3,
+                        "grid": v.get("grid")}
+                    for k, v in res.items() if not k.isdigit()},
         "all_bitwise_ok": all(v.get("bitwise_ok", True) for v in res.values()),
         "output": {"class": "exact"},
     }
