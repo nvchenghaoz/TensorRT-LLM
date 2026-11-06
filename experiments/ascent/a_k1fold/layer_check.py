@@ -57,6 +57,8 @@ class FoldAttnStandIn(torch.nn.Module):
         self.waux = (torch.randn(5120, 64, generator=gen, device="cuda") / 70.0).to(torch.bfloat16)
         self.ev0, self.ev1 = torch.cuda.Event(), torch.cuda.Event()
         self.rec = None
+        # Read by DeepseekV41DecoderLayer.forward (prefill AR pipeline, landing 77) on every call.
+        self.o_b_proj = types.SimpleNamespace(reduce_output=True, all_reduce=None)
 
     def stash_k1_fold(self, pending):
         self.probe.stash_k1_fold(pending)
@@ -112,6 +114,8 @@ def build(cfg, n_layers):
         layer.forward_MoE = moe_with_ar(layer._moe_standin)
         layer.mapping = types.SimpleNamespace(enable_attention_dp=False)
         layer.mlp = types.SimpleNamespace()
+        # Instance attributes __init__ / post_load_weights set (pitfall 3569): no prefill AR pipeline here.
+        layer._v41_ar_pipe, layer._v41_ar_pipe_attn, layer._v41_ar_pipe_moe = None, False, False
     LMG.k1fold_warmup(*layers[0].self_attn.probe._wq_a_wkv)
     return layers, model, hidden
 

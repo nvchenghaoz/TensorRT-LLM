@@ -328,6 +328,7 @@ def qnorm_chain_warmup(a_weight, a_weight_scale, weight, weight_scale, norm_weig
     """Eager warmup of both chain kernels (run before capture; a no-op once done or while capturing)."""
     _chain_a_warmup(a_weight, a_weight_scale)
     _qnorm_warmup(weight, weight_scale, norm_weight, eps, n_split)
+    k1fold_warmup(a_weight, a_weight_scale)
 
 
 def qnorm_mm(rows: torch.Tensor, norm_weight: torch.Tensor, eps: float, weight: torch.Tensor,
