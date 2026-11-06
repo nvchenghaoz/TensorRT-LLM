@@ -58,6 +58,15 @@ TRTLLM_LP_AR_TWOSHOT_CTAS for the sweep only. LP ipc_barriers_in/out sized (1 + 
   the WHOLE pair on one slot; base stays 8e291e60 (landing 56 touches no comm file). Pair 1715/1716 (austin:4-7) was
   CANCELLED during runner recovery (1715 base was still installing the wheel, 1716 never started): no measurement.
   Re-queued the whole pair (run_serving_pair) once more; class PRECISION, targets c1/c4 TTFT, guards 2588(b).
+- Pair 1726 (base 8e291e60) / 1727 (cand 26820110), austin:4-7 on node smc521ge-0043, back to back, BOTH VALID,
+  memory.used 3 MiB on every GPU at each arm's start. Gate noise base 1.61% / cand 1.11%.
+  | case | TTFT mean base -> cand | TPOT base -> cand |
+  | c1 | 139.81 -> 139.00 (-0.6%) | 5.0821 -> 5.0854 (+0.07%) |
+  | c2 | 294.87 -> 290.42 (-1.5%) | 6.1659 -> 6.1679 (+0.03%) |
+  | c4 | 438.01 -> 406.74 (-7.1%) | 7.6887 -> 7.5313 (-2.0%) |
+  Guards pass (c2 TTFT faster; every TPOT within +0.1% or faster). c4 TTFT target -7.1% (well beyond 1.61% floor);
+  c1 TTFT target -0.6% is inside noise. check_submission ready; its only approval note is the averaged 1.89% < 3%
+  serving_latency floor (pitfall 2899), which the top-lead TTFT-target ruling replaces. Submitted precision, checks [1655].
 
 # Idea 94 (branch 94): LOWPRECISION FP8-payload two-shot AR for prefill-size messages: status
 
