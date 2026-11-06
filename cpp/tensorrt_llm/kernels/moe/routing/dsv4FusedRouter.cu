@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <math.h>
+#include <type_traits>
 
 namespace cg = cooperative_groups;
 
@@ -124,10 +125,46 @@ constexpr int kMaxPairs = kMaxTokens * kTopK;   // 48
 static_assert(kNumWarps * 2 == kQTiles && kChunksPerWarp * kChunk == 2 * kQTileK,
     "each warp's GEMV k-range is exactly two q0 tiles");
 
-template <int kNumTokens, bool kRoute>
-__global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRouterParams const __grid_constant__ p)
+// K1 fold (kFoldK1): dynamic shared memory layout. Raw (pre-norm) bf16 layer_input of every token, the norm weight,
+// the per-warp sums of squares and the rstd of every token.
+constexpr int kFoldChunks = kHiddenDim / 8; // 640 8-element chunks per token: one per thread
+static_assert(kFoldChunks == kBlockSize, "pass A maps chunk c of every token to thread c");
+
+template <int kNumTokens>
+struct FoldSmem
+{
+    static constexpr int kLiBytes = kNumTokens * kHiddenDim * 2;
+    static constexpr int kNwOffset = kLiBytes;
+    static constexpr int kWarpSumOffset = kNwOffset + kHiddenDim * 2;
+    static constexpr int kRstdOffset = kWarpSumOffset + kNumTokens * 32 * 4;
+    static constexpr int kBytes = kRstdOffset + 16 * 4;
+};
+
+__device__ __forceinline__ float foldRcpApproxFtz(float x)
+{
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+__device__ __forceinline__ float foldRsqrtApprox(float x)
+{
+    float r;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+__device__ __forceinline__ float foldBf16Round(float x)
+{
+    return __bfloat162float(__float2bfloat16_rn(x));
+}
+
+template <int kNumTokens, bool kRoute, bool kFoldK1>
+__global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(
+    std::conditional_t<kFoldK1, FusedRouterFoldParams, FusedRouterParams> const __grid_constant__ p)
 {
     static_assert(kNumTokens >= 1 && kNumTokens <= kMaxTokens, "1..8 tokens");
+    static_assert(!kFoldK1 || kNumTokens <= kMaxFoldTokens, "K1 fold: 1..4 tokens (shared memory)");
     constexpr int kPairs = kNumTokens * kTopK;
     int const warpId = threadIdx.x / 32;
     int const lane = threadIdx.x % 32;
@@ -164,10 +201,141 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
                      "l"(p.bias + threadIdx.x * 4)
                      : "memory");
     }
+    [[maybe_unused]] uint8_t* foldSmem = nullptr;
+    if constexpr (kFoldK1)
+    {
+        // The norm weight (read-only for the forward) goes to shared memory like the bias: 640 x 16 B.
+        extern __shared__ __align__(16) uint8_t dsv4FoldDynSmem[];
+        foldSmem = dsv4FoldDynSmem;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\ncp.async.commit_group;\n" ::"r"(
+                         static_cast<uint32_t>(__cvta_generic_to_shared(
+                             foldSmem + FoldSmem<kNumTokens>::kNwOffset + threadIdx.x * 16))),
+                     "l"(p.k1NormWeight + threadIdx.x * 8)
+                     : "memory");
+    }
 
     if (!p.testSkipWait)
     {
         gridDependencyWait();
+    }
+
+    if constexpr (kFoldK1)
+    {
+        // ---- K1 fold, pass A (every thread, chunk = threadIdx.x of every token): post update + lagged collapse
+        // -> raw bf16 li in shared memory. _k1_chunk's expressions: nr = post[j] * x, nr = fma(comb[k][j], r[k], nr)
+        // for k = 0..3, nr = bf16(nr), li = fma(pre[j], nr, li) from 0 for j = 0..3, li = bf16(li).
+        __nv_bfloat16* smLi = reinterpret_cast<__nv_bfloat16*>(foldSmem);
+        int const chunk = threadIdx.x;
+#pragma unroll
+        for (int m = 0; m < kNumTokens; ++m)
+        {
+            int64_t const off = static_cast<int64_t>(m) * kHiddenDim + chunk * 8;
+            uint4 const xv = *reinterpret_cast<uint4 const*>(p.k1X + off);
+            __nv_bfloat16 const* rBase = p.k1Residual + static_cast<int64_t>(m) * 4 * kHiddenDim + chunk * 8;
+            uint4 rv[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                rv[k] = *reinterpret_cast<uint4 const*>(rBase + k * kHiddenDim);
+            }
+            float post[4];
+            float pre[4];
+            float comb[16];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                post[j] = p.k1Post[m * 4 + j];
+                pre[j] = p.k1Pre[m * 4 + j];
+            }
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+            {
+                comb[j] = p.k1Comb[m * 16 + j];
+            }
+            __nv_bfloat16 const* xe = reinterpret_cast<__nv_bfloat16 const*>(&xv);
+            uint4 outv;
+            __nv_bfloat16* oe = reinterpret_cast<__nv_bfloat16*>(&outv);
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+            {
+                float const xf = __bfloat162float(xe[e]);
+                float rf[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                {
+                    rf[k] = __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&rv[k])[e]);
+                }
+                float li = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float nr = __fmul_rn(post[j], xf);
+#pragma unroll
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        nr = __fmaf_rn(comb[k * 4 + j], rf[k], nr);
+                    }
+                    nr = foldBf16Round(nr);
+                    li = __fmaf_rn(pre[j], nr, li);
+                }
+                oe[e] = __float2bfloat16_rn(li);
+            }
+            *reinterpret_cast<uint4*>(smLi + m * kHiddenDim + chunk * 8) = outv;
+        }
+        asm volatile("cp.async.wait_all;\n" ::: "memory");
+        __syncthreads();
+
+        // ---- pass B: the sum of squares in K1's order for its P threads. Thread t of a P-thread group sums chunks
+        // t, t + P, ... of its token, each pair v = 0..3 as s += fma(x, x, y * y); lane 0 of every warp then holds
+        // the xor butterfly (16, 8, 4, 2, 1). P % 32 == 0, so every group is whole warps.
+        int const P = p.k1ReducerThreads;
+        int const groups = kBlockSize / P;
+        int const grp = threadIdx.x / P;
+        int const t = threadIdx.x - grp * P;
+        float* smWarpSum = reinterpret_cast<float*>(foldSmem + FoldSmem<kNumTokens>::kWarpSumOffset);
+        float* smRstd = reinterpret_cast<float*>(foldSmem + FoldSmem<kNumTokens>::kRstdOffset);
+        if (grp < groups)
+        {
+            for (int m = grp; m < kNumTokens; m += groups)
+            {
+                float s = 0.0f;
+                for (int c = t; c < kFoldChunks; c += P)
+                {
+                    uint4 const v = *reinterpret_cast<uint4 const*>(smLi + m * kHiddenDim + c * 8);
+                    __nv_bfloat162 const* hv = reinterpret_cast<__nv_bfloat162 const*>(&v);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                    {
+                        float const lx = __low2float(hv[j]);
+                        float const ly = __high2float(hv[j]);
+                        s = __fadd_rn(s, __fmaf_rn(lx, lx, __fmul_rn(ly, ly)));
+                    }
+                }
+#pragma unroll
+                for (int off = 16; off >= 1; off /= 2)
+                {
+                    s = __fadd_rn(s, __shfl_xor_sync(0xffffffffu, s, off));
+                }
+                if (lane == 0)
+                {
+                    smWarpSum[m * 32 + t / 32] = s;
+                }
+            }
+        }
+        __syncthreads();
+        // ---- pass C: total = sequential sum over warps from warp 0; rstd = rsqrt(fma(total, rcp(hidden), eps)).
+        if (threadIdx.x < kNumTokens)
+        {
+            int const m = threadIdx.x;
+            float total = smWarpSum[m * 32];
+            for (int w = 1; w < P / 32; ++w)
+            {
+                total = __fadd_rn(total, smWarpSum[m * 32 + w]);
+            }
+            float const rcp = foldRcpApproxFtz(static_cast<float>(kHiddenDim));
+            smRstd[m] = foldRsqrtApprox(__fmaf_rn(total, rcp, p.k1NormEps));
+        }
+        __syncthreads();
     }
 
     // ---- GEMV: router_gemm_mma_kernel's loads, MMA order and reduction.
@@ -175,11 +343,53 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
     uint4 const zero4 = make_uint4(0u, 0u, 0u, 0u);
     __nv_bfloat16 const* aRow0 = p.x + g * kHiddenDim;
     uint4 a0[kChunksPerWarp];
-#pragma unroll
-    for (int c = 0; c < kChunksPerWarp; c++)
+    if constexpr (kFoldK1)
     {
-        int const k = kWarp + c * kChunk + q * 8;
-        a0[c] = row0Valid ? *reinterpret_cast<uint4 const*>(aRow0 + k) : zero4;
+        // K1 fold: the operand is layer_input = bf16((li * rstd) * w) (_k1_norm), from shared memory. This CTA also
+        // stores its share (8-element units u = k / 8 with u % kNumCtas == blockIdx.x) of layer_input to out.
+        __nv_bfloat16 const* smLi = reinterpret_cast<__nv_bfloat16 const*>(foldSmem);
+        __nv_bfloat16 const* smNw
+            = reinterpret_cast<__nv_bfloat16 const*>(foldSmem + FoldSmem<kNumTokens>::kNwOffset);
+        float const rstd
+            = row0Valid ? reinterpret_cast<float const*>(foldSmem + FoldSmem<kNumTokens>::kRstdOffset)[g] : 0.0f;
+#pragma unroll
+        for (int c = 0; c < kChunksPerWarp; c++)
+        {
+            int const k = kWarp + c * kChunk + q * 8;
+            if (row0Valid)
+            {
+                uint4 const lv = *reinterpret_cast<uint4 const*>(smLi + g * kHiddenDim + k);
+                uint4 const wv = *reinterpret_cast<uint4 const*>(smNw + k);
+                __nv_bfloat16 const* le = reinterpret_cast<__nv_bfloat16 const*>(&lv);
+                __nv_bfloat16 const* we = reinterpret_cast<__nv_bfloat16 const*>(&wv);
+                uint4 ov;
+                __nv_bfloat16* oe = reinterpret_cast<__nv_bfloat16*>(&ov);
+#pragma unroll
+                for (int e = 0; e < 8; ++e)
+                {
+                    oe[e] = __float2bfloat16_rn(
+                        __fmul_rn(__fmul_rn(__bfloat162float(le[e]), rstd), __bfloat162float(we[e])));
+                }
+                a0[c] = ov;
+                if ((k / 8) % kNumCtas == static_cast<int>(blockIdx.x))
+                {
+                    *reinterpret_cast<uint4*>(p.k1Out + g * kHiddenDim + k) = ov;
+                }
+            }
+            else
+            {
+                a0[c] = zero4;
+            }
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int c = 0; c < kChunksPerWarp; c++)
+        {
+            int const k = kWarp + c * kChunk + q * 8;
+            a0[c] = row0Valid ? *reinterpret_cast<uint4 const*>(aRow0 + k) : zero4;
+        }
     }
     if constexpr (kRoute)
     {
@@ -477,10 +687,38 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(FusedRout
 }
 
 template <int kNumTokens>
+void launchFold(FusedRouterFoldParams const& params, cudaStream_t stream)
+{
+    auto kernel = params.qOut != nullptr ? dsv4FusedRouterKernel<kNumTokens, true, true>
+                                         : dsv4FusedRouterKernel<kNumTokens, false, true>;
+    constexpr int kSmem = FoldSmem<kNumTokens>::kBytes;
+    static bool const kAttrSet = []
+    {
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(dsv4FusedRouterKernel<kNumTokens, true, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(dsv4FusedRouterKernel<kNumTokens, false, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+        return true;
+    }();
+    (void) kAttrSet;
+    cudaLaunchConfig_t config{};
+    config.gridDim = kNumCtas;
+    config.blockDim = kBlockSize;
+    config.dynamicSmemBytes = kSmem;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, params));
+}
+
+template <int kNumTokens>
 void launch(FusedRouterParams const& params, cudaStream_t stream)
 {
-    auto kernel = params.qOut != nullptr ? dsv4FusedRouterKernel<kNumTokens, true>
-                                         : dsv4FusedRouterKernel<kNumTokens, false>;
+    auto kernel = params.qOut != nullptr ? dsv4FusedRouterKernel<kNumTokens, true, false>
+                                         : dsv4FusedRouterKernel<kNumTokens, false, false>;
     cudaLaunchConfig_t config{};
     config.gridDim = kNumCtas;
     config.blockDim = kBlockSize;
@@ -517,6 +755,28 @@ void invokeDsv4FusedRouter(FusedRouterParams const& paramsIn, cudaStream_t strea
     case 7: launch<7>(params, stream); break;
     case 8: launch<8>(params, stream); break;
     default: TLLM_CHECK_WITH_INFO(false, "dsv4 fused router supports 1..8 tokens");
+    }
+}
+
+void invokeDsv4FusedRouterK1Fold(FusedRouterFoldParams const& paramsIn, cudaStream_t stream)
+{
+    FusedRouterFoldParams params = paramsIn;
+    static bool const kTestSkipWait = []
+    {
+        char const* skipWait = std::getenv("TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT");
+        return skipWait != nullptr && skipWait[0] == '1';
+    }();
+    params.testSkipWait = kTestSkipWait ? 1 : 0;
+    int const P = params.k1ReducerThreads;
+    TLLM_CHECK_WITH_INFO(P == 96 || P == 224 || P == 256 || P == 480, "K1 fold: reducer threads must be 96/224/256/480");
+    TLLM_CHECK_WITH_INFO(params.k1Out == params.x, "K1 fold: out must be the router input x");
+    switch (params.numTokens)
+    {
+    case 1: launchFold<1>(params, stream); break;
+    case 2: launchFold<2>(params, stream); break;
+    case 3: launchFold<3>(params, stream); break;
+    case 4: launchFold<4>(params, stream); break;
+    default: TLLM_CHECK_WITH_INFO(false, "dsv4 fused router K1 fold supports 1..4 tokens");
     }
 }
 

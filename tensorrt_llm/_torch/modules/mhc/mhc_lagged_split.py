@@ -246,20 +246,67 @@ TEST_AUX_SLEEP_CYCLES = int(os.environ.get("TRTLLM_MHC_SPLIT_TEST_SLEEP_CYCLES",
 TEST_KEEP_K2_LAYER_INPUT = os.environ.get("TRTLLM_MHC_SPLIT_TEST_KEEP_K2", "0") == "1"
 
 
+# K1 fold (decode M <= 4, SM120): at the hc_ffn boundary K1 is not launched; the MoE's fused router launch
+# (torch.ops.trtllm.dsv4_fused_router[_route]_k1fold) computes layer_input itself after its PDL wait and writes it
+# into the boundary's layer_input tensor, and the shared expert (aux stream) runs its own K1 into its own buffer.
+# TRTLLM_DSV4_ROUTER_K1_FOLD=0 turns it off (K1 on the main stream as before).
+K1_FOLD_ENV_ON = os.environ.get("TRTLLM_DSV4_ROUTER_K1_FOLD", "1") != "0"
+# The kernel takes 1..4 tokens. Default 2: in the 40-layer cold-L2 chain (job 1601) the fold saves 4.1 / 3.1
+# us/layer at M=1 / 2 but costs +3.1 us/layer at M=4 (every CTA reads M x 50 KB of K1 inputs).
+K1_FOLD_MAX_TOKENS = min(4, int(os.environ.get("TRTLLM_DSV4_ROUTER_K1_FOLD_MAX_M", "2")))
+
+
+class K1FoldPending:
+    """The K1 of one split boundary, not launched yet: ``out`` (the boundary's layer_input) is written by the
+    consumer's fused router launch (:meth:`fold_args`), or by :meth:`materialize` (the plain K1 into ``out`` on
+    the current stream) when the consumer cannot fold it. :meth:`run_copy` runs K1 into a fresh buffer on the
+    current stream (the shared expert's input on its aux stream)."""
+
+    __slots__ = ("out", "args", "reducer_threads", "norm_eps", "done", "folded")
+
+    def __init__(self, out, args, norm_eps, reducer_threads):
+        self.out = out
+        self.args = args  # (x_prev, residual_prev, post, comb, pre, norm_weight)
+        self.norm_eps = float(norm_eps)
+        self.reducer_threads = int(reducer_threads)
+        self.done = False
+        self.folded = False  # True when the router launch produced ``out`` (not materialize)
+
+    def fold_args(self):
+        """(x_prev, residual, post, comb, pre, norm_weight, norm_eps, reducer_threads) for the fold op; marks
+        ``out`` as produced by that launch."""
+        self.done = True
+        self.folded = True
+        return (*self.args, self.norm_eps, self.reducer_threads)
+
+    def materialize(self):
+        if not self.done:
+            self.done = True
+            mhc_lagged_layer_input(*self.args, self.norm_eps, self.reducer_threads, out=self.out)
+        return self.out
+
+    def run_copy(self):
+        if TEST_AUX_SLEEP_CYCLES > 0:
+            torch.cuda._sleep(TEST_AUX_SLEEP_CYCLES)
+        return mhc_lagged_layer_input(*self.args, self.norm_eps, self.reducer_threads)
+
+
 class MhcSplitJoin:
     """Pending K2 of one split boundary: ``join()`` makes the calling stream wait for it.
 
     Holds a reference to every K2 input until the join: the caller rebinds/drops them
     (``residual, ... = boundary(...)``), and the caching allocator would otherwise hand
     their blocks to later main-stream allocations while K2 still reads them.
+    ``k1_fold``: the boundary's K1 when it was deferred to the consumer (K1 fold), else None.
     """
 
-    __slots__ = ("event", "keep", "k2_layer_input")
+    __slots__ = ("event", "keep", "k2_layer_input", "k1_fold")
 
-    def __init__(self, event, keep, k2_layer_input=None):
+    def __init__(self, event, keep, k2_layer_input=None, k1_fold=None):
         self.event = event
         self.keep = keep
         self.k2_layer_input = k2_layer_input
+        self.k1_fold = k1_fold
 
     def join(self):
         if self.event is not None:

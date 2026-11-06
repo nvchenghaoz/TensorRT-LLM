@@ -57,6 +57,25 @@ _ENV_LOWM = "TRTLLM_CSA2_LOWM_WO"
 # chain sweep at the TP4 rank shapes (experiments/ascent/lowm_wo/bench.py, job 1104).
 _LOWM_WO_A_CONFIGS = {m: ((4, 2, 2) if m <= 2 else (8, 4, 2)) for m in range(1, MAX_DECODE_ROWS + 1)}
 _LOWM_WO_B_CONFIGS = {m: ((4, 1, 1) if m <= 2 else (8, 1, 2)) for m in range(1, MAX_DECODE_ROWS + 1)}
+# Attention all-reduce early trigger (decode M <= 4, idea 313): the AR launches its dependents at its start, so the
+# next main-stream kernel (with the K1 fold, the MoE's fused router, which reads nothing upstream before its
+# griddepcontrol.wait) stages its weights while the AR polls. Default: on exactly when the K1 fold is on.
+_ATTN_AR_EARLY_TRIGGER = (
+    os.environ.get(
+        "TRTLLM_DSV4_ATTN_AR_EARLY_TRIGGER", os.environ.get("TRTLLM_DSV4_ROUTER_K1_FOLD", "1")
+    )
+    != "0"
+)
+_ATTN_AR_EARLY_TRIGGER_MAX_M = 4
+
+
+def _attn_all_reduce_params(m: int):
+    """None (the default all-reduce params) or AllReduceParams with trigger_completion_at_end=False."""
+    if not _ATTN_AR_EARLY_TRIGGER or not 1 <= m <= _ATTN_AR_EARLY_TRIGGER_MAX_M:
+        return None
+    from tensorrt_llm._torch.distributed import AllReduceParams
+
+    return AllReduceParams(trigger_completion_at_end=False)
 
 
 def _env_on(name: str) -> bool:
@@ -370,7 +389,9 @@ class B12xWOProjection:
             self._wo_b(tmp, out, m)
             result = out[:, :, 0]
             if self.o_b_proj.reduce_output:
-                result = self.o_b_proj.all_reduce(result, all_reduce_params=None)
+                result = self.o_b_proj.all_reduce(
+                    result, all_reduce_params=_attn_all_reduce_params(m)
+                )
         else:
             # tmp is physical [groups, M, rank]; o_b_proj wants [M, groups * rank].
             o_lora = tmp.permute(0, 2, 1).reshape(m, self.groups * self.rank).contiguous()
@@ -487,7 +508,9 @@ class LowMWOProjection:
         if self._use_direct_wo_b():
             result = self._wo_b_mm(o_lora)
             if self.o_b_proj.reduce_output:
-                result = self.o_b_proj.all_reduce(result, all_reduce_params=None)
+                result = self.o_b_proj.all_reduce(
+                    result, all_reduce_params=_attn_all_reduce_params(output.shape[0])
+                )
         else:
             result = self.o_b_proj(o_lora)
         if not torch.cuda.is_current_stream_capturing():

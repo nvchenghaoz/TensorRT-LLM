@@ -632,7 +632,9 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             else None
         )
 
-    def _mhc_boundary(self, mhc: mHC, which: int, x_prev, residual, post_mix, comb_mix, pre, norm):
+    def _mhc_boundary(
+        self, mhc: mHC, which: int, x_prev, residual, post_mix, comb_mix, pre, norm, defer_k1=False
+    ):
         """``mhc.fused_hc_lagged`` or its two-stream split; returns (outputs, join or None)."""
         if self._mhc_split_stream is not None:
             ev0, ev1 = self._mhc_split_events[which]
@@ -647,6 +649,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 self._mhc_split_stream,
                 ev0,
                 ev1,
+                defer_k1=defer_k1,
             )
             if split is not None:
                 return split
@@ -660,6 +663,19 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             norm_eps=norm.variance_epsilon,
         )
         return outputs, None
+
+    def _k1_fold_eligible(self, x_attn: torch.Tensor, image_mask) -> bool:
+        """K1 fold at the hc_ffn boundary: decode M <= 4, no image mask, no attention DP, and an MoE whose fused
+        router can take it (DeepseekV4MoE.k1_fold_supported)."""
+        from tensorrt_llm._torch.modules.mhc import mhc_lagged_split as _split
+
+        if not _split.K1_FOLD_ENV_ON or self._mhc_split_stream is None or image_mask is not None:
+            return False
+        m = x_attn.shape[0] if x_attn.dim() == 2 else -1
+        if not 1 <= m <= _split.K1_FOLD_MAX_TOKENS or self.mapping.enable_attention_dp:
+            return False
+        supported = getattr(self.mlp, "k1_fold_supported", None)
+        return supported is not None and supported(m)
 
     def _decoder_global_input(self, hc_state: HCState) -> torch.Tensor:
         """Use the ordinary fused boundary's collapse/norm and BF16 rounding."""
@@ -801,6 +817,8 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 return HCState.resolved(residual, pre_mix=ffn_pre)
         # Attention's post update + FFN boundary + post_attention RMSNorm in one fused pair.
         # Split (decode): its residual/ffn_pre/post_mix/comb_mix join right after the MoE.
+        # K1 fold (decode M <= 4): the MoE's fused router launch computes this boundary's layer_input itself.
+        defer_k1 = self._k1_fold_eligible(x_attn, image_mask)
         (residual, ffn_pre, post_mix, comb_mix, layer_input), ffn_join = self._mhc_boundary(
             self.hc_ffn,
             1,
@@ -810,7 +828,11 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             comb_mix,
             attn_pre,
             self.post_attention_layernorm,
+            defer_k1=defer_k1,
         )
+        k1_fold = ffn_join.k1_fold if ffn_join is not None else None
+        if k1_fold is not None:
+            self.mlp.stash_k1_fold(k1_fold)
         x_ffn = self.forward_MoE(
             hidden_states=layer_input,
             attn_metadata=attn_metadata,
@@ -819,6 +841,8 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             hidden_states_normalized=True,
             **({"image_mask": image_mask} if image_mask is not None else {}),
         )
+        if k1_fold is not None and not k1_fold.done:
+            raise RuntimeError("K1 fold: the MoE did not produce the deferred layer_input")
         if ffn_join is not None:
             # No HCState leaves this layer with K2 pending.
             ffn_join.join()

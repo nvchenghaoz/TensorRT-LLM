@@ -1616,8 +1616,41 @@ class DeepseekV4Gate(nn.Module):
             self._fused_router_counter = counter
         return counter
 
+    def k1_fold_supported(self, num_tokens: int) -> bool:
+        """fused_forward can take a K1 fold (k1_fold=) for this many tokens."""
+        return (
+            _DSV4_FUSED_ROUTER
+            and not self.is_hashed
+            and self.top_k == 6
+            and 1 <= num_tokens <= 4
+            and hasattr(torch.ops.trtllm, "dsv4_fused_router_k1fold")
+            and hasattr(torch.ops.trtllm, "dsv4_fused_router_route_k1fold")
+            and tuple(self.weight.shape) == (384, 5120)
+            and self.weight.dtype == torch.bfloat16
+            and self.e_score_correction_bias is not None
+            and self.e_score_correction_bias.dtype == torch.float32
+        )
+
     def fused_forward(
-        self, hidden_states: torch.Tensor, decode_state=None
+        self, hidden_states: torch.Tensor, decode_state=None, k1_fold=None
+    ) -> Optional[torch.Tensor]:
+        """See _fused_forward. ``k1_fold`` (mhc_lagged_split.K1FoldPending of exactly ``hidden_states``): the
+        launch also computes hidden_states (the hc_ffn K1, bitwise) after its PDL wait and writes it; when the
+        call does not qualify, K1 runs first (materialize) and the call proceeds as without it."""
+        if k1_fold is not None and not (
+            k1_fold.out is hidden_states
+            and hidden_states.dim() == 2
+            and self.k1_fold_supported(hidden_states.shape[0])
+        ):
+            k1_fold.materialize()
+            k1_fold = None
+        logits = self._fused_forward(hidden_states, decode_state, k1_fold)
+        if logits is None and k1_fold is not None:
+            k1_fold.materialize()
+        return logits
+
+    def _fused_forward(
+        self, hidden_states: torch.Tensor, decode_state=None, k1_fold=None
     ) -> Optional[torch.Tensor]:
         """Decode router GEMV + top-6 gate in one launch (torch.ops.trtllm.dsv4_fused_router, 1..8 tokens).
 
@@ -1657,8 +1690,14 @@ class DeepseekV4Gate(nn.Module):
             pre = decode_state.preroute_buffers(hidden_states, self.top_k)
         if pre is not None:
             ws, buf = pre
-            indices, weights, logits = torch.ops.trtllm.dsv4_fused_router_route(
+            route_op = torch.ops.trtllm.dsv4_fused_router_route
+            fold_args = ()
+            if k1_fold is not None:
+                route_op = torch.ops.trtllm.dsv4_fused_router_route_k1fold
+                fold_args = k1_fold.fold_args()
+            indices, weights, logits = route_op(
                 hidden_states,
+                *fold_args,
                 self.weight,
                 self.e_score_correction_bias,
                 counter,
@@ -1677,8 +1716,14 @@ class DeepseekV4Gate(nn.Module):
             decode_state.set_prerouted(hidden_states, indices, weights, ws, buf)
             self._routing_method.fused_routing = (logits, indices, weights)
             return logits
-        indices, weights, logits = torch.ops.trtllm.dsv4_fused_router(
+        router_op = torch.ops.trtllm.dsv4_fused_router
+        fold_args = ()
+        if k1_fold is not None:
+            router_op = torch.ops.trtllm.dsv4_fused_router_k1fold
+            fold_args = k1_fold.fold_args()
+        indices, weights, logits = router_op(
             hidden_states,
+            *fold_args,
             self.weight,
             self.e_score_correction_bias,
             counter,
@@ -2221,6 +2266,28 @@ class DeepseekV4MoE(nn.Module):
             and gate_up_quant_config.group_size == 128
         )
 
+    def k1_fold_supported(self, num_tokens: int) -> bool:
+        """Whether this MoE's decode fused router can take the hc_ffn boundary's K1 (K1 fold, 1..4 tokens)."""
+        return (
+            self.gate.k1_fold_supported(num_tokens)
+            and not self.use_dp
+            and not getattr(self, "_per_layer_dynamic_eplb_enabled", False)
+        )
+
+    def stash_k1_fold(self, pending) -> None:
+        """The next forward() of exactly ``pending.out`` produces it through the fused router (K1 fold)."""
+        self._k1_fold = pending
+
+    def _take_k1_fold(self, hidden_states):
+        pending = getattr(self, "_k1_fold", None)
+        if pending is None:
+            return None
+        self._k1_fold = None
+        if pending.out is not hidden_states:
+            pending.materialize()
+            return None
+        return pending
+
     def _fi_decode_state_for(self, hidden_states, hidden_states_fp4, do_finalize):
         """The experts' SM12x FlashInfer decode state when its run() takes exactly ``hidden_states`` next (BF16
         decode, finalized, no communication, at most _DSV4_FUSED_ROUTER_ROUTE_MAX_M tokens), else None. A state
@@ -2251,7 +2318,11 @@ class DeepseekV4MoE(nn.Module):
         all_rank_num_tokens,
         do_finalize,
         image_mask: Optional[torch.Tensor] = None,
+        k1_fold=None,
     ):
+        if k1_fold is not None and (self.use_dp or image_mask is not None):
+            k1_fold.materialize()
+            k1_fold = None
         # max-throughput
         use_dp_padding = False
         # Add DP padding on SM120 for context comm performance
@@ -2280,7 +2351,10 @@ class DeepseekV4MoE(nn.Module):
                 decode_state=self._fi_decode_state_for(
                     hidden_states, hidden_states_fp4, do_finalize
                 ),
+                k1_fold=k1_fold,
             )
+        elif k1_fold is not None:
+            k1_fold.materialize()
         if router_logits is None:
             router_logits = self.gate(hidden_states)
 
@@ -2330,8 +2404,22 @@ class DeepseekV4MoE(nn.Module):
         use_decode_split = not use_row_split and self._use_shared_decode_split(
             hidden_states, hidden_states_fp4, do_finalize
         )
+        # K1 fold: hidden_states is written by the routed path's fused router launch; the shared expert computes
+        # its own copy (the same K1, bitwise) on its stream.
+        k1_fold = self._take_k1_fold(hidden_states)
+        if k1_fold is not None and (use_row_split or hidden_states_fp4 is not None):
+            k1_fold.materialize()
+            k1_fold = None
 
         def _compute_shared_output():
+            if k1_fold is not None:
+                shared_in = k1_fold.run_copy()
+                if use_decode_split:
+                    return self._shared_decode_split_output(shared_in)
+                shared_output = self.shared_experts(shared_in)
+                if self.shared_output_scale is not None:
+                    shared_output *= self.shared_output_scale
+                return shared_output
             if use_decode_split:
                 return self._shared_decode_split_output(hidden_states)
             if use_row_split:
@@ -2359,6 +2447,7 @@ class DeepseekV4MoE(nn.Module):
                 all_rank_num_tokens,
                 do_finalize,
                 image_mask=image_mask,
+                k1_fold=k1_fold,
             )
             return routed_output
 
