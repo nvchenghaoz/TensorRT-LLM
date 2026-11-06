@@ -211,7 +211,66 @@ def build_variants():
     class Stage0(Ref140):
         skip_select = True
 
-    return {"ref140": Ref140, "stage0": Stage0, "A": None}
+    def make_diag(base_cls, run_select, run_publish):
+        """Bench-only cost split: the wide kernel with its select and/or publish removed."""
+
+        class Diag(base_cls):
+            @cute.kernel
+            def kernel(
+                self,
+                scores: cute.Pointer,
+                visible: cute.Pointer,
+                output: cute.Pointer,
+                sparse_ids: cute.Pointer,
+                sparse_counts: cute.Pointer,
+                count: Int32,
+                width: Int32,
+                blocks: Int32,
+                selected_blocks: Int32,
+                published_width: Int32,
+                scores_stride: Int64,
+                output_stride: Int64,
+                sparse_stride: Int64,
+            ):
+                tid, _, _ = cute.arch.thread_idx()
+                q, _, _ = cute.arch.block_idx()
+                smem = ns.SmemAllocator()
+                n = Int64(count)
+                bsz = Int64(self.block_size)
+                score_t = ns.tensor2d(scores, n, Int64(width), scores_stride)
+                visible_length = Int64(ns.tensor1d(visible, n)[q])
+                latest = (visible_length + bsz - Int64(1)) // bsz - Int64(1)  # visible >= 0
+                keys = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
+                ids = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
+                partial = smem.allocate_tensor(
+                    Int32, cute.make_layout(5 * max(self.threads // 32, 1)), 16
+                )
+                hist = smem.allocate_tensor(Int32, cute.make_layout(4 * 256), 16)
+                if cutlass.const_expr(run_select):
+                    self._select_wide(
+                        score_t, keys, ids, partial, hist, q, width, blocks, selected_blocks,
+                        latest, tid,
+                    )
+                if cutlass.const_expr(run_publish):
+                    self._publish(
+                        output, sparse_ids, sparse_counts, ids, partial, n, q, width,
+                        selected_blocks, published_width, output_stride, sparse_stride,
+                        visible_length, tid,
+                    )
+                else:
+                    if tid == 0:
+                        ns.tensor1d(sparse_counts, n)[q] = ids[0]
+
+        return Diag
+
+    return {
+        "ref140": Ref140,
+        "stage0": Stage0,
+        "A": None,
+        "empty": make_diag(Ref140, False, False),
+        "keys_scan": make_diag(Stage0, True, False),
+        "A_nopub": make_diag(ns.CandidatePublishKernel, True, False),
+    }
 
 
 def use(variants, name):
@@ -270,7 +329,7 @@ def variants_mode(args):
         if "ref140" in names:
             ref = [t.clone() for t in outs["ref140"]()]
             for name in names:
-                if name not in ("ref140", "stage0"):
+                if name == "A":
                     same[name] = all(torch.equal(x, y) for x, y in zip(outs[name](), ref))
         row["equal_to_ref140"] = same
         log(json.dumps(row))
@@ -362,13 +421,15 @@ def check_mode(args):
             torch.cuda.synchronize()
             n1 = torch.cuda.memory_stats().get("allocation.all.allocated", 0)
             m1 = torch.cuda.memory_allocated()
-            alloc = (n1 - n0) + (m1 - m0)
+            alloc = n1 - n0  # allocations made during the 20 replays (frees ignored)
+            mem_delta = m1 - m0
             passed = (not bad_iters) and ref_det and ref_vs_fb and alloc == 0
             ok &= passed
             line = dict(count=count, width=width, kind=kind, tie_rows=len(ties),
                         replays=B.WARMUP + B.ITERS, bad_iters=len(bad_iters),
                         max_bad_rows=bad_rows, ref_deterministic=ref_det,
-                        ref140_eq_fallback_nontie=ref_vs_fb, alloc_delta=alloc, passed=passed)
+                        ref140_eq_fallback_nontie=ref_vs_fb, replay_allocs=alloc,
+                        mem_delta=mem_delta, passed=passed)
             log(json.dumps(line))
             report.append(line)
             del g
@@ -400,7 +461,9 @@ def check_mode(args):
     print(json.dumps({"passed": bool(ok), "compared_against":
                       "branch 140 CandidatePublishKernel (landing 47) on every row incl. ties; "
                       "140 vs PyTorch fallback on non-tie rows",
-                      "shipped_keys": len(shipped), "cases": report,
+                      "shipped_keys": len(shipped), "cases_passed": sum(c["passed"] for c in report),
+                      "cases": len(report),
+                      "failed": [c for c in report if not c["passed"]],
                       "decode": launches}))
 
 

@@ -20,7 +20,7 @@ for step in sys.argv[1:] or ["variants", "check", "pytest"]:
         if line.strip():
             last = line.strip()
     p.wait()
-    results[step] = {"returncode": p.returncode, "last": last[-4000:]}
+    results[step] = {"returncode": p.returncode, "last": last}
 ok = all(r["returncode"] == 0 for r in results.values())
 summary = {}
 for step, r in results.items():
@@ -30,6 +30,9 @@ for step, r in results.items():
         summary[step] = r["last"][-500:]
 if "check" in summary and isinstance(summary["check"], dict):
     ok = ok and bool(summary["check"].get("passed"))
-    summary["check"] = {"passed": summary["check"].get("passed")}
+    summary["check"] = {k: summary["check"].get(k) for k in
+                        ("passed", "cases_passed", "cases", "failed", "decode")}
+elif "check" in summary:
+    ok = False
 print(json.dumps({"passed": bool(ok), "steps": {k: v["returncode"] for k, v in results.items()},
                   "summary": summary}))
