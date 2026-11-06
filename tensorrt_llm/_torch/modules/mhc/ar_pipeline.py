@@ -20,6 +20,8 @@ Env:
   ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_CHUNK_ROWS`` (default 1024).
   ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_MIN_ROWS``: smallest boundary T that is pipelined (default 4096: each pipelined
       boundary adds ~0.1-0.3 ms of host launch work, which the host-paced c1 prefill (T=2048) would pay 1:1).
+  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_MAX_ROWS``: largest boundary T that is pipelined (default 6144, below the
+      max_num_tokens=8192 activation peak).
 """
 
 import os
@@ -51,6 +53,11 @@ PIPELINE_ON = _RAW not in ("0", "1", "off", "false", "no")
 PIPELINE_K = 0 if _RAW in ("", "auto") or not PIPELINE_ON else int(_RAW)  # 0 = k(T)
 PIPELINE_CHUNK_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_CHUNK_ROWS", 1024)
 PIPELINE_MIN_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_MIN_ROWS", 4096)
+# Largest boundary T that is pipelined. The served engine's activation peak is at max_num_tokens (8192), where main
+# already runs with only ~0.1-0.3 GB of headroom; the comm-stream allocator pool the chunk all-reduce outputs live in
+# (~T x hidden x 2 bytes) pushed a T=8192 step out of memory in the serving guard (branch 199, job 1898). Below the
+# peak the pool fits inside the memory main's 8192-token step already reserves.
+PIPELINE_MAX_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_MAX_ROWS", 6144)
 
 
 def k_for(T: int) -> int:
@@ -84,7 +91,7 @@ def chunk_bounds(T: int, k: int, min_chunk_rows: int = MIN_CHUNK_ROWS, align: in
 
 def plan(T: int):
     """The shape part of the pipelining decision: chunk bounds for a T-row boundary, or None (unpipelined)."""
-    if not PIPELINE_ON or T < max(PIPELINE_MIN_ROWS, 2 * MIN_CHUNK_ROWS):
+    if not PIPELINE_ON or T < max(PIPELINE_MIN_ROWS, 2 * MIN_CHUNK_ROWS) or T > PIPELINE_MAX_ROWS:
         return None
     return chunk_bounds(T, k_for(T))
 
