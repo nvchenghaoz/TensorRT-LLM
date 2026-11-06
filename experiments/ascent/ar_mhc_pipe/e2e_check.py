@@ -36,6 +36,9 @@ SERVER_SETTINGS = {
     "pipeline_parallel_size": 1, "tensor_parallel_size": 4, "trust_remote_code": True}
 PREFIX, SUFFIX = 32768, 2048
 OUT = int(os.environ.get("E2E_OUT_TOKENS", "16"))
+# Requests per batch: 3 x 2048 = one 6144-token prefill step, inside the pipelined range (MIN_ROWS 4096 .. MAX_ROWS
+# 6144); a 4-request (8192-token) step runs main's unpipelined path.
+BATCH = int(os.environ.get("E2E_BATCH", "3"))
 LP_TOL, TIE_TOL = 1.6835, 3.3669
 CAP_RE = re.compile(r"\[TAIL_MOE_GRAPH\] rank (\d+) layer (\d+): captured")
 FAIL_RE = re.compile(r"\[TAIL_MOE_GRAPH\][^\n]*capture failed")
@@ -203,8 +206,8 @@ def run_arm(ckpt, arm, reps, outdir):
         llm.generate([prompt(2 + j) for j in range(4)], spn)
         log("warmup done")
         for r in range(reps):
-            keys = [f"r{r}-b{j}" for j in range(4)]
-            outs = llm.generate([prompt(100 + 8 * r + j) for j in range(4)], spn)
+            keys = [f"r{r}-b{j}" for j in range(BATCH)]
+            outs = llm.generate([prompt(100 + 8 * r + j) for j in range(BATCH)], spn)
             for k, o in zip(keys, outs):
                 rec(k, o)
             o = llm.generate([prompt(100 + 8 * r + 5)], spn)
@@ -214,7 +217,7 @@ def run_arm(ckpt, arm, reps, outdir):
             tdir = Path(outdir) / "trace"
             tdir.mkdir(parents=True, exist_ok=True)
             llm.start_profile(output_dir=str(tdir), num_steps=6, activities=["CPU", "GPU"])
-            outs = llm.generate([prompt(900 + j) for j in range(4)], SamplingParams(max_tokens=4, temperature=0.0,
+            outs = llm.generate([prompt(900 + j) for j in range(BATCH)], SamplingParams(max_tokens=4, temperature=0.0,
                                                                                     ignore_eos=True))
             try:
                 llm.stop_profile()
@@ -329,7 +332,7 @@ def main():
         log(f"arm {arm} rc={p.returncode} records={len(results[arm]['records'])} tail_graph={caps[arm]}")
     out = {"head": head, "tail_graph": caps, "sha256": {a: results[a].get("sha256") for a in results},
            "errors": {a: results[a].get("errors") for a in results}}
-    passed = all(not results[a].get("errors") and len(results[a]["records"]) == 5 * reps for a in results)
+    passed = all(not results[a].get("errors") and len(results[a]["records"]) == (BATCH + 1) * reps for a in results)
     passed = passed and all(c["captured_pairs"] == 80 and not c["failed"] for c in caps.values())
     if "off" in results and "on" in results:
         rows = compare(results["off"], results["on"])
