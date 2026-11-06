@@ -46,7 +46,39 @@ end-to-end guard (plan 3610 (6)). Class REORDERED (chunked LP, same as landing 7
 - Then ONE same-slot run_serving_pair, base 06efaf15 vs final head; submit metric = c4 TTFT (serving_latency), with
   c1/c2/c4 TTFT/TPOT reported; pass = c4 TTFT, c4 TPOT, c2 TTFT not worse beyond the floor.
 
+## FINAL KERNEL PAIR 2113 (base 06efaf15) / 2114 (head 43967ba2; ar_pipeline.py as 790201cb), smc521ge-0046 austin:0
+(GPUs 0-3, NUMA 0), same slot, consecutive. Per boundary AR + fused mHC, max over ranks of the median of 3 x 100:
+| T | base (main) | head | delta | noise base/head |
+|---|---|---|---|---|
+| 6145 (PRIMARY, served c4 follower) | 2157.2 us serial | 1616.6 us B | -25.1% (-540.6 us) | 0.95% / 1.21% |
+| 8192 | 2811.6 serial | 2155.1 B | -23.4% | 0.62% / 1.09% |
+| 6144 | 1634.1 D | 1636.1 D | +0.1% (in noise) | 1.15% / 1.25% |
+| 4096 | 1126.0 D | 1122.9 D | -0.3% (in noise) | 1.54% / 1.54% |
+| 2048 | 673.4 serial | 673.4 serial | 0.0% | 1.37% / 1.36% |
+Claim per c4 follower step: 37 eligible boundaries x 540.6 us = ~20.0 ms (kernel time; served share not measured).
+ABAB at 6145 in the head arm (4+4 blocks, block medians max over ranks): D (77's run() forced, MAX_ROWS 6400)
+1616.47 us (spread 0.00%), B 1613.07 us (spread 0.18%): B 0.21% faster -> B keeps 6145; gate unchanged (idea 396
+stays the fallback). Receipts in 2114 (all passed): untimed sequence = timed harness's warmup/iters/reset points,
+1440/1440 calls bitwise vs 77's run() forced to the same bounds at 4096/6144/6145/8192, finite; gate_check (streams
++ bitwise vs main's run(), env 0 => no plan for T in 1..16384); chain 1000 calls x {4096, 4099, 6145, 8192}, LP IPC
+flags OK before every reset, 0 rerun mismatches.
+
+## GATE TABLE (required by plan 15m (2))
+| T | path | chunk bounds | status |
+|---|---|---|---|
+| 2048 | unpipelined (MIN_ROWS 4096 host guard) | - | MEASURED 2113/2114: 673.4 -> 673.4 us |
+| 4096 | landing 77 design D unchanged: chunk LP on the priority -1 comm stream, mHC on the caller stream | 4 x 1024 | MEASURED 2113/2114 (1126.0 -> 1122.9 us), bitwise vs main's run() 2102/2114, chain 2102/2114 |
+| 6144 | landing 77 design D unchanged | 6 x 1024 | MEASURED 2113/2114 (1634.1 -> 1636.1 us), bitwise 2102/2114 |
+| 6145 | design B: chunk LP on the caller (main) stream, mHC on a priority 0 side stream | 5 x 1152 + 385 | MEASURED 2113/2114 (2157.2 -> 1616.6 us), bitwise vs 77 forced 2114, chain 2114; served 6145 step UNTESTED |
+| 8192 | design B | 8 x 1024 | MEASURED 2113/2114 (2811.6 -> 2155.1 us), bitwise 2102/2114, chain 2102/2114; served 8192 steps 2085/2090 |
+
 ## UNTESTED / NEXT
+- No serving pair (plan 15l (3): submit on the kernel pair; do not queue one now). The served c4 follower step
+  (6145) under B is not run end to end on this branch; served receipts 2085/2090 ran 4 x 2048 batches through the
+  LLM API (step[EXTEND bs=4 toks=8192], B at 8192, more memory than 6145): startup + both memory_pool_prepop passes
+  and every 8192 step completed on all 4 ranks, 40/40 vs env 0 within tolerance, decode 240 lamport / 0 LP per rank,
+  tail graph 80/80. The next validation window guards c1/c2/c4.
+- Pre-existing note: ar_mhc_pipe/swap_stage0.py only runs on commit 86194012 (env-selectable roles).
 - Kernel pair 2053 (base 06efaf15) / 2054 (head), pair.py T in {2048, 4096, 6144, 8192}.
 - Untimed checks: chain_check.py (1000 calls x {4096, 4099, 8192}, IPC flags) + e2e_check.py off,on with E2E_BATCH=4
   (8192-token prefill steps; KV capacity lines compared between arms; decode lamport-only / 0 LP; tail graph 80/80).
