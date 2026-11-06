@@ -1,3 +1,19 @@
+# Branch 192 / idea 345 (build_on 181, served bytes = dce96ec1; adds only experiments/ascent/ drivers)
+- Parent jobs 1655/1726/1727 are REFUSED for read from this branch (pitfall 131), so own check 1769 ran first.
+- Check 1769 (smc521ge-0043 austin:0 = half 0-3, commit 3c804c0a; job345_check.sh -> guard.sh -> run_lp_trace.sh):
+  PASS. lp_check STEP 1 (timeout -s KILL 300), 12-pair peer assert, trace: rank0 EXTEND 40 LP + 40 NCCL AR, DECODE
+  0 LP / 400 lamport on all 4 ranks, tail graph 80/80, 0 capture failed; bench sweep LP 2048 rel_rms 0.0373 (heavy
+  0.0204), 1000-call robust 0 nonfinite / IPC flags OK / 0 rerun mismatch; routing M=1..16,128 LP==AUTO bitwise.
+- Kernel_time pair 1787 (base 8e291e60, AUTO) / 1788 (cand, LOWPRECISION), smc521ge-0043 austin:4 = half 4-7,
+  back to back, `bench.py pair2`, max over ranks of median of 3 x 100 (us/call):
+  | M | base | cand | delta | noise b/c |
+  | 16 (graph) | 18.0 lamport | 18.0 lamport | 0 | 0.23/0.14 |
+  | 128 | 66.5 NCCL RING | 66.4 NCCL RING | -0.1% | 0.068/0.072 |
+  | 2048 | 783.6 | 478.9 | -38.9% | 0.007/0.015 |
+  | 4096 | 1552.3 | 949.2 | -38.9% | 0.004/0.015 |
+  | 6144 | 2323.9 | 1450.9 | -37.6% | 0.004/0.015 |
+  Visible GPU SM clocks 2265-2347 MHz, throttle 0. check_submission ready; submitted kernel_time, PRECISION.
+
 # Branch 181 / idea 226 (build_on 158): LP FP8 two-shot prefill AR + wider two-shot grid: STATUS
 
 Synced (three-way merge, no conflicts) onto main 8e291e60. Files the merge touched beyond 158's own: none (158's
