@@ -10,6 +10,13 @@ LPT="$(dirname "$HERE")/lp_ar_trace"
   nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv;
   echo "HEAD $(git -C "$HERE" rev-parse HEAD 2>&1)"; } 1>&2
 bash "$LPT/guard.sh" true || exit 3
+# pitfall 3271: receipt of the native library this job actually loads (path, mtime, landing-61 mtile_v3 symbol count)
+LIB=$("$PY" -c 'import os, tensorrt_llm; print(os.path.join(os.path.dirname(tensorrt_llm.__file__), "libs", "libtensorrt_llm.so"))' 2>/dev/null | tail -1)
+{ echo "[lib] path=$LIB"; ls -l --time-style=full-iso "$LIB" 2>&1;
+  for f in "$(dirname "$LIB")"/*.so; do
+    c1=$(grep -c -a fused_pmap_gemm_fma_mtile_v3 "$f" 2>/dev/null); c2=$(grep -c -a lowPrecisionTwoShotAllReduceKernel "$f" 2>/dev/null)
+    [ "${c1:-0}" != "0" -o "${c2:-0}" != "0" ] && echo "[lib] $(ls -l --time-style=full-iso "$f") mtile_v3=$c1 lpTwoShot=$c2"
+  done; } 1>&2
 "$PY" -c '
 import sys, torch
 n = torch.cuda.device_count()

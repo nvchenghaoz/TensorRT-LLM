@@ -37,6 +37,10 @@ class HCState:
     # sublayer collapses with (`pre_mapping_lagged`). V4 leaves it None, so
     # `is_deferred` and both constructors behave exactly as before.
     pre_mix: Optional[torch.Tensor] = None
+    # V4.1 prefill AR pipeline (mhc/ar_pipeline.py): when set, ``x_prev`` is the rank-local
+    # partial sum and this AllReduce must reduce it before any use; the consumer either
+    # pipelines it with its fused boundary or reduces it in full first.
+    x_prev_allreduce: Optional[object] = None
 
     @property
     def is_deferred(self) -> bool:
@@ -54,6 +58,7 @@ class HCState:
         comb_mix: torch.Tensor,
         x_prev: torch.Tensor,
         pre_mix: Optional[torch.Tensor] = None,
+        x_prev_allreduce: Optional[object] = None,
     ) -> "HCState":
         return cls(
             residual=residual,
@@ -61,7 +66,15 @@ class HCState:
             comb_mix=comb_mix,
             x_prev=x_prev,
             pre_mix=pre_mix,
+            x_prev_allreduce=x_prev_allreduce,
         )
+
+    def reduced_x_prev(self) -> Optional[torch.Tensor]:
+        """``x_prev`` with any pending prefill all-reduce applied (in full); clears the flag."""
+        if self.x_prev_allreduce is not None:
+            self.x_prev = self.x_prev_allreduce(self.x_prev)
+            self.x_prev_allreduce = None
+        return self.x_prev
 
 
 try:
