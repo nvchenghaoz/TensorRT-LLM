@@ -49,7 +49,18 @@
   their cross-tree ON gain was not measured in a pair (no time before the 01:00 hard stop); follow-up = add 5,6 and re-pair.
 - Spans c4: K2' start rel merge end A0 -4.7 -> A1 -9.9 us; merge tail 1.7 -> 3.7 us; body 6.56 -> 7.66 us.
 - Output sha256 identical across trees at counts 1-8 for default / F32_PARTIALS=0 / ENABLE_PDL=0 / ATTN_PDL=0.
-- Check 1802: check --children --counts 1,2,3,4,8 (new bucket edges).
+- Check 1802 (check --children --counts 1,2,3,4,8) sat queued > 70 min (coach 9744 hold) and was cancelled at
+  01:2x PST per area lead's final instruction (no new GPU job; hard stop 01:45). Submission refused: check 1752
+  is on c833b20d, not dd1faf8e.
+
+## WIP CLOSE (01:2x PST 11-06)
+- DONE: interface (trigger_entry kernel arg, binding enable_pdl bit 2, TRTLLM_CSA2_CAKE_BODY_TRIGGER_ENTRY 1/0),
+  default ON at {1,2,3,4} (commit dd1faf8e). Pair 1781/1782 measured on dd1faf8e (table above, bitwise hashes
+  across trees). Check 1752 bitwise on c833b20d (same code, default {1..8}; every count also run with entry OFF).
+- UNTESTED: the untimed check on dd1faf8e's bucket edges (counts 3 ON, 8 OFF via default).
+- NEXT: ONE 1-GPU job `chain_332.py check {checkpoint} --children --counts 1,2,3,4,8` on dd1faf8e (or later), then
+  submit with pair 1781/1782 + that check. Optional follow-up: add 5,6 to the set (in-tree A2 -2.7% / -1.1%) and
+  re-pair counts 1-8.
 
 ## NEXT (original)
 1. When 57 lands: sync_main, add trigger_entry to the fold render's entry/signature/launch (both kF32Mid
