@@ -51,6 +51,9 @@ TRTLLM_LP_AR_TWOSHOT_CTAS for the sweep only. LP ipc_barriers_in/out sized (1 + 
 - Class: PRECISION (top lead 9958). Targets c1/c4 TTFT, each alone; guards 2588(b).
 - DONE: code, checks 1640/1655, pair 1663/1664 (guards pass, c4 TTFT -7.7%). UNTESTED: none.
   NEXT: ONE run_serving_pair rerun once GPUs are free and the disk is clear, then submit precision with that pair.
+- Pair 1698 (base 8e291e60) / 1699 (cand 28bc447f), austin:4-7: base VALID (noise 0.0139; c1 145.00/5.141,
+  c2 304.45/6.223, c4 462.25/7.479 TTFT/TPOT ms); candidate INVALID, same orphan-process OOM (free 6.22 GiB; all 8 GPUs
+  at ~89.7 GB / 100% util at server launch). Reported to the area lead per rev 6g(3); NOT re-queued. Waiting on a ruling.
 
 # Idea 94 (branch 94): LOWPRECISION FP8-payload two-shot AR for prefill-size messages: status
 
