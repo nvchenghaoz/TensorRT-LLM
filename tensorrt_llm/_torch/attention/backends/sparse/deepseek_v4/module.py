@@ -24,7 +24,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import AuxStreamType
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
@@ -477,6 +477,51 @@ def project_sparse_attn_output(
             self.inverse_rotary_emb.is_neox,
         )
         return _deepseek_v4_fp8_o_a_proj(self, attn_fp8, attn_scale)
+
+    if self.o_a_proj.dtype == torch.float8_e4m3fn and is_sm_120f():
+        # SM120: inverse RoPE + 1x128 UE8M0 quant + permute102 in one Triton launch,
+        # bitwise equal to mla_rope_inplace + per_token_quant_and_transform below.
+        from . import prefill_wo_quant as pwq
+
+        cos_sin = self.inverse_rotary_emb.rotary_cos_sin
+        if (
+            pwq.prefill_wo_quant_enabled()
+            and not self.inverse_rotary_emb.is_neox
+            and pwq.supports(
+                attn_output_tensor,
+                cos_sin,
+                self.n_local_groups,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            )
+        ):
+            from tensorrt_llm._torch.attention.mla import _sm120_bmm_out_direct_ok
+
+            mat1_fp8, mat1_scale = pwq.inv_rope_quant_permute102(
+                attn_output_tensor,
+                position_ids.view(-1),
+                cos_sin,
+                self.n_local_groups,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            )
+            o_lora = torch.empty(
+                [num_tokens, self.n_local_groups, self.o_lora_rank],
+                device=attn_output_tensor.device,
+                dtype=attn_output_tensor.dtype,
+            )
+            out = o_lora.transpose(0, 1)
+            if _sm120_bmm_out_direct_ok(out):
+                torch.ops.trtllm.fp8_block_scaling_bmm_out(
+                    mat1_fp8, self.o_a_proj, mat1_scale, self.o_a_proj_scale, out
+                )
+            else:
+                tmp = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
+                torch.ops.trtllm.fp8_block_scaling_bmm_out(
+                    mat1_fp8, self.o_a_proj, mat1_scale, self.o_a_proj_scale, tmp
+                )
+                out.copy_(tmp)
+            return self.o_b_proj(o_lora.flatten(1))
 
     # Restore the RoPE portion before output projection.
     torch.ops.trtllm.mla_rope_inplace(
