@@ -37,6 +37,20 @@
   K3' ends 15.7 us after merge end (A0 20.0). Output sha256 identical across trees for default / F32_PARTIALS=0 /
   ENABLE_PDL=0 / ATTN_PDL=0 at every count.
 
+## EVALUATOR ROUND (00:0x PST 11-06, commit dd1faf8e)
+- Default narrowed: `_BODY_TRIGGER_ENTRY_COUNTS = {1,2,3,4}`; counts >= 5 launch as main (A0 path, trigger_entry=0).
+- Pair 1781 (main d4372068) / 1782 (branch), same slot austin:3, SM 2347 MHz, counts 1-8, ms per 40-layer step
+  (median, p10-p90; noise 0.33-0.59%):
+  c1 0.8837 (0.8824-0.8858) -> 0.8734 (0.8704-0.8755) -1.17% | c2 0.8900 -> 0.8683 -2.44% |
+  c3 0.9216 -> 0.8947 -2.92% | c4 0.9554 -> 0.9297 -2.69% | c5 0.9891 -> 0.9895 +0.04% | c6 1.0117 -> 1.0126 +0.09% |
+  c7 1.0567 -> 1.0565 -0.02% | c8 1.0735 -> 1.0756 +0.20% (5-8: unchanged path, within noise).
+- In-tree forced-ON (A2) vs A0 at 5-8: c5 962.9 vs 989.5 us (-2.7%), c6 999.8 vs 1010.8 (-1.1%), c7 1056.1 vs 1055.7 (tie),
+  c8 1077.2 vs 1075.2 (+0.2%, body 7.01 -> 7.57 us/layer). Crossover between 6 and 7. Counts 5/6 are NOT enabled here:
+  their cross-tree ON gain was not measured in a pair (no time before the 01:00 hard stop); follow-up = add 5,6 and re-pair.
+- Spans c4: K2' start rel merge end A0 -4.7 -> A1 -9.9 us; merge tail 1.7 -> 3.7 us; body 6.56 -> 7.66 us.
+- Output sha256 identical across trees at counts 1-8 for default / F32_PARTIALS=0 / ENABLE_PDL=0 / ATTN_PDL=0.
+- Check 1802: check --children --counts 1,2,3,4,8 (new bucket edges).
+
 ## NEXT (original)
 1. When 57 lands: sync_main, add trigger_entry to the fold render's entry/signature/launch (both kF32Mid
    instantiations), extend the binding check + cake_decode.py gating to the fold render body.
