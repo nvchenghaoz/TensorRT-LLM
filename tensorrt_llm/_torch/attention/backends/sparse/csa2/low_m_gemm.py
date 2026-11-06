@@ -61,7 +61,11 @@ _L2PF = 4  # debug_flags bit 2: L2-prefetch pf_w / pf_sf (bits 3-4 position, bit
 # A's CTAs exit stage from L2 instead of DRAM. Per M: (position, evict_last, frac/256); position 0 = after A's own
 # bulk copies (before its trigger), 1 = after A's weights landed, 2 = after A's PDL wait. A prefetch is a hint, so
 # outputs are bitwise unchanged. TRTLLM_CSA2_QB_L2PF=0 disables it; "pos,evict_last,frac" overrides every M.
-_L2PF_DEFAULT: dict[int, tuple[int, int, int]] = {m: (0, 0, 256) for m in range(1, 9)}
+# Measured in the 40-layer cold-L2 chain with the real hc_attn K1 (experiments/ascent/qb_l2pf/bench.py arms, job
+# 1592), us/layer vs off: M=1 every arm slower (+0.5..+2.1: all of B's CTAs are co-resident there, so the prefetch
+# only lengthens A) -> off; M=2 pos 1 frac 154 -0.73 (25.48 vs 26.21); M=4 pos 2 frac 102 -1.58 (25.91 vs 27.49).
+# M=3 shares M=4's A/B configurations; M>=5 was not measured and stays off.
+_L2PF_DEFAULT: dict[int, tuple[int, int, int]] = {2: (1, 0, 154), 3: (2, 0, 102), 4: (2, 0, 102)}
 _l2pf_cache: dict = {}
 
 

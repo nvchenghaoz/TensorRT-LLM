@@ -36,13 +36,99 @@ IDX_N = 4096
 LAYERS = 40
 DRAM_GBPS = 1506.0
 EPS = 1e-6
-MS = tuple(int(v) for v in os.environ.get("L2PF_MS", "1,2,4,8").split(","))
+MS = tuple(int(v) for v in os.environ.get("L2PF_MS", "1,2,3,4,8").split(","))
 ROUNDS = int(os.environ.get("L2PF_ROUNDS", "30"))
 WARMUP = 5
 
 
 def log(*a):
     print(*a, flush=True)
+
+
+COMPILES = {"n": 0, "in_capture": 0, "capturing": False}
+
+
+def _count_compiles():
+    """Wrap Triton / CuTe / cpp_extension compile entry points; count calls made while a graph is being captured."""
+    def wrap(mod, name):
+        fn = getattr(mod, name, None)
+        if fn is None or getattr(fn, "_l2pf_wrapped", False):
+            return
+
+        def w(*a, **k):
+            COMPILES["n"] += 1
+            if COMPILES["capturing"]:
+                COMPILES["in_capture"] += 1
+            return fn(*a, **k)
+
+        w._l2pf_wrapped = True
+        setattr(mod, name, w)
+
+    try:
+        import triton
+        import triton.compiler as tc
+        import triton.compiler.compiler as tcc
+        wrap(tcc, "compile")
+        wrap(tc, "compile")  # JITFunction.create_binder does `from ..compiler import compile`
+        wrap(triton, "compile")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import cutlass.cute as cute
+        wrap(cute, "compile")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import torch.utils.cpp_extension as ce
+        wrap(ce, "load")
+        wrap(ce, "load_inline")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def occupancy_table(L):
+    """S0: dynamic smem/CTA (csa2SmemBytes in mxfp8LowMGemm.cu, same formula), grid and smem-limited CTAs/SM of
+    A (chain wq_a||wkv) and B (fused q_norm + wq_b, plain 8192 and indexer 12288) at M = 1/2/4/8."""
+    props = torch.cuda.get_device_properties(0)
+    per_sm = getattr(props, "shared_memory_per_multiprocessor", 102400)
+    k_row_pad = 32
+
+    def smem(warps, ck, rt, m, k):
+        kc = k // ck
+        kcb = kc // 32
+        rows = 16 * rt
+        w_bytes = rows * (kc + k_row_pad)
+        red = warps * rows * 8 * 4
+        return (w_bytes + rt * (kcb // 4) * 256 + m * kc + ((m * kcb + 15) // 16) * 16 + (ck - 1) * rows * m * 4
+                + (0 if red <= w_bytes else red))
+
+    out = {"smem_per_sm": per_sm, "reserved_per_cta": 1024}
+    for m in (1, 2, 4, 8):
+        row = {}
+        for name, n, k, cfg in (("A_wq_a_wkv", A_N, HIDDEN, L.chain_a_config_for(A_N, HIDDEN, m)),
+                                ("B_plain", QB_N, Q_RANK, L.qnorm_config_for(QB_N, Q_RANK, m)),
+                                ("B_indexer", QB_N + IDX_N, Q_RANK, L.qnorm_config_for(QB_N + IDX_N, Q_RANK, m))):
+            if cfg is None:
+                row[name] = None
+                continue
+            s = smem(cfg[0], cfg[1], cfg[2], m, k)
+            row[name] = {"cfg": list(cfg), "smem": s, "grid": n // (16 * cfg[2]) * cfg[1], "threads": cfg[0] * 32,
+                         "ctas_per_sm": per_sm // (s + 1024)}
+        row["K1_mhc_lagged"] = {"grid": m, "note": "Triton, 1 CTA per row; smem from its compiled metadata below"}
+        out[str(m)] = row
+    try:
+        from tensorrt_llm._torch.modules.mhc import mhc_lagged_split as S
+        kern = S._mhc_lagged_layer_input_kernel
+        caches = getattr(kern, "device_caches", None) or {}
+        for dev, c in caches.items():
+            for key, ck in (c[0].items() if isinstance(c, tuple) else c.items()):
+                md = getattr(ck, "metadata", None)
+                out["K1_compiled"] = {"shared": getattr(md, "shared", None), "num_warps": getattr(md, "num_warps", None),
+                                      "n_regs": getattr(ck, "n_regs", None)}
+                break
+    except Exception as e:  # noqa: BLE001
+        out["K1_compiled"] = repr(e)[:200]
+    return out
 
 
 def make_weight(n, k, gen):
@@ -58,6 +144,7 @@ class Chain:
         from tensorrt_llm._torch.attention.backends.sparse.csa2 import low_m_gemm as L
         from tensorrt_llm._torch.modules.mhc.mhc_lagged_split import mhc_lagged_layer_input
 
+        _count_compiles()
         self.L = L
         self.k1 = mhc_lagged_layer_input
         self.has_pf = "l2_prefetch" in inspect.signature(L.low_m_mm).parameters
@@ -121,9 +208,13 @@ class Chain:
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for l in range(LAYERS):
-                self.layer(l, inp, outs, dbg)
+        COMPILES["capturing"] = True
+        try:
+            with torch.cuda.graph(g):
+                for l in range(LAYERS):
+                    self.layer(l, inp, outs, dbg)
+        finally:
+            COMPILES["capturing"] = False
         torch.cuda.synchronize()
         return g, outs
 
@@ -311,12 +402,17 @@ def mode_check(ch, gen):
                             bad[n] += 1
                             break
         res[str(m)] = {"iterations": iters, "bad_layer_iters": bad, "finite": fin,
-                       "tensors_per_layer": [len(l) for l in o_ref[:3]]}
+                       "tensors_per_layer": [len(l) for l in o_ref[:3]],
+                       "default_setting": ch.L.l2pf_setting(m) if ch.has_pf else None,
+                       "compiles_in_capture_so_far": COMPILES["in_capture"]}
         log(f"CHECK M={m}: {res[str(m)]}")
         ok &= all(v == 0 for v in bad.values())
         del g_ref, cands
         torch.cuda.empty_cache()
-    return {"passed": bool(ok), "per_m": res}
+    os.environ["TRTLLM_CSA2_QB_L2PF"] = "1"
+    ok &= COMPILES["in_capture"] == 0
+    return {"passed": bool(ok), "per_m": res, "compiles_total": COMPILES["n"],
+            "compiles_in_capture": COMPILES["in_capture"]}
 
 
 def main():
@@ -330,6 +426,29 @@ def main():
         log(f"{'indexer' if ix else 'plain'}: A+B weight+SF {wb / 1e6:.2f} MB floor {wb / (DRAM_GBPS * 1e3):.2f} us")
     if mode == "arms":
         out = mode_arms(ch, gen)
+    elif mode == "pairchk":
+        # candidate arm of the final pair, one job: S0 table, the timing (tree default), then the untimed bitwise
+        # checks in children (PDL on with its own TRTLLM_ENABLE_PDL=0 grandchild), so a check failure cannot hide
+        # the timing and vice versa.
+        occ = occupancy_table(ch.L)
+        log(f"S0 occupancy {json.dumps(occ)}")
+        os.environ["TRTLLM_CSA2_QB_L2PF"] = "1"
+        out = mode_pair(ch, gen)
+        env = dict(os.environ, L2PF_MS=os.environ.get("L2PF_CHECK_MS", "1,2,3,4,8"),
+                   L2PF_ARMS=os.environ.get("L2PF_ARMS", "PF0_f256_pl"))
+        env.pop("TRTLLM_CSA2_QB_L2PF", None)
+        log("child: check (PDL on, then its TRTLLM_ENABLE_PDL=0 child)")
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), "check"], env=env, capture_output=True,
+                           text=True, timeout=2400)
+        sys.stdout.write(p.stdout[-8000:])
+        sys.stdout.flush()
+        try:
+            child = json.loads(p.stdout.strip().splitlines()[-1])
+        except Exception:  # noqa: BLE001
+            child = {"passed": False, "rc": p.returncode, "stderr": p.stderr[-3000:]}
+        out["passed"] = bool(child.get("passed"))
+        out["check"] = child
+        out["s0_occupancy"] = occ
     elif mode == "check":
         out = mode_check(ch, gen)
         if os.environ.get("TRTLLM_ENABLE_PDL") != "0":
