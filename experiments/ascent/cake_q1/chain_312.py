@@ -394,13 +394,100 @@ def mode_check(args):
                       "direct": summary, "chain": rep2, "lease": CH.lease_info()}))
 
 
+def _digest(tensors):
+    import hashlib
+
+    h = hashlib.sha256()
+    for t in tensors:
+        h.update(t.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def mode_hash(args):
+    """Cross-tree bitwise check: run in BOTH trees (run_gpu_pair) and compare the digests.
+
+    CakeDecode() is built from the environment exactly as production builds it. The base tree runs main ('main');
+    the candidate runs TRTLLM_CSA2_CAKE_F32_VARIANT=default and =auto. Per case: eager output + out_lse digest and
+    the graph replay digest (after finite sentinels); then the 40-layer attention + WO chain (counts 1/2/4/8) as a
+    CUDA graph with TRTLLM_CSA2_ATTN_PDL=1 and =0 (80 outputs digested per replay).
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import module as MOD
+
+    pools = CC.build_pools(5, large=False)
+    world = CH.World(args.ckpt)
+    shapes = [(640, None), (640, 384), (128, None)]
+    envs = ["default", "auto"] if CAND else [None]
+    ok, res = True, {}
+    for envv in envs:
+        if envv is not None:
+            os.environ["TRTLLM_CSA2_CAKE_F32_VARIANT"] = envv
+        key = envv or "main"
+        cases = {}
+        for count in [int(c) for c in args.counts.split(",")]:
+            for width, main_w in shapes:
+                tag = f"M{count}_w{width}{'' if main_w is None else '_k' + str(main_w)}"
+                sel, q, sink = case_inputs(count, width, 40 + count, main_w)
+                cake = CD.CakeDecode()
+                out = torch.empty_like(q)
+                call(cake, q, sink, sel, pools, width, out, True)
+                torch.cuda.synchronize()
+                d_eager = _digest([out, lse_of(cake)])
+                g, _ = capture_fn(lambda: call(cake, q, sink, sel, pools, width, out, True))
+                poison(cake, out)
+                g.replay()
+                torch.cuda.synchronize()
+                d_graph = _digest([out, lse_of(cake)])
+                ok &= d_graph == d_eager
+                cases[tag] = dict(eager=d_eager, graph=d_graph, plan=[p["variant"] for p in plan_of(cake)])
+                del g
+        for count in [int(c) for c in args.chain_counts.split(",") if c]:
+            for pdl_env in ("1", "0"):
+                os.environ["TRTLLM_CSA2_ATTN_PDL"] = pdl_env
+                MOD._attn_pdl_enabled.cache_clear()
+                chain = CH.Chain(world, count, seed=20 + count)
+                for L in chain.layers:
+                    L["fi"]._cake = CD.CakeDecode()
+                g, outs = CH.capture(chain, "default")
+                chain.poison(outs)
+                CH.flush()
+                g.replay()
+                torch.cuda.synchronize()
+                flags = sum(bool(chain.flag(L)) for L in chain.layers)
+                variants = sorted({p["variant"] for L in chain.layers for p in plan_of(L["fi"]._cake)})
+                cases[f"chain_M{count}_pdl{pdl_env}"] = dict(
+                    graph=_digest(list(outs) + [L["out"] for L in chain.layers]), pdl_flag_layers=flags,
+                    plan=variants)
+                del g, outs, chain
+                torch.cuda.empty_cache()
+        os.environ.pop("TRTLLM_CSA2_ATTN_PDL", None)
+        MOD._attn_pdl_enabled.cache_clear()
+        res[key] = dict(digest=_digest_str({k: v.get("graph") for k, v in cases.items()}), cases=cases)
+        log(key, json.dumps(res[key]))
+    if CAND:
+        same = {k: {c: res[k]["cases"][c]["graph"] == res["default"]["cases"][c]["graph"]
+                    for c in res[k]["cases"]} for k in res}
+        ok &= all(all(v.values()) for v in same.values())
+    print(json.dumps({"passed": bool(ok), "tree": "candidate" if CAND else "base",
+                      "digests": {k: v["digest"] for k, v in res.items()},
+                      "compared": "sha256 of Cake output + out_lse (direct, eager and graph) and of the 40-layer "
+                                  "attention+WO chain graph outputs (TRTLLM_CSA2_ATTN_PDL=1/0); compare the "
+                                  "candidate's 'default'/'auto' digests with the base tree's 'main' digest",
+                      "cases": {k: {c: v["graph"] for c, v in r["cases"].items()} for k, r in res.items()}}))
+
+
+def _digest_str(d):
+    import hashlib
+
+    return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["time", "check"])
+    ap.add_argument("mode", choices=["time", "check", "hash"])
     ap.add_argument("ckpt", nargs="?", default="")
     ap.add_argument("--counts", default="1,2,4,8,16")
     ap.add_argument("--chain-counts", default="1,2,4,8")
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=100)
     a = ap.parse_args()
-    mode_time(a) if a.mode == "time" else mode_check(a)
+    {"time": mode_time, "check": mode_check, "hash": mode_hash}[a.mode](a)
