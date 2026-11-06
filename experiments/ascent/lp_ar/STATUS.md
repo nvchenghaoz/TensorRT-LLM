@@ -2,10 +2,25 @@
 
 Synced (three-way merge, no conflicts) onto main 8e291e60. Files the merge touched beyond 158's own: none (158's
 10 files merged cleanly; engine.json keeps main's keys verbatim + allreduce_strategy LOWPRECISION).
-Kernel change (bitwise vs LP-16CTA): lowPrecisionTwoShotAllReduceKernel grid = LP_TWOSHOT_DEFAULT_CTAS (64, committed
-before the first GPU job; capped at LP_TWOSHOT_MAX_CTAS 128 and at one block pass per block), env
+Kernel change (bitwise vs LP-16CTA): lowPrecisionTwoShotAllReduceKernel grid = LP_TWOSHOT_DEFAULT_CTAS (64 committed
+before the first GPU job, set to 16 after the job-1640 width tie; capped at LP_TWOSHOT_MAX_CTAS 128 and at one block pass per block), env
 TRTLLM_LP_AR_TWOSHOT_CTAS for the sweep only. LP ipc_barriers_in/out sized (1 + 128) * tp * 8 bytes
 (allreduce_helper.py lowprecision_barrier_bytes); IpcMemory.IPC_BARRIERS_SIZE_PER_GPU unchanged.
+
+## Job A = GPU job 1640 (4 GPU, austin:4 = GPUs 4-7, node smc521ge-0072, lease 8db3c825, commit 79162eab, default 64): PASSED
+- lp_check 220 calls: 0 nonfinite / nondeterministic / mismatched-rank; rel_rms real 0.0373, heavy 0.0202.
+- Width table, max-rank median us/call ([M,5120] bf16; noise_floor at 2048 in brackets):
+  | M | NCCL | LP16 | LP32 | LP48 | LP64 | LP96 | LP128 |
+  | 2048 | 787.0 | 478.8 (1.3%) | 472.9 (1.6%) | 474.6 (1.3%) | 475.0 (1.9%) | 475.9 (2.3%) | 476.7 (2.6%) |
+  | 4096 | 1556.0 | 941.6 | 934.8 | 935.5 | 936.7 | 936.5 | 938.8 |
+  | 6144 | 2331.4 | 1432.2 | 1425.1 | 1422.0 | 1426.0 | 1423.9 | 1427.3 |
+  Every width is bitwise equal to env=16 (0 mismatched calls/elements, 120 calls/rank, flags OK, grid seen in flags).
+  Best gain -1.2% (LP32 at 2048), inside noise -> RULING 5o-2: default set to 16 (LP_TWOSHOT_DEFAULT_CTAS = 16).
+  The kernel is PCIe-bandwidth bound; the grid width is not a lever.
+- 1000-call robust run (default 64): 0 nonfinite, IPC flags OK before each reset, 0 re-run mismatches.
+- trace_graph --with-check: rank 0 EXTEND 40 LP + 40 NCCL AR, DECODE 0 LP / 400 lamport on all 4 ranks, tail graph
+  80/80 captured, 0 capture failed. Routing M=1..16, 128 LP == AUTO bitwise.
+- Next: job B (same script) on the default-16 head, then ONE run_serving_pair vs main 8e291e60, then submit.
 
 ## DECLARED TARGET (fixed before the pair; top-lead ruling 15:0x 11-05, plan 2913 5o-1)
 - Measure: TTFT-specific. TARGETS: c1 TTFT mean and c4 TTFT mean, each judged alone (lower is better).
