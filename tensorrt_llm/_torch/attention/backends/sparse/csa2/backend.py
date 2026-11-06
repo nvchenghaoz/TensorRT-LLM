@@ -840,6 +840,9 @@ class CSA2FlashInfer:
         # Generation-only rows on SM120/SM121: FlashInfer's Cake DeepSeek-V4.1
         # mixed-cache decode reads the packed SWA/main pools in place (no staging).
         self._cake = None
+        # Shared-context prefill on SM120/SM121: FlashInfer's DeepSeek-V4.1 FullBF16
+        # direct sparse prefill reads the packed pools in place (no bank decode).
+        self._fi_prefill = None
 
     def __call__(
         self,
@@ -1181,6 +1184,86 @@ class CSA2FlashInfer:
             )
         return output if output is not None else result.flatten(1)
 
+    def _use_fi_prefill(self, q, metadata, forward_args) -> bool:
+        if forward_args.attention_input_type != AttentionInputType.context_only:
+            return False
+        if not self.fused_glue or self.attention is None or not q.is_cuda:
+            return False
+        if self.attention.sparse_params.use_packed_sparse_attention:
+            return False
+        if metadata.num_tokens <= 64 or torch.cuda.is_current_stream_capturing():
+            return False
+        from .fi_sparse_prefill import fi_prefill_available
+
+        return fi_prefill_available(q.device.index)
+
+    def _forward_fi_prefill(self, q, metadata, forward_args):
+        """Shared-context rows through FlashInfer's FullBF16 direct sparse prefill.
+
+        Reads the packed SWA/main pools in place; replaces stage_shared_rows (bank
+        decode) + FA2 paged prefill + sink epilogue. Falls back to that staged path,
+        on the same prepared inputs, for geometry the route does not cover.
+        """
+        from . import fi_sparse_prefill as fsp
+
+        attention = self.attention
+        attention._validate_helper_output(q, forward_args)
+        inputs = attention.prepare_sparse_inputs(q, metadata, forward_args)
+        count, heads = metadata.num_tokens, attention.num_heads
+        query = q.view(count, heads, _HEAD_DIM)
+        scale = 1.0 / (attention.q_scaling * math.sqrt(_HEAD_DIM))
+        sink = forward_args.attention_sinks
+        output = forward_args.output
+        has_main = inputs.topk_indices is not None
+        main_logical = inputs.main_logical_indices if has_main else None
+        mapping = inputs.main_mapping if has_main else None
+        if (not has_main or (main_logical is not None and mapping is not None)) and fsp.supported(
+            query,
+            inputs.swa_pool,
+            inputs.swa_indices,
+            inputs.main_pool,
+            main_logical,
+            mapping,
+            metadata.shared_plan,
+        ):
+            if self._fi_prefill is None:
+                self._fi_prefill = fsp.FISharedPrefill()
+            out = torch.empty_like(query) if output is None else output.view_as(query)
+            with torch.cuda.device(q.device):
+                self._fi_prefill(
+                    query,
+                    inputs.swa_pool,
+                    inputs.swa_indices,
+                    inputs.main_pool if has_main else None,
+                    main_logical,
+                    mapping,
+                    metadata.shared_plan,
+                    sink,
+                    scale,
+                    out,
+                )
+            return output if output is not None else out.flatten(1)
+        # Staged fallback: the shared tail of prepare_selected + run_shared.
+        metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices)
+        selection = metadata.prepared_indices
+        self._evict_eager_plans(metadata, (count, heads, selection.shape[1], q.device, scale))
+        args = (query, metadata.shared_pool, selection, sink, scale)
+        if (
+            output is not None
+            and output.is_contiguous()
+            and output.shape == (count, heads * _HEAD_DIM)
+            and output.dtype == torch.bfloat16
+        ):
+            with torch.cuda.device(q.device):
+                self.run_shared(*args, protect=metadata._csa2_graph_reserved, out=output.view_as(query))
+            return output
+        with torch.cuda.device(q.device):
+            result = self.run_shared(*args, protect=metadata._csa2_graph_reserved).flatten(1)
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
+
     def _use_cake_decode(self, q, metadata, forward_args) -> bool:
         if forward_args.attention_input_type != AttentionInputType.generation_only:
             return False
@@ -1200,6 +1283,8 @@ class CSA2FlashInfer:
         if self._use_cake_decode(q, metadata, forward_args):
             return self._forward_cake_decode(q, metadata, forward_args)
         shared = metadata.shared_plan is not None
+        if shared and self._use_fi_prefill(q, metadata, forward_args):
+            return self._forward_fi_prefill(q, metadata, forward_args)
         if not shared and self.fused_glue:
             query, swa, extra, lengths, sink, scale = self.attention.prepare_selected_pools(
                 q, metadata, forward_args
