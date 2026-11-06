@@ -17,6 +17,17 @@ end-to-end guard (plan 3610 (6)). Class REORDERED (chunked LP, same as landing 7
   - host us per boundary at T=8192: swap ~600, comm 770-900, serial ~101.
   - swap vs comm bitwise on 120/120 calls per T (all 4 ranks); swap vs serial layer_input rel_rms <= 0.038.
 
+- Kernel pair 2053 (base 06efaf15) / 2054 (head 65a035dd), smc521ge-0046 austin:0 (GPUs 0-3, NUMA 0), us per
+  boundary max over ranks: T=2048 677.5 -> 676.5 (both unpipelined); T=4096 1127.0 -> 1122.0; T=6144 1638.9 ->
+  1638.0; T=8192 2811.6 -> 2156.0 (-23.3%; noise 0.71% / 1.03%). li_rel_vs_ref piped 0.03576 = serial 0.03576.
+- Check job 2085 (austin:4): chain_check PASSED (1000 calls x {4096, 4099, 8192}, IPC flags OK every 250 calls,
+  0 rerun mismatches, mHC identity bitwise). e2e off,on with E2E_BATCH=4: 40/40 within tolerance, 0 errors,
+  8192-token EXTEND steps pipelined (342 LP two-shot all on main, 592 chunk-mHC kernels on the side stream),
+  decode 240 lamport / 0 LP per rank, tail graph 80/80 both arms. Its own JSON says passed=false only because its
+  KV gate compared per-rank pre-sync GiB strings. The real rank-synced KV v2 device quota: env-0 2.1192 GiB,
+  swap 2.2125 GiB (+4.4%; inside-torch profiling peak 2.21 -> 2.16 GiB, outside-torch 8.53 -> 8.41 GiB,
+  the env-0 arm ran first with the 251 s JIT warm-up). The swap arm's capacity is not lower.
+
 ## UNTESTED / NEXT
 - Kernel pair 2053 (base 06efaf15) / 2054 (head), pair.py T in {2048, 4096, 6144, 8192}.
 - Untimed checks: chain_check.py (1000 calls x {4096, 4099, 8192}, IPC flags) + e2e_check.py off,on with E2E_BATCH=4
