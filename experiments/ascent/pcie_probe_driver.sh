@@ -29,6 +29,19 @@ echo "[preamble] HEAD $(git -C "$HERE" rev-parse HEAD 2>/dev/null) (detached sna
 git -C "$HERE" log --oneline -3 2>/dev/null
 env | grep -E '^(NCCL_|TRTLLM_ENABLE_PDL|TLLM_AR|TRTLLM_DSV4)' || echo "[preamble] no NCCL_/TRTLLM_ENABLE_PDL/TLLM_AR/TRTLLM_DSV4 env"
 
+# ruling (pitfall 3271): which libtensorrt_llm.so this job loads, its mtime, and symbol/string counts
+TLLM_DIR=$("$PY" -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("tensorrt_llm").origin))')
+for LIB in "$TLLM_DIR/libs/libtensorrt_llm.so" "$TLLM_DIR/libs/libth_common.so"; do
+  if [ -f "$LIB" ]; then
+    echo "[lib] $(readlink -f "$LIB") mtime=$(stat -c %y "$(readlink -f "$LIB")") size=$(stat -c %s "$(readlink -f "$LIB")")"
+    for S in allreduce_fusion_kernel_oneshot_lamport TLLM_AR_SM120_PDL TLLM_AR_LOG_LAUNCH TRTLLM_LP_AR_TWOSHOT_CTAS TLLM_PCIE_CUSTOM_AR_MAX_BYTES; do
+      echo "[lib]   strings count ${S}: $(grep -a -o "$S" "$LIB" | wc -l)"
+    done
+  else
+    echo "[lib] missing $LIB"
+  fi
+done
+
 "$PY" -c '
 import sys, torch
 n = torch.cuda.device_count()
