@@ -655,7 +655,7 @@ _FUSED_HC_HALF_FMA_MT_TN_TM = (
 # _FUSED_HC_MT2_ID_BASE + tokens per CTA, so the ids of the tactics above are unchanged.
 # Must stay in sync with the C++ pickFhcFmaMtile() table.
 _FUSED_HC_MT2_ID_BASE = 16
-_FUSED_HC_HALF_FMA_MT2_TN_TM = ((24, 4),)
+_FUSED_HC_HALF_FMA_MT2_TN_TM = ((24, 4), (12, 2))
 # M-tiled build v3 (fused_pmap_gemm_fma_mtile_v3<TM, NG, 1>: TM tokens x all 24 columns per
 # CTA, new_r staged in shared memory, int32 token offsets): tokens per CTA. tile_n is 24.
 # Bitwise equal to the tactics above. Its tactic tile_m is _FUSED_HC_MT3_ID_BASE + TM, so
