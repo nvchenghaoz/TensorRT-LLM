@@ -150,8 +150,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--also-time", action="store_true", help="run stage0.py --mode time first (diagnostic)")
     args = ap.parse_args()
     log("gpu memory.used at start:", gpu_memory())
+    if args.also_time:
+        import subprocess
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        proc = subprocess.run(
+            [sys.executable, os.path.join(here, "stage0.py"), "--mode", "time"], capture_output=True, text=True
+        )
+        for line in proc.stdout.splitlines():
+            if line.startswith(("P ", "R ")):
+                log("[stage0 time]", line)
+        log("[stage0 time] returncode", proc.returncode)
     report = {"cases": {}}
     ok = True
     shapes = [(1, 2048, True), (1, 2048, False), (1, 128, True), (1, 128, False), (3, 2048, True), (3, 128, False)]
