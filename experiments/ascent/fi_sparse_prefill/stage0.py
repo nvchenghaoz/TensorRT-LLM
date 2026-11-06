@@ -282,6 +282,24 @@ def time_fn(fn, iters, warmup):
     return {"median_ms": med, "p10_ms": p10, "p90_ms": p90, "noise": (p90 - p10) / med}
 
 
+def time_graph(fn, reps=10, iters=20):
+    """GPU time per call from CUDA-graph replays of ``reps`` back-to-back calls (no host cost)."""
+    try:
+        fn()
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(reps):
+                fn()
+        g.replay()
+        torch.cuda.synchronize()
+        res = time_fn(g.replay, iters, 2)
+        return {k: (v / reps if k.endswith("_ms") else v) for k, v in res.items()}
+    except Exception as e:  # noqa: BLE001
+        torch.cuda.synchronize()
+        return {"error": str(e)[:200]}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="all", choices=("all", "check", "time"))
@@ -370,10 +388,19 @@ def main():
             tm = time_fn(lambda: s.run_main(helper), args.iters, args.warmup)
             tf = time_fn(lambda: s.run_fi(fi), args.iters, args.warmup)
             tk = time_fn(lambda: s.run_fi_kernel_only(fi), args.iters, args.warmup)
-            result["shapes"].setdefault(name, {})["time"] = {"main": tm, "fi_with_prep": tf, "fi_kernel": tk}
+            tg = time_graph(lambda: s.run_fi_kernel_only(fi))
+            tgp = time_graph(lambda: s.run_fi(fi))
+            result["shapes"].setdefault(name, {})["time"] = {
+                "main": tm,
+                "fi_with_prep": tf,
+                "fi_kernel": tk,
+                "fi_kernel_graph": tg,
+                "fi_with_prep_graph": tgp,
+            }
             log(
                 f"P {name}: main {tm['median_ms']:.4f} ms (n {tm['noise']:.3f}) | fi+prep {tf['median_ms']:.4f} "
-                f"(n {tf['noise']:.3f}) | fi kernel {tk['median_ms']:.4f}"
+                f"(n {tf['noise']:.3f}) | fi kernel {tk['median_ms']:.4f} | graph kernel "
+                f"{tg.get('median_ms', -1):.4f} graph fi+prep {tgp.get('median_ms', -1):.4f}"
             )
 
         def seq(names, fn_name):
