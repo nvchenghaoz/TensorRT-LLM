@@ -339,10 +339,13 @@ void cake_sparse_mla_sm120_dsv41_mixed_decode(TensorView q, TensorView kv_cache,
     CheckDevice(mo, "mid_out", device, 16);
     const bool mid_f32 = encode_dlpack_dtype(mo.dtype()) == encode_dlpack_dtype(dl_float32);
     if (mid_f32) {
-      // fp32 split partials: only the h16 `default` decode bodies write them.
-      TVM_FFI_CHECK(body.launch == &h16::decode_default::launch || body.launch == &h16::decode_dual_default::launch,
+      // fp32 split partials: only the h16 `default` decode bodies and the h16 `sa+lq+el` / `sa+pw+lq+el` fold
+      // render (TRT-LLM CSA2 overlay) write them.
+      TVM_FFI_CHECK(body.launch == &h16::decode_default::launch || body.launch == &h16::decode_dual_default::launch ||
+                        body.launch == &h16::decode_dual_sa_lq_el::launch ||
+                        body.launch == &h16::decode_dual_sa_pw_lq_el::launch,
                     ValueError)
-          << "float32 mid_out is served only by the 16-head `default` decode bodies";
+          << "float32 mid_out is served only by the 16-head `default`, `sa+lq+el` and `sa+pw+lq+el` decode bodies";
       mid_out_f32_ptr = static_cast<float*>(mo.data_ptr());
     } else {
       CheckDtype(mo, "mid_out", dl_bfloat16, "bfloat16");

@@ -182,6 +182,9 @@ class CakeDsv41MixedDispatch:
 
 
 DEFAULT_VARIANT = "default"
+# TRT-LLM CSA2 overlay: the 16-head dual fold render whose bodies also write fp32 split partials (the binding's
+# fp32 merge combines them). Merge-variant twins are irrelevant there (the fp32 merge replaces them).
+F32_FOLD_VARIANTS = frozenset(("sa+lq+el", "sa+pw+lq+el"))
 
 
 def dispatch_from_manifest(manifest: dict) -> CakeDsv41MixedDispatch:
@@ -1206,11 +1209,17 @@ def _launch_decode(
                 f"got {tuple(mid_out.shape)} {mid_out.dtype}"
             )
         if mid_out.dtype == torch.float32 and (
-            num_heads != 16 or plan.variant != DEFAULT_VARIANT
+            num_heads != 16
+            or (
+                plan.variant != DEFAULT_VARIANT
+                and not (call.extra_flat is not None and plan.variant in F32_FOLD_VARIANTS)
+            )
         ):
-            # fp32 split partials (TRT-LLM CSA2 overlay) are written only by the 16-head `default` bodies.
+            # fp32 split partials (TRT-LLM CSA2 overlay) are written only by the 16-head `default` bodies
+            # and the 16-head dual `sa+lq+el` / `sa+pw+lq+el` fold render.
             raise ValueError(
-                "float32 mid_out requires 16 query heads and variant='default', got "
+                "float32 mid_out requires 16 query heads and variant='default' (or a dual "
+                f"{sorted(F32_FOLD_VARIANTS)} render), got "
                 f"{num_heads} heads and variant {plan.variant!r}"
             )
         if (
