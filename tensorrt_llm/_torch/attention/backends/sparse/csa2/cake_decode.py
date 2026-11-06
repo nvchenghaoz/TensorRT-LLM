@@ -33,6 +33,10 @@ import triton.language as tl
 
 _HEAD_DIM = 512
 
+# (max count, render) buckets for 16-head dual fp32-partials calls under TRTLLM_CSA2_CAKE_F32_VARIANT=auto;
+# counts above the last bucket keep the plain `default` body.
+_F32_FOLD_BUCKETS = ((16, "sa+pw+lq+el"),)
+
 
 # Every runtime argument stays unspecialized: eager mixed steps see new batch shapes
 # (page-table rows, slice offsets), and a value/alignment specialization would JIT a
@@ -293,11 +297,32 @@ class CakeDecode:
     split sink path. Off, the stock BF16 partials and dispatched variant run.
     """
 
-    def __init__(self, f32_partials: bool | None = None) -> None:
+    def __init__(self, f32_partials: bool | None = None, f32_variant: str | None = None) -> None:
         self._buffers: dict[tuple, dict[str, torch.Tensor]] = {}
         if f32_partials is None:
             f32_partials = os.environ.get("TRTLLM_CSA2_CAKE_F32_PARTIALS", "1") != "0"
         self.f32_partials = bool(f32_partials)
+        if f32_variant is None:
+            f32_variant = os.environ.get("TRTLLM_CSA2_CAKE_F32_VARIANT", "auto")
+        self.f32_variant = str(f32_variant)
+
+    def _f32_variant_for(self, count: int, has_main: bool) -> str:
+        """The exact Cake render that writes the fp32 partials for one 16-head call.
+
+        ``auto``: dual (SWA + main) calls take the h16 fold render (``sa+lq+el`` /
+        ``sa+pw+lq+el``, FlashInfer overlay) in the count buckets where it is faster,
+        else the plain ``default`` body; ``default`` restores the plain body everywhere;
+        any other value pins that label on dual calls. Every render computes the same
+        fp32 partials (exact renders of one kernel).
+        """
+        if not has_main or self.f32_variant == "default":
+            return "default"
+        if self.f32_variant != "auto":
+            return self.f32_variant
+        for limit, label in _F32_FOLD_BUCKETS:
+            if count <= limit:
+                return label
+        return "default"
 
     def _scratch(self, count, heads, swa_width, main_width, device):
         key = (count, heads, swa_width, main_width, device)
@@ -405,7 +430,7 @@ class CakeDecode:
                 int(bool(enable_pdl)) | (2 if pdl_consumer else 0),
             )
             return out
-        variant = "default" if self._use_f32(heads) else None
+        variant = self._f32_variant_for(count, has_main) if self._use_f32(heads) else None
         info = cake_sparse_mla_sm120_dsv41_mixed_decode(
             q,
             swa_pool,

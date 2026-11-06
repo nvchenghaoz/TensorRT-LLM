@@ -50,14 +50,14 @@ def make_values(rows, gen, *, large=True):
     return v.to(torch.bfloat16)
 
 
-def build_pools(seed, device="cuda", extremes=False):
+def build_pools(seed, device="cuda", extremes=False, large=True):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import store_rows
 
     gen = torch.Generator().manual_seed(seed)
     swa_pool = torch.zeros((SWA_ROWS, 528), dtype=torch.uint8, device=device)
     main_pool = torch.zeros((MAIN_ROWS, 288), dtype=torch.uint8, device=device)
-    sv = make_values(SWA_ROWS, gen).to(device)
-    mv = make_values(MAIN_ROWS, gen).to(device)
+    sv = make_values(SWA_ROWS, gen, large=large).to(device)
+    mv = make_values(MAIN_ROWS, gen, large=large).to(device)
     store_rows(swa_pool, torch.arange(SWA_ROWS, device=device), sv, "swa")
     store_rows(main_pool, torch.arange(MAIN_ROWS, device=device), mv, "main")
     if extremes:
