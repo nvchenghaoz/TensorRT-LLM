@@ -42,18 +42,26 @@ def cgroup():
 
 
 def guard():
+    """Wait-only (method 3075): poll up to 180 s; never kill anything."""
+    import time
+
     import torch
 
-    used_max = 0.0
-    for i in range(torch.cuda.device_count()):
-        free, total = torch.cuda.mem_get_info(i)
-        used = (total - free) / (1 << 30)
-        log(f"GUARD gpu {i} {torch.cuda.get_device_name(i)} used {used:.2f} GiB of "
-            f"{total / (1 << 30):.2f}")
-        used_max = max(used_max, used)
-    if used_max > 4.0:
-        log(f"DIRTY SLOT {used_max:.2f}")
-        sys.exit(3)
+    deadline = time.monotonic() + 180.0
+    while True:
+        used = []
+        for i in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(i)
+            used.append((i, (total - free) / (1 << 30), total / (1 << 30)))
+        for i, u, t in used:
+            log(f"GUARD gpu {i} {torch.cuda.get_device_name(i)} used {u:.2f} GiB of {t:.2f}")
+        used_max = max(u for _, u, _ in used)
+        if used_max <= 4.0:
+            return
+        if time.monotonic() > deadline:
+            log("DIRTY SLOT " + " ".join(f"gpu{i}={u:.2f}GiB" for i, u, _ in used))
+            sys.exit(3)
+        time.sleep(15)
 
 
 def run(tag, mode, extra_env):
@@ -81,14 +89,18 @@ def run(tag, mode, extra_env):
 def main():
     os.environ.setdefault("B185_KV_GB", "12")
     log(f"{LABEL} host {socket.gethostname()} CVD {os.environ.get('CUDA_VISIBLE_DEVICES')} "
-        f"nproc {os.cpu_count()} affinity {len(os.sched_getaffinity(0))}")
+        f"nproc {os.cpu_count()} affinity {len(os.sched_getaffinity(0))} "
+        f"slot_cwd {os.getcwd()}")
+    import torch
+
+    log(f"{LABEL} torch.get_num_threads {torch.get_num_threads()}")
     guard()
     rc, default, cg_default = run("DEFAULT", "pair", {})
     if rc or default is None:
         log(f"DEFAULT failed rc {rc}")
         sys.exit(rc or 1)
     rc_d, _, cg_diag = run("DIAG", "diag", {})
-    rc_t, threads1, cg_t1 = run("THREADS1", "pair", {"OMP_NUM_THREADS": "1"})
+    rc_t, threads1, cg_t1 = run("THREADS1", "pair", {"B185_THREADS": "1"})
     for shape, row in default["detail"].items():
         t1 = (threads1 or {}).get("detail", {}).get(shape, {})
         log(f"ROW {LABEL} {shape} DEFAULT a {row['a_prepare']} | THREADS1 a {t1.get('a_prepare')}")

@@ -407,6 +407,9 @@ def run_diag(rig):
 
 def main():
     torch.manual_seed(0)
+    if os.environ.get("B185_THREADS"):
+        torch.set_num_threads(int(os.environ["B185_THREADS"]))
+    log(f"threads {torch.get_num_threads()} affinity {len(os.sched_getaffinity(0))}")
     log(f"host {os.uname().nodename} gpu {torch.cuda.get_device_name()} mode {MODE} "
         f"fast_prepare env {os.environ.get('TRTLLM_CSA2_FAST_PREPARE', '<unset>')}")
     with torch.inference_mode():

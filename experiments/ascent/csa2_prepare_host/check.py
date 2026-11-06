@@ -35,6 +35,10 @@ def digest(flag):
 
 
 def main():
+    sys.path.insert(0, HERE)
+    from arm import guard  # wait-only dirty-slot guard (exit 3)
+
+    guard()
     result = {}
     slow, fast = digest("0"), digest("1")
     ok = slow is not None and fast is not None
