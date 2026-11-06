@@ -63,7 +63,7 @@ def acqrel() -> bool:
     thread 0 (release of the CTA's partial stores by cumulativity, acquire of the other
     slices' partials), then bar.red.or; no per-thread membar.gl before the count and none
     before the slot loads.  Same values, same slice order: the sum is bitwise unchanged."""
-    return os.environ.get(ENV_ACQREL, "0") == "1"
+    return os.environ.get(ENV_ACQREL, "1") == "1"
 
 
 def key():

@@ -35,6 +35,7 @@ KNOBS = {"KACQ": "TRTLLM_SM12X_FI_FC12_KACQ", "EW2": "TRTLLM_SM12X_FI_FC12_EARLY
          "ACQREL": "TRTLLM_SM12X_FI_SPLITK_ACQREL"}
 REPS = int(os.environ.get("PAIR_REPS", "8"))
 SEEDS = int(os.environ.get("BENCH_SEEDS", "6"))
+DSETS = int(os.environ.get("PAIR_DSETS", "1"))
 LAYERS = bench.LAYERS
 
 
@@ -105,7 +106,9 @@ def main():
                                                 for li in range(LAYERS))] for s in range(SEEDS)]
         m, d = case.split("_")
         m, d = int(m[1:]), int(d[1:])
-        return m, [[routing(m, d, seed=li) for li in range(LAYERS)]]
+        # DSETS distinct expert draws of the same D, averaged like the mix seeds
+        return m, [[routing(m, d, seed=li + 97 * k) for li in range(LAYERS)]
+                   for k in range(DSETS)]
 
     cases = targets + secondary
     graphs = {}
@@ -123,7 +126,8 @@ def main():
     for v in KNOBS.values():
         os.environ[v] = "0"
     vals = {k: [] for k in graphs}
-    for r in range(REPS):
+    warm = int(os.environ.get("PAIR_WARM_REPS", "1"))  # discarded reps (clocks, caches)
+    for r in range(-warm, REPS):
         order = arms if r % 2 == 0 else arms[::-1]
         for case in cases:
             line = []
@@ -135,9 +139,10 @@ def main():
                     sp.append(t["layer_us"])
                     kernels.setdefault(name, set()).update(t["kernels"])
                 v = sum(sp) / len(sp)
-                vals[(case, name)].append(v)
+                if r >= 0:
+                    vals[(case, name)].append(v)
                 line.append(f"{name}={v:.3f}")
-            log(f"rep {r} {case}: " + " ".join(line))
+            log(f"rep {r}{' (warm, discarded)' if r < 0 else ''} {case}: " + " ".join(line))
     rows = []
     ref = arms[0][0]
     for case in cases:

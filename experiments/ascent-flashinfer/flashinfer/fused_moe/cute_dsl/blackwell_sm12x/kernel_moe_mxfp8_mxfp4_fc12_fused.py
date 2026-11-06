@@ -69,11 +69,11 @@ EARLY_W2_ENV = "TRTLLM_SM12X_FI_FC12_EARLY_W2"
 
 
 def kacq_enabled() -> bool:
-    return os.environ.get(KACQ_ENV, "0") == "1"
+    return os.environ.get(KACQ_ENV, "1") == "1"
 
 
 def early_w2_enabled() -> bool:
-    return os.environ.get(EARLY_W2_ENV, "0") == "1"
+    return os.environ.get(EARLY_W2_ENV, "1") == "1"
 
 
 def compile_env_key():
