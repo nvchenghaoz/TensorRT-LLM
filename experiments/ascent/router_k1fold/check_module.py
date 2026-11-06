@@ -24,14 +24,20 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "router_prewait"))
 
+# Producer spin (ns) of the stand-in AR. The skip-wait negative control and its positive twin (slow_producer) spin
+# 200 us so that a router reading x_attn before griddepcontrol.wait always reads the NaN poison (at 6 us the M=2
+# fold's prologue raced past the producer's write in job 1644 and the control went uncaught).
+SLOW_SPIN = "200000"
 ARMS = {
     "default": {},
     "fold_off": {"TRTLLM_DSV4_ROUTER_K1_FOLD": "0"},
     "max_m4": {"TRTLLM_DSV4_ROUTER_K1_FOLD_MAX_M": "4"},
     "aux_sleep": {"TRTLLM_MHC_SPLIT_TEST_SLEEP_CYCLES": "200000"},
     "pdl0": {"TRTLLM_ENABLE_PDL": "0"},
-    "skip_wait": {"TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT": "1"},
+    "slow_producer": {"K1FOLD_CHECK_SPIN_NS": SLOW_SPIN},
+    "skip_wait": {"TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT": "1", "K1FOLD_CHECK_SPIN_NS": SLOW_SPIN},
 }
+HASH_ARMS = ("default", "fold_off", "max_m4", "aux_sleep", "pdl0", "slow_producer")
 HIDDEN = 5120
 WARMUP, ITERS = 5, 20
 
@@ -142,18 +148,26 @@ def run_arm(arm):
     def same(a, b):
         return a.shape == b.shape and bool(torch.equal(bits(a), bits(b)))
 
-    report = {"arm": arm, "cases": {}, "jit_in_capture": 0}
+    SPIN_NS = int(os.environ.get("K1FOLD_CHECK_SPIN_NS", "6000"))
+    report = {"arm": arm, "cases": {}, "jit_in_capture": 0, "spin_ns": SPIN_NS}
     h_all = hashlib.sha256()
     for m in (1, 2, 4, 8):
         bufs = [t.clone() for t in fresh(m, 0)]
         src, res, post, comb, pre = bufs
         xa = torch.empty_like(src)
-        with autotune(skip_dynamic_tuning_buckets=True):
-            mhc.fused_hc_lagged(src, res, post, comb, pre, norm_weight=nw, norm_eps=1e-6)
+        # One tactic set for every arm: the first arm tunes and saves, later arms load it (job 1644: an
+        # independently tuned M=8 mHC tactic changed max_m4's hash although no arm folds at M=8).
+        cache = os.environ.get("K1FOLD_AUTOTUNE_CACHE")
+        if cache and os.path.exists(cache):
+            with autotune(tune_mode=False, cache_path=cache):
+                mhc.fused_hc_lagged(src, res, post, comb, pre, norm_weight=nw, norm_eps=1e-6)
+        else:
+            with autotune(cache_path=cache, skip_dynamic_tuning_buckets=True):
+                mhc.fused_hc_lagged(src, res, post, comb, pre, norm_weight=nw, norm_eps=1e-6)
         state = {}
 
         def body():
-            ext.producer(src, xa, 6000, 4, 256, empty, True)
+            ext.producer(src, xa, SPIN_NS, 4, 256, empty, True)
             sp = mhc.fused_hc_lagged_split(xa, res, post, comb, pre, nw, 1e-6, aux_mhc, ev0, ev1,
                                            defer_k1=fold_wanted(m))
             assert sp is not None, "split did not engage"
@@ -239,10 +253,13 @@ def run_arm(arm):
 
 
 def main():
+    import tempfile
     results = {}
+    cache = os.path.join(tempfile.mkdtemp(prefix="k1fold_tune_"), "autotune_cache.json")
     for arm, env in ARMS.items():
         e = dict(os.environ)
         e.update(env)
+        e["K1FOLD_AUTOTUNE_CACHE"] = cache
         log(f"=== arm {arm} env {env}")
         p = subprocess.run([sys.executable, os.path.abspath(__file__), "arm", arm], env=e, capture_output=True,
                            text=True, timeout=1500)
@@ -287,11 +304,13 @@ def main():
         if not all(v > 0 for v in caught.values()):
             failures.append(f"skip_wait negative control not caught at the fold M: {caught}")
     hashes = {a: r.get("hash") for a, r in results.items()}
-    same_hash = len({hashes[a] for a in ("default", "fold_off", "max_m4", "aux_sleep", "pdl0") if a in hashes}) == 1
-    if not same_hash:
-        failures.append(f"output hashes differ across arms: {hashes}")
+    per_m_hashes = {m: {a: results[a]["cases"][m]["hash"] for a in HASH_ARMS if "cases" in results.get(a, {})}
+                    for m in ("1", "2", "4", "8")}
+    if any(a not in hashes for a in HASH_ARMS) or len({hashes[a] for a in HASH_ARMS}) != 1:
+        diff_m = [m for m, hs in per_m_hashes.items() if len(set(hs.values())) != 1]
+        failures.append(f"output hashes differ across arms at M={diff_m}: {per_m_hashes}")
     print(json.dumps({"passed": not failures, "failures": failures, "skip_wait_bad_iterations": caught,
-                      "hashes": hashes,
+                      "hashes": hashes, "per_m_hashes": per_m_hashes, "autotune_cache": cache,
                       "compared": "fold graph outputs vs eager mHC.fused_hc_lagged layer_input + dsv4_fused_router",
                       "arms": {a: {m: {k: v for k, v in c.items() if k != "first_bad"}
                                    for m, c in r.get("cases", {}).items()} for a, r in results.items()}}))
