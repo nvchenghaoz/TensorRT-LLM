@@ -38,11 +38,23 @@ def _matmul_with_output_dtype(input: torch.Tensor, weight: torch.Tensor,
 
 
 @triton.jit
-def _embedding_gather_kernel(ids_ptr, w_ptr, out_ptr, num_embeddings,
-                             H: tl.constexpr, BLOCK: tl.constexpr,
-                             PDL: tl.constexpr):
+def _embedding_gather_kernel(ids_ptr,
+                             w_ptr,
+                             out_ptr,
+                             num_embeddings,
+                             H: tl.constexpr,
+                             BLOCK: tl.constexpr,
+                             PDL: tl.constexpr,
+                             HC: tl.constexpr = 1,
+                             pre_ptr=None,
+                             WRITE_PRE: tl.constexpr = False,
+                             HC_P2: tl.constexpr = 1):
     """out[t] = weight[ids[t]] for ids in [0, num_embeddings), zeros otherwise (flashinfer's rejection sampler
-    pads with -1): the non-parallel masked lookup's values in one launch per call."""
+    pads with -1): the non-parallel masked lookup's values in one launch per call.
+
+    With HC > 1 the row is loaded once and stored HC times to out[t * HC + r] (the mHC stream seed,
+    bitwise ``lookup.unsqueeze(1).repeat(1, HC, 1)``); WRITE_PRE also writes the fp32 one-hot
+    pre_mix[t, r, 0] = (r == 0)."""
     t = tl.program_id(0)
     if PDL:
         gdc_wait_with_memory_clobber()
@@ -53,12 +65,60 @@ def _embedding_gather_kernel(ids_ptr, w_ptr, out_ptr, num_embeddings,
         offs = h0 + tl.arange(0, BLOCK)
         m = offs < H
         v = tl.load(w_ptr + row * H + offs, mask=m & ok, other=0.0)
-        tl.store(out_ptr + t.to(tl.int64) * H + offs, v, mask=m)
+        for r in tl.static_range(HC):
+            tl.store(out_ptr + (t.to(tl.int64) * HC + r) * H + offs, v, mask=m)
+    if WRITE_PRE:
+        rr = tl.arange(0, HC_P2)
+        tl.store(pre_ptr + t.to(tl.int64) * HC + rr,
+                 tl.where(rr == 0, 1.0, 0.0).to(tl.float32),
+                 mask=rr < HC)
     if PDL:
         # PDL rule: release the dependents only after a CTA barrier that follows the last global access (the ids
         # may live in a block the caching allocator recycles for a dependent's pre-wait write)
         tl.debug_barrier()
         tl.extra.cuda.gdc_launch_dependents()
+
+
+def embedding_gather_hc(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    hc: int,
+    with_pre_mix: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """One-launch lookup + mHC stream seed of a full (non-parallel) table.
+
+    Returns a contiguous ``[N, hc, hidden]`` tensor, bitwise
+    ``masked_lookup(input).unsqueeze(1).repeat(1, hc, 1)``, and, when ``with_pre_mix``, a fresh fp32
+    ``[N, hc, 1]`` one-hot (1.0 at stream 0), bitwise ``zeros(...); [:, 0, :] = 1.0``.
+    """
+    ids = input.reshape(-1)
+    if not ids.is_contiguous():
+        ids = ids.contiguous()
+    num_embeddings, hidden = weight.shape
+    n = ids.numel()
+    out = torch.empty((n, hc, hidden), dtype=weight.dtype, device=weight.device)
+    pre = (torch.empty((n, hc, 1), dtype=torch.float32, device=weight.device)
+           if with_pre_mix else None)
+    if n > 0:
+        from ..flashinfer_utils import get_env_enable_pdl
+        pdl = get_env_enable_pdl()
+        # 16-byte bf16 vectors over 128 threads with no masked lanes when hidden divides by 1024.
+        block = 1024 if hidden % 1024 == 0 else min(
+            triton.next_power_of_2(hidden), 8192)
+        _embedding_gather_kernel[(n, )](ids,
+                                        weight,
+                                        out,
+                                        num_embeddings,
+                                        H=hidden,
+                                        BLOCK=block,
+                                        PDL=pdl,
+                                        HC=hc,
+                                        pre_ptr=pre,
+                                        WRITE_PRE=with_pre_mix,
+                                        HC_P2=triton.next_power_of_2(hc),
+                                        num_warps=4,
+                                        launch_pdl=pdl)
+    return out, pre
 
 
 def embedding_gather(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

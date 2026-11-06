@@ -1469,7 +1469,12 @@ class DeepseekV41Model(DeepseekV4Model):
         )
         return HCState.resolved(residual, pre_mix=hc_state.pre_mix)
 
-    def _init_hc_state(self, hidden_states: torch.Tensor) -> HCState:
+    # The fused embed seed writes the one-hot pre_mix below in its own launch.
+    _hc_seed_writes_pre_mix = True
+
+    def _init_hc_state(
+        self, hidden_states: torch.Tensor, pre_mix: Optional[torch.Tensor] = None
+    ) -> HCState:
         """Seed the lagged ``pre`` with the reference's one-hot.
 
         ``make_identity_pre_mix`` (model.py:1159) is ``zeros(..., hc_mult)`` with
@@ -1480,11 +1485,15 @@ class DeepseekV41Model(DeepseekV4Model):
         embedding, and a uniform ``1/mult`` seed would be right only by accident
         of the streams being identical -- and would diverge the moment engram
         fires on layer 0.
+
+        ``pre_mix``, when given, is that same one-hot written fresh by the fused
+        embed seed (``embedding_gather_hc``).
         """
-        pre_mix = hidden_states.new_zeros(
-            (hidden_states.shape[0], self.hc_mult, 1), dtype=torch.float32
-        )
-        pre_mix[:, 0, :] = 1.0
+        if pre_mix is None:
+            pre_mix = hidden_states.new_zeros(
+                (hidden_states.shape[0], self.hc_mult, 1), dtype=torch.float32
+            )
+            pre_mix[:, 0, :] = 1.0
         return HCState.resolved(hidden_states, pre_mix=pre_mix)
 
     def _finalize_hc_state(self, hc_state: HCState) -> torch.Tensor:
