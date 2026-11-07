@@ -424,7 +424,7 @@ class LowMWOProjection:
     """
 
     def __init__(self, module) -> None:
-        ops = torch.ops.trtllm
+        ops = native_ops
         if not (hasattr(ops, "csa2_lowm_wo_a") and hasattr(ops, "csa2_mxfp8_low_m_gemm")):
             raise RuntimeError("csa2_lowm_wo_a / csa2_mxfp8_low_m_gemm are not built")
         weight = module.o_a_proj
