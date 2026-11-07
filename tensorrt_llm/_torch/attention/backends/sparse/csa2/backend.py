@@ -1128,6 +1128,89 @@ class CSA2FlashInfer:
                 for previous in others[: max(len(others) - keep, 0)]:
                     del cache[previous]
 
+    def _cake_shared_indices(self, inputs, count):
+        """This layer's forward-shared Cake indices: ``(swa_ready, main_share)``.
+
+        ``swa_ready`` is the int32 SWA slab the forward's SWA refresh launch wrote for
+        this layer (same slots as ``inputs.swa_indices``, masked by this layer's pool
+        rows), or ``None``. ``main_share`` lets the layers of one staging group (same KV
+        owner and index source, hence the same selections, page mapping and, through the
+        owner's compression ratio, the same visible lengths) share one main-slot prep.
+        """
+        import os
+
+        source = getattr(inputs.state, "metadata", None)
+        layer_idx = getattr(self.attention, "layer_idx", None)
+        group = inputs.stage_group
+        if source is None or layer_idx is None or group is None:
+            return None, None
+        if os.environ.get("TRTLLM_CSA2_CAKE_GROUPED_PREP", "1") == "0":
+            return None, None
+        start = int(group[2])
+
+        def signature(tensor):
+            return (tensor.data_ptr(), tuple(tensor.shape), tensor.stride(), tensor.dtype)
+
+        def layer_slab(slabs):
+            # This layer's per-forward slab, if it holds rows [start, start + count).
+            slab = (slabs or {}).get(layer_idx)
+            if slab is None or slab.dim() < 1 or start + count > slab.shape[0]:
+                return None
+            return slab
+
+        swa_ready = None
+        slabs32 = getattr(source, "csa2_swa_indices32", None)
+        if slabs32 and inputs.swa_indices is not None:
+            slab32 = layer_slab(slabs32)
+            slab = layer_slab(getattr(source, "csa2_swa_indices", None))
+            capacities = getattr(source, "csa2_swa_capacities", ())
+            if (
+                slab32 is not None
+                and slab is not None
+                and layer_idx < len(capacities)
+                and capacities[layer_idx] == inputs.swa_pool.shape[0]
+                and slab32.shape == slab.shape
+                and inputs.swa_indices.shape == (count, slab.shape[1])
+                and inputs.swa_indices.data_ptr() == slab[start].data_ptr()
+            ):
+                swa_ready = slab32[start : start + count]
+        main_share = None
+        registry = getattr(source, "csa2_cake_shared", None)
+        mapping = inputs.main_mapping
+        if (
+            registry is not None
+            and mapping is not None
+            and inputs.topk_indices is not None
+            and inputs.main_pool is not None
+            and group[0] is not None
+        ):
+            table, page_size, max_positions, requests, visible = mapping
+            visible_key = signature(visible)
+            lengths = layer_slab(getattr(source, "csa2_visible_lengths", None))
+            if (
+                lengths is not None
+                and lengths.dim() == 1
+                and tuple(visible.shape) == (count,)
+                and visible.data_ptr() == lengths[start].data_ptr()
+            ):
+                # The SWA refresh writes visible[layer] = (position + 1) // ratio[layer], and
+                # every layer of one KV owner has the owner's compression ratio (CSA2Layout).
+                visible_key = ("refresh_visible", group[0])
+            share_key = (
+                group[0],  # KV owner
+                group[1],  # index source
+                start,
+                visible_key,
+                signature(inputs.topk_indices),
+                signature(table),
+                int(page_size),
+                int(max_positions),
+                signature(requests),
+                signature(inputs.main_pool),
+            )
+            main_share = (registry, share_key)
+        return swa_ready, main_share
+
     def _forward_cake_decode(self, q, metadata, forward_args):
         """Generation-only rows through the Cake mixed-cache decode, reading the packed pools.
 
@@ -1152,6 +1235,7 @@ class CSA2FlashInfer:
                 self._cake = cake_decode.CakeDecode()
             if out is None:
                 out = torch.empty_like(query)
+            swa_ready, main_share = self._cake_shared_indices(inputs, count)
             with torch.cuda.device(q.device):
                 self._cake(
                     query,
@@ -1164,6 +1248,8 @@ class CSA2FlashInfer:
                     out,
                     mapping=inputs.main_mapping,
                     pdl_consumer=bool(getattr(inputs.state, "output_pdl_consumer", False)),
+                    swa_ready=swa_ready,
+                    main_share=main_share,
                 )
             return output if output is not None else out.flatten(1)
         # Staged fallback: the same tail as prepare_selected_pools + _forward_pools_decode.

@@ -166,11 +166,14 @@ def _glue_kernels():
 
         tile = 8
 
-        def __init__(self, window: int, block: int):
+        def __init__(self, window: int, block: int, with_int32: bool = False):
             if window <= 0 or window > 1024:
                 raise ValueError("CSA2 SWA window must be within 1..1024")
             self.window = window
             self.block = block
+            # Also write the Cake decode's int32 read slots: ``-1`` unless
+            # 0 <= read < the layer's SWA pool rows (``_cake_index_prep_kernel``'s SWA half).
+            self.with_int32 = with_int32
             self.threads = max(32, min(1024, -(-window // 32) * 32))
 
         @cute.jit
@@ -185,6 +188,8 @@ def _glue_kernels():
             reads: cute.Pointer,  # int64 [swa_layers, tokens, window]
             writes: cute.Pointer,  # int64 [swa_layers, tokens]
             visible: cute.Pointer,  # int64 [layers, tokens]
+            reads32: cute.Pointer,  # int32 [swa_layers, tokens, window] (with_int32 only)
+            capacity: cute.Pointer,  # int64 [swa_layers]: SWA pool rows (with_int32 only)
             tokens: Int32,
             swa_layers: Int32,
             layers: Int32,
@@ -201,6 +206,8 @@ def _glue_kernels():
                 reads,
                 writes,
                 visible,
+                reads32,
+                capacity,
                 tokens,
                 swa_layers,
                 layers,
@@ -223,6 +230,8 @@ def _glue_kernels():
             reads: cute.Pointer,
             writes: cute.Pointer,
             visible: cute.Pointer,
+            reads32: cute.Pointer,
+            capacity: cute.Pointer,
             tokens: Int32,
             swa_layers: Int32,
             layers: Int32,
@@ -263,6 +272,13 @@ def _glue_kernels():
                 requests_t = tensor1d(requests, Int64(tokens))
                 reads_t = tensor1d(reads, Int64(swa_layers) * Int64(tokens) * Int64(window))
                 writes_t = tensor1d(writes, Int64(swa_layers) * Int64(tokens))
+                reads32_t = reads_t
+                pool_rows = Int64(0)
+                if cutlass.const_expr(self.with_int32):
+                    reads32_t = tensor1d(
+                        reads32, Int64(swa_layers) * Int64(tokens) * Int64(window)
+                    )
+                    pool_rows = Int64(tensor1d(capacity, Int64(swa_layers))[layer])
                 for offset in cutlass.range(self.tile):
                     token = first + offset
                     if token < tokens:
@@ -299,6 +315,11 @@ def _glue_kernels():
                             if logical < read_floor:
                                 read = Int64(-1)
                             reads_t[row * window + Int64(column)] = read
+                            if cutlass.const_expr(self.with_int32):
+                                read32 = Int32(-1)
+                                if (read >= 0) & (read < pool_rows):
+                                    read32 = Int32(read)
+                                reads32_t[row * window + Int64(column)] = read32
                             if column == window - 1:
                                 writes_t[row] = slot
 
@@ -1942,6 +1963,8 @@ def refresh_swa_slots(
     writes: torch.Tensor,
     visible: torch.Tensor,
     block: int,
+    reads32: torch.Tensor | None = None,
+    capacity: torch.Tensor | None = None,
 ) -> None:
     """Fill ``reads[S, T, W]`` and ``writes[S, T]`` of the first ``S`` (SWA) layers and
     ``visible[L, T]`` of every model layer in one launch.
@@ -1951,6 +1974,10 @@ def refresh_swa_slots(
 
     ``tables`` is int64 ``[S, 4]`` holding each SWA layer's page-table pointer,
     row stride (elements), row count and column count; ``ratios`` is int32 ``[L]``.
+
+    With ``reads32`` (int32 ``[S, T, W]``) and ``capacity`` (int64 ``[S]`` SWA pool
+    rows) the same launch also writes the Cake decode's int32 read slots: ``read``
+    when ``0 <= read < capacity[layer]``, else ``-1``.
     """
     swa_layers, tokens, window = reads.shape
     layers = visible.shape[0]
@@ -1958,6 +1985,20 @@ def refresh_swa_slots(
         return
     _check(reads.is_contiguous() and writes.is_contiguous() and visible.is_contiguous(), "slabs")
     _check(reads.dtype == writes.dtype == visible.dtype == torch.int64, "CSA2 SWA slabs are int64")
+    with_int32 = reads32 is not None
+    if with_int32:
+        _check(
+            capacity is not None
+            and reads32.shape == reads.shape
+            and reads32.dtype == torch.int32
+            and reads32.is_contiguous()
+            and capacity.dtype == torch.int64
+            and capacity.is_contiguous()
+            and capacity.numel() == swa_layers,
+            "CSA2 int32 SWA reads [S, T, W] with int64 capacity [S]",
+        )
+    else:
+        reads32, capacity = reads, reads  # unused placeholders of the plain variant
     _check(positions.dtype == torch.int32 and positions.is_contiguous(), "positions int32")
     _check(requests.dtype == torch.int64 and requests.is_contiguous(), "requests int64")
     for floor in (floors, read_floors):
@@ -1965,10 +2006,10 @@ def refresh_swa_slots(
     _check(tables.shape == (swa_layers, 4) and tables.dtype == torch.int64, "tables [S, 4] int64")
     _check(ratios.shape == (layers,) and ratios.dtype == torch.int32, "ratios [L] int32")
     ns = _glue_kernels()
-    key = ("swa_refresh", window, block, positions.device.index)
+    key = ("swa_refresh", window, block, positions.device.index, with_int32)
     _launch(
         key,
-        lambda: ns.SwaRefreshKernel(window, block),
+        lambda: ns.SwaRefreshKernel(window, block, with_int32),
         _ptr(positions),
         _ptr(requests, align=8),
         _ptr(floors, align=8),
@@ -1978,6 +2019,8 @@ def refresh_swa_slots(
         _ptr(reads, align=8),
         _ptr(writes, align=8),
         _ptr(visible, align=8),
+        _ptr(reads32, align=4) if with_int32 else _ptr(reads32, torch.int32, align=4),
+        _ptr(capacity, align=8),
         int(tokens),
         int(swa_layers),
         int(layers),
