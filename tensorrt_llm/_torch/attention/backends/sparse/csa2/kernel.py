@@ -104,6 +104,25 @@ def _glue_kernels():
     def bitcast_u32_f32(bits, *, loc=None, ip=None):
         return Float32(llvm.bitcast(T.f32(), cutlass.Uint32(bits).ir_value(loc=loc, ip=ip)))
 
+    @dsl_user_op
+    def bitcast_f32_i32(value, *, loc=None, ip=None):
+        return Int32(llvm.bitcast(T.i32(), Float32(value).ir_value(loc=loc, ip=ip)))
+
+    @dsl_user_op
+    def match_any_i32(value, *, loc=None, ip=None):
+        """``__match_any_sync(0xffffffff, value)``: lanes holding the same value."""
+        return Int32(
+            llvm.inline_asm(
+                T.i32(),
+                [Int32(value).ir_value(loc=loc, ip=ip)],
+                "match.any.sync.b32 $0, $1, -1;",
+                "=r,r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+        )
+
     @cute.jit
     def floor_div(a: Int64, b: Int64) -> Int64:
         """PyTorch ``//`` for signed integers (round toward negative infinity)."""
@@ -917,8 +936,10 @@ def _glue_kernels():
         def __init__(self, block_size: int, padded_blocks: int, sparse_block: int = 0):
             if block_size <= 0 or padded_blocks <= 0 or padded_blocks & (padded_blocks - 1):
                 raise ValueError("CSA2 candidate publication needs a power-of-two block capacity")
-            if padded_blocks > 4096:
-                raise ValueError("CSA2 candidate publication supports up to 4096 blocks")
+            if padded_blocks > 8192:
+                # 8192 fp32 values + int32 ids = 64 KB of dynamic shared memory
+                # (above the 48 KB default; SM120 opts in up to 99 KB per block).
+                raise ValueError("CSA2 candidate publication supports up to 8192 blocks")
             if sparse_block < 0 or (sparse_block and block_size % sparse_block):
                 raise ValueError("CSA2 sparse blocks must divide the candidate block")
             self.block_size = block_size
@@ -926,6 +947,13 @@ def _glue_kernels():
             self.sparse_block = sparse_block
             self.ratio = block_size // sparse_block if sparse_block else 1
             self.threads = max(32, min(1024, padded_blocks // 2 if padded_blocks >= 64 else 32))
+            # Above 4096 blocks two padded bitonic sorts in one CTA are slower than
+            # the PyTorch path, so the wide path selects the Top-K blocks with a
+            # radix select of the K-th block key plus one block scan that compacts
+            # them in ascending block order (same set and tie rule: larger value,
+            # then smaller block id), and reads the scores coalesced.
+            self.wide = padded_blocks > 4096
+            self.coalesced = self.wide and 32 % block_size == 0
 
         @cute.jit
         def __call__(
@@ -989,6 +1017,236 @@ def _glue_kernels():
                     stride = stride // 2
                 size = size * 2
 
+        @cute.jit
+        def _block_sum2(self, a, b, partial, base: cutlass.Constexpr, lane, warp):
+            """Block-wide sums of two Int32 values; ``partial[base:base+2*warps]`` scratch."""
+            warps = self.threads // 32
+            offset = 1
+            while offset < 32:
+                a = a + cute.arch.shuffle_sync_bfly(a, offset=offset)
+                b = b + cute.arch.shuffle_sync_bfly(b, offset=offset)
+                offset = offset * 2
+            if lane == 0:
+                partial[base + warp] = a
+                partial[base + warps + warp] = b
+            cute.arch.barrier()
+            a = Int32(0)
+            b = Int32(0)
+            if lane < warps:
+                a = partial[base + lane]
+                b = partial[base + warps + lane]
+            offset = 1
+            while offset < 32:
+                a = a + cute.arch.shuffle_sync_bfly(a, offset=offset)
+                b = b + cute.arch.shuffle_sync_bfly(b, offset=offset)
+                offset = offset * 2
+            return a, b
+
+        @cute.jit
+        def _select_wide(
+            self, score_t, keys, ids, partial, hist, q, width, blocks, selected_blocks, latest, tid
+        ):
+            """Top-K blocks in ascending id order into ``ids`` (``INT32_MAX`` tail).
+
+            ``keys`` holds an order-preserving Int32 image of each block maximum
+            (``-0.0`` folded into ``+0.0``; padding below ``-inf``), stored
+            transposed (block ``t * per_thread + i`` at ``i * threads + t``) so each
+            thread loads its contiguous chunk of keys into registers bank-conflict
+            free. The K-th largest key ``T`` is found 8 bits per round from a
+            256-bin shared histogram (``hist``, one zeroed buffer per round);
+            blocks above ``T`` and the first ``K - #above`` blocks equal to ``T``
+            (ascending id) are selected, and unreachable ``-inf`` blocks are dropped.
+            """
+            lane = tid % 32
+            warp = tid // 32
+            warps = self.threads // 32
+            per_thread = self.padded // self.threads
+            bs = self.block_size
+            pad_key = Int32(-(2**31))
+            sign = Int32(-(2**31))
+            neg_inf_key = Int32(-(2**31) + 0x007FFFFF)  # key of -inf
+            for b in cutlass.range(tid, self.padded, self.threads):
+                ids[b] = Int32(_INT32_MAX)
+            for b in cutlass.range(tid, 4 * 256, self.threads):
+                hist[b] = Int32(0)
+            for b in cutlass.range(blocks + tid, self.padded, self.threads):
+                keys[(b % per_thread) * self.threads + b // per_thread] = pad_key
+            if cutlass.const_expr(self.coalesced):
+                unroll = 8
+                span = blocks * Int32(bs)
+                for base in cutlass.range(0, span, self.threads * unroll):
+                    loaded = []
+                    for u in cutlass.range_constexpr(unroll):
+                        column = base + Int32(u * self.threads) + tid
+                        clamped = column
+                        if clamped >= width:
+                            clamped = width - 1
+                        value = Float32(score_t[q, clamped])
+                        if column >= width:
+                            value = Float32(float("-inf"))
+                        loaded.append(value)
+                    for u in cutlass.range_constexpr(unroll):
+                        value = loaded[u]
+                        offset = 1
+                        while offset < bs:
+                            value = cute.arch.fmax(
+                                value, cute.arch.shuffle_sync_bfly(value, offset=offset)
+                            )
+                            offset = offset * 2
+                        column = base + Int32(u * self.threads) + tid
+                        b = column // Int32(bs)
+                        if (column % Int32(bs) == 0) & (b < blocks):
+                            if Int64(b) == latest:
+                                value = Float32(float("inf"))
+                            bits = bitcast_f32_i32(value + Float32(0.0))
+                            if bits < 0:
+                                bits = bits ^ Int32(0x7FFFFFFF)
+                            keys[(b % per_thread) * self.threads + b // per_thread] = bits
+            else:
+                for b in cutlass.range(tid, blocks, self.threads):
+                    value = Float32(float("-inf"))
+                    first = Int64(b) * Int64(bs)
+                    last = first + Int64(bs)
+                    if last > Int64(width):
+                        last = Int64(width)
+                    for column in cutlass.range(first, last, 1):
+                        value = cute.arch.fmax(value, Float32(score_t[q, Int32(column)]))
+                    if Int64(b) == latest:
+                        value = Float32(float("inf"))
+                    bits = bitcast_f32_i32(value + Float32(0.0))
+                    if bits < 0:
+                        bits = bits ^ Int32(0x7FFFFFFF)
+                    keys[(b % per_thread) * self.threads + b // per_thread] = bits
+            cute.arch.barrier()
+            # This thread's contiguous chunk (blocks tid * per_thread + i), in registers.
+            mine = []
+            for i in cutlass.range_constexpr(per_thread):
+                mine.append(keys[i * self.threads + tid])
+            # T = K-th largest key; every block is selected when K >= blocks.
+            threshold = neg_inf_key
+            radix_prefix = Int32(0)  # sign-flipped (unsigned-ordered) bits of T fixed so far
+            remaining = selected_blocks  # rank of T among keys matching the prefix
+            if selected_blocks < blocks:
+                below = (Int32(1) << lane) - Int32(1)
+                for r in cutlass.range_constexpr(4):
+                    shift = 24 - 8 * r
+                    hbase = r * 256
+                    for i in cutlass.range_constexpr(per_thread):
+                        flipped = mine[i] ^ sign
+                        digit = (flipped >> shift) & Int32(255)
+                        if cutlass.const_expr(r == 0):
+                            peers = match_any_i32(digit)
+                            if (peers & below) == Int32(0):
+                                cute.arch.atomic_add(
+                                    ptr=(hist.iterator + (hbase + digit)).llvm_ptr,
+                                    val=cute.arch.popc(peers),
+                                    sem="relaxed",
+                                    scope="cta",
+                                )
+                        else:
+                            hit = ((flipped ^ radix_prefix) >> (shift + 8)) == Int32(0)
+                            if cute.arch.vote_any_sync(hit):
+                                tag = Int32(256)
+                                if hit:
+                                    tag = digit
+                                peers = match_any_i32(tag)
+                                if hit & ((peers & below) == Int32(0)):
+                                    cute.arch.atomic_add(
+                                        ptr=(hist.iterator + (hbase + digit)).llvm_ptr,
+                                        val=cute.arch.popc(peers),
+                                        sem="relaxed",
+                                        scope="cta",
+                                    )
+                    cute.arch.barrier()
+                    # Every warp finds the same digit: lane l holds bins l + 32 j.
+                    cols = []
+                    for j in cutlass.range_constexpr(8):
+                        cols.append(hist[hbase + j * 32 + lane])
+                    totals = []
+                    for j in cutlass.range_constexpr(4):
+                        packed = cols[2 * j] | (cols[2 * j + 1] << 16)
+                        for s in cutlass.range_constexpr(5):
+                            packed = packed + cute.arch.shuffle_sync_bfly(packed, offset=1 << s)
+                        totals.append(packed & Int32(65535))
+                        totals.append(packed >> 16)  # two totals <= 8192 per word: no carry
+                    hcol = Int32(0)
+                    above_columns = Int32(0)
+                    found = Int32(0)
+                    running = Int32(0)
+                    for jj in cutlass.range_constexpr(8):
+                        if (found == Int32(0)) & (running + totals[7 - jj] >= remaining):
+                            hcol = Int32(7 - jj)
+                            above_columns = running
+                            found = Int32(1)
+                        running = running + totals[7 - jj]
+                    count_bin = cols[0]
+                    for j in cutlass.range_constexpr(1, 8):
+                        if hcol == Int32(j):
+                            count_bin = cols[j]
+                    suffix = count_bin  # suffix sums over higher lanes = higher digits
+                    for s in cutlass.range_constexpr(5):
+                        upper = cute.arch.shuffle_sync(suffix, lane + Int32(1 << s))
+                        if lane + Int32(1 << s) < Int32(32):
+                            suffix = suffix + upper
+                    beyond = above_columns + suffix - count_bin
+                    crossing = (beyond < remaining) & (beyond + count_bin >= remaining)
+                    ballot = Int32(cute.arch.vote_ballot_sync(crossing))
+                    winner = cute.arch.popc((ballot & (Int32(0) - ballot)) - Int32(1))
+                    bin_above = cute.arch.shuffle_sync(beyond, winner)
+                    radix_prefix = radix_prefix | ((hcol * Int32(32) + winner) << shift)
+                    remaining = remaining - bin_above
+                threshold = radix_prefix ^ sign
+            # One scan of packed (above, equal) counts over contiguous chunks.
+            local = Int32(0)
+            for i in cutlass.range_constexpr(per_thread):
+                key = mine[i]
+                if key > threshold:
+                    local = local + 1
+                if key == threshold:
+                    local = local + 65536
+            inclusive = local
+            offset = 1
+            while offset < 32:
+                other = cute.arch.shuffle_sync(inclusive, lane - offset)
+                if lane >= offset:
+                    inclusive = inclusive + other
+                offset = offset * 2
+            scan_base = 4 * warps
+            if lane == 31:
+                partial[scan_base + warp] = inclusive
+            cute.arch.barrier()
+            warp_total = Int32(0)
+            if lane < warps:
+                warp_total = partial[scan_base + lane]
+            warp_inclusive = warp_total
+            offset = 1
+            while offset < 32:
+                other = cute.arch.shuffle_sync(warp_inclusive, lane - offset)
+                if lane >= offset:
+                    warp_inclusive = warp_inclusive + other
+                offset = offset * 2
+            total = cute.arch.shuffle_sync(warp_inclusive, Int32(31))
+            before_warp = cute.arch.shuffle_sync(warp_inclusive, warp) - partial[scan_base + warp]
+            prefix = before_warp + inclusive - local
+            above = prefix & 65535
+            equal = prefix >> 16
+            take = selected_blocks - (total & 65535)
+            if threshold == neg_inf_key:
+                take = Int32(0)  # ties at -inf are unreachable
+            for i in cutlass.range_constexpr(per_thread):
+                b = tid * per_thread + i
+                key = mine[i]
+                taken = equal
+                if taken > take:
+                    taken = take
+                if (key > threshold) | ((key == threshold) & (equal < take)):
+                    ids[above + taken] = Int32(b)
+                if key > threshold:
+                    above = above + 1
+                if key == threshold:
+                    equal = equal + 1
+            cute.arch.barrier()
+
         @cute.kernel
         def kernel(
             self,
@@ -1009,14 +1267,62 @@ def _glue_kernels():
             tid, _, _ = cute.arch.thread_idx()
             q, _, _ = cute.arch.block_idx()
             smem = SmemAllocator()
-            values = smem.allocate_tensor(Float32, cute.make_layout(self.padded), 16)
-            ids = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
-            partial = smem.allocate_tensor(Int32, cute.make_layout(max(self.threads // 32, 1)), 16)
             n = Int64(count)
             block_size = Int64(self.block_size)
             score_t = tensor2d(scores, n, Int64(width), scores_stride)
             visible_length = Int64(tensor1d(visible, n)[q])
             latest = floor_div(visible_length - 1, block_size)
+            if cutlass.const_expr(self.wide):
+                keys = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
+                ids = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
+                partial = smem.allocate_tensor(
+                    Int32, cute.make_layout(5 * max(self.threads // 32, 1)), 16
+                )
+                hist = smem.allocate_tensor(Int32, cute.make_layout(4 * 256), 16)
+                self._select_wide(
+                    score_t,
+                    keys,
+                    ids,
+                    partial,
+                    hist,
+                    q,
+                    width,
+                    blocks,
+                    selected_blocks,
+                    latest,
+                    tid,
+                )
+            else:
+                values = smem.allocate_tensor(Float32, cute.make_layout(self.padded), 16)
+                ids = smem.allocate_tensor(Int32, cute.make_layout(self.padded), 16)
+                partial = smem.allocate_tensor(
+                    Int32, cute.make_layout(max(self.threads // 32, 1)), 16
+                )
+                self._select_sorted(
+                    score_t, values, ids, width, blocks, selected_blocks, latest, q, tid
+                )
+            self._publish(
+                output,
+                sparse_ids,
+                sparse_counts,
+                ids,
+                partial,
+                n,
+                q,
+                width,
+                selected_blocks,
+                published_width,
+                output_stride,
+                sparse_stride,
+                visible_length,
+                tid,
+            )
+
+        @cute.jit
+        def _select_sorted(
+            self, score_t, values, ids, width, blocks, selected_blocks, latest, q, tid
+        ):
+            block_size = Int64(self.block_size)
             for b in cutlass.range(tid, self.padded, self.threads):
                 value = Float32(float("-inf"))
                 identifier = Int32(_INT32_MAX)
@@ -1044,6 +1350,26 @@ def _glue_kernels():
                     ids[k] = Int32(_INT32_MAX)
             cute.arch.barrier()
             self._bitonic_sort(values, ids, False, tid)
+
+        @cute.jit
+        def _publish(
+            self,
+            output,
+            sparse_ids,
+            sparse_counts,
+            ids,
+            partial,
+            n,
+            q,
+            width,
+            selected_blocks,
+            published_width,
+            output_stride,
+            sparse_stride,
+            visible_length,
+            tid,
+        ):
+            block_size = Int64(self.block_size)
             out_t = tensor2d(output, n, Int64(published_width), output_stride)
             selected_width = Int64(selected_blocks) * block_size
             local_valid = Int32(0)
@@ -1110,6 +1436,341 @@ def _glue_kernels():
                         identifier = block * ratio + column % ratio
                     sparse_t[q, column] = identifier
 
+    # ------------------------------------- K8: owner index-key gather (SM120)
+
+    class IndexKeyGatherKernel:
+        """Owner slot mapping, FP4 index-key gather and logical positions in one launch.
+
+        Mirrors ``CSA2TrtllmMetadata._map_global_slots`` (without visibility),
+        ``CSA2CacheManager.gather_indexer_keys`` over native ``[pages, 64, 1, 68]``
+        page-footer pages and the indexer's ``torch.where(slots >= 0, positions,
+        -1)``. Key row ``i`` of the ``[rows, width]`` tile resolves logical
+        position ``positions[r, c]`` (or ``c``) of request ``requests[r]``; invalid
+        or unbacked rows gather zero bytes and logical position ``-1``. CTA 0
+        also writes the int32 row bounds ``starts[q] = q * start_step`` and
+        ``ends[q] = starts[q] + width``. Each key row is 16 data words plus one
+        scale word; 16 lanes copy one row.
+        """
+
+        ROWS = 16
+        LANES = 16
+        THREADS = ROWS * LANES
+
+        def __init__(self, has_positions: bool, out_int64: bool):
+            self.has_positions = has_positions
+            self.out_int64 = out_int64
+
+        @cute.jit
+        def __call__(
+            self,
+            positions: cute.Pointer,  # int32/int64 [rows, width] strided (has_positions)
+            requests: cute.Pointer,  # int32/int64 [rows]
+            table: cute.Pointer,  # int32 [table_rows, table_cols] strided
+            pages: cute.Pointer,  # int32 words of the index page pool
+            keys: cute.Pointer,  # int32 [rows * width, 16] (out)
+            scales: cute.Pointer,  # int32 [rows * width] (out)
+            logical: cute.Pointer,  # int32/int64 [rows * width] (out)
+            starts: cute.Pointer,  # int32 [queries] (out)
+            ends: cute.Pointer,  # int32 [queries] (out)
+            rows: Int32,
+            width: Int32,
+            table_rows: Int32,
+            table_cols: Int32,
+            table_stride: Int64,
+            page_size: Int64,
+            max_positions: Int64,
+            capacity: Int64,
+            page_words: Int64,
+            pool_words: Int64,
+            position_stride: Int64,
+            queries: Int32,
+            start_step: Int32,
+            stream: cuda.CUstream,
+        ):
+            blocks = (rows * width + self.ROWS - 1) // self.ROWS
+            if blocks < 1:
+                blocks = Int32(1)
+            self.kernel(
+                positions,
+                requests,
+                table,
+                pages,
+                keys,
+                scales,
+                logical,
+                starts,
+                ends,
+                rows,
+                width,
+                table_rows,
+                table_cols,
+                table_stride,
+                page_size,
+                max_positions,
+                capacity,
+                page_words,
+                pool_words,
+                position_stride,
+                queries,
+                start_step,
+            ).launch(grid=[blocks, 1, 1], block=[self.THREADS, 1, 1], stream=stream)
+
+        @cute.kernel
+        def kernel(
+            self,
+            positions: cute.Pointer,
+            requests: cute.Pointer,
+            table: cute.Pointer,
+            pages: cute.Pointer,
+            keys: cute.Pointer,
+            scales: cute.Pointer,
+            logical: cute.Pointer,
+            starts: cute.Pointer,
+            ends: cute.Pointer,
+            rows: Int32,
+            width: Int32,
+            table_rows: Int32,
+            table_cols: Int32,
+            table_stride: Int64,
+            page_size: Int64,
+            max_positions: Int64,
+            capacity: Int64,
+            page_words: Int64,
+            pool_words: Int64,
+            position_stride: Int64,
+            queries: Int32,
+            start_step: Int32,
+        ):
+            tid, _, _ = cute.arch.thread_idx()
+            bid, _, _ = cute.arch.block_idx()
+            if bid == 0:
+                starts_t = tensor1d(starts, Int64(queries))
+                ends_t = tensor1d(ends, Int64(queries))
+                for q in cutlass.range(tid, queries, self.THREADS):
+                    first = q * start_step
+                    starts_t[q] = first
+                    ends_t[q] = first + width
+            total = rows * width
+            index = bid * self.ROWS + tid // self.LANES
+            lane = tid % self.LANES
+            if index < total:
+                r = index // width
+                c = index - r * width
+                position = Int64(c)
+                if cutlass.const_expr(self.has_positions):
+                    position = Int64(
+                        tensor2d(positions, Int64(rows), Int64(width), position_stride)[r, c]
+                    )
+                request = Int64(tensor1d(requests, Int64(rows))[r])
+                slot = Int64(-1)
+                if (table_rows > 0) & (table_cols > 0):
+                    safe_position = position
+                    if safe_position < 0:
+                        safe_position = Int64(0)
+                    column = safe_position // page_size
+                    valid = (position >= 0) & (position < max_positions)
+                    valid = valid & (column < Int64(table_cols))
+                    valid = valid & (request >= 0) & (request < Int64(table_rows))
+                    safe_request = request
+                    if safe_request < 0:
+                        safe_request = Int64(0)
+                    if safe_request > Int64(table_rows) - 1:
+                        safe_request = Int64(table_rows) - 1
+                    safe_column = column
+                    if safe_column > Int64(table_cols) - 1:
+                        safe_column = Int64(table_cols) - 1
+                    table_t = tensor2d(table, Int64(table_rows), Int64(table_cols), table_stride)
+                    physical = Int64(table_t[Int32(safe_request), Int32(safe_column)])
+                    if valid & (physical >= 0):
+                        slot = physical * page_size + (safe_position - column * page_size)
+                data_word = Int32(0)
+                scale_word = Int32(0)
+                if (slot >= 0) & (slot < capacity):
+                    page = slot // 64
+                    row = slot - page * 64
+                    base = page * page_words
+                    pages_t = tensor1d(pages, pool_words)
+                    data_word = Int32(pages_t[base + row * 16 + Int64(lane)])
+                    if lane == 0:
+                        scale_word = Int32(pages_t[base + 1024 + row])
+                out = Int64(index)
+                tensor1d(keys, Int64(total) * 16)[out * 16 + Int64(lane)] = data_word
+                if lane == 0:
+                    tensor1d(scales, Int64(total))[out] = scale_word
+                    mapped = Int64(-1)
+                    if slot >= 0:
+                        mapped = position
+                    if cutlass.const_expr(self.out_int64):
+                        tensor1d(logical, Int64(total))[out] = mapped
+                    else:
+                        tensor1d(logical, Int64(total))[out] = Int32(mapped)
+
+    # ------------------------------ K9: mask logits by logical positions
+
+    class MaskPositionsKernel:
+        """``valid = (positions >= 0) & (positions < visible[:, None])`` and
+        ``logits.masked_fill_(~valid, -inf)`` over ``[count, width]`` in one launch."""
+
+        THREADS = 256
+        PER_THREAD = 4
+
+        @cute.jit
+        def __call__(
+            self,
+            logits: cute.Pointer,  # float32 [count, width] strided
+            positions: cute.Pointer,  # int32/int64 [count, width], row stride may be 0
+            visible: cute.Pointer,  # int32/int64 [count]
+            valid: cute.Pointer,  # uint8 [count, width] (out)
+            count: Int32,
+            width: Int32,
+            logits_stride: Int64,
+            position_stride: Int64,
+            valid_stride: Int64,
+            stream: cuda.CUstream,
+        ):
+            span = self.THREADS * self.PER_THREAD
+            self.kernel(
+                logits,
+                positions,
+                visible,
+                valid,
+                count,
+                width,
+                logits_stride,
+                position_stride,
+                valid_stride,
+            ).launch(
+                grid=[count, (width + span - 1) // span, 1],
+                block=[self.THREADS, 1, 1],
+                stream=stream,
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            logits: cute.Pointer,
+            positions: cute.Pointer,
+            visible: cute.Pointer,
+            valid: cute.Pointer,
+            count: Int32,
+            width: Int32,
+            logits_stride: Int64,
+            position_stride: Int64,
+            valid_stride: Int64,
+        ):
+            tid, _, _ = cute.arch.thread_idx()
+            q, chunk, _ = cute.arch.block_idx()
+            n = Int64(count)
+            logits_t = tensor2d(logits, n, Int64(width), logits_stride)
+            positions_t = tensor2d(positions, n, Int64(width), position_stride)
+            valid_t = tensor2d(valid, n, Int64(width), valid_stride)
+            bound = Int64(tensor1d(visible, n)[q])
+            first = chunk * self.THREADS * self.PER_THREAD + tid
+            for j in cutlass.range_constexpr(self.PER_THREAD):
+                column = first + j * self.THREADS
+                if column < width:
+                    position = Int64(positions_t[q, column])
+                    flag = cutlass.Uint8(0)
+                    if (position >= 0) & (position < bound):
+                        flag = cutlass.Uint8(1)
+                    else:
+                        logits_t[q, column] = Float32(float("-inf"))
+                    valid_t[q, column] = flag
+
+    # ------------- K9b: assemble split-key logits and mask by logical positions
+
+    class MaskSplitPositionsKernel:
+        """``MaskPositionsKernel`` whose logits come from a split-key layout.
+
+        Column ``s * chunk + k`` of row ``q`` copies
+        ``src[q * src_row_stride + s * src_split_stride + k]`` into
+        ``logits[q, column]`` (``-inf`` where invalid) and writes ``valid``,
+        in one launch over ``[count, splits, chunk]``.
+        """
+
+        THREADS = 256
+        PER_THREAD = 4
+
+        @cute.jit
+        def __call__(
+            self,
+            src: cute.Pointer,  # float32 split-key output
+            logits: cute.Pointer,  # float32 [count, splits * chunk] (out)
+            positions: cute.Pointer,  # int32/int64 [count, width], row stride may be 0
+            visible: cute.Pointer,  # int32/int64 [count]
+            valid: cute.Pointer,  # uint8 [count, width] (out)
+            count: Int32,
+            splits: Int32,
+            chunk: Int32,
+            src_row_stride: Int64,
+            src_split_stride: Int64,
+            logits_stride: Int64,
+            position_stride: Int64,
+            valid_stride: Int64,
+            stream: cuda.CUstream,
+        ):
+            span = self.THREADS * self.PER_THREAD
+            self.kernel(
+                src,
+                logits,
+                positions,
+                visible,
+                valid,
+                count,
+                splits,
+                chunk,
+                src_row_stride,
+                src_split_stride,
+                logits_stride,
+                position_stride,
+                valid_stride,
+            ).launch(
+                grid=[count, splits, (chunk + span - 1) // span],
+                block=[self.THREADS, 1, 1],
+                stream=stream,
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            src: cute.Pointer,
+            logits: cute.Pointer,
+            positions: cute.Pointer,
+            visible: cute.Pointer,
+            valid: cute.Pointer,
+            count: Int32,
+            splits: Int32,
+            chunk: Int32,
+            src_row_stride: Int64,
+            src_split_stride: Int64,
+            logits_stride: Int64,
+            position_stride: Int64,
+            valid_stride: Int64,
+        ):
+            tid, _, _ = cute.arch.thread_idx()
+            q, split, part = cute.arch.block_idx()
+            n = Int64(count)
+            width = Int64(splits) * Int64(chunk)
+            src_t = tensor1d(src, n * src_row_stride)
+            logits_t = tensor2d(logits, n, width, logits_stride)
+            positions_t = tensor2d(positions, n, width, position_stride)
+            valid_t = tensor2d(valid, n, width, valid_stride)
+            bound = Int64(tensor1d(visible, n)[q])
+            base = Int64(q) * src_row_stride + Int64(split) * src_split_stride
+            first = part * self.THREADS * self.PER_THREAD + tid
+            for j in cutlass.range_constexpr(self.PER_THREAD):
+                k = first + j * self.THREADS
+                if k < chunk:
+                    column = split * chunk + k
+                    position = Int64(positions_t[q, column])
+                    flag = cutlass.Uint8(0)
+                    if (position >= 0) & (position < bound):
+                        flag = cutlass.Uint8(1)
+                        logits_t[q, column] = src_t[base + Int64(k)]
+                    else:
+                        logits_t[q, column] = Float32(float("-inf"))
+                    valid_t[q, column] = flag
+
     class Namespace:
         pass
 
@@ -1119,6 +1780,9 @@ def _glue_kernels():
     ns.cute = cute
     ns.llvm = llvm
     ns.T = T
+    ns.IndexKeyGatherKernel = IndexKeyGatherKernel
+    ns.MaskPositionsKernel = MaskPositionsKernel
+    ns.MaskSplitPositionsKernel = MaskSplitPositionsKernel
     ns.dsl_user_op = dsl_user_op
     ns.SmemAllocator = SmemAllocator
     ns.make_ptr = make_ptr
@@ -1489,6 +2153,209 @@ def mask_logits_(logits: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return logits
 
 
+def index_key_gather_supported(pages: torch.Tensor, table: torch.Tensor) -> bool:
+    """Whether ``gather_owner_index_keys`` addresses these pages and this page table."""
+    return (
+        pages.is_cuda
+        and pages.dtype == torch.uint8
+        and pages.ndim == 4
+        and tuple(pages.shape[1:]) == (64, 1, 68)
+        and pages.stride(3) == 1
+        and pages.stride(1) == 68
+        and pages.stride(0) % 4 == 0
+        and pages.data_ptr() % 4 == 0
+        and table.dtype == torch.int32
+        and table.ndim == 2
+        and (table.shape[1] <= 1 or table.stride(1) == 1)
+    )
+
+
+def gather_owner_index_keys(
+    pages: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    page_size: int,
+    max_positions: int,
+    width: int,
+    queries: int,
+    positions: torch.Tensor | None = None,
+    start_step: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused ``global_slot_tile`` + ``gather_indexer_keys`` + logical positions.
+
+    ``requests`` holds one request row per tile row; without ``positions`` the
+    tile is one row of logical positions ``arange(width)``. Returns int8
+    ``[rows * width, 64]`` key bytes, int32 ``[rows * width, 1]`` scale words,
+    logical positions ``[rows, width]`` (``-1`` where unbacked; int64 or the
+    dtype of ``positions``) and int32 ``[queries]`` row starts/ends.
+    """
+    rows = int(requests.shape[0])
+    device = pages.device
+    if positions is not None:
+        _check(positions.ndim == 2 and positions.shape == (rows, width), "positions [rows, width]")
+        _check(positions.dtype in (torch.int32, torch.int64), "positions int32/int64")
+        if width > 1 and positions.stride(1) != 1:
+            positions = positions.contiguous()
+    out_dtype = torch.int64 if positions is None else positions.dtype
+    total = rows * width
+    keys = torch.empty((total, 64), dtype=torch.int8, device=device)
+    scales = torch.empty((total, 1), dtype=torch.int32, device=device)
+    logical = torch.empty((rows, width), dtype=out_dtype, device=device)
+    starts = torch.empty((queries,), dtype=torch.int32, device=device)
+    ends = torch.empty((queries,), dtype=torch.int32, device=device)
+    if total == 0 and queries == 0:
+        return keys, scales, logical, starts, ends
+    _check(requests.dtype in (torch.int32, torch.int64) and requests.is_cuda, "requests")
+    if requests.stride(0) != 1 and rows > 1:
+        requests = requests.contiguous()
+    pool_words = (
+        ((pages.shape[0] - 1) * pages.stride(0) + 64 * 68) // 4 if pages.shape[0] > 0 else 1
+    )
+    request_int64 = requests.dtype == torch.int64
+    position_ptr = positions if positions is not None else requests
+    position_int64 = position_ptr.dtype == torch.int64
+    ns = _glue_kernels()
+    _launch(
+        ("index_key_gather", positions is not None, out_dtype == torch.int64, device.index),
+        lambda: ns.IndexKeyGatherKernel(positions is not None, out_dtype == torch.int64),
+        _ptr(position_ptr, align=8 if position_int64 else 4),
+        _ptr(requests, align=8 if request_int64 else 4),
+        _ptr(table),
+        _ptr(pages, torch.int32),
+        _ptr(keys, torch.int32),
+        _ptr(scales),
+        _ptr(logical, align=8 if out_dtype == torch.int64 else 4),
+        _ptr(starts),
+        _ptr(ends),
+        rows,
+        int(width),
+        int(table.shape[0]),
+        int(table.shape[1]),
+        int(table.stride(0)) if table.shape[0] > 1 else int(table.shape[1]),
+        int(page_size),
+        int(max_positions),
+        int(pages.shape[0]) * 64,
+        int(pages.stride(0)) // 4,
+        int(pool_words),
+        int(positions.stride(0)) if positions is not None and rows > 1 else int(width),
+        int(queries),
+        int(start_step),
+        _stream(device),
+    )
+    return keys, scales, logical, starts, ends
+
+
+def mask_positions_(
+    logits: torch.Tensor, positions: torch.Tensor, visible: torch.Tensor
+) -> torch.Tensor:
+    """``valid = (positions >= 0) & (positions < visible[:, None])``; masks ``logits`` in place
+    with ``-inf`` where invalid and returns the boolean ``valid``, in one launch."""
+    count, width = logits.shape
+    valid = torch.empty((count, width), dtype=torch.bool, device=logits.device)
+    if count == 0 or width == 0:
+        return valid
+    _check(logits.dtype == torch.float32 and logits.stride(1) == 1, "logits")
+    _check(positions.shape == (count, width), "positions match logits")
+    _check(positions.dtype in (torch.int32, torch.int64), "positions int32/int64")
+    if width > 1 and positions.stride(1) != 1:
+        positions = positions.contiguous()
+    _check(visible.dtype in (torch.int32, torch.int64) and visible.shape == (count,), "visible")
+    if count > 1 and visible.stride(0) != 1:
+        visible = visible.contiguous()
+    ns = _glue_kernels()
+    position_int64 = positions.dtype == torch.int64
+    visible_int64 = visible.dtype == torch.int64
+    _launch(
+        ("mask_positions", logits.device.index),
+        lambda: ns.MaskPositionsKernel(),
+        _ptr(logits),
+        _ptr(positions, align=8 if position_int64 else 4),
+        _ptr(visible, align=8 if visible_int64 else 4),
+        _ptr(valid, torch.uint8, align=1),
+        int(count),
+        int(width),
+        int(logits.stride(0)),
+        int(positions.stride(0)) if count > 1 else int(width),
+        int(width),
+        _stream(logits.device),
+    )
+    return valid
+
+
+def mask_split_positions(
+    src: torch.Tensor,
+    splits: int,
+    chunk: int,
+    src_row_stride: int,
+    src_split_stride: int,
+    positions: torch.Tensor,
+    visible: torch.Tensor,
+    *,
+    compile_only: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Assembled, masked fp32 ``[count, splits * chunk]`` logits and their boolean validity.
+
+    Equivalent to ``logits = src.as_strided((count, splits, chunk), (src_row_stride,
+    src_split_stride, 1)).contiguous().view(count, -1)`` followed by
+    ``mask_positions_(logits, positions, visible)``, in one launch.
+
+    ``compile_only`` compiles this call's specialization without launching (CuTe
+    kernels cannot compile inside a CUDA-graph capture). Returns ``None``, with
+    nothing launched, when called inside a capture before its specialization
+    was compiled; the caller then keeps the unfused path.
+    """
+    count = int(positions.shape[0])
+    width = int(splits) * int(chunk)
+    device = src.device
+    logits = torch.empty((count, width), dtype=torch.float32, device=device)
+    valid = torch.empty((count, width), dtype=torch.bool, device=device)
+    if count == 0 or width == 0:
+        return logits, valid
+    _check(src.dtype == torch.float32 and src.is_cuda, "split-key logits float32")
+    _check(chunk > 0 and src_split_stride >= chunk and src_row_stride >= 0, "split layout")
+    extent = src.untyped_storage().nbytes() // 4 - src.storage_offset()
+    last = (count - 1) * src_row_stride + (splits - 1) * src_split_stride + chunk
+    _check(last <= extent, "split layout within the source storage")
+    _check(positions.shape == (count, width), "positions [count, splits * chunk]")
+    _check(positions.dtype in (torch.int32, torch.int64), "positions int32/int64")
+    if width > 1 and positions.stride(1) != 1:
+        positions = positions.contiguous()
+    _check(visible.dtype in (torch.int32, torch.int64) and visible.shape == (count,), "visible")
+    if count > 1 and visible.stride(0) != 1:
+        visible = visible.contiguous()
+    ns = _glue_kernels()
+    position_int64 = positions.dtype == torch.int64
+    visible_int64 = visible.dtype == torch.int64
+    key = ("mask_split_positions", device.index)
+    args = (
+        _ptr(src),
+        _ptr(logits),
+        _ptr(positions, align=8 if position_int64 else 4),
+        _ptr(visible, align=8 if visible_int64 else 4),
+        _ptr(valid, torch.uint8, align=1),
+        count,
+        int(splits),
+        int(chunk),
+        int(src_row_stride),
+        int(src_split_stride),
+        width,
+        int(positions.stride(0)) if count > 1 else width,
+        width,
+        _stream(device),
+    )
+    full_key = (key, tuple(
+        arg._csa2_signature if isinstance(arg, ns.cute.Pointer) else None for arg in args
+    ))
+    if compile_only:
+        if full_key not in _COMPILED and not torch.cuda.is_current_stream_capturing():
+            _COMPILED[full_key] = ns.cute.compile(ns.MaskSplitPositionsKernel(), *args)
+        return None
+    if full_key not in _COMPILED and torch.cuda.is_current_stream_capturing():
+        return None
+    _launch(key, lambda: ns.MaskSplitPositionsKernel(), *args)
+    return logits, valid
+
+
 def gather_candidate_scores(
     logits: torch.Tensor,
     valid: torch.Tensor,
@@ -1595,7 +2462,7 @@ def publish_candidates_(
     blocks = -(-width // block_size)
     if count == 0:
         return True
-    if blocks == 0 or blocks > 4096 or block_size <= 0:
+    if blocks == 0 or blocks > 8192 or block_size <= 0:
         return False
     published_width = int(output.shape[1])
     selected_blocks = min(int(top_k_blocks), blocks)

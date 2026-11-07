@@ -192,6 +192,23 @@ def _cute_dsl_fp8_bmm_out(
         torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
 
 
+def _sm120_bmm_out_direct_ok(out: torch.Tensor) -> bool:
+    """Whether the SM120 fp8 block-scaling BMM can write into ``out`` directly.
+
+    The TMA store needs a unit last stride, 16-byte aligned row/batch strides
+    and a 16-byte aligned base address; otherwise fall back to a temp + copy.
+    """
+    if out.dim() != 3 or out.dtype != torch.bfloat16:
+        return False
+    elem = out.element_size()
+    return (
+        out.stride(2) == 1
+        and (out.stride(0) * elem) % 16 == 0
+        and (out.stride(1) * elem) % 16 == 0
+        and out.data_ptr() % 16 == 0
+    )
+
+
 def fp8_block_scaling_bmm_out(
     mat1: torch.Tensor,
     mat2_fp8: torch.Tensor,
@@ -211,11 +228,18 @@ def fp8_block_scaling_bmm_out(
         out.copy_(output)
     elif is_sm_120f(sm_version):
         mat1_fp8, mat1_scale = fp8_utils.per_token_quant_and_transform(mat1, need_permute102=True)
-        output = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
-        torch.ops.trtllm.fp8_block_scaling_bmm_out(
-            mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, output
-        )
-        out.copy_(output)
+        if _sm120_bmm_out_direct_ok(out):
+            # The SM120 kernel's TMA store takes D strides (ldd, strideD)
+            # natively, so write straight into the (possibly strided) view.
+            torch.ops.trtllm.fp8_block_scaling_bmm_out(
+                mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out
+            )
+        else:
+            output = out.new_empty(out.shape, dtype=out.dtype, device=out.device)
+            torch.ops.trtllm.fp8_block_scaling_bmm_out(
+                mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, output
+            )
+            out.copy_(output)
     elif is_sm_100f(sm_version):
         if use_cute_dsl_blockscaling_bmm:
             mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(mat1)

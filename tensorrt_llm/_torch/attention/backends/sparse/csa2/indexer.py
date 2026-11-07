@@ -29,6 +29,35 @@ try:
 except ImportError:  # The bundled DeepGEMM predates the sparse indexer kernels
     _HAS_SPARSE_MQA_LOGITS = False
 
+try:
+    from tensorrt_llm.deep_gemm import fp8_fp4_mqa_logits as _fp8_fp4_mqa_logits
+except ImportError:
+    _fp8_fp4_mqa_logits = None
+
+# Query rows per CTA of DeepGEMM's sm120_fp4_mqa_logits (BLOCK_Q): a CTA scans the
+# union of its rows' key ranges, so each key split gets a whole query block.
+_SPLIT_DECODE_BLOCK_Q = 4
+# Target CTAs (rows x splits) for one split-key decode launch; more blocks than
+# this stopped helping at 1-8 rows of 16K-37K keys on SM120 (188 SMs).
+_SPLIT_DECODE_TARGET_BLOCKS = 128
+_SPLIT_DECODE_CHOICES = (64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1)
+# Eagerly built constant rows (Top-K row bounds) retained per indexer: rows of at
+# most this many queries (decode/graph batches), and at most this many entries.
+_CONSTANT_ROW_CACHE_COUNT = 256
+_CONSTANT_ROW_CACHE_ENTRIES = 1024
+
+
+def _split_decode_count(rows: int, width: int) -> int:
+    """Number of disjoint key sub-ranges per decode row (fixed per geometry)."""
+    for splits in _SPLIT_DECODE_CHOICES:
+        if (
+            rows * splits <= _SPLIT_DECODE_TARGET_BLOCKS
+            and width % splits == 0
+            and (width // splits) % 64 == 0
+        ):
+            return splits
+    return 1
+
 from ..dsa.indexer import _INDEXER_MQA_LOGITS_ELEM_BUDGET, Indexer, _split_prefill_queries
 from ..dsa.params import DSAParams
 from ..params import use_self_sampling_gvr
@@ -36,10 +65,16 @@ from .kernel import (
     dsl_available,
     finalize_selection_,
     gather_candidate_scores,
+    gather_owner_index_keys,
+    index_key_gather_supported,
     mask_logits_,
+    mask_positions_,
+    mask_split_positions,
     publish_candidates_,
 )
 from .metadata import CSA2TrtllmMetadata
+from .split_decode_replicate import replicate_split_queries
+from .split_decode_replicate import warm as replicate_split_queries_warm
 from .params import CSA2ForwardState, CSA2Layout, CSA2Mode, CSA2Params
 from .quantization import (
     INDEX_DATA_BYTES,
@@ -47,6 +82,12 @@ from .quantization import (
     INDEX_SCALE_BYTES,
     pack_index_queries_split,
 )
+
+
+# Query rows per dense candidate-consumer tile: bounds the dense prefix logits
+# plus the gathered candidate scores and masks below the owner layer's own
+# prefill logits tile.
+_DENSE_CANDIDATE_TILE_ROWS = 512
 
 
 @dataclass
@@ -67,6 +108,10 @@ class _ChunkInputs:
     # Every row's domain is column ``[0, width)`` of the logits (one shared K
     # prefix), so selection reads the logits in place without a column gather.
     shared_columns: bool = False
+    # Candidate consumers on the dense kernels: each row's candidate logical
+    # positions ``[queries, candidates]`` into the shared K prefix. The prefix
+    # is scored densely once and each row gathers its candidate columns.
+    candidate_columns: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -127,9 +172,19 @@ class CSA2Indexer(Indexer):
             if compatible and self.options.use_cute_dsl_topk
             else TopKImplementation.CUDA_RADIX
         )
+        # SM120 decode also runs the exact CuTe-DSL radix-filter Top-K (one
+        # cluster launch per call instead of CUDA radix split + merge); its
+        # prefill and the heuristic/GVR engines keep the SM100-only gate.
+        decode_exact = exact
+        if (
+            IS_CUTLASS_DSL_AVAILABLE
+            and 120 <= sm < 130
+            and self.options.use_cute_dsl_topk
+        ):
+            decode_exact = TopKImplementation.CUTE_DSL_RADIX
         if not torch.cuda.is_available():
-            exact = TopKImplementation.TORCH
-        prefill, decode = exact, exact
+            exact = decode_exact = TopKImplementation.TORCH
+        prefill, decode = exact, decode_exact
         if compatible and self.options.enable_heuristic_topk:
             if self.options.use_self_sampling_topk and use_self_sampling_gvr(
                 enable_heuristic_topk=True,
@@ -191,20 +246,224 @@ class CSA2Indexer(Indexer):
     def _constant_rows(self, count: int, value: int, device: torch.device) -> torch.Tensor:
         """Int32 ``[count]`` tensor filled with ``value``; contents never change.
 
-        A captured graph keeps addressing these rows on every replay, so rows
-        created while capturing are retained for the indexer's lifetime (there
-        are few graph geometries). Eager calls see many query counts and get a
-        transient: an evictable cache entry could be freed and reused while a
-        graph that captured it still reads it.
+        Same pattern as ``_split_decode_bounds``: an eager call fills its row
+        now and retains it (small counts only, never evicted, so a graph that
+        captured it can keep reading it). A capture reuses a retained eager row
+        and records no fill; without one, the graph gets its own uncached row,
+        kept by the graph pool and refilled on every replay. Eager calls never
+        see a capture-time row, whose fill only runs when its graph replays.
         """
         cache = self.__dict__.setdefault("_constant_row_cache", {})
         key = (str(device), count, value)
         rows = cache.get(key)
-        if rows is None:
-            rows = torch.full((count,), value, dtype=torch.int32, device=device)
-            if rows.is_cuda and torch.cuda.is_current_stream_capturing():
-                cache[key] = rows
+        if rows is not None:
+            return rows
+        rows = torch.full((count,), value, dtype=torch.int32, device=device)
+        if (
+            count <= _CONSTANT_ROW_CACHE_COUNT
+            and len(cache) < _CONSTANT_ROW_CACHE_ENTRIES
+            and not (rows.is_cuda and torch.cuda.is_current_stream_capturing())
+        ):
+            cache[key] = rows
         return rows
+
+    def _split_decode_supported(self, q_data: torch.Tensor, q_scale: Optional[torch.Tensor]) -> bool:
+        """One split-key DeepGEMM launch can score every decode row (SM120 FP4)."""
+        return (
+            _fp8_fp4_mqa_logits is not None
+            and q_scale is not None
+            and q_data.is_cuda
+            and self.use_fp4
+            and self.head_dim == 128
+            and self.n_heads in (16, 32, 64)
+            and dsl_available()
+            and 120 <= get_sm_version() < 130
+        )
+
+    def _split_decode_bounds(
+        self, rows: int, width: int, splits: int, device: torch.device
+    ) -> torch.Tensor:
+        """Int32 ``[2, rows * splits * BLOCK_Q]`` key starts/ends of the replicated rows.
+
+        Replica ``p`` of split ``s`` of row ``r`` starts at ``r * width + s * chunk``;
+        only ``p == 0`` scores (``chunk`` keys), the block's other rows are empty so
+        the block scans exactly its sub-range. Contents never change: built
+        eagerly once per geometry and retained; while capturing without an eager
+        entry the graph builds its own copy on every replay.
+        """
+        cache = self.__dict__.setdefault("_split_decode_cache", {})
+        key = (str(device), rows, width, splits)
+        bounds = cache.get(key)
+        if bounds is not None:
+            return bounds
+        block = _SPLIT_DECODE_BLOCK_Q
+        chunk = width // splits
+        index = torch.arange(rows * splits * block, dtype=torch.int64, device=device)
+        lane = index % block
+        split = (index // block) % splits
+        row = index // (block * splits)
+        starts = row * width + split * chunk
+        ends = torch.where(lane == 0, starts + chunk, starts)
+        bounds = torch.stack((starts, ends)).to(torch.int32)
+        if not (bounds.is_cuda and torch.cuda.is_current_stream_capturing()):
+            cache[key] = bounds
+        return bounds
+
+    def _split_key_decode_raw(
+        self,
+        q_data: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        width: int,
+    ) -> tuple[torch.Tensor, int, int, int, int]:
+        """Split-key DeepGEMM output and its layout ``(out, splits, chunk, row_stride, split_stride)``.
+
+        Logit ``k`` of sub-range ``s`` of row ``r`` (column ``s * chunk + k``) is
+        ``out.view(-1)[r * row_stride + s * split_stride + k]``.
+        """
+        rows, heads = q_data.shape[0], q_data.shape[1]
+        splits = _split_decode_count(rows, width)
+        block = _SPLIT_DECODE_BLOCK_Q
+        chunk = width // splits
+        reps = splits * block
+        bounds = self._split_decode_bounds(rows, width, splits, q_data.device)
+        # Materialized replicas: with one row, reshape of the expand is a stride-0 view.
+        scale = q_scale.contiguous().view(torch.int32).reshape(rows, heads)
+        # CUDA-graph decode: one Triton launch writes the three replica buffers
+        # (raw-bit copies, the same bytes). Eager calls keep the ATen copies and
+        # only compile the kernel once per head count.
+        replicas = replicate_split_queries(q_data, scale, weights, reps)
+        if replicas is not None:
+            q, scale, w = replicas
+        else:
+            replicate_split_queries_warm(q_data, scale, weights, reps)
+            q = q_data.view(torch.int8)
+            q = q[:, None].expand(rows, reps, heads, q.shape[2]).contiguous()
+            q = q.view(rows * reps, heads, q.shape[3])
+            scale = scale[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+            w = weights[:, None].expand(rows, reps, heads).contiguous().view(rows * reps, heads)
+        out = _fp8_fp4_mqa_logits(
+            (q, scale),
+            (k_data.view(torch.int8), k_scale.contiguous().view(torch.int32).reshape(-1)),
+            w,
+            bounds[0],
+            bounds[1],
+            clean_logits=False,
+            max_seqlen_k=chunk,
+        )
+        stride = out.stride(0)
+        return out, splits, chunk, reps * stride, block * stride
+
+    def _split_key_decode_logits(
+        self,
+        q_data: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        """FP32 ``[rows, width]`` logits of row ``r`` over keys ``[r * width, (r + 1) * width)``.
+
+        One DeepGEMM launch replaces one launch per row: each row is replicated
+        into ``splits`` query blocks that each scan a disjoint key sub-range, and
+        compressed logits put sub-range ``s`` of row ``r`` in replica row
+        ``(r * splits + s) * BLOCK_Q``. Every logit is the same per-(query, key)
+        computation as the per-row call, so the values are bitwise identical.
+        """
+        rows = q_data.shape[0]
+        out, splits, chunk, row_stride, split_stride = self._split_key_decode_raw(
+            q_data, q_scale, weights, k_data, k_scale, width
+        )
+        return (
+            out.as_strided((rows, splits, chunk), (row_stride, split_stride, 1))
+            .contiguous()
+            .view(rows, width)
+        )
+
+    def select_split_decode(
+        self,
+        q_data: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        logical_positions: torch.Tensor,
+        visible_lengths: torch.Tensor,
+        output_indices: torch.Tensor,
+        score_hook: Optional[Callable[[torch.Tensor], None]] = None,
+        radix_aux_indices: Optional[torch.Tensor] = None,
+        radix_aux_logits: Optional[torch.Tensor] = None,
+        gvr_prior_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Decode selection for all rows at once over per-row gathered keys.
+
+        Row ``r`` owns keys ``[r * width, (r + 1) * width)`` whose columns map to
+        ``logical_positions[r]`` (``[rows, width]``). Equivalent, row by row, to
+        ``forward_prepared`` on each row's own keys with full-width bounds: the
+        logits come from one split-key launch, then one mask, one Top-K and one
+        finalize run over every row.
+        """
+        width = logical_positions.shape[1]
+        rows = q_data.shape[0]
+        masked_valid = None
+        if not (q_data.is_cuda and dsl_available() and rows > 0 and width > 0):
+            logits = self._split_key_decode_logits(
+                q_data, q_scale, weights, k_data, k_scale, width
+            )
+        else:
+            out, splits, chunk, row_stride, split_stride = self._split_key_decode_raw(
+                q_data, q_scale, weights, k_data, k_scale, width
+            )
+            fused = None
+            if torch.cuda.is_current_stream_capturing():
+                # CUDA-graph decode only: assemble the split-key output into
+                # row-major logits and mask them in one launch (the same bytes as
+                # the assembly copy + mask_positions_).
+                fused = mask_split_positions(
+                    out, splits, chunk, row_stride, split_stride, logical_positions,
+                    visible_lengths,
+                )
+            else:
+                # Eager (mixed) steps keep the assembly copy + mask launches; only
+                # compile the graph kernel here, once per signature (no launch).
+                warm = self.__dict__.setdefault("_split_mask_warm", set())
+                signature = (
+                    q_data.device.index,
+                    logical_positions.dtype,
+                    visible_lengths.dtype,
+                    logical_positions.stride(0) == 0,
+                )
+                if signature not in warm:
+                    mask_split_positions(
+                        out, splits, chunk, row_stride, split_stride, logical_positions,
+                        visible_lengths, compile_only=True,
+                    )
+                    warm.add(signature)
+            if fused is not None:
+                logits, masked_valid = fused
+            else:
+                logits = (
+                    out.as_strided((rows, splits, chunk), (row_stride, split_stride, 1))
+                    .contiguous()
+                    .view(rows, width)
+                )
+        return self._select_mapped_logits(
+            logits,
+            None,
+            None,
+            logical_positions,
+            visible_lengths,
+            output_indices,
+            score_hook,
+            False,
+            radix_aux_indices,
+            radix_aux_logits,
+            gvr_prior_indices,
+            masked_valid=masked_valid,
+        )
 
     def select_prepared_scores(
         self,
@@ -309,6 +568,7 @@ class CSA2Indexer(Indexer):
         sparse_positions: Optional[torch.Tensor] = None,
         sparse_counts: Optional[torch.Tensor] = None,
         shared_columns: bool = False,
+        candidate_columns: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """CSA2 logical selection over the shared quantized MQA kernels.
 
@@ -352,6 +612,21 @@ class CSA2Indexer(Indexer):
                     )
                 )
             return output_indices.fill_(-1)
+        if candidate_columns is not None and score_hook is None and sparse_indices is None:
+            return self._select_candidate_columns(
+                q_data,
+                k_data,
+                k_scale,
+                weights,
+                row_starts,
+                row_ends,
+                q_scale,
+                logical_positions,
+                candidate_columns,
+                visible_lengths,
+                output_indices,
+                is_prefill,
+            )
         if (
             self.options.skip_indexer_for_short_seqs
             and sparse_indices is None
@@ -418,6 +693,61 @@ class CSA2Indexer(Indexer):
             gvr_prior_indices,
         )
 
+    def _select_candidate_columns(
+        self,
+        q_data: torch.Tensor,
+        k_data: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        q_scale: Optional[torch.Tensor],
+        shared_positions: torch.Tensor,
+        candidates: torch.Tensor,
+        visible_lengths: torch.Tensor,
+        output_indices: torch.Tensor,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        """Candidate selection over densely scored shared-prefix logits.
+
+        ``k_data`` is one request's shared prefix (logical positions
+        ``[0, width)``, unbacked ones ``-1`` in ``shared_positions``), every row
+        bounded by ``[0, width)``. A (query, key) logit does not depend on the
+        key's column, so gathering column ``candidates[r, c]`` of the dense
+        logits gives the bits the per-row candidate key gather scores. The
+        validity of each candidate is the per-row gather's: in-range and
+        backed; ``visible_lengths <= width`` masks the rest.
+        """
+        width = k_data.shape[0]
+        logits = self._call_mqa_logits(
+            q_data,
+            k_data,
+            k_scale,
+            weights,
+            row_starts,
+            row_ends,
+            q_scale,
+            clean_logits=False,
+        )
+        columns = candidates.clamp(0, width - 1).long()
+        scores = logits.gather(1, columns)
+        del logits
+        valid = (candidates >= 0) & (candidates < width)
+        valid &= shared_positions[0][columns] >= 0
+        del columns
+        logical = torch.where(valid, candidates, -1)
+        del valid
+        return self._select_mapped_logits(
+            scores,
+            None,
+            None,
+            logical,
+            visible_lengths,
+            output_indices,
+            None,
+            is_prefill,
+        )
+
     def _invalidate_emission_holes(self, bad_rows: torch.Tensor) -> None:
         """Force stock masked-score GVR for rows whose raw emission saw page holes.
 
@@ -456,6 +786,7 @@ class CSA2Indexer(Indexer):
         radix_aux_logits: Optional[torch.Tensor] = None,
         gvr_prior_indices: Optional[torch.Tensor] = None,
         valid_counts: Optional[torch.Tensor] = None,
+        masked_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Select over logits whose columns map to ``logical_positions``.
 
@@ -464,7 +795,9 @@ class CSA2Indexer(Indexer):
         scores), which skips the column gather entirely. With ``valid_counts``
         the candidate source already made each row's valid columns its leading
         ones (sparse candidate logits), so the Top-K is bounded by the counts
-        instead of masking.
+        instead of masking. With ``masked_valid`` the caller already masked
+        ``logits`` in place with ``-inf`` and ``masked_valid`` is its boolean
+        validity (``mask_positions_`` semantics).
         """
         width = logical_positions.shape[1]
         if valid_counts is not None:
@@ -475,24 +808,33 @@ class CSA2Indexer(Indexer):
                     (prior >= 0) & (prior < valid_counts[:, None]), gvr_prior_indices, -1
                 )
         else:
-            offsets = torch.arange(width, device=logits.device)
-            if row_starts is None and row_ends is None and logits.shape[1] == width:
+            fused_mask = False
+            if masked_valid is not None:
+                # The caller already assembled and masked ``logits`` (one launch).
+                scores, valid, fused_mask = logits, masked_valid, True
+            elif row_starts is None and row_ends is None and logits.shape[1] == width:
                 scores = logits
-                valid = logical_positions >= 0
+                if scores.is_cuda and dsl_available() and scores.stride(1) == 1:
+                    # One launch for the validity mask and the in-place -inf fill.
+                    valid = mask_positions_(scores, logical_positions, visible_lengths)
+                    fused_mask = True
+                else:
+                    valid = logical_positions >= 0
             else:
                 if row_starts is None:
                     row_starts = self._constant_rows(logits.shape[0], 0, logits.device)
                 if row_ends is None:
                     row_ends = self._constant_rows(logits.shape[0], logits.shape[1], logits.device)
-                columns = row_starts.long()[:, None] + offsets
+                columns = row_starts.long()[:, None] + torch.arange(width, device=logits.device)
                 in_bounds = (columns >= 0) & (columns < row_ends[:, None])
                 in_bounds &= columns < logits.shape[1]
                 scores = logits.gather(1, columns.clamp(0, logits.shape[1] - 1))
                 valid = in_bounds & (logical_positions >= 0)
-            valid &= logical_positions < visible_lengths[:, None]
-            # The logits are this call's own transient: mask them in place so
-            # the boolean mask is the only full-width temporary.
-            scores.masked_fill_(~valid, -torch.inf)
+            if not fused_mask:
+                valid &= logical_positions < visible_lengths[:, None]
+                # The logits are this call's own transient: mask them in place so
+                # the boolean mask is the only full-width temporary.
+                scores.masked_fill_(~valid, -torch.inf)
             if gvr_prior_indices is not None:
                 if width:
                     prior = gvr_prior_indices.long()
@@ -502,6 +844,7 @@ class CSA2Indexer(Indexer):
                 else:
                     gvr_prior_indices = torch.full_like(gvr_prior_indices, -1)
             if not is_prefill and self.options.use_gvr_emission and self.top_k._gvr_emission_armed:
+                offsets = torch.arange(width, device=logits.device)
                 bad_rows = (
                     (offsets[None, :] < visible_lengths[:, None]) & (logical_positions < 0)
                 ).any(dim=1)
@@ -706,6 +1049,11 @@ class CSA2Indexer(Indexer):
                     ),
                     is_prefill=chunk.is_prefill,
                     shared_columns=inputs.shared_columns and inputs.sparse_indices is None,
+                    candidate_columns=(
+                        inputs.candidate_columns[row_slice]
+                        if inputs.candidate_columns is not None
+                        else None
+                    ),
                     score_hook=hook,
                     radix_aux_indices=radix_aux_indices[first:last]
                     if radix_aux_indices is not None
@@ -1213,8 +1561,45 @@ class CSA2Indexer(Indexer):
                 metadata.publish_indexer_prior(self.layer_idx, logical)
             return logical
 
+        fused_geometry = []
+
+        def fused_keys():
+            # One CuTe launch maps owner slots, gathers the FP4 key rows and
+            # writes logical positions and row bounds (bitwise the ATen chain).
+            if not fused_geometry:
+                geometry = None
+                owner = metadata.csa2_kv_sources[self.layer_idx]
+                if q_fp8.is_cuda and dsl_available() and owner is not None:
+                    pages = manager.get_index_pages(layer.kv_source)
+                    table = metadata.csa2_global_page_tables[owner]
+                    if index_key_gather_supported(pages, table):
+                        geometry = (
+                            pages,
+                            table,
+                            metadata.csa2_global_page_sizes[owner],
+                            metadata.csa2_global_max_positions[owner],
+                        )
+                fused_geometry.append(geometry)
+            return fused_geometry[0]
+
         def candidate_tile(start: int, end: int) -> _ChunkInputs:
             positions = candidates[start:end]
+            geometry = fused_keys() if positions.dtype in (torch.int32, torch.int64) else None
+            if geometry is not None:
+                pages, table, page_size, owner_positions = geometry
+                width = positions.shape[1]
+                keys, scales, mapped, starts, ends = gather_owner_index_keys(
+                    pages,
+                    table,
+                    metadata.csa2_token_requests[start:end],
+                    page_size,
+                    owner_positions,
+                    width,
+                    end - start,
+                    positions=positions,
+                    start_step=width,
+                )
+                return _ChunkInputs(keys, scales, starts, ends, mapped, visible[start:end])
             slots = metadata.global_slot_tile(self.layer_idx, start, end, positions)
             keys, scales = manager.gather_indexer_keys(layer.kv_source, slots.flatten())
             width = positions.shape[1]
@@ -1231,6 +1616,27 @@ class CSA2Indexer(Indexer):
         def shared_keys(start: int, end: int, width: int) -> _ChunkInputs:
             # A request's compressed prefix is gathered once and shared by all
             # query tiles. Cached and newly published keys have the same owner.
+            geometry = fused_keys()
+            if geometry is not None:
+                pages, table, page_size, owner_positions = geometry
+                keys, scales, mapped, starts, ends = gather_owner_index_keys(
+                    pages,
+                    table,
+                    metadata.csa2_token_requests[start : start + 1],
+                    page_size,
+                    owner_positions,
+                    width,
+                    end - start,
+                )
+                return _ChunkInputs(
+                    keys,
+                    scales,
+                    starts,
+                    ends,
+                    mapped.expand(end - start, -1),
+                    visible[start:end],
+                    shared_columns=True,
+                )
             positions = torch.arange(width, device=q_fp8.device)
             slots = metadata.global_slot_tile(self.layer_idx, start, start + 1, positions[None, :])[
                 0
@@ -1276,6 +1682,18 @@ class CSA2Indexer(Indexer):
             sparse_descriptors = metadata.prepare_sparse_indexer(self.layer_idx, self.sparse_block)
             if sparse_descriptors is None:
                 paged = None
+        # SM120 has no paged decode indexer: score every decode row in one
+        # split-key launch, then mask, select and finalize once for all rows.
+        split_width = 0
+        if paged is None and decode_start < count:
+            split_width = candidates.shape[1] if candidates is not None else max_positions
+        split_decode = (
+            split_width > 0
+            and (candidates is None or candidates.dtype in (torch.int32, torch.int64))
+            and (split_width > self.index_topk or not self.options.skip_indexer_for_short_seqs)
+            and self._split_decode_supported(q_fp8, q_scale)
+            and fused_keys() is not None
+        )
         chunks = []
         for request, (begin, end) in enumerate(ranges):
             is_prefill = request < num_contexts
@@ -1305,7 +1723,38 @@ class CSA2Indexer(Indexer):
                         )
                     )
                     continue
-                if not is_prefill and paged is not None:
+                if not is_prefill and (paged is not None or split_decode):
+                    continue
+                if (
+                    is_prefill
+                    and not graph_mode
+                    and score_hook is None
+                    and candidates.dtype in (torch.int32, torch.int64)
+                    and candidates.shape[1] > self.index_topk
+                ):
+                    # Score the request's shared prefix densely once and gather
+                    # each query's candidate columns: about one prefix of key
+                    # dots per query instead of the candidate key gather.
+                    width = min(
+                        max_positions, metadata.csa2_request_start_positions[request] + end - begin
+                    )
+
+                    def load_dense(begin=begin, end=end, width=width):
+                        inputs = shared_keys(begin, end, width)
+                        inputs.candidate_columns = candidates[begin:end]
+                        return inputs
+
+                    chunks.append(
+                        _QueryChunk(
+                            begin,
+                            end,
+                            width,
+                            load=load_dense,
+                            max_query_tokens=min(
+                                metadata.indexer_max_chunk_size, _DENSE_CANDIDATE_TILE_ROWS
+                            ),
+                        )
+                    )
                     continue
                 # Without the sparse kernels, gather each query's candidate rows
                 # and score them densely. Split across ranks before gathering;
@@ -1322,7 +1771,7 @@ class CSA2Indexer(Indexer):
                     )
                 )
                 continue
-            if not is_prefill and paged is not None:
+            if not is_prefill and (paged is not None or split_decode):
                 continue
             chunk_size = metadata.indexer_max_chunk_size
             for start in range(begin, end, chunk_size):
@@ -1352,7 +1801,7 @@ class CSA2Indexer(Indexer):
         # Exact radix decode scratch is also needed by non-native candidate
         # paths. Its rows correspond to model queries, not FMHA staging tiles.
         radix_indices = radix_logits = None
-        if any(not chunk.is_prefill for chunk in chunks):
+        if split_decode or any(not chunk.is_prefill for chunk in chunks):
             radix_indices = torch.empty(
                 (count, 10, self.index_topk), dtype=torch.int32, device=q_fp8.device
             )
@@ -1373,6 +1822,38 @@ class CSA2Indexer(Indexer):
             decode_start,
             sharded_outputs=sharded,
         )
+        if split_decode:
+            pages, table, page_size, owner_positions = fused_keys()
+            keys, scales, mapped, _, _ = gather_owner_index_keys(
+                pages,
+                table,
+                metadata.csa2_token_requests[decode_start:count],
+                page_size,
+                owner_positions,
+                split_width,
+                0,
+                positions=candidates[decode_start:count] if candidates is not None else None,
+            )
+            hook = None
+            if score_hook is not None:
+
+                def hook(scores: torch.Tensor) -> None:
+                    score_hook(scores, decode_start, count)
+
+            self.select_split_decode(
+                q_fp8[decode_start:count],
+                q_scale[decode_start:count],
+                weights[decode_start:count],
+                keys,
+                scales,
+                mapped,
+                visible[decode_start:count],
+                logical[decode_start:count],
+                hook,
+                radix_indices[decode_start:count],
+                radix_logits[decode_start:count],
+                prior[: count - decode_start] if prior is not None else None,
+            )
         if paged is not None:
             decode_count = count - decode_start
             hook = None

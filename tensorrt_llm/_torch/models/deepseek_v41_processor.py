@@ -106,6 +106,7 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
     """
 
     supports_token_id_mm_expansion = True
+    supports_tokenization_cache = True
 
     def __init__(
         self,
@@ -113,6 +114,7 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         config: PretrainedConfig,
         tokenizer: PreTrainedTokenizerBase | None,
         trust_remote_code: bool = True,
+        enable_tokenization_cache: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(model_path, config, tokenizer, trust_remote_code, **kwargs)
@@ -150,6 +152,20 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
                 f"Tokenizer image placeholder ID {placeholder_id} does not match "
                 f"config.image_token_id {self._image_token_id}"
             )
+        # The cache needs the HF fast tokenizer itself (``is_fast`` and offset
+        # mappings), not the TransformersTokenizer wrapper. It tokenizes without
+        # special tokens, so it serves add_special_tokens=True (the
+        # /v1/completions default) only for a tokenizer that adds none; this
+        # checkpoint's BOS is part of the prompt text.
+        self._cache_adds_no_special_tokens = False
+        if enable_tokenization_cache:
+            try:
+                self._cache_adds_no_special_tokens = hf_tokenizer.num_special_tokens_to_add() == 0
+            except Exception:  # noqa: BLE001 - unknown affixes: no cache
+                self._cache_adds_no_special_tokens = False
+        self._init_tokenization_cache(
+            enable_tokenization_cache and self._cache_adds_no_special_tokens, hf_tokenizer
+        )
 
     @property
     def config(self) -> PretrainedConfig:
@@ -340,8 +356,18 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         """Tokenize a formatted prompt and replace each image placeholder."""
         if inputs.get("prompt") is None:
             return self.call_with_token_ids(inputs, sampling_params)
-        add_special_tokens = sampling_params.add_special_tokens if sampling_params else True
-        token_ids = self.tokenizer.encode(inputs["prompt"], add_special_tokens=add_special_tokens)
+        token_ids = None
+        if not inputs.get("multi_modal_data"):
+            token_ids = self._encode_with_tokenization_cache(
+                inputs["prompt"],
+                sampling_params,
+                adds_no_special_tokens=self._cache_adds_no_special_tokens,
+            )
+        if token_ids is None:
+            add_special_tokens = sampling_params.add_special_tokens if sampling_params else True
+            token_ids = self.tokenizer.encode(
+                inputs["prompt"], add_special_tokens=add_special_tokens
+            )
         return self._process_prompt(token_ids, inputs)
 
     def _process_prompt(

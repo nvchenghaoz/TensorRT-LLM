@@ -161,6 +161,10 @@ class BaseWorker(GenerationExecutor):
         check_cuda_architecture_supported(device_id)
         torch.cuda.set_device(device_id)
         configure_cpu_affinity(device_id)
+        # Before any NCCL communicator exists: NCCL reads its env knobs once.
+        from tensorrt_llm._torch.distributed.nccl_tuning import \
+            apply_pcie_nccl_defaults
+        apply_pcie_nccl_defaults()
 
     def setup_engine(self):
         """

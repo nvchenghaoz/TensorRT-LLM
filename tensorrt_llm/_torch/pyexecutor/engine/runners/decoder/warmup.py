@@ -1458,11 +1458,13 @@ class DecoderWarmup:
         if not isinstance(kv_cache_manager, CSA2CacheManager):
             return
 
-        from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41Engram
+        from tensorrt_llm._torch.modules.engram import Engram
 
+        # Any Engram subclass with kernels to compile: the built-in DeepseekV41Engram
+        # and the modeling_v2 DeepSeek-V4.1 targets' copies of it.
         with torch.inference_mode():
             for module in self.model.modules():
-                if isinstance(module, DeepseekV41Engram):
+                if isinstance(module, Engram) and hasattr(module, "warmup_kernels"):
                     module.warmup_kernels()
         torch.cuda.synchronize()
         # Idle attention-DP ranks also finish JIT before collective forwards.

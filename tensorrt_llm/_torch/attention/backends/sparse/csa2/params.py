@@ -256,6 +256,9 @@ class CSA2ForwardState:
     index_k: torch.Tensor | None = None
     output_position_ids: torch.Tensor | None = None
     output_rotary_cos_sin: torch.Tensor | None = None
+    # The output projection's first kernel is a PDL waiter (csa2_lowm_wo_a) that reads the
+    # attention output only after griddepcontrol.wait: the last attention kernel may trigger first.
+    output_pdl_consumer: bool = False
     swa_transform: RowTransform | None = None
     main_transform: RowTransform | None = None
     index_transform: RowTransform | None = None
