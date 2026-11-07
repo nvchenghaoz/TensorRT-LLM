@@ -663,17 +663,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         return _arp.plan(rows.shape[0])
 
     def _mhc_boundary(
-        self,
-        mhc: mHC,
-        which: int,
-        x_prev,
-        residual,
-        post_mix,
-        comb_mix,
-        pre,
-        norm,
-        defer_k1=False,
-        defer_k1_max_tokens=None,
+        self, mhc: mHC, which: int, x_prev, residual, post_mix, comb_mix, pre, norm, defer_k1=False
     ):
         """``mhc.fused_hc_lagged`` or its two-stream split; returns (outputs, join or None)."""
         if self._mhc_split_stream is not None:
@@ -693,7 +683,6 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 # Only the hc_attn boundary (0): its K1's PDL dependent is the attention-input
                 # wq_a||wkv low-M GEMM, which stages constant weights before its wait (idea 208).
                 k1_trigger_first=which == 0,
-                defer_k1_max_tokens=defer_k1_max_tokens,
             )
             if split is not None:
                 return split
@@ -720,27 +709,6 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             return False
         supported = getattr(self.mlp, "k1_fold_supported", None)
         return supported is not None and supported(m)
-
-    def _attn_k1_fold_eligible(self, x_prev: torch.Tensor, image_mask) -> bool:
-        """K1 fold at the hc_attn boundary (idea 386): decode M <= TRTLLM_CSA2_A_K1_FOLD_MAX_M (2), no image
-        mask, no attention DP, a CSA2 attention that takes it (it re-checks, and materializes the K1 itself
-        when its attention-input chain cannot fold it)."""
-        from tensorrt_llm._torch.attention.backends.sparse.csa2 import low_m_gemm as _lowm
-
-        if not _lowm.A_K1_FOLD_ENV_ON or self._mhc_split_stream is None or image_mask is not None:
-            return False
-        if x_prev is None or x_prev.dim() < 1 or x_prev.shape[-1] == 0:
-            return False
-        m = x_prev.numel() // x_prev.shape[-1]
-        if not 1 <= m <= _lowm.A_K1_FOLD_MAX_M or self.mapping.enable_attention_dp:
-            return False
-        return hasattr(self.self_attn, "stash_k1_fold")
-
-    @staticmethod
-    def _attn_k1_fold_max_m() -> int:
-        from tensorrt_llm._torch.attention.backends.sparse.csa2 import low_m_gemm as _lowm
-
-        return _lowm.A_K1_FOLD_MAX_M
 
     def _decoder_global_input(self, hc_state: HCState) -> torch.Tensor:
         """Use the ordinary fused boundary's collapse/norm and BF16 rounding."""
@@ -835,7 +803,6 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         # C++ fused boundary (GEMM + bigfuse with the lagged pre-mix and the input RMSNorm
         # folded in); the GEMM backend (FMA / tcgen05 TF32) is the autotuner's per-M choice.
         attn_join = None
-        attn_k1_fold = None
         entry_piped = False
         if deferred and hc_state.x_prev_allreduce is not None:
             # The previous layer deferred its MoE all-reduce (prefill AR pipeline): reduce x_prev in row
@@ -866,8 +833,6 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             # becomes the materialized stream that this layer's post_mapping needs.
             # Split (decode): residual/attn_pre/post_mix/comb_mix are valid only after
             # attn_join, which joins right after self_attn below.
-            # K1 fold (decode M <= 2): the attention-input chain's A computes this boundary's layer_input.
-            attn_defer_k1 = self._attn_k1_fold_eligible(hc_state.x_prev, image_mask)
             (residual, attn_pre, post_mix, comb_mix, layer_input), attn_join = self._mhc_boundary(
                 self.hc_attn,
                 0,
@@ -877,12 +842,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 hc_state.comb_mix,
                 pre_mix,
                 self.input_layernorm,
-                defer_k1=attn_defer_k1,
-                defer_k1_max_tokens=self._attn_k1_fold_max_m() if attn_defer_k1 else None,
             )
-            attn_k1_fold = attn_join.k1_fold if attn_join is not None else None
-            if attn_k1_fold is not None:
-                self.self_attn.stash_k1_fold(attn_k1_fold)
         else:
             attn_pre, post_mix, comb_mix, layer_input = self.hc_attn.pre_mapping_lagged(
                 residual,
@@ -922,8 +882,6 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 all_reduce_params=AllReduceParams(enable_allreduce=not self.disable_attn_allreduce),
                 **kwargs,
             )
-        if attn_k1_fold is not None and not attn_k1_fold.done:
-            raise RuntimeError("K1 fold: the attention did not produce the deferred layer_input")
         if attn_join is not None:
             attn_join.join()
             attn_join = None

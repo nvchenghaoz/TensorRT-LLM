@@ -247,115 +247,6 @@ std::vector<torch::Tensor> csa2QnormLowMGemm(torch::Tensor const& x, torch::Tens
     return outs;
 }
 
-//! SM120 CSA2 decode attention-input GEMM A (wq_a||wkv) with the hc_attn mHC lagged K1 folded in (M <= 2).
-//!
-//! layer_input = mhc_lagged_layer_input(x_prev, residual, post, comb, pre, norm_w, eps, reducer_threads) is computed
-//! inside the kernel after its PDL wait (bitwise) and written to `layerInput` (by the cluster of row tile 0); the
-//! return value is `csa2_mxfp8_low_m_gemm(layer_input, w, wsf, ...)[0]` (n_split 0, one stage).
-torch::Tensor csa2Mxfp8LowMGemmK1Fold(torch::Tensor const& xPrev, torch::Tensor const& residual,
-    torch::Tensor const& post, torch::Tensor const& comb, torch::Tensor const& pre, torch::Tensor const& normW,
-    double eps, int64_t reducerThreads, torch::Tensor const& layerInput, torch::Tensor const& w,
-    torch::Tensor const& wsf, int64_t warps, int64_t clusterK, int64_t rowTiles, bool pdl, int64_t debugFlags,
-    std::optional<torch::Tensor> pfW, std::optional<torch::Tensor> pfSf, int64_t pfFrac,
-    std::optional<torch::Tensor> xqOut, std::optional<torch::Tensor> xsfOut)
-{
-    int const sm = tensorrt_llm::common::getSMVersion();
-    TORCH_CHECK(sm == 120, "csa2_mxfp8_low_m_gemm_k1fold requires SM120, got SM", sm);
-    TORCH_CHECK(xPrev.is_cuda() && xPrev.scalar_type() == at::kBFloat16 && xPrev.dim() == 2 && xPrev.is_contiguous(),
-        "x_prev must be a contiguous 2-D bf16 CUDA tensor");
-    int64_t const m = xPrev.size(0);
-    int64_t const k = xPrev.size(1);
-    int64_t const n = w.size(0);
-    TORCH_CHECK(residual.scalar_type() == at::kBFloat16 && residual.is_contiguous() && residual.numel() == m * 4 * k,
-        "residual must be a contiguous bf16 [M, 4, K] tensor");
-    for (auto const* t : {&post, &pre})
-    {
-        TORCH_CHECK(t->scalar_type() == at::kFloat && t->is_contiguous() && t->numel() == m * 4,
-            "post / pre must be contiguous fp32 [M, 4]");
-    }
-    TORCH_CHECK(comb.scalar_type() == at::kFloat && comb.is_contiguous() && comb.numel() == m * 16,
-        "comb must be contiguous fp32 [M, 4, 4]");
-    TORCH_CHECK(normW.scalar_type() == at::kBFloat16 && normW.is_contiguous() && normW.numel() == k,
-        "norm_w must be a contiguous bf16 [K] tensor");
-    TORCH_CHECK(layerInput.scalar_type() == at::kBFloat16 && layerInput.is_contiguous() && layerInput.dim() == 2
-            && layerInput.size(0) == m && layerInput.size(1) == k,
-        "layer_input must be a contiguous bf16 [M, K] tensor");
-    for (auto const* t : {&xPrev, &residual, &normW, &layerInput})
-    {
-        TORCH_CHECK(t->get_device() == xPrev.get_device() && reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
-            "K1 tensors must be 16-byte aligned on x_prev's device");
-    }
-    TORCH_CHECK(w.scalar_type() == at::kFloat8_e4m3fn && w.is_contiguous() && w.dim() == 2 && w.size(1) == k,
-        "w must be a contiguous e4m3 [N, K] tensor");
-    TORCH_CHECK(wsf.scalar_type() == at::kByte || wsf.scalar_type() == at::kFloat8_e8m0fnu,
-        "wsf must be uint8 UE8M0 scales");
-    int64_t const sfNeed = (n + 127) / 128 * 128 * ((k / 32 + 3) / 4 * 4);
-    TORCH_CHECK(wsf.is_contiguous() && wsf.numel() >= sfNeed, "wsf must be the contiguous swizzled buffer of ", sfNeed,
-        " bytes");
-    TORCH_CHECK(
-        reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(wsf.data_ptr()) % 16 == 0,
-        "w and wsf must be 16-byte aligned");
-    TORCH_CHECK(tensorrt_llm::kernels::isCsa2K1FoldSupported(static_cast<int32_t>(warps),
-                    static_cast<int32_t>(clusterK), static_cast<int32_t>(rowTiles), static_cast<int32_t>(m),
-                    static_cast<int32_t>(k), static_cast<int32_t>(reducerThreads)),
-        "csa2_mxfp8_low_m_gemm_k1fold: unsupported configuration (warps ", warps, ", cluster_k ", clusterK,
-        ", row_tiles ", rowTiles, ") at M=", m, " K=", k, " P=", reducerThreads);
-    TORCH_CHECK(xqOut.has_value() == xsfOut.has_value(), "xq_out and xsf_out come together");
-    if (xqOut.has_value())
-    {
-        int64_t const sfActNeed = (m + 127) / 128 * 128 * ((k / 32 + 3) / 4 * 4);
-        TORCH_CHECK(xqOut->is_cuda() && xqOut->is_contiguous() && xqOut->numel() == m * k
-                && xqOut->element_size() == 1 && reinterpret_cast<uintptr_t>(xqOut->data_ptr()) % 16 == 0,
-            "xq_out must be a contiguous [M, K] byte tensor");
-        TORCH_CHECK(xsfOut->is_contiguous() && xsfOut->numel() >= sfActNeed && xsfOut->element_size() == 1,
-            "xsf_out is too small");
-    }
-    auto pfRange = [&](std::optional<torch::Tensor> const& t) -> std::pair<uint8_t const*, int64_t>
-    {
-        if (!t.has_value())
-        {
-            return {nullptr, 0};
-        }
-        TORCH_CHECK(t->is_cuda() && t->is_contiguous() && t->get_device() == xPrev.get_device()
-                && reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
-            "pf_w / pf_sf must be contiguous 16-byte aligned CUDA tensors on x_prev's device");
-        return {reinterpret_cast<uint8_t const*>(t->data_ptr()), t->numel() * t->element_size()};
-    };
-    auto const pf0 = pfRange(pfW);
-    auto const pf1 = pfRange(pfSf);
-    c10::cuda::CUDAGuard const deviceGuard{xPrev.device()};
-    auto out = torch::empty({m, n}, xPrev.options());
-    tensorrt_llm::kernels::invokeCsa2Mxfp8LowMGemmK1Fold(reinterpret_cast<__nv_bfloat16 const*>(xPrev.data_ptr()),
-        reinterpret_cast<__nv_bfloat16 const*>(residual.data_ptr()), post.data_ptr<float>(), comb.data_ptr<float>(),
-        pre.data_ptr<float>(), reinterpret_cast<__nv_bfloat16 const*>(normW.data_ptr()), static_cast<float>(eps),
-        static_cast<int32_t>(reducerThreads), reinterpret_cast<__nv_bfloat16*>(layerInput.data_ptr()),
-        static_cast<int32_t>(m), static_cast<int32_t>(n), static_cast<int32_t>(k),
-        reinterpret_cast<uint8_t const*>(w.data_ptr()), reinterpret_cast<uint8_t const*>(wsf.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), static_cast<int32_t>(out.stride(0)),
-        xqOut.has_value() ? reinterpret_cast<uint8_t*>(xqOut->data_ptr()) : nullptr,
-        xsfOut.has_value() ? reinterpret_cast<uint8_t*>(xsfOut->data_ptr()) : nullptr, static_cast<int32_t>(warps),
-        static_cast<int32_t>(clusterK), static_cast<int32_t>(rowTiles), pdl && tensorrt_llm::common::getEnvEnablePDL(),
-        at::cuda::getCurrentCUDAStream(xPrev.get_device()), static_cast<int32_t>(debugFlags), pf0.first, pf0.second,
-        pf1.first, pf1.second, static_cast<int32_t>(pfFrac));
-    return out;
-}
-
-//! Test / audit only: csa2Mxfp8LowMGemmInstanceStats on `dev`'s device; returns 7 int64 values (see the header).
-torch::Tensor csa2LowMGemmInstanceStats(torch::Tensor const& dev, int64_t warps, int64_t clusterK, int64_t rowTiles,
-    int64_t m, int64_t k, bool norm, bool pf, bool k1fold)
-{
-    c10::cuda::CUDAGuard const deviceGuard{dev.device()};
-    int64_t stats[7] = {};
-    tensorrt_llm::kernels::csa2Mxfp8LowMGemmInstanceStats(static_cast<int32_t>(warps), static_cast<int32_t>(clusterK),
-        static_cast<int32_t>(rowTiles), static_cast<int32_t>(m), static_cast<int32_t>(k), norm, pf, k1fold, stats);
-    auto out = torch::empty({7}, torch::dtype(torch::kInt64));
-    for (int i = 0; i < 7; ++i)
-    {
-        out[i] = stats[i];
-    }
-    return out;
-}
-
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -374,20 +265,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "csa2_qnorm_low_m_gemm(Tensor x, Tensor w, Tensor wsf, Tensor norm_w, float eps, int warps, int cluster_k, "
         "int row_tiles, int n_split, bool pdl, int debug_flags=0, Tensor(a!)? xq_out=None, Tensor(b!)? xsf_out=None) "
         "-> Tensor[]");
-    m.def(
-        "csa2_mxfp8_low_m_gemm_k1fold(Tensor x_prev, Tensor residual, Tensor post, Tensor comb, Tensor pre, "
-        "Tensor norm_w, float eps, int reducer_threads, Tensor(a!) layer_input, Tensor w, Tensor wsf, int warps, "
-        "int cluster_k, int row_tiles, bool pdl, int debug_flags=0, Tensor? pf_w=None, Tensor? pf_sf=None, "
-        "int pf_frac=256, Tensor(b!)? xq_out=None, Tensor(c!)? xsf_out=None) -> Tensor");
-    m.def(
-        "csa2_low_m_gemm_instance_stats(Tensor dev, int warps, int cluster_k, int row_tiles, int m, int k, bool norm, "
-        "bool pf, bool k1fold) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("csa2_mxfp8_low_m_gemm_k1fold", &tensorrt_llm::torch_ext::csa2Mxfp8LowMGemmK1Fold);
-    m.impl("csa2_low_m_gemm_instance_stats", &tensorrt_llm::torch_ext::csa2LowMGemmInstanceStats);
     m.impl("minimax_m3_mxfp8_low_m_gemm", &tensorrt_llm::torch_ext::minimaxM3Mxfp8LowMGemm);
     m.impl("csa2_mxfp8_low_m_gemm", &tensorrt_llm::torch_ext::csa2Mxfp8LowMGemm);
     m.impl("csa2_qnorm_low_m_gemm", &tensorrt_llm::torch_ext::csa2QnormLowMGemm);

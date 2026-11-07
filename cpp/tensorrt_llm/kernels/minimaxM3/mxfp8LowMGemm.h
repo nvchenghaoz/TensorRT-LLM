@@ -77,29 +77,6 @@ void invokeCsa2QnormLowMGemm(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int
     int32_t ldo, __nv_bfloat16* out2, int32_t ldo2, int32_t nSplit, int32_t warps, int32_t clusterK, int32_t rowTiles,
     bool pdl, cudaStream_t stream, int32_t debugFlags = 0, uint8_t* xqOut = nullptr, uint8_t* xsfOut = nullptr);
 
-//! Test / audit only: occupancy and attributes of one csa2 low-M GEMM kernel instance (single stage) at M rows and K
-//! columns: outStats[7] = {cudaOccupancyMaxActiveClusters (grid of N = 1792; 0 without a cluster), max blocks per SM,
-//! dynamic smem bytes, registers per thread, local (spill) bytes, static smem bytes, max threads per block}.
-void csa2Mxfp8LowMGemmInstanceStats(int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t k, bool norm,
-    bool pf, bool k1fold, int64_t* outStats);
-
-//! Whether `invokeCsa2Mxfp8LowMGemmK1Fold` is built for (warps, clusterK, rowTiles) at M rows, K columns and the hc_attn
-//! mHC K1 reducer thread count `reducerThreads` (K = 5120, M <= 2; configurations (4, 4, 2) and (8, 2, 2)).
-bool isCsa2K1FoldSupported(
-    int32_t warps, int32_t clusterK, int32_t rowTiles, int32_t m, int32_t k, int32_t reducerThreads);
-
-//! `invokeCsa2Mxfp8LowMGemm` (single stage, no n split) whose activation is the hc_attn mHC lagged K1 output computed
-//! in-kernel after the PDL wait, bit for bit as mhc_lagged_layer_input(xPrev, residual, post, comb, pre, normW, eps,
-//! reducerThreads): every CTA computes its K slice (cluster split; DSMEM exchange of K1's partial sums), quantizes it
-//! exactly as the in-kernel path does, and the cluster of row tile 0 writes the full `layerInput` [M, K].
-//! debugFlags / pf* as in `invokeCsa2Mxfp8LowMGemm` (bit 0: negative control that skips the PDL wait).
-void invokeCsa2Mxfp8LowMGemmK1Fold(__nv_bfloat16 const* xPrev, __nv_bfloat16 const* residual, float const* post,
-    float const* comb, float const* pre, __nv_bfloat16 const* normW, float eps, int32_t reducerThreads,
-    __nv_bfloat16* layerInput, int32_t m, int32_t n, int32_t k, uint8_t const* w, uint8_t const* wsf,
-    __nv_bfloat16* out, int32_t ldo, uint8_t* xqOut, uint8_t* xsfOut, int32_t warps, int32_t clusterK,
-    int32_t rowTiles, bool pdl, cudaStream_t stream, int32_t debugFlags = 0, uint8_t const* pfP0 = nullptr,
-    int64_t pfN0 = 0, uint8_t const* pfP1 = nullptr, int64_t pfN1 = 0, int32_t pfFrac = 256);
-
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

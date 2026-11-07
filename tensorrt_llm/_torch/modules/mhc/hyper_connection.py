@@ -422,7 +422,6 @@ class mHC(nn.Module):
         event1: torch.cuda.Event,
         defer_k1: bool = False,
         k1_trigger_first: bool = False,
-        defer_k1_max_tokens: Optional[int] = None,
     ):
         """:meth:`fused_hc_lagged` split over two streams (decode, small M; SM120).
 
@@ -499,9 +498,7 @@ class mHC(nn.Module):
             return None
 
         k1_fold = None
-        # The consumer's own row limit (hc_attn: the csa2 A fold); default the router fold's.
-        k1_defer_max = _split.K1_FOLD_MAX_TOKENS if defer_k1_max_tokens is None else defer_k1_max_tokens
-        if defer_k1 and 1 <= B <= k1_defer_max and hidden == 5120:
+        if defer_k1 and 1 <= B <= _split.K1_FOLD_MAX_TOKENS and hidden == 5120:
             k1_fold = _split.K1FoldPending(
                 torch.empty_like(x_prev_flat),
                 (x_prev_flat, residual_prev_flat, post_flat, comb_flat, pre_flat, nw),
