@@ -993,4 +993,899 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
 #endif
 }
 
+// ===================================================================
+// fused_pmap_gemm_fma_mtile<N_PER_BLOCK, TM>
+// -------------------------------------------------------------------
+// M-tiled variant of fused_pmap_gemm_fma_ksplit<N_PER_BLOCK, 1, 0, true>
+// (NUM_K_SPLITS = 1, BF16_VEC = 8, WRITE_RESIDUAL = true) for prefill-size M.
+// Each CTA handles TM consecutive tokens, so every W_T register load is reused
+// TM times instead of once (the ksplit kernel streams the whole 24 x 4*hidden
+// fp32 W_T through L2 once per token).
+//
+// BITWISE EQUAL to the ksplit kernel: for every token, every thread owns the
+// same h positions (tid*8 + s*2048), and every accumulator sees the same fmaf
+// chain:
+//   new_r[j][v] = pm[j]*x[v], then fmaf(comb[k][j], r[k][v], .) for k = 0..3;
+//   sqr  += fmaf over (step, j, v);
+//   acc[n] += fmaf over (step, j, v).
+// The loop is reorganised j-outer / n-inner, which leaves each per-(n) and
+// per-(j,v) chain unchanged.  The warp xor-shuffle tree and the sequential
+// 8-warp sum into Yp/Rp are the ksplit kernel's, run once per token.
+// Grid: (ceil(M / TM), N / N_PER_BLOCK, 1).  Block: 256 threads.
+// Yp layout [1, M, N], Rp [1, M] (same as ksplit with ks = 1).
+// ===================================================================
+template <int N_PER_BLOCK, int TM>
+__launch_bounds__(256, (TM * N_PER_BLOCK <= 48) ? 2 : 1) __global__
+    void fused_pmap_gemm_fma_mtile(__nv_bfloat16 const* __restrict__ residual_in,
+        __nv_bfloat16 const* __restrict__ x_in, float const* __restrict__ post_mix,
+        float const* __restrict__ comb_mix, float const* __restrict__ W_T, float* __restrict__ Yp,
+        float* __restrict__ Rp, int M, int hidden_size, int N, int K, __nv_bfloat16* __restrict__ residual_out)
+{
+    constexpr int HC_MULT = 4;
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+    constexpr int BF16_VEC = 8;
+
+    int const tok0 = blockIdx.x * TM;
+    int const n_start = blockIdx.y * N_PER_BLOCK;
+    int const tid = threadIdx.x;
+    int const warp_id = tid / WARP_SIZE;
+    int const lane = tid % WARP_SIZE;
+    bool const do_sqr = (n_start == 0);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
+    __shared__ float s_post[TM][HC_MULT];
+    __shared__ float s_comb[TM][HC_MULT][HC_MULT];
+
+    if (tid < TM * HC_MULT)
+    {
+        int const t = tid / HC_MULT;
+        int const c = tid % HC_MULT;
+        int const tok = min(tok0 + t, M - 1);
+        s_post[t][c] = post_mix[tok * HC_MULT + c];
+    }
+    if (tid < TM * HC_MULT * HC_MULT)
+    {
+        int const t = tid / (HC_MULT * HC_MULT);
+        int const rc = tid % (HC_MULT * HC_MULT);
+        int const tok = min(tok0 + t, M - 1);
+        s_comb[t][rc / HC_MULT][rc % HC_MULT] = comb_mix[tok * HC_MULT * HC_MULT + rc];
+    }
+    __syncthreads();
+
+    // Tokens past M (last CTA) recompute token M-1 and never write.
+    long long tok_res[TM];
+    long long tok_x[TM];
+    bool tok_ok[TM];
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        int const tok = min(tok0 + t, M - 1);
+        tok_ok[t] = (tok0 + t) < M;
+        tok_res[t] = static_cast<long long>(tok) * HC_MULT * hidden_size;
+        tok_x[t] = static_cast<long long>(tok) * hidden_size;
+    }
+
+    float acc[TM][N_PER_BLOCK];
+    float sqr[TM];
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        sqr[t] = 0.0f;
+#pragma unroll
+        for (int n = 0; n < N_PER_BLOCK; n++)
+            acc[t][n] = 0.0f;
+    }
+
+    for (int h = tid * BF16_VEC; h < hidden_size; h += BLOCK_SIZE * BF16_VEC)
+    {
+        uint4 x_raw[TM];
+        uint4 r_raw[TM][HC_MULT];
+#pragma unroll
+        for (int t = 0; t < TM; t++)
+        {
+            x_raw[t] = *reinterpret_cast<uint4 const*>(&x_in[tok_x[t] + h]);
+#pragma unroll
+            for (int k = 0; k < HC_MULT; k++)
+                r_raw[t][k] = *reinterpret_cast<uint4 const*>(&residual_in[tok_res[t] + k * hidden_size + h]);
+        }
+
+#pragma unroll
+        for (int j = 0; j < HC_MULT; j++)
+        {
+            float new_r[TM][BF16_VEC];
+#pragma unroll
+            for (int t = 0; t < TM; t++)
+            {
+                float const pmj = s_post[t][j];
+                __nv_bfloat162 const* xp = reinterpret_cast<__nv_bfloat162 const*>(&x_raw[t]);
+#pragma unroll
+                for (int v = 0; v < 4; v++)
+                {
+                    float2 f = __bfloat1622float2(xp[v]);
+                    new_r[t][2 * v + 0] = pmj * f.x;
+                    new_r[t][2 * v + 1] = pmj * f.y;
+                }
+#pragma unroll
+                for (int k = 0; k < HC_MULT; k++)
+                {
+                    float const ckj = s_comb[t][k][j];
+                    __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&r_raw[t][k]);
+#pragma unroll
+                    for (int v = 0; v < 4; v++)
+                    {
+                        float2 f = __bfloat1622float2(rp[v]);
+                        new_r[t][2 * v + 0] = fmaf(ckj, f.x, new_r[t][2 * v + 0]);
+                        new_r[t][2 * v + 1] = fmaf(ckj, f.y, new_r[t][2 * v + 1]);
+                    }
+                }
+            }
+
+            if (do_sqr)
+            {
+#pragma unroll
+                for (int t = 0; t < TM; t++)
+                {
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+                        sqr[t] = fmaf(new_r[t][v], new_r[t][v], sqr[t]);
+                    if (tok_ok[t])
+                    {
+                        uint4 packed;
+                        __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
+#pragma unroll
+                        for (int v = 0; v < 4; v++)
+                            pairs[v] = __float22bfloat162_rn(make_float2(new_r[t][2 * v], new_r[t][2 * v + 1]));
+                        *reinterpret_cast<uint4*>(residual_out + tok_res[t] + j * hidden_size + h) = packed;
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int n = 0; n < N_PER_BLOCK; n++)
+            {
+                long long const w_base = static_cast<long long>(n_start + n) * K + j * hidden_size + h;
+                float w[BF16_VEC];
+                asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                             : "=f"(w[0]), "=f"(w[1]), "=f"(w[2]), "=f"(w[3])
+                             : "l"(W_T + w_base));
+                asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                             : "=f"(w[4]), "=f"(w[5]), "=f"(w[6]), "=f"(w[7])
+                             : "l"(W_T + w_base + 4));
+#pragma unroll
+                for (int t = 0; t < TM; t++)
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+                        acc[t][n] = fmaf(new_r[t][v], w[v], acc[t][n]);
+            }
+        }
+    }
+
+    constexpr int COLS_PER_GROUP = NUM_WARPS;
+    constexpr int SQRSUM_SLOT = COLS_PER_GROUP;
+    constexpr int N_GROUPS = (N_PER_BLOCK + COLS_PER_GROUP - 1) / COLS_PER_GROUP;
+    constexpr unsigned FULL_WARP_MASK = 0xffffffff;
+
+    __shared__ float s_warp[NUM_WARPS][COLS_PER_GROUP + 1];
+
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        int const token = tok0 + t;
+#pragma unroll
+        for (int g = 0; g < N_GROUPS; g++)
+        {
+            constexpr int LAST_COLS = N_PER_BLOCK - (N_GROUPS - 1) * COLS_PER_GROUP;
+            int const n_cols = (g == N_GROUPS - 1) ? LAST_COLS : COLS_PER_GROUP;
+#pragma unroll
+            for (int n = 0; n < COLS_PER_GROUP; n++)
+            {
+                if (n < n_cols)
+                {
+#pragma unroll
+                    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+                        acc[t][g * COLS_PER_GROUP + n]
+                            += __shfl_xor_sync(FULL_WARP_MASK, acc[t][g * COLS_PER_GROUP + n], off);
+                }
+            }
+            if (g == 0 && do_sqr)
+            {
+#pragma unroll
+                for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+                    sqr[t] += __shfl_xor_sync(FULL_WARP_MASK, sqr[t], off);
+            }
+            if (lane == 0)
+            {
+#pragma unroll
+                for (int n = 0; n < COLS_PER_GROUP; n++)
+                    if (n < n_cols)
+                        s_warp[warp_id][n] = acc[t][g * COLS_PER_GROUP + n];
+                if (g == 0 && do_sqr)
+                    s_warp[warp_id][SQRSUM_SLOT] = sqr[t];
+            }
+            __syncthreads();
+            if (tok_ok[t] && lane == 0 && warp_id < n_cols)
+            {
+                float val = 0.0f;
+#pragma unroll
+                for (int w = 0; w < NUM_WARPS; w++)
+                    val += s_warp[w][warp_id];
+                int const n_global = n_start + g * COLS_PER_GROUP + warp_id;
+                Yp[static_cast<long long>(token) * N + n_global] = val;
+            }
+            if (tok_ok[t] && g == 0 && do_sqr && lane == 0 && warp_id == 0)
+            {
+                float sq = 0.0f;
+#pragma unroll
+                for (int w = 0; w < NUM_WARPS; w++)
+                    sq += s_warp[w][SQRSUM_SLOT];
+                Rp[token] = sq;
+            }
+            __syncthreads();
+        }
+    }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// ===================================================================
+// fused_pmap_gemm_fma_mtile_v2<N_PER_BLOCK, TM, RAW_SMEM, MIN_BLOCKS>
+// -------------------------------------------------------------------
+// Spill-free rebuild of fused_pmap_gemm_fma_mtile<N_PER_BLOCK, TM>.  BITWISE
+// EQUAL to it (and so to the ks = 1 ksplit kernel): every thread owns the same
+// h positions, and every fmaf chain (new_r, sqr, acc) and the shuffle / 8-warp
+// epilogue are the same operations in the same order.  Only register
+// allocation and data movement change:
+//   - MIN_BLOCKS is explicit (1 lifts the 128-register cap that made the
+//     (12,4)/(8,4)/(24,2) builds spill).
+//   - token offsets are int32 (the launcher checks M * 4 * hidden < 2^31).
+//   - the W_T loads stay volatile asm, as in v1 (non-volatile let ptxas hoist
+//     them and spill more, job 1426).
+//   - RAW_SMEM stages the thread-private bf16 inputs (x and the 4 residual
+//     streams of each token) in shared memory with cp.async instead of
+//     keeping 20 * TM registers live across the j loop.  Each thread reads
+//     only the slots it wrote, so no barrier is needed.  The next h-step's
+//     copies are issued once j = 3 has consumed the current ones.
+//     Dynamic smem: TM * 5 * 256 * 16 bytes.
+// Grid: (ceil(M / TM), N / N_PER_BLOCK, 1).  Block: 256 threads.
+// ===================================================================
+// Thread-private cp.async of one h-step's bf16 inputs (4 residual streams + x per token)
+// into slots [(t * 5 + k) * 256 + tid] of the dynamic smem buffer.
+template <int TM>
+__device__ __forceinline__ void mtile_v2_issue_raw(uint4* s_raw, __nv_bfloat16 const* __restrict__ residual_in,
+    __nv_bfloat16 const* __restrict__ x_in, int const (&tok_res)[TM], int hidden_size, int hh, int tid)
+{
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        // x offset = tok * hidden = tok_res / 4 (tok_res = tok * 4 * hidden >= 0): no separate
+        // tok_x registers live across the h loop.
+        int const tok_x = tok_res[t] >> 2;
+#pragma unroll
+        for (int k = 0; k < 5; k++)
+        {
+            __nv_bfloat16 const* src = (k < 4) ? &residual_in[tok_res[t] + k * hidden_size + hh] : &x_in[tok_x + hh];
+            unsigned const dst = static_cast<unsigned>(__cvta_generic_to_shared(&s_raw[(t * 5 + k) * 256 + tid]));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+        }
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <int N_PER_BLOCK, int TM, bool RAW_SMEM, int MIN_BLOCKS, bool J_ROLLED = false>
+__launch_bounds__(256, MIN_BLOCKS) __global__
+    void fused_pmap_gemm_fma_mtile_v2(__nv_bfloat16 const* __restrict__ residual_in,
+        __nv_bfloat16 const* __restrict__ x_in, float const* __restrict__ post_mix,
+        float const* __restrict__ comb_mix, float const* __restrict__ W_T, float* __restrict__ Yp,
+        float* __restrict__ Rp, int M, int hidden_size, int N, int K, __nv_bfloat16* __restrict__ residual_out)
+{
+    constexpr int HC_MULT = 4;
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+    constexpr int BF16_VEC = 8;
+    constexpr int RAW_SLOTS = HC_MULT + 1; // slot k < 4: residual stream k; slot 4: x
+
+    int const tok0 = blockIdx.x * TM;
+    int const n_start = blockIdx.y * N_PER_BLOCK;
+    int const tid = threadIdx.x;
+    int const warp_id = tid / WARP_SIZE;
+    int const lane = tid % WARP_SIZE;
+    bool const do_sqr = (n_start == 0);
+
+    extern __shared__ uint4 s_raw_dyn[];
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
+    __shared__ float s_post[TM][HC_MULT];
+    __shared__ float s_comb[TM][HC_MULT][HC_MULT];
+
+    if (tid < TM * HC_MULT)
+    {
+        int const t = tid / HC_MULT;
+        int const c = tid % HC_MULT;
+        int const tok = min(tok0 + t, M - 1);
+        s_post[t][c] = post_mix[tok * HC_MULT + c];
+    }
+    if (tid < TM * HC_MULT * HC_MULT)
+    {
+        int const t = tid / (HC_MULT * HC_MULT);
+        int const rc = tid % (HC_MULT * HC_MULT);
+        int const tok = min(tok0 + t, M - 1);
+        s_comb[t][rc / HC_MULT][rc % HC_MULT] = comb_mix[tok * HC_MULT * HC_MULT + rc];
+    }
+
+    // Tokens past M (last CTA) recompute token M-1 and never write.
+    int tok_res[TM];
+    int tok_x[TM];
+    bool tok_ok[TM];
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        int const tok = min(tok0 + t, M - 1);
+        tok_ok[t] = (tok0 + t) < M;
+        tok_res[t] = tok * HC_MULT * hidden_size;
+        tok_x[t] = tok * hidden_size;
+    }
+
+    if constexpr (RAW_SMEM)
+    {
+        if (tid * BF16_VEC < hidden_size)
+            mtile_v2_issue_raw<TM>(s_raw_dyn, residual_in, x_in, tok_res, hidden_size, tid * BF16_VEC, tid);
+    }
+    __syncthreads();
+
+    float acc[TM][N_PER_BLOCK];
+    float sqr[TM];
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        sqr[t] = 0.0f;
+#pragma unroll
+        for (int n = 0; n < N_PER_BLOCK; n++)
+            acc[t][n] = 0.0f;
+    }
+
+    for (int h = tid * BF16_VEC; h < hidden_size; h += BLOCK_SIZE * BF16_VEC)
+    {
+        uint4 x_raw[RAW_SMEM ? 1 : TM];
+        uint4 r_raw[RAW_SMEM ? 1 : TM][HC_MULT];
+        if constexpr (RAW_SMEM)
+        {
+            asm volatile("cp.async.wait_all;\n" ::: "memory");
+        }
+        else
+        {
+#pragma unroll
+            for (int t = 0; t < TM; t++)
+            {
+                x_raw[t] = *reinterpret_cast<uint4 const*>(&x_in[tok_x[t] + h]);
+#pragma unroll
+                for (int k = 0; k < HC_MULT; k++)
+                    r_raw[t][k] = *reinterpret_cast<uint4 const*>(&residual_in[tok_res[t] + k * hidden_size + h]);
+            }
+        }
+
+        // J_ROLLED keeps the j loop rolled: nothing register-resident is indexed by j
+        // (s_post/s_comb are smem, W_T/residual_out are addresses), so this only stops ptxas
+        // from overlapping j+1's new_r with j's GEMM, which costs 8 * TM extra live registers.
+#pragma unroll(J_ROLLED ? 1 : HC_MULT)
+        for (int j = 0; j < HC_MULT; j++)
+        {
+            float new_r[TM][BF16_VEC];
+#pragma unroll
+            for (int t = 0; t < TM; t++)
+            {
+                float const pmj = s_post[t][j];
+                uint4 xr;
+                if constexpr (RAW_SMEM)
+                    xr = s_raw_dyn[(t * RAW_SLOTS + HC_MULT) * BLOCK_SIZE + tid];
+                else
+                    xr = x_raw[t];
+                __nv_bfloat162 const* xp = reinterpret_cast<__nv_bfloat162 const*>(&xr);
+#pragma unroll
+                for (int v = 0; v < 4; v++)
+                {
+                    float2 f = __bfloat1622float2(xp[v]);
+                    new_r[t][2 * v + 0] = pmj * f.x;
+                    new_r[t][2 * v + 1] = pmj * f.y;
+                }
+#pragma unroll
+                for (int k = 0; k < HC_MULT; k++)
+                {
+                    float const ckj = s_comb[t][k][j];
+                    uint4 rr;
+                    if constexpr (RAW_SMEM)
+                        rr = s_raw_dyn[(t * RAW_SLOTS + k) * BLOCK_SIZE + tid];
+                    else
+                        rr = r_raw[t][k];
+                    __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&rr);
+#pragma unroll
+                    for (int v = 0; v < 4; v++)
+                    {
+                        float2 f = __bfloat1622float2(rp[v]);
+                        new_r[t][2 * v + 0] = fmaf(ckj, f.x, new_r[t][2 * v + 0]);
+                        new_r[t][2 * v + 1] = fmaf(ckj, f.y, new_r[t][2 * v + 1]);
+                    }
+                }
+            }
+
+            if constexpr (RAW_SMEM)
+            {
+                // All of this step's slots are consumed: prefetch the next step.
+                if (j == HC_MULT - 1 && h + BLOCK_SIZE * BF16_VEC < hidden_size)
+                    mtile_v2_issue_raw<TM>(
+                        s_raw_dyn, residual_in, x_in, tok_res, hidden_size, h + BLOCK_SIZE * BF16_VEC, tid);
+            }
+
+            if (do_sqr)
+            {
+#pragma unroll
+                for (int t = 0; t < TM; t++)
+                {
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+                        sqr[t] = fmaf(new_r[t][v], new_r[t][v], sqr[t]);
+                    if (tok_ok[t])
+                    {
+                        uint4 packed;
+                        __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
+#pragma unroll
+                        for (int v = 0; v < 4; v++)
+                            pairs[v] = __float22bfloat162_rn(make_float2(new_r[t][2 * v], new_r[t][2 * v + 1]));
+                        *reinterpret_cast<uint4*>(residual_out + tok_res[t] + j * hidden_size + h) = packed;
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int n = 0; n < N_PER_BLOCK; n++)
+            {
+                float const* wp = W_T + (n_start + n) * K + j * hidden_size + h;
+                float w[BF16_VEC];
+                // volatile, as in v1: job 1426 showed non-volatile W_T loads let ptxas hoist
+                // them across n/j and spill (STACK 536-1200 B at 255 regs).
+                asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                             : "=f"(w[0]), "=f"(w[1]), "=f"(w[2]), "=f"(w[3])
+                             : "l"(wp));
+                asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                             : "=f"(w[4]), "=f"(w[5]), "=f"(w[6]), "=f"(w[7])
+                             : "l"(wp + 4));
+#pragma unroll
+                for (int t = 0; t < TM; t++)
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+                        acc[t][n] = fmaf(new_r[t][v], w[v], acc[t][n]);
+            }
+        }
+    }
+
+    constexpr int COLS_PER_GROUP = NUM_WARPS;
+    constexpr int SQRSUM_SLOT = COLS_PER_GROUP;
+    constexpr int N_GROUPS = (N_PER_BLOCK + COLS_PER_GROUP - 1) / COLS_PER_GROUP;
+    constexpr unsigned FULL_WARP_MASK = 0xffffffff;
+
+    __shared__ float s_warp[NUM_WARPS][COLS_PER_GROUP + 1];
+
+#pragma unroll
+    for (int t = 0; t < TM; t++)
+    {
+        int const token = tok0 + t;
+#pragma unroll
+        for (int g = 0; g < N_GROUPS; g++)
+        {
+            constexpr int LAST_COLS = N_PER_BLOCK - (N_GROUPS - 1) * COLS_PER_GROUP;
+            int const n_cols = (g == N_GROUPS - 1) ? LAST_COLS : COLS_PER_GROUP;
+#pragma unroll
+            for (int n = 0; n < COLS_PER_GROUP; n++)
+            {
+                if (n < n_cols)
+                {
+#pragma unroll
+                    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+                        acc[t][g * COLS_PER_GROUP + n]
+                            += __shfl_xor_sync(FULL_WARP_MASK, acc[t][g * COLS_PER_GROUP + n], off);
+                }
+            }
+            if (g == 0 && do_sqr)
+            {
+#pragma unroll
+                for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+                    sqr[t] += __shfl_xor_sync(FULL_WARP_MASK, sqr[t], off);
+            }
+            if (lane == 0)
+            {
+#pragma unroll
+                for (int n = 0; n < COLS_PER_GROUP; n++)
+                    if (n < n_cols)
+                        s_warp[warp_id][n] = acc[t][g * COLS_PER_GROUP + n];
+                if (g == 0 && do_sqr)
+                    s_warp[warp_id][SQRSUM_SLOT] = sqr[t];
+            }
+            __syncthreads();
+            if (tok_ok[t] && lane == 0 && warp_id < n_cols)
+            {
+                float val = 0.0f;
+#pragma unroll
+                for (int w = 0; w < NUM_WARPS; w++)
+                    val += s_warp[w][warp_id];
+                int const n_global = n_start + g * COLS_PER_GROUP + warp_id;
+                Yp[static_cast<long long>(token) * N + n_global] = val;
+            }
+            if (tok_ok[t] && g == 0 && do_sqr && lane == 0 && warp_id == 0)
+            {
+                float sq = 0.0f;
+#pragma unroll
+                for (int w = 0; w < NUM_WARPS; w++)
+                    sq += s_warp[w][SQRSUM_SLOT];
+                Rp[token] = sq;
+            }
+            __syncthreads();
+        }
+    }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// ===================================================================
+// fused_pmap_gemm_fma_mtile_v3<TM, NG, MIN_BLOCKS>
+// -------------------------------------------------------------------
+// TM tokens x all 24 N columns per CTA (v1/v2 take at most 4 tokens), so each
+// CTA streams W_T [24, 4*hidden] fp32 from L2 once per TM tokens instead of
+// once per 4.  BITWISE EQUAL to fused_pmap_gemm_fma_mtile (v1) and to the
+// ks = 1 ksplit kernel.
+//
+// ORDER MAP v1 -> v3.  In v1, thread tid ("vtid") of warp w = tid / 32 owns
+// h = tid*8 + s*2048 (s = 0, 1, ...; h < hidden), and for every (token t, n):
+//   new_r[j][v] = pm[t][j] * x[h+v], then fmaf(comb[t][k][j], r[t][k][h+v], .), k = 0..3
+//   acc[t][n]  = fmaf chain over (s, j, v) in that lexicographic order, from 0
+//   sqr[t]     = fmaf(new_r, new_r, .) chain over (s, j, v), from 0
+//   warp value = xor-shuffle tree (off = 16, 8, 4, 2, 1) over the 32 lanes
+//   Yp / Rp    = ((((0 + warp0) + warp1) + ...) + warp7)
+// v3 keeps every one of those chains and trees; only WHO runs them changes:
+//   - The CTA walks v1's 8 warps one at a time ("virtual warp" vw = 0..7) and,
+//     inside vw, v1's s steps in order.  Lane l of EVERY physical warp plays
+//     vtid = 32*vw + l, so the per-lane h positions (and the shuffle partners)
+//     are v1's.
+//   - pmap phase: physical warp p computes new_r for tokens p, p+8, ... (TM/8
+//     of them) at vtid's h, all 4 j, with v1's expressions, writes the bf16
+//     residual_out exactly as v1, runs the sqr chain, and stages new_r (fp32,
+//     unrounded) in shared memory.  Each (t, vtid) new_r is computed once.
+//   - GEMM phase: physical warp p = (token group a = p / NG, n group g = p % NG)
+//     reads new_r of its TM/(8/NG) tokens from shared memory and its 24/NG
+//     columns of W_T (volatile ld.global, prefetched one j ahead), and extends
+//     acc[t][n] with v1's fmaf(new_r[v], w[v], acc) for v = 0..7 at each (s, j):
+//     the same per-(t, n, vtid) chain, in the same order.
+//   - At the end of vw, acc and sqr go through v1's xor-shuffle tree inside the
+//     physical warp (lanes = vtids of vw) and lane 0 stores the warp value in
+//     s_part[vw] / s_sqp[vw] (virtual warps with no valid h store 0, as v1's
+//     idle warps do).  The final pass adds s_part[0..7] in order from 0.0f.
+// TM need not be a multiple of 8: pmap slot i of warp p exists only when t = p + 8 i < TM
+// (compile-time true when TM % 8 == 0, so those builds are unchanged); each token still runs
+// v1's chains once, so the result stays bitwise equal.
+// Constraints: N == 24, M * 4 * hidden < 2^31 (int32 offsets), TM % (8 / NG) == 0.
+// Grid: (ceil(M / TM), 1, 1).  Block: 256 threads.
+// Dynamic smem: 4 * TM * 32 lanes * 8 floats = TM * 4 KB (new_r of one vw step).
+// ===================================================================
+__device__ __forceinline__ uint4 mtile_v3_ld_stream(void const* p)
+{
+    uint4 r;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+                 : "l"(p));
+    return r;
+}
+
+template <int TM, int NG, int MIN_BLOCKS>
+__launch_bounds__(256, MIN_BLOCKS) __global__
+    void fused_pmap_gemm_fma_mtile_v3(__nv_bfloat16 const* __restrict__ residual_in,
+        __nv_bfloat16 const* __restrict__ x_in, float const* __restrict__ post_mix,
+        float const* __restrict__ comb_mix, float const* __restrict__ W_T, float* __restrict__ Yp,
+        float* __restrict__ Rp, int M, int hidden_size, int N, int K, __nv_bfloat16* __restrict__ residual_out)
+{
+    constexpr int HC_MULT = 4;
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+    constexpr int BF16_VEC = 8;
+    constexpr int N_TOTAL = 24;
+    constexpr int H_STEP = BLOCK_SIZE * BF16_VEC; // v1's h stride per s step (2048)
+    constexpr int VW_SPAN = WARP_SIZE * BF16_VEC; // h span of one v1 warp (256)
+    static_assert(NUM_WARPS % NG == 0 && N_TOTAL % NG == 0, "NG must divide 8 and 24");
+    constexpr int NT_R = (TM + NUM_WARPS - 1) / NUM_WARPS; // pmap token slots per thread
+    constexpr bool TM_FULL = (TM % NUM_WARPS) == 0;        // every slot of every warp is a token
+    constexpr int A_GROUPS = NUM_WARPS / NG;
+    static_assert(TM % A_GROUPS == 0, "TM must divide into token groups");
+    constexpr int TMT = TM / A_GROUPS;   // GEMM tokens per thread
+    constexpr int TNT = N_TOTAL / NG;    // GEMM columns per thread
+    constexpr unsigned FULL_WARP_MASK = 0xffffffff;
+
+    int const tok0 = blockIdx.x * TM;
+    int const tid = threadIdx.x;
+    int const warp_id = tid / WARP_SIZE;
+    int const lane = tid % WARP_SIZE;
+    int const a_grp = warp_id / NG;
+    int const n_grp = warp_id % NG;
+
+    extern __shared__ float4 s_nr[]; // [HC_MULT][TM][2 halves][32 lanes]
+    __shared__ float s_part[NUM_WARPS][TM][N_TOTAL];
+    __shared__ float s_sqp[NUM_WARPS][TM];
+    __shared__ float s_post[TM][HC_MULT];
+    __shared__ float s_comb[TM][HC_MULT][HC_MULT];
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
+    for (int i = tid; i < TM * HC_MULT; i += BLOCK_SIZE)
+    {
+        int const t = i / HC_MULT;
+        int const tok = min(tok0 + t, M - 1);
+        s_post[t][i % HC_MULT] = post_mix[tok * HC_MULT + i % HC_MULT];
+    }
+    for (int i = tid; i < TM * HC_MULT * HC_MULT; i += BLOCK_SIZE)
+    {
+        int const t = i / (HC_MULT * HC_MULT);
+        int const rc = i % (HC_MULT * HC_MULT);
+        int const tok = min(tok0 + t, M - 1);
+        s_comb[t][rc / HC_MULT][rc % HC_MULT] = comb_mix[tok * HC_MULT * HC_MULT + rc];
+    }
+    // Virtual warps with no valid h keep 0 partials (v1's idle warps write 0).
+    for (int i = tid; i < NUM_WARPS * TM * N_TOTAL; i += BLOCK_SIZE)
+        (&s_part[0][0][0])[i] = 0.0f;
+    for (int i = tid; i < NUM_WARPS * TM; i += BLOCK_SIZE)
+        (&s_sqp[0][0])[i] = 0.0f;
+
+    // pmap tokens of this thread: warp_id + 8 * i.  Tokens past M recompute M-1, never write.
+    int tok_res[NT_R];
+    bool tok_ok[NT_R];
+#pragma unroll
+    for (int i = 0; i < NT_R; i++)
+    {
+        int const t = warp_id + NUM_WARPS * i;
+        tok_ok[i] = (tok0 + t) < M;
+        tok_res[i] = min(tok0 + t, M - 1) * HC_MULT * hidden_size;
+    }
+    // Pmap slot i of this warp holds a CTA token (t = warp_id + 8 i < TM).
+    auto slot_in = [&](int i) { return TM_FULL || (warp_id + NUM_WARPS * i) < TM; };
+
+    uint4 raw[NT_R][HC_MULT + 1]; // slot k < 4: residual stream k; slot 4: x
+    auto load_raw = [&](int hh)
+    {
+#pragma unroll
+        for (int i = 0; i < NT_R; i++)
+        {
+            if (slot_in(i))
+            {
+#pragma unroll
+                for (int k = 0; k < HC_MULT; k++)
+                    raw[i][k] = mtile_v3_ld_stream(&residual_in[tok_res[i] + k * hidden_size + hh]);
+                raw[i][HC_MULT] = mtile_v3_ld_stream(&x_in[(tok_res[i] >> 2) + hh]);
+            }
+        }
+    };
+
+    float const* const w_row = W_T + n_grp * TNT * K;
+    float wcur[TNT][BF16_VEC];
+    auto load_w = [&](float (&wd)[TNT][BF16_VEC], int hh, int jj)
+    {
+#pragma unroll
+        for (int n = 0; n < TNT; n++)
+        {
+            float const* wp = w_row + n * K + jj * hidden_size + hh;
+            asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                         : "=f"(wd[n][0]), "=f"(wd[n][1]), "=f"(wd[n][2]), "=f"(wd[n][3])
+                         : "l"(wp));
+            asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
+                         : "=f"(wd[n][4]), "=f"(wd[n][5]), "=f"(wd[n][6]), "=f"(wd[n][7])
+                         : "l"(wp + 4));
+        }
+    };
+
+    float acc[TMT][TNT];
+    float sqr[NT_R];
+#pragma unroll
+    for (int i = 0; i < TMT; i++)
+#pragma unroll
+        for (int n = 0; n < TNT; n++)
+            acc[i][n] = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NT_R; i++)
+        sqr[i] = 0.0f;
+
+    int vw = 0;
+    int s = 0;
+    int h = lane * BF16_VEC;
+    bool valid = h < hidden_size;
+    bool const any_step = hidden_size > 0;
+    if (valid)
+    {
+        load_raw(h);
+        load_w(wcur, h, 0);
+    }
+    __syncthreads();
+
+    while (any_step)
+    {
+        // ---- pmap phase: new_r of tokens warp_id + 8 i at (vw, s), all 4 j ----
+        if (valid)
+        {
+#pragma unroll
+            for (int i = 0; i < NT_R; i++)
+            {
+                if (!slot_in(i))
+                    continue;
+                int const t = warp_id + NUM_WARPS * i;
+#pragma unroll
+                for (int j = 0; j < HC_MULT; j++)
+                {
+                    float new_r[BF16_VEC];
+                    float const pmj = s_post[t][j];
+                    __nv_bfloat162 const* xp = reinterpret_cast<__nv_bfloat162 const*>(&raw[i][HC_MULT]);
+#pragma unroll
+                    for (int v = 0; v < 4; v++)
+                    {
+                        float2 f = __bfloat1622float2(xp[v]);
+                        new_r[2 * v + 0] = pmj * f.x;
+                        new_r[2 * v + 1] = pmj * f.y;
+                    }
+#pragma unroll
+                    for (int k = 0; k < HC_MULT; k++)
+                    {
+                        float const ckj = s_comb[t][k][j];
+                        __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&raw[i][k]);
+#pragma unroll
+                        for (int v = 0; v < 4; v++)
+                        {
+                            float2 f = __bfloat1622float2(rp[v]);
+                            new_r[2 * v + 0] = fmaf(ckj, f.x, new_r[2 * v + 0]);
+                            new_r[2 * v + 1] = fmaf(ckj, f.y, new_r[2 * v + 1]);
+                        }
+                    }
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+                        sqr[i] = fmaf(new_r[v], new_r[v], sqr[i]);
+                    if (tok_ok[i])
+                    {
+                        uint4 packed;
+                        __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
+#pragma unroll
+                        for (int v = 0; v < 4; v++)
+                            pairs[v] = __float22bfloat162_rn(make_float2(new_r[2 * v], new_r[2 * v + 1]));
+                        *reinterpret_cast<uint4*>(residual_out + tok_res[i] + j * hidden_size + h) = packed;
+                    }
+                    s_nr[((j * TM + t) * 2 + 0) * WARP_SIZE + lane]
+                        = make_float4(new_r[0], new_r[1], new_r[2], new_r[3]);
+                    s_nr[((j * TM + t) * 2 + 1) * WARP_SIZE + lane]
+                        = make_float4(new_r[4], new_r[5], new_r[6], new_r[7]);
+                }
+            }
+        }
+
+        // ---- next step (uniform across the CTA): v1's next s, else the next virtual warp ----
+        int nvw = vw;
+        int ns = s + 1;
+        if (vw * VW_SPAN + ns * H_STEP >= hidden_size)
+        {
+            nvw = vw + 1;
+            ns = 0;
+        }
+        bool const has_next = nvw < NUM_WARPS && nvw * VW_SPAN < hidden_size;
+        int const nh = nvw * VW_SPAN + lane * BF16_VEC + ns * H_STEP;
+        bool const nvalid = has_next && nh < hidden_size;
+        if (nvalid)
+            load_raw(nh); // raw[] is consumed: prefetch the next step's inputs
+        __syncthreads();  // s_nr visible
+
+        // ---- GEMM phase: acc[t][n] += new_r * W_T over j = 0..3, v = 0..7 ----
+#pragma unroll 1
+        for (int j = 0; j < HC_MULT; j++)
+        {
+            float wnxt[TNT][BF16_VEC];
+            if (j + 1 < HC_MULT)
+            {
+                if (valid)
+                    load_w(wnxt, h, j + 1);
+            }
+            else if (nvalid)
+            {
+                load_w(wnxt, nh, 0);
+            }
+            if (valid)
+            {
+#pragma unroll
+                for (int i = 0; i < TMT; i++)
+                {
+                    int const t = a_grp * TMT + i;
+                    float4 const lo = s_nr[((j * TM + t) * 2 + 0) * WARP_SIZE + lane];
+                    float4 const hi = s_nr[((j * TM + t) * 2 + 1) * WARP_SIZE + lane];
+                    float const nr[BF16_VEC] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+#pragma unroll
+                        for (int n = 0; n < TNT; n++)
+                            acc[i][n] = fmaf(nr[v], wcur[n][v], acc[i][n]);
+                }
+            }
+#pragma unroll
+            for (int n = 0; n < TNT; n++)
+#pragma unroll
+                for (int v = 0; v < BF16_VEC; v++)
+                    wcur[n][v] = wnxt[n][v];
+        }
+
+        // ---- end of virtual warp vw: v1's xor-shuffle trees, warp value to smem ----
+        if (nvw != vw || !has_next)
+        {
+#pragma unroll
+            for (int i = 0; i < TMT; i++)
+            {
+#pragma unroll
+                for (int n = 0; n < TNT; n++)
+                {
+#pragma unroll
+                    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+                        acc[i][n] += __shfl_xor_sync(FULL_WARP_MASK, acc[i][n], off);
+                    if (lane == 0)
+                        s_part[vw][a_grp * TMT + i][n_grp * TNT + n] = acc[i][n];
+                    acc[i][n] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < NT_R; i++)
+            {
+                if (!slot_in(i))
+                    continue;
+#pragma unroll
+                for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+                    sqr[i] += __shfl_xor_sync(FULL_WARP_MASK, sqr[i], off);
+                if (lane == 0)
+                    s_sqp[vw][warp_id + NUM_WARPS * i] = sqr[i];
+                sqr[i] = 0.0f;
+            }
+        }
+        __syncthreads(); // GEMM reads of s_nr done before the next pmap phase overwrites it
+        if (!has_next)
+            break;
+        vw = nvw;
+        s = ns;
+        h = nh;
+        valid = nvalid;
+    }
+
+    // ---- v1's sequential 8-warp sums ----
+    for (int i = tid; i < TM * N_TOTAL; i += BLOCK_SIZE)
+    {
+        int const t = i / N_TOTAL;
+        int const n = i % N_TOTAL;
+        if (tok0 + t < M)
+        {
+            float val = 0.0f;
+#pragma unroll
+            for (int w = 0; w < NUM_WARPS; w++)
+                val += s_part[w][t][n];
+            Yp[(tok0 + t) * N + n] = val;
+        }
+    }
+    if (tid < TM && tok0 + tid < M)
+    {
+        float sq = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NUM_WARPS; w++)
+            sq += s_sqp[w][tid];
+        Rp[tok0 + tid] = sq;
+    }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 } // namespace fused_fma_kernels

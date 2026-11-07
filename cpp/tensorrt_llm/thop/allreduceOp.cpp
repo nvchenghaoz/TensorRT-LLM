@@ -1433,13 +1433,14 @@ private:
         // For ONESHOT, TWOSHOT, LOWPRECISION, fallback is allowed.
         auto const message_size = seq_len * hidden_size;
 
-        // Check if LOWPRECISION is supported.
-        if (isUsingLowPrecision(hidden_size))
+        auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(mType);
+
+        // Check if LOWPRECISION is supported. The threshold is on the whole message, not on one row.
+        if (isUsingLowPrecision(message_size_bytes))
         {
             return AllReduceStrategyType::LOWPRECISION;
         }
 
-        auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(mType);
         auto const max_workspace_size
             = tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(mGroup.size());
 
@@ -1451,7 +1452,8 @@ private:
         // This rule based heuristic only chooses between NCCL_SYMMETRIC and MIN_LATENCY strategies.
         // From this point, all fusion patterns are supported by all these strategies: NCCL_SYMMETRIC, ONESHOT, TWOSHOT
         // and MIN_LATENCY.
-        if (mStrategy != AllReduceStrategyType::AUTO)
+        // LOWPRECISION below its size threshold takes the same path as AUTO.
+        if (mStrategy != AllReduceStrategyType::AUTO && mStrategy != AllReduceStrategyType::LOWPRECISION)
         {
             // Check TWOSHOT constraint: seq_len >= tp_size
             if (mStrategy == AllReduceStrategyType::TWOSHOT && seq_len < mGroup.size())
@@ -1462,6 +1464,12 @@ private:
             }
             return mStrategy;
         }
+        else if (!mIsNVLINKSupported)
+        {
+            // PCIe-only group with peer access (ifFallbackToNCCL already capped the size): the lookup table was
+            // tuned on NVLink, so take the one-shot lamport kernel, whose critical path is posted peer writes.
+            return AllReduceStrategyType::ONESHOT;
+        }
         else
         {
             return tensorrt_llm::utils::customAllReduceUtils::selectStrategyLookUpTable(
@@ -1469,12 +1477,30 @@ private:
         }
     }
 
+    static size_t getPcieCustomAllReduceMaxBytes()
+    {
+        // Largest message the custom ONESHOT/TWOSHOT kernels may take on a PCIe-only (no NVLink) group with full
+        // peer access; larger messages use NCCL. Unset or TLLM_PCIE_CUSTOM_AR_MAX_BYTES=0 keeps every size on NCCL.
+        static size_t const maxBytes = []()
+        {
+            char const* env = std::getenv("TLLM_PCIE_CUSTOM_AR_MAX_BYTES");
+            return env != nullptr ? static_cast<size_t>(std::strtoull(env, nullptr, 10))
+                                  : static_cast<size_t>(kPcieCustomAllReduceDefaultMaxBytes);
+        }();
+        return maxBytes;
+    }
+
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
         // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL fallback.
-        if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
+        if (message_size_bytes > max_workspace_size || !mIsP2PSupported)
         {
             return true;
+        }
+        // Without NVLink, the custom kernels still run over PCIe peer-to-peer up to a size cap.
+        if (!mIsNVLINKSupported)
+        {
+            return message_size_bytes > getPcieCustomAllReduceMaxBytes();
         }
 
         return false;
@@ -1496,6 +1522,13 @@ private:
     }
 
 private:
+    // PCIe-only default cap for the custom kernels (see getPcieCustomAllReduceMaxBytes): 0, every size on NCCL. The
+    // DeepSeek-V4.1-Flash SM120 modeling_v2 target sets TLLM_PCIE_CUSTOM_AR_MAX_BYTES=524288: on 4x RTX PRO 6000 (PCIe
+    // Gen5, TP4, bf16 x 5120) one-shot beats NCCL up to ~32 tokens (320 KiB) and loses from 64 tokens (640 KiB) up;
+    // two-shot wins only near 64 tokens (49 vs 53 us), and at prefill sizes both lose to NCCL (2048 tokens: one-shot
+    // 1.71 ms, two-shot 0.90 ms, NCCL with NCCL_P2P_LEVEL=PHB 0.78 ms).
+    static constexpr size_t kPcieCustomAllReduceDefaultMaxBytes = 0;
+
     std::set<int> mGroup;
     bool mIsNVLINKSupported;
     bool mIsP2PSupported;

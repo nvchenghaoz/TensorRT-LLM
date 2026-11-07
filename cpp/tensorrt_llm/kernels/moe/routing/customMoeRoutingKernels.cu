@@ -22,6 +22,7 @@
 #include "tensorrt_llm/kernels/moe/routing/customMoeRoutingKernels.h"
 #include "tensorrt_llm/kernels/moeTopKFuncs.cuh"
 #include <climits> // For INT_MAX
+#include <cstdlib> // For std::getenv
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cub/cub.cuh>
@@ -312,14 +313,27 @@ INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, true);
 
 static constexpr int kTOPK = 6;
 
+namespace gate_forward_detail
+{
+// Warp maximum of a 32-bit unsigned value (redux.sync, sm_80+).
+__device__ __forceinline__ uint32_t warpMaxU32(uint32_t value)
+{
+    uint32_t result;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(result) : "r"(value));
+    return result;
+}
+} // namespace gate_forward_detail
+
 // CUDA kernel for gate forward
 // Input: pre-computed scores from linear(x, weight) done outside kernel
 // Template parameters:
 //   nExperts: number of experts
 //   topK: number of top experts to select
 //   hash: true for hash mode, false for topk mode
+//   legacyBody: the original top-k body (the default). TRTLLM_GATE_FORWARD_FAST_BODY=1 selects the other body, which
+//               computes the same values with the same expressions and the same selection order (see below).
 // One warp per row (batch element)
-template <int nExperts, int topK, bool hash>
+template <int nExperts, int topK, bool hash, bool legacyBody = false>
 __global__ void gate_forward_kernel(
     float const* __restrict__ scores_in, // [batch_size, nExperts] - pre-computed from linear(x, weight)
     float const* __restrict__ bias,      // [nExperts] (only used when hash=false)
@@ -351,6 +365,88 @@ __global__ void gate_forward_kernel(
     // Pointer to this warp's shared memory and input scores
     float* my_smem = smem_scores[local_warp_id];
     float const* scores_row = scores_in + global_warp_id * nExperts;
+
+    if constexpr (!hash && !legacyBody)
+    {
+        // Same math as the legacy body below, with one global round trip and 32-bit warp reductions:
+        // (1) all score loads (through L2: the router just wrote them) and all bias loads are issued before any math;
+        // (2) the selection keys are reduceTopK's packed keys (moeTopKFuncs.cuh), sorted per lane by reduceTopK's own
+        //     Sort; each round takes the warp maximum of the leading keys as two 32-bit reductions (the score half,
+        //     then the index half among the lanes holding that score), which is exactly reduceTopK's 64-bit maximum,
+        //     and the winner lane drops its key with reduceTopK's filler. So the experts and their order are the same;
+        // (3) the gather, the sum reduction and the weight expression are unchanged.
+        using RedType = reduce_topk::TopKRedType<float>;
+        constexpr float minValue = -1e30f;
+
+        float raw[kExpertsPerThread];
+#pragma unroll
+        for (int e = 0; e < kExpertsPerThread; ++e)
+        {
+            raw[e] = __ldcg(scores_row + lane_id + e * WARP_SIZE);
+        }
+        float const* token_bias = image_mask != nullptr && image_mask[global_warp_id] ? vision_bias : bias;
+        float bias_v[kExpertsPerThread];
+#pragma unroll
+        for (int e = 0; e < kExpertsPerThread; ++e)
+        {
+            bias_v[e] = token_bias[lane_id + e * WARP_SIZE];
+        }
+
+        RedType keys[kExpertsPerThread];
+#pragma unroll
+        for (int e = 0; e < kExpertsPerThread; ++e)
+        {
+            int const expert_id = lane_id + e * WARP_SIZE;
+            float const s = raw[e];
+            float const sp = s > kSoftplusThreshold ? s : log1pf(expf(s));
+            float const score = sqrtf(sp);
+            my_smem[expert_id] = score;
+            keys[e] = RedType{score + bias_v[e], expert_id};
+        }
+
+        reduce_topk::Sort<kExpertsPerThread, RedType>::run(keys);
+
+        int my_topk_index = 0;
+        uint64_t packedMax = 0;
+#pragma unroll
+        for (int k = 0; k < topK; ++k)
+        {
+            if (k > 0 && packedMax == keys[0].compValIdx)
+            {
+                // This lane held the previous maximum: drop it, as reduceTopK does.
+#pragma unroll
+                for (int i = 0; i + 1 < kExpertsPerThread; ++i)
+                {
+                    keys[i] = keys[i + 1];
+                }
+                keys[kExpertsPerThread - 1] = RedType{minValue, lane_id + (kExpertsPerThread - 1) * WARP_SIZE};
+            }
+            uint32_t const scoreBits = static_cast<uint32_t>(keys[0].compValIdx >> 32);
+            uint32_t const maxScoreBits = gate_forward_detail::warpMaxU32(scoreBits);
+            uint32_t const indexBits = gate_forward_detail::warpMaxU32(
+                scoreBits == maxScoreBits ? static_cast<uint32_t>(keys[0].compValIdx) : 0U);
+            packedMax = (static_cast<uint64_t>(maxScoreBits) << 32) | indexBits;
+            if (lane_id == k)
+            {
+                my_topk_index = RedType::kMaxIdx - static_cast<int32_t>(indexBits & 0xFFFF);
+            }
+        }
+        __syncwarp(); // scores in shared memory are visible to the whole warp
+
+        float my_topk_value = 0.0f;
+        if (lane_id < topK)
+        {
+            my_topk_value = my_smem[my_topk_index]; // original score (no bias)
+        }
+        float weight_sum = cg::reduce(warp, my_topk_value, cg::plus<float>{});
+        if (lane_id < topK)
+        {
+            out_weights[global_warp_id * topK + lane_id]
+                = (my_topk_value / (weight_sum + kWeightEpsilon)) * route_scale;
+            out_indices[global_warp_id * topK + lane_id] = my_topk_index;
+        }
+        return;
+    }
 
 // Load scores, apply score function (softplus + sqrt), and store to shared memory
 #pragma unroll
@@ -434,8 +530,20 @@ void launch_gate_forward_kernel(float* scores_in, float* bias, int* input_ids, i
     constexpr int threads_per_block = warps_per_block * WARP_SIZE;
     int const blocks = (batch_size + warps_per_block - 1) / warps_per_block;
 
-    gate_forward_kernel<nExperts, kTOPK, hash><<<blocks, threads_per_block, 0, stream>>>(scores_in, bias, input_ids,
-        tid2eid, out_weights, out_indices, batch_size, route_scale, image_mask, vision_bias);
+    // Opt-in for the faster top-k body (bitwise equal; the DeepSeek-V4.1-Flash SM120 modeling_v2 target sets it). Read
+    // per call so a test can flip it in-process; decode runs inside CUDA graphs, where this host read is not replayed.
+    char const* fast_env = std::getenv("TRTLLM_GATE_FORWARD_FAST_BODY");
+    bool const legacy = hash || fast_env == nullptr || fast_env[0] != '1';
+    if (legacy)
+    {
+        gate_forward_kernel<nExperts, kTOPK, hash, true><<<blocks, threads_per_block, 0, stream>>>(scores_in, bias,
+            input_ids, tid2eid, out_weights, out_indices, batch_size, route_scale, image_mask, vision_bias);
+    }
+    else
+    {
+        gate_forward_kernel<nExperts, kTOPK, hash, false><<<blocks, threads_per_block, 0, stream>>>(scores_in, bias,
+            input_ids, tid2eid, out_weights, out_indices, batch_size, route_scale, image_mask, vision_bias);
+    }
 }
 
 void gate_forward(void* scores_in, // [batch_size, nExperts] - pre-computed from linear(x, weight)

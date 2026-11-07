@@ -45,6 +45,16 @@ constexpr int LP_ALLREDUCE_MAX_ELTS_IN_WORKSPACE = 32 * 1024 * 1024;
 constexpr int LP_ALLREDUCE_MIN_ELTS_THRESHOLD = 8 * 1024 * 1024;
 constexpr int LP_ALLREDUCE_MAX_TP_SIZE = 8;
 constexpr int LP_ALLREDUCE_MAX_RANKS_PER_NODE = 16;
+// Grid of lowPrecisionTwoShotAllReduceKernel (ranks_per_node <= 4). Separate from LP_ALLREDUCE_MAX_BLOCKS, which
+// sizes the hierarchical (8-rank) workspace. Block b's inter-stage barrier uses uint64 flag
+// RANKS + b * RANKS + rank of peer_barrier_ptrs_in, so that buffer must hold RANKS * (1 + LP_TWOSHOT_MAX_CTAS) flags
+// (allreduce_helper.py CustomAllReduceHelper.lowprecision_barrier_bytes mirrors this). The output does not depend on
+// the grid: both stages grid-stride over fixed per-warp groups. TRTLLM_LP_AR_TWOSHOT_CTAS overrides the default.
+constexpr int LP_TWOSHOT_MAX_CTAS = 128;
+// 16 = the original LP_ALLREDUCE_MAX_BLOCKS * 2. Job 1640 width sweep ([M,5120] bf16, M 2048/4096/6144, 4 ranks): every
+// width 32..128 is bitwise equal to 16 but at most 1.2% faster (LP_32 2048: 472.9 vs 478.8 us), inside the 1.3-2.6%
+// per-arm noise, so the default stays 16.
+constexpr int LP_TWOSHOT_DEFAULT_CTAS = 16;
 
 struct StaticLowPrecisionBuffers
 {

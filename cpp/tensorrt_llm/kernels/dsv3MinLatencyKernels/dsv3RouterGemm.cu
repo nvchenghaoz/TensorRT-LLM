@@ -242,6 +242,32 @@ __device__ __forceinline__ void routerGemmMma(float* out, __nv_bfloat16 const* m
 
     float acc[kTilesN][4] = {};
 
+    // When the whole K-slice of a warp fits in one load batch (384 x 5120, 640 threads: 8 chunks per warp) and
+    // there is no latent output, issue the first kPreWaitChunks weight (B) chunks before the PDL wait: the weights
+    // are constants that no predecessor kernel writes, so their DRAM latency overlaps the predecessor's tail (in the
+    // DeepSeek-V4.1 decode step the predecessor is the mHC layer-input kernel, which releases the router early).
+    // Activation (A) loads and the remaining B chunks stay after the wait. MMA order and the reduction are unchanged
+    // (bitwise). Depth 2 of 8: deeper pre-wait loading saves more behind a long predecessor but slows the kernel by
+    // 2-9% when there is no PDL window (RTX PRO 6000, 40-layer chain); depth 2 is neutral there. Other instances
+    // keep the old path.
+    constexpr bool kPreWaitWeights = (kChunksPerWarp == kBatch) && (kLatentDim == 0);
+    constexpr int kPreWaitChunks = kPreWaitWeights ? 2 : 0;
+    uint4 b_pre[kPreWaitWeights ? kPreWaitChunks : 1][kTilesN];
+    if constexpr (kPreWaitWeights)
+    {
+        int const k_lane = k_warp + q * 8;
+#pragma unroll
+        for (int c = 0; c < kPreWaitChunks; c++)
+        {
+#pragma unroll
+            for (int t = 0; t < kTilesN; t++)
+            {
+                b_pre[c][t] = *reinterpret_cast<uint4 const*>(
+                    mat_b + static_cast<int64_t>(n_base + t * 8 + g) * kHiddenDim + k_lane + c * kChunk);
+            }
+        }
+    }
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
@@ -277,8 +303,15 @@ __device__ __forceinline__ void routerGemmMma(float* out, __nv_bfloat16 const* m
 #pragma unroll
             for (int t = 0; t < kTilesN; t++)
             {
-                b[c][t] = *reinterpret_cast<uint4 const*>(
-                    weight + static_cast<int64_t>(weightColumn + t * 8 + g) * kHiddenDim + k);
+                if (kPreWaitWeights && batch + c < kPreWaitChunks)
+                {
+                    b[c][t] = b_pre[(batch + c < kPreWaitChunks) ? c : 0][t];
+                }
+                else
+                {
+                    b[c][t] = *reinterpret_cast<uint4 const*>(
+                        weight + static_cast<int64_t>(weightColumn + t * 8 + g) * kHiddenDim + k);
+                }
             }
         }
 #pragma unroll
@@ -368,8 +401,9 @@ void invokeRouterGemmMma(float* output, __nv_bfloat16 const* mat_a, __nv_bfloat1
     // 8 expert columns per CTA and 14 warps splitting K: for 896 x 7168 that is 112 CTAs (one wave on B200)
     // each doing 16 k-chunks per warp. Measured B200 (graph replay, L2-warm) vs the cuBLAS fallback:
     // M=1 2.79 vs 7.36 us, M=8 3.77 vs 7.62 us, M=16 4.70 vs 6.64 us.
+    // For 384 x 5120 (DeepSeek-V4.1-Flash) a 20-warp CTA gives 8 k-chunks per warp, all kept in flight.
     constexpr int kExpertsPerCta = 8;
-    constexpr int kBlockSize = 448;
+    constexpr int kBlockSize = kHiddenDim == 5120 ? 640 : 448;
     static_assert(kNumExperts % kExpertsPerCta == 0, "kNumExperts must be a multiple of kExpertsPerCta");
     cudaLaunchConfig_t config;
     config.gridDim = kNumExperts / kExpertsPerCta;
@@ -641,6 +675,29 @@ template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__n
 
 template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 16, 288, 4096>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+// num_experts=384, hidden_dim=5120 instantiations (DeepSeek-V4.1-Flash), tensor-core variant: 48 CTAs of 20 warps,
+// 8 k-chunks per warp all in flight.
+#define INSTANTIATE_ROUTER_GEMM_MMA_V41(kNumTokens)                                                                    \
+    template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemmMma<kNumTokens, 384, 5120>(            \
+        float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+INSTANTIATE_ROUTER_GEMM_MMA_V41(1)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(2)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(3)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(4)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(5)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(6)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(7)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(8)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(9)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(10)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(11)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(12)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(13)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(14)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(15)
+INSTANTIATE_ROUTER_GEMM_MMA_V41(16)
+#undef INSTANTIATE_ROUTER_GEMM_MMA_V41
 
 } // namespace kernels::dsv3MinLatencyKernels
 

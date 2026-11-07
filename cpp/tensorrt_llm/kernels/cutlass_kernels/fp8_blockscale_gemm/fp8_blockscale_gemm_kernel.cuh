@@ -17,6 +17,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cub/cub.cuh>
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
@@ -973,6 +974,85 @@ void launch_sm120_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
+// SM120 FP8 block-scale tile choice for shape_m > 64 (prefill; M <= 64 keeps <32,128,4>).
+// Every config runs the same per-element chain of SM120_16x8x32_TN_VS MMAs over K into one fp32 accumulator and the
+// same epilogue, so the output is bitwise identical for every tile; only the work split changes.
+// The persistent grid runs ceil(tiles / SMs) waves of tiles. The per-CTA time of one 128-wide k-tile depends on the
+// config and hardly on how many CTAs are active, so pick the config minimizing
+//   waves * (k_tiles * ktile_cost + wave_overhead).
+// Constants (1e-2 us) are fitted on RTX PRO 6000 (188 SMs) cold-L2 sweeps of the DeepSeek-V4.1 TP4 shapes
+// (experiments/ascent/sm120bs_tiles/sweep.py): [M,5120]x[2304,5120], [M,1152]x[5120,1152], 2x[M,4096]x[1024,4096],
+// M = 128..2048. Opt-in: TRTLLM_SM120_FP8_BLOCKSCALE_TILE_HEURISTIC=1 enables it; unset keeps <64,128,4> for M > 64.
+enum class Sm120BlockScaleTile : int
+{
+    k64x128x4 = 0,
+    k32x64x4,
+    k64x64x4,
+    k96x128x2,
+    k128x128x2,
+};
+
+inline Sm120BlockScaleTile pick_sm120_blockscale_tile(
+    uint32_t num_problems, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    static bool const kEnabled = []()
+    {
+        char const* env = std::getenv("TRTLLM_SM120_FP8_BLOCKSCALE_TILE_HEURISTIC");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (!kEnabled || num_sms <= 0)
+    {
+        return Sm120BlockScaleTile::k64x128x4;
+    }
+    struct Cand
+    {
+        Sm120BlockScaleTile tile;
+        int64_t tile_m;
+        int64_t tile_n;
+        int64_t ktile_cost;
+    };
+    // The production <64,128,4> comes first and wins ties.
+    static constexpr Cand kCands[] = {
+        {Sm120BlockScaleTile::k64x128x4, 64, 128, 72},
+        {Sm120BlockScaleTile::k32x64x4, 32, 64, 41},
+        {Sm120BlockScaleTile::k64x64x4, 64, 64, 53},
+        {Sm120BlockScaleTile::k96x128x2, 96, 128, 90},
+        {Sm120BlockScaleTile::k128x128x2, 128, 128, 108},
+    };
+    constexpr int64_t kWaveOverhead = 350;
+    int64_t const k_tiles = (static_cast<int64_t>(shape_k) + 127) / 128;
+    bool const narrow_n_ok = shape_n % 64 == 0;
+    Sm120BlockScaleTile best = Sm120BlockScaleTile::k64x128x4;
+    int64_t best_cost = -1;
+    for (auto const& c : kCands)
+    {
+        if (c.tile_n < 128 && !narrow_n_ok)
+        {
+            continue;
+        }
+        int64_t const tiles = static_cast<int64_t>(num_problems) * ((shape_m + c.tile_m - 1) / c.tile_m)
+            * ((shape_n + c.tile_n - 1) / c.tile_n);
+        int64_t const waves = (tiles + num_sms - 1) / num_sms;
+        int64_t const cost = waves * (k_tiles * c.ktile_cost + kWaveOverhead);
+        if (best_cost < 0 || cost < best_cost)
+        {
+            best = c.tile;
+            best_cost = cost;
+        }
+    }
+    return best;
+}
+
+#define TLLM_SM120_BLOCKSCALE_TILE_SWITCH(TILE, LAUNCH)                                                               \
+    switch (TILE)                                                                                                      \
+    {                                                                                                                  \
+    case Sm120BlockScaleTile::k32x64x4: LAUNCH(32, 64, 4); break;                                                      \
+    case Sm120BlockScaleTile::k64x64x4: LAUNCH(64, 64, 4); break;                                                      \
+    case Sm120BlockScaleTile::k96x128x2: LAUNCH(96, 128, 2); break;                                                    \
+    case Sm120BlockScaleTile::k128x128x2: LAUNCH(128, 128, 2); break;                                                  \
+    default: LAUNCH(64, 128, 4); break;                                                                                \
+    }
+
 void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
     uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
 {
@@ -997,8 +1077,13 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     }
     else
     {
-        launch_sm120_gemm_kernel<64, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
-            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+#define TLLM_SM120_GEMM_LAUNCH(TM, TN, ST)                                                                             \
+    launch_sm120_gemm_kernel<TM, TN, ST>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,         \
+        scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms)
+        TLLM_SM120_BLOCKSCALE_TILE_SWITCH(
+            pick_sm120_blockscale_tile(num_problems, shape_m, shape_n, shape_k, num_device_sms),
+            TLLM_SM120_GEMM_LAUNCH)
+#undef TLLM_SM120_GEMM_LAUNCH
     }
 }
 
@@ -1330,16 +1415,21 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
 
+#define TLLM_SM120_STRIDED_BMM_LAUNCH(TM, TN, ST)                                                                     \
+    launch_sm120_gemm_kernel<TM, TN, ST>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,        \
+        scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms)
     if (shape_m <= 64)
     {
-        launch_sm120_gemm_kernel<32, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
-            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+        TLLM_SM120_STRIDED_BMM_LAUNCH(32, 128, 4);
     }
     else
     {
-        launch_sm120_gemm_kernel<64, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
-            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+        // Same bitwise-exact tile choice as gemm_dispatch_sm120 (e.g. DeepSeek-V4 wo_a 2 x [M,4096]x[1024,4096]).
+        TLLM_SM120_BLOCKSCALE_TILE_SWITCH(
+            pick_sm120_blockscale_tile(num_problems, shape_m, shape_n, shape_k, num_device_sms),
+            TLLM_SM120_STRIDED_BMM_LAUNCH)
     }
+#undef TLLM_SM120_STRIDED_BMM_LAUNCH
 }
 
 void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a, int ld_a,

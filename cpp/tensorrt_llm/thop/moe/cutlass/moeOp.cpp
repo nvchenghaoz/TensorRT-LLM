@@ -387,7 +387,20 @@ public:
         }
 #endif
 #ifdef ENABLE_FP4
-        if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())
+        if (isWMxfp4AMxfp8Quant() && mActivationDtype != c10::ScalarType::Float8_e4m3fn)
+        {
+            // BF16/FP16 activations with MXFP4 weights + MXFP8 activation scaling: the MXFP8 quant of the input
+            // is folded into expandInputRowsKernel (InputType = 16-bit, T = e4m3).
+            // The runner's InputType is its OutputType (switch_output_type<..., NeedQuant=true>), so a 16-bit input
+            // of another dtype than the output would be reinterpreted bit for bit.
+            TORCH_CHECK(mActivationDtype == mOutputDtype,
+                "16-bit input with MXFP4 weights and MXFP8 activation scaling (in-kernel MXFP8 quant) requires the "
+                "input dtype to equal the output dtype; got input ",
+                torch::toString(mActivationDtype), " and output ", torch::toString(mOutputDtype));
+            mInnerDimMultiplier = 16; // 16 FP4 -> 1 LONG
+            mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp4_e2m1, true>(mOutputDtype);
+        }
+        else if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())
         {
             mInnerDimMultiplier = 16; // 16 FP4 -> 1 LONG
             mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp4_e2m1>(mOutputDtype);
@@ -652,6 +665,13 @@ public:
             // MXFP4 weights are required to bealigned to 128 bytes
             TORCH_CHECK(hidden_size % 128 == 0, "hidden_size must be divisible by 128 for MXFP4 weights");
             TORCH_CHECK(inter_size % 128 == 0, "inter_size must be divisible by 128 for MXFP4 weights");
+            if (isWMxfp4AMxfp8Quant() && mActivationDtype != c10::ScalarType::Float8_e4m3fn)
+            {
+                TORCH_CHECK(!input_sf.has_value(),
+                    "16-bit input with MXFP8 activation scaling is quantized in-kernel; input_sf must be None");
+                TORCH_CHECK(input.sizes()[1] == hidden_size,
+                    "16-bit input with MXFP8 activation scaling must have hidden_size columns");
+            }
         }
         else
         {
@@ -1222,6 +1242,8 @@ public:
             auto activation_dtype
                 = (mUseW4GroupScaling && !isWFP4A16Quant()) ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
             activation_dtype = isNvfp4Quant() ? at::ScalarType::Long : activation_dtype;
+            // The GEMMs of the in-kernel-quant MXFP8 runner see e4m3 activations, like the FP8-input runner.
+            activation_dtype = isWMxfp4AMxfp8Quant() ? at::ScalarType::Float8_e4m3fn : activation_dtype;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                 tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
@@ -2651,7 +2673,8 @@ private:
     bool isNvfp4Quant() const
     {
         return mWeightDtype == c10::ScalarType::Long
-            && mActivationDtype != c10::ScalarType::Float8_e4m3fn; // FP8 activation does not use FP4
+            && mActivationDtype != c10::ScalarType::Float8_e4m3fn // FP8 activation does not use FP4
+            && !mUseMxfp8ActScaling;                              // 16-bit input quantized to MXFP8 in-kernel
     }
 
     bool isWFP4A16Quant() const
@@ -2687,8 +2710,11 @@ private:
 
     bool isWMxfp4AMxfp8Quant() const
     {
-        return mActivationDtype == c10::ScalarType::Float8_e4m3fn && mWeightDtype == c10::ScalarType::Long
-            && mUseMxfp8ActScaling;
+        // FP8 input carries pre-quantized MXFP8 rows + input_sf; BF16/FP16 input is quantized to MXFP8 inside the
+        // row expansion (expandInputRowsKernel need_mxfp8_quant path).
+        return (mActivationDtype == c10::ScalarType::Float8_e4m3fn || mActivationDtype == c10::ScalarType::BFloat16
+                   || mActivationDtype == c10::ScalarType::Half)
+            && mWeightDtype == c10::ScalarType::Long && mUseMxfp8ActScaling;
     }
 };
 

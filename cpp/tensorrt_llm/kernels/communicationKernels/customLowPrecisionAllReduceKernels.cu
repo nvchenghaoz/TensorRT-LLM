@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include <cooperative_groups.h>
+#include <cstdlib>
 #include <tuple>
 #include <type_traits>
 
@@ -746,6 +747,292 @@ static __global__ void lowPrecisionTwoShotAllReduceKernel(LowPrecisionAllReduceP
         src_d, reinterpret_cast<T*>(params.local_output_buffer_ptr), smem_allgather, dst_rank);
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// PUSH (posted-write) two-shot for ranks_per_node <= 4 (TRTLLM_LP_AR_PUSH=1, default off, messages >=
+// LP_PUSH_MIN_MESSAGE_BYTES). Same math and bits as lowPrecisionPreprocessKernel + lowPrecisionTwoShotAllReduceKernel
+// (the PULL path), but every cross-GPU transfer is a posted WRITE instead of a peer READ:
+//   1. scatter: rank i quantizes chunk j of its input exactly as the preprocess kernel does (same per-warp groups,
+//      same expressions) and writes it into rank j's buffer at slot i (the pull path keeps it in its own buffer at slot
+//      j, where rank j reads it). RANKS groups of ctas_per_peer CTAs, one group per destination rank.
+//   2. reduce: rank j sums its chunk from LOCAL slots (j + ii) % RANKS, the pull path's order, requantizes exactly as
+//      lowPrecisionTwoShotFirstStageKernel and writes the result into every rank's OTHER ping/pong buffer at slot j.
+//   3. gather: every rank dequantizes all chunks from its LOCAL other buffer as lowPrecisionTwoShotSecondStageKernel.
+// The other buffer is free during this call: the entry barrier guarantees every rank has finished the previous call
+// (which used it), and nobody can enter the next call before this rank does. No preprocess kernel and no extra
+// workspace. Flags live in peer_barrier_ptrs_in after the pull kernel's RANKS * (1 + LP_TWOSHOT_MAX_CTAS):
+//   scatter flag  RANKS * (1 + LP_TWOSHOT_MAX_CTAS) + lb * RANKS + src,                    lb < LP_PUSH_CTAS_PER_PEER
+//   gather flag   RANKS * (1 + LP_TWOSHOT_MAX_CTAS + LP_PUSH_CTAS_PER_PEER) + b * RANKS + src, b < RANKS * that
+// (allreduce_helper.py CustomAllReduceHelper.lowprecision_barrier_bytes sizes the buffer for them).
+// Probe job 1841 (fact 3330), 4 ranks x 3 peers x 2.6 MB concurrent: SM posted writes 43.6 GB/s at 16 CTAs/peer vs
+// SM peer reads 34.6 GB/s.
+constexpr int LP_PUSH_CTAS_PER_PEER = 16;
+constexpr size_t LP_PUSH_MIN_MESSAGE_BYTES = size_t(2) << 20;
+
+template <typename T, typename QUANT_T, int32_t RANKS_PER_NODE>
+static __global__ void lowPrecisionTwoShotPushAllReduceKernel(LowPrecisionAllReduceParams params, int32_t ctas_per_peer)
+{
+    constexpr float QUANT_MAX = QuantMaxValue<QUANT_T>::value;
+    constexpr int32_t elts_per_thread = sizeof(int4) / sizeof(QUANT_T);
+    constexpr int32_t elts_per_load = sizeof(int4) / sizeof(T);
+    constexpr int32_t loads_per_thread = elts_per_thread / elts_per_load;
+    constexpr int32_t NUM_ELTS_PER_WARP_IN = (WARP_SIZE - 1) * elts_per_thread;
+    constexpr int32_t NUM_ELTS_PER_WARP_OUT = WARP_SIZE * elts_per_thread;
+    constexpr uint32_t SCATTER_FLAG_BASE = RANKS_PER_NODE * (1 + LP_TWOSHOT_MAX_CTAS);
+    constexpr uint32_t GATHER_FLAG_BASE = SCATTER_FLAG_BASE + RANKS_PER_NODE * LP_PUSH_CTAS_PER_PEER;
+    using PackedInputType = typename PackedOn16Bytes<T>::Type;
+    using PackedQuantType = typename PackedOn16Bytes<QUANT_T>::Type;
+
+    const int32_t bidx = blockIdx.x;
+    const int32_t tidx = threadIdx.x;
+    const int32_t lane_id = tidx % WARP_SIZE;
+    const int32_t wid = tidx / WARP_SIZE;
+    const int32_t my_rank = params.local_rank;
+    const size_t elts_per_rank = params.elts_per_rank;
+    const size_t buffer_elts_per_rank = params.buffer_elts_per_rank;
+    const size_t num_warp_groups = buffer_elts_per_rank / NUM_ELTS_PER_WARP_OUT;
+    const uint64_t flag = params.barrier_flag;
+    const int32_t lb = bidx % ctas_per_peer;
+
+    extern __shared__ float smem[];
+
+    multi_gpu_barrier(params.peer_barrier_ptrs_in, flag, my_rank, RANKS_PER_NODE, tidx, bidx);
+
+    // 1. Quantize chunk `target` of the input (as lowPrecisionPreprocessKernel) and write it to rank target, slot
+    //    my_rank. Warp group g holds input elements [g * 496, g * 496 + 496) of the chunk at fp8 positions [0, 496) of
+    //    [g * 512, g * 512 + 512) and its float scale at position 496; lane L holds elements [16 L, 16 L + 16).
+    {
+        const int32_t group = bidx / ctas_per_peer;
+        const int32_t target = (my_rank + group) % RANKS_PER_NODE;
+        T const* in = reinterpret_cast<T const*>(params.local_input_buffer_ptr) + elts_per_rank * target;
+        QUANT_T* dst = reinterpret_cast<QUANT_T*>(params.peer_comm_buffer_ptrs[target]) + buffer_elts_per_rank * my_rank;
+        for (size_t wg = static_cast<size_t>(lb) * LP_ALLREDUCE_WARP_NUM_PER_BLOCK + wid; wg < num_warp_groups;
+             wg += static_cast<size_t>(ctas_per_peer) * LP_ALLREDUCE_WARP_NUM_PER_BLOCK)
+        {
+            const size_t start_in = wg * NUM_ELTS_PER_WARP_IN;
+            PackedInputType vals[loads_per_thread];
+#pragma unroll
+            for (int32_t i = 0; i < loads_per_thread; ++i)
+            {
+                const int32_t local_offset = lane_id * elts_per_thread + i * elts_per_load;
+                if (local_offset < NUM_ELTS_PER_WARP_IN && start_in + local_offset < elts_per_rank)
+                {
+                    vals[i].packed = *reinterpret_cast<int4 const*>(in + start_in + local_offset);
+                }
+                else
+                {
+#pragma unroll
+                    for (int j = 0; j < elts_per_load; j++)
+                    {
+                        vals[i].unpacked[j] = 0.0f;
+                    }
+                }
+            }
+
+            float scalar = 0;
+            for (int32_t i = 0; i < loads_per_thread; ++i)
+            {
+#pragma unroll
+                for (int32_t j = 0; j < elts_per_load; ++j)
+                {
+                    scalar = cuda_max(cuda_abs((float) (vals[i].unpacked[j])), scalar);
+                }
+            }
+
+            scalar = warp_reduce_max(scalar);
+            if (scalar != 0.0f)
+            {
+                scalar = QUANT_MAX / scalar;
+            }
+
+            PackedQuantType out_val;
+            if (lane_id < (WARP_SIZE - 1))
+            {
+#pragma unroll
+                for (int32_t i = 0; i < loads_per_thread; ++i)
+                {
+#pragma unroll
+                    for (int32_t j = 0; j < elts_per_load; ++j)
+                    {
+                        float v = vals[i].unpacked[j];
+                        if (scalar != 0.0f)
+                        {
+                            v *= scalar;
+                        }
+                        out_val.unpacked[i * elts_per_load + j] = static_cast<QUANT_T>(v);
+                    }
+                }
+            }
+            else
+            {
+                out_val.packed = make_int4(0, 0, 0, 0);
+                *(reinterpret_cast<float*>(&out_val)) = scalar;
+            }
+            *reinterpret_cast<int4*>(dst + wg * NUM_ELTS_PER_WARP_OUT + lane_id * elts_per_thread) = out_val.packed;
+        }
+
+        __syncthreads();
+        if (tidx == 0)
+        {
+            lp_allreduce_st_flag_release(
+                flag, params.peer_barrier_ptrs_in[target] + SCATTER_FLAG_BASE + lb * RANKS_PER_NODE + my_rank);
+        }
+    }
+
+    // Wait until every source rank's CTA lb has written its slice of my chunk (block bidx reduces a subset of it).
+    if (tidx < RANKS_PER_NODE)
+    {
+        uint64_t v = 0;
+        uint64_t* p = params.peer_barrier_ptrs_in[my_rank] + SCATTER_FLAG_BASE + lb * RANKS_PER_NODE + tidx;
+        do
+        {
+            lp_allreduce_ld_flag_acquire(v, p);
+        } while (v != flag);
+    }
+    __syncthreads();
+
+    // 2. Reduce my chunk from local slots (as lowPrecisionTwoShotFirstStageKernel) and push it to every rank.
+    QUANT_T* src_d[RANKS_PER_NODE];
+    QUANT_T* reduced_d[RANKS_PER_NODE];
+    int32_t dst_rank[RANKS_PER_NODE];
+#pragma unroll
+    for (int32_t ii = 0; ii < RANKS_PER_NODE; ++ii)
+    {
+        int32_t rank = (my_rank + ii) % RANKS_PER_NODE;
+        src_d[ii] = reinterpret_cast<QUANT_T*>(params.peer_comm_buffer_ptrs[my_rank]) + buffer_elts_per_rank * rank;
+        reduced_d[ii] = reinterpret_cast<QUANT_T*>(params.peer_comm_buffer_ptrs[RANKS_PER_NODE + rank])
+            + buffer_elts_per_rank * my_rank;
+        dst_rank[ii] = rank;
+    }
+    {
+        float* smem_scalar_ptr = &smem[RANKS_PER_NODE * wid];
+        const size_t in_start
+            = (bidx * LP_ALLREDUCE_WARP_NUM_PER_BLOCK + wid) * NUM_ELTS_PER_WARP_OUT + lane_id * elts_per_thread;
+
+        for (size_t local_offset = in_start; local_offset < buffer_elts_per_rank;
+             local_offset += gridDim.x * blockDim.x * elts_per_thread)
+        {
+            float sums[elts_per_thread];
+#pragma unroll
+            for (int32_t ii = 0; ii < elts_per_thread; ++ii)
+            {
+                sums[ii] = 0;
+            }
+
+            {
+                PackedQuantType vals[RANKS_PER_NODE];
+#pragma unroll
+                for (int32_t ii = 0; ii < RANKS_PER_NODE; ++ii)
+                {
+                    vals[ii].packed = *reinterpret_cast<int4 const*>(&src_d[ii][local_offset]);
+                }
+
+                if (lane_id == (WARP_SIZE - 1))
+                {
+#pragma unroll
+                    for (int32_t ii = 0; ii < RANKS_PER_NODE; ++ii)
+                    {
+                        float* tmp_scalar = (float*) (&(vals[ii]));
+                        smem_scalar_ptr[ii] = tmp_scalar[0];
+                    }
+                }
+                __syncwarp();
+
+                if (lane_id < (WARP_SIZE - 1))
+                {
+                    for (int32_t ii = 0; ii < RANKS_PER_NODE; ++ii)
+                    {
+#pragma unroll
+                        for (int32_t jj = 0; jj < elts_per_thread; ++jj)
+                        {
+                            if (smem_scalar_ptr[ii] != 0)
+                            {
+                                sums[jj] += (float) (vals[ii].unpacked[jj]) / smem_scalar_ptr[ii];
+                            }
+                            else
+                            {
+                                sums[jj] += (float) (vals[ii].unpacked[jj]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            {
+                float scalar = 0;
+
+                if (lane_id < (WARP_SIZE - 1))
+                {
+#pragma unroll
+                    for (int32_t ii = 0; ii < elts_per_thread; ++ii)
+                    {
+                        scalar = cuda_max(cuda_abs(sums[ii]), scalar);
+                    }
+                }
+
+                scalar = warp_reduce_max(scalar);
+
+                if (scalar != 0.0f)
+                {
+                    scalar = (QUANT_MAX) / scalar;
+                }
+
+                PackedQuantType tmp_val;
+                if (lane_id < (WARP_SIZE - 1))
+                {
+#pragma unroll
+                    for (int32_t ii = 0; ii < elts_per_thread; ++ii)
+                    {
+                        float tmp = sums[ii];
+                        if (scalar != 0.0f)
+                        {
+                            tmp *= scalar;
+                        }
+                        tmp_val.unpacked[ii] = static_cast<QUANT_T>(tmp);
+                    }
+                }
+                else
+                {
+                    tmp_val.packed = make_int4(0, 0, 0, 0);
+                    ((float*) (&tmp_val))[0] = scalar;
+                }
+
+                // Remote ranks first, own copy last.
+#pragma unroll
+                for (int32_t ii = 1; ii <= RANKS_PER_NODE; ++ii)
+                {
+                    *reinterpret_cast<int4*>(reduced_d[ii % RANKS_PER_NODE] + local_offset) = tmp_val.packed;
+                }
+            }
+        }
+    }
+
+    // Block bidx of every rank pushed the same offsets: signal all ranks, then wait for all of them.
+    __syncthreads();
+    if (tidx < RANKS_PER_NODE)
+    {
+        lp_allreduce_st_flag_release(
+            flag, params.peer_barrier_ptrs_in[tidx] + GATHER_FLAG_BASE + bidx * RANKS_PER_NODE + my_rank);
+        uint64_t v = 0;
+        uint64_t* p = params.peer_barrier_ptrs_in[my_rank] + GATHER_FLAG_BASE + bidx * RANKS_PER_NODE + tidx;
+        do
+        {
+            lp_allreduce_ld_flag_acquire(v, p);
+        } while (v != flag);
+    }
+    __syncthreads();
+
+    // 3. Dequantize every rank's reduced chunk from my local other buffer.
+    QUANT_T* gathered_d[RANKS_PER_NODE];
+#pragma unroll
+    for (int32_t ii = 0; ii < RANKS_PER_NODE; ++ii)
+    {
+        gathered_d[ii] = reinterpret_cast<QUANT_T*>(params.peer_comm_buffer_ptrs[RANKS_PER_NODE + my_rank]);
+    }
+    float* smem_allgather = smem + (RANKS_PER_NODE * LP_ALLREDUCE_WARP_NUM_PER_BLOCK);
+    lowPrecisionTwoShotSecondStageKernel<RANKS_PER_NODE, QUANT_T, T>(params.buffer_elts_per_rank, params.elts_per_rank,
+        gathered_d, reinterpret_cast<T*>(params.local_output_buffer_ptr), smem_allgather, dst_rank);
+}
+
 template <typename T_IN, typename T_OUT>
 __global__ void lowPrecisionHierPreprocessKernel(
     const T_IN* __restrict__ input, size_t n_in, T_OUT* __restrict__ output)
@@ -1252,6 +1539,33 @@ static __global__ __launch_bounds__(512, 1) void lowPrecisionTwoShotHierAllReduc
     }
 }
 
+// CTAs of lowPrecisionTwoShotAllReduceKernel. TRTLLM_LP_AR_TWOSHOT_CTAS (read on every call, so a sweep can change it
+// between calls; it must be the same on every rank) overrides LP_TWOSHOT_DEFAULT_CTAS, clamped to
+// [1, LP_TWOSHOT_MAX_CTAS].
+static int lowPrecisionTwoShotCtas()
+{
+    int ctas = LP_TWOSHOT_DEFAULT_CTAS;
+    char const* env = std::getenv("TRTLLM_LP_AR_TWOSHOT_CTAS");
+    if (env != nullptr && env[0] != '\0')
+    {
+        int const v = std::atoi(env);
+        if (v >= 1)
+        {
+            ctas = v;
+        }
+    }
+    return ctas < LP_TWOSHOT_MAX_CTAS ? ctas : LP_TWOSHOT_MAX_CTAS;
+}
+
+// TRTLLM_LP_AR_PUSH=1 selects the PUSH kernel for messages >= LP_PUSH_MIN_MESSAGE_BYTES (it needs the larger barrier
+// buffer CustomAllReduceHelper.lowprecision_barrier_bytes sizes); unset or 0 keeps the original PULL two-shot
+// (preprocess + peer reads). Read on every call; it must be the same on every rank.
+static bool lowPrecisionPushEnabled()
+{
+    char const* env = std::getenv("TRTLLM_LP_AR_PUSH");
+    return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
+}
+
 template <typename T, typename QUANT_T, int RANKS_PER_NODE>
 void lowPrecisionAllReduceDispatchRanksPerNode(kernels::LowPrecisionAllReduceParams& params, cudaStream_t stream)
 {
@@ -1261,7 +1575,7 @@ void lowPrecisionAllReduceDispatchRanksPerNode(kernels::LowPrecisionAllReducePar
     if (RANKS_PER_NODE <= 4)
     {
 
-        int blocks_per_grid = LP_ALLREDUCE_MAX_BLOCKS * 2, threads_per_block = LP_ALLREDUCE_DEFAULT_BLOCK_SIZE;
+        int blocks_per_grid = lowPrecisionTwoShotCtas(), threads_per_block = LP_ALLREDUCE_DEFAULT_BLOCK_SIZE;
 
         params.elts_per_rank = params.elts_total / RANKS_PER_NODE;
         params.rank_offset = params.rank * params.elts_per_rank;
@@ -1272,6 +1586,25 @@ void lowPrecisionAllReduceDispatchRanksPerNode(kernels::LowPrecisionAllReducePar
 
         params.buffer_offset = my_rank * elts_per_block_with_scale * num_rounds_per_rank;
         params.buffer_elts_per_rank = elts_per_block_with_scale * num_rounds_per_rank;
+        if (lowPrecisionPushEnabled() && params.elts_total * sizeof(T) >= LP_PUSH_MIN_MESSAGE_BYTES)
+        {
+            int ctas_per_peer = LP_PUSH_CTAS_PER_PEER;
+            if (static_cast<size_t>(ctas_per_peer) > num_rounds_per_rank)
+            {
+                ctas_per_peer = static_cast<int>(num_rounds_per_rank);
+            }
+            lowPrecisionTwoShotPushAllReduceKernel<T, QUANT_T, RANKS_PER_NODE>
+                <<<ctas_per_peer * RANKS_PER_NODE, threads_per_block,
+                    (LP_ALLREDUCE_WARP_NUM_PER_BLOCK * RANKS_PER_NODE) * sizeof(float) * 2, stream>>>(
+                    params, ctas_per_peer);
+            return;
+        }
+        // A block covers elts_per_block per pass; more blocks than passes would only add barrier traffic. Kept with
+        // the PUSH opt-in so the default PULL launch is unchanged.
+        if (lowPrecisionPushEnabled() && static_cast<size_t>(blocks_per_grid) > num_rounds_per_rank)
+        {
+            blocks_per_grid = static_cast<int>(num_rounds_per_rank);
+        }
         lowPrecisionPreprocessKernel<RANKS_PER_NODE, T, QUANT_T>
             <<<num_rounds_per_rank * RANKS_PER_NODE, threads_per_block, 0, stream>>>(
                 (T const*) params.local_input_buffer_ptr, params.elts_per_rank, params.buffer_elts_per_rank,
@@ -1384,6 +1717,14 @@ LowPrecisionAllReduceParams LowPrecisionAllReduceParams::deserialize(
     for (int i = 0; i < tpSize; ++i)
     {
         params.peer_comm_buffer_ptrs[i] = static_buffers->peer_comm_buffer_ptrs[buffer_offset + i];
+    }
+    // The other ping/pong buffer at [tpSize, 2 * tpSize): the PUSH two-shot lands its reduced chunks there.
+    if (2 * tpSize <= LP_ALLREDUCE_MAX_RANKS_PER_NODE)
+    {
+        for (int i = 0; i < tpSize; ++i)
+        {
+            params.peer_comm_buffer_ptrs[tpSize + i] = static_buffers->peer_comm_buffer_ptrs[tpSize - buffer_offset + i];
+        }
     }
     for (int i = 0; i < tpSize; ++i)
     {

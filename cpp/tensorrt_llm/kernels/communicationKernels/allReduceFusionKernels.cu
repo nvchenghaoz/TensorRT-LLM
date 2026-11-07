@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
+#include <cstdlib>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -423,9 +424,22 @@ public:
         namespace cg = cooperative_groups;
         cg::cluster_group cluster = cg::this_cluster();
         cg::grid_group grid = cg::this_grid();
-        token_id = grid.cluster_rank();
-        access_id_in_token = cluster.thread_rank();
-        token_stride = grid.num_clusters();
+        int const threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
+        if (cluster.num_blocks() == 1 && static_cast<int>(blockDim.x) < threads_per_token)
+        {
+            // Split launch without clusters (SM120 plain all-reduce): k = threads_per_token / blockDim.x CTAs
+            // cover one token. The launcher guarantees blockDim.x * k == threads_per_token and gridDim.x % k == 0.
+            int const k = threads_per_token / blockDim.x;
+            token_id = blockIdx.x / k;
+            access_id_in_token = (blockIdx.x % k) * blockDim.x + threadIdx.x;
+            token_stride = gridDim.x / k;
+        }
+        else
+        {
+            token_id = grid.cluster_rank();
+            access_id_in_token = cluster.thread_rank();
+            token_stride = grid.num_clusters();
+        }
 #else
         token_id = blockIdx.x;
         access_id_in_token = threadIdx.x;
@@ -621,6 +635,11 @@ void launch_twoshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t
         params, begin_tokens, token_num_per_ranks));
 }
 
+// CTAs per token for the plain one-shot all-reduce when cluster launch is unavailable (SM120/SM121). The default 1
+// keeps one CTA per token; TLLM_AR_SM120_CTAS_PER_TOKEN opts in (the DeepSeek-V4.1-Flash SM120 modeling_v2 target
+// sets 4: 4 CTAs x 160 threads per 5120-wide bf16 token measured best at decode M=1..8, 4-rank PCIe, PDL on).
+constexpr int kSm120DefaultCtasPerToken = 1;
+
 bool use_oneshot(int token_num)
 {
     return token_num <= kOneShotMaxToken;
@@ -681,10 +700,42 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
         cluster_size /= 2;
     }
     TLLM_CHECK(oneshot || threads_per_block >= params.nranks);
+    // Without cluster launch (SM120/SM121) one CTA would carry a whole token. For the plain one-shot all-reduce
+    // (no per-token reduction) split each token over k CTAs instead; the per-element rank-ordered sum is unchanged,
+    // so the output is bitwise equal to the 1-CTA launch. k comes from TLLM_AR_SM120_CTAS_PER_TOKEN (unset or 1 = off).
+    int ctas_per_token = 1;
+    if constexpr (Pattern == AllReduceFusionPattern::kAllReduce)
+    {
+        if (!supports_cluster && oneshot && cluster_size == 1)
+        {
+            static int const env_k = []()
+            {
+                char const* v = std::getenv("TLLM_AR_SM120_CTAS_PER_TOKEN");
+                return v == nullptr ? kSm120DefaultCtasPerToken : std::max(1, std::atoi(v));
+            }();
+            int k = env_k;
+            // k must divide the token's accesses and leave whole warps per CTA; otherwise fall back to fewer CTAs.
+            while (k > 1 && (threads_per_block % k != 0 || (threads_per_block / k) % 32 != 0))
+            {
+                --k;
+            }
+            // Keep at least one whole token per wave: the grid below is rounded to whole tokens.
+            while (k > 1 && k > sm_count)
+            {
+                --k;
+            }
+            ctas_per_token = k;
+            threads_per_block /= ctas_per_token;
+        }
+    }
     int block_size = threads_per_block;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
 
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
+    if (ctas_per_token > 1)
+    {
+        grid_size = (std::min(sm_count, cluster_num * ctas_per_token) / ctas_per_token) * ctas_per_token;
+    }
     cudaLaunchConfig_t cfg;
     cudaLaunchAttribute attribute[2];
     cfg.gridDim = grid_size;
@@ -698,7 +749,14 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     attribute[1].val.clusterDim.y = 1;
     attribute[1].val.clusterDim.z = 1;
     cfg.attrs = attribute;
-    cfg.numAttrs = supports_cluster ? 2 : 0;
+    // Without cluster launch, TLLM_AR_SM120_PDL=1 keeps the PDL attribute (attribute[0]): the kernels wait on
+    // cudaGridDependencySynchronize before reading their inputs. Unset keeps the attribute-free launch.
+    static bool const sm120_pdl = []()
+    {
+        char const* v = std::getenv("TLLM_AR_SM120_PDL");
+        return v != nullptr && v[0] == '1';
+    }();
+    cfg.numAttrs = supports_cluster ? 2 : ((sm120_pdl && SM >= 90) ? 1 : 0);
     if (oneshot)
     {
         bool trigger_completion_at_end = params.trigger_completion_at_end;

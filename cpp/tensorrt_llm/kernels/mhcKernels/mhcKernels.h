@@ -101,6 +101,18 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream,
     float const* pre_mix_ext = nullptr, float* pre_mix_out = nullptr);
 
+// M-tiled variant of mhcFusedHcFmaLaunch (num_k_splits = 1) for prefill-size M:
+// fused_pmap_gemm_fma_mtile<tile_n, tile_m> processes tile_m tokens per CTA and
+// is bitwise equal to the ks = 1 ksplit kernel.  Supported (tile_n, tile_m):
+// see pickFhcFmaMtile.  Workspaces: y_acc fp32 [M, 24], r_acc fp32 [M].
+void mhcFusedHcFmaMtileLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
+    float const* post_mix_prev, float const* comb_mix_prev, float const* w_t, float const* hc_scale,
+    float const* hc_base, __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur,
+    __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size,
+    int hc_mult, int tile_n, int tile_m, int bigfuse_block_size, float rms_eps, float hc_pre_eps,
+    float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight,
+    float norm_eps, cudaStream_t stream, float const* pre_mix_ext = nullptr, float* pre_mix_out = nullptr);
+
 // Single-kernel all-in-one fused hyper-connection boundary launcher (TF32 tcgen05 path).
 //
 // Wraps fused_allinone_tf32_pmap_gemm_atomic_impl: pmap + TF32 GEMM + bigfuse
