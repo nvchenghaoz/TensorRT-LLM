@@ -110,13 +110,15 @@ def _cake_index_prep_kernel(
     MAIN_P2: tl.constexpr,
     HAS_MAIN: tl.constexpr,
     MAPPED: tl.constexpr,
+    HAS_SWA: tl.constexpr = True,
 ):
     q = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, SWA_P2)
-    live = cols < SWA_W
-    slot = tl.load(swa_ptr + q * swa_rs + cols * swa_cs, mask=live, other=-1).to(tl.int64)
-    ok = (slot >= 0) & (slot < swa_capacity)
-    tl.store(swa_out + q * SWA_W + cols, tl.where(ok, slot, -1).to(tl.int32), mask=live)
+    if HAS_SWA:
+        cols = tl.arange(0, SWA_P2)
+        live = cols < SWA_W
+        slot = tl.load(swa_ptr + q * swa_rs + cols * swa_cs, mask=live, other=-1).to(tl.int64)
+        ok = (slot >= 0) & (slot < swa_capacity)
+        tl.store(swa_out + q * SWA_W + cols, tl.where(ok, slot, -1).to(tl.int32), mask=live)
     if HAS_MAIN:
         cols = tl.arange(0, MAIN_P2)
         live = cols < MAIN_W
@@ -146,7 +148,14 @@ def _cake_index_prep_kernel(
 
 
 def prepare_cake_indices(
-    swa_slots, swa_capacity, swa_out, main=None, main_capacity=0, main_out=None, mapping=None
+    swa_slots,
+    swa_capacity,
+    swa_out,
+    main=None,
+    main_capacity=0,
+    main_out=None,
+    mapping=None,
+    has_swa=True,
 ):
     """Write int32 physical slots (``-1`` = masked) for Cake, one launch.
 
@@ -154,10 +163,13 @@ def prepare_cake_indices(
     ``[count, main_width]`` either physical main rows (``mapping is None``) or
     logical positions mapped through ``mapping = (table, page_size,
     max_positions, requests, visible)`` exactly as the staging kernels do.
+    ``has_swa=False`` writes only the main half (``swa_out`` is left untouched).
     """
     count, swa_width = swa_slots.shape
     has_main = main is not None and main.shape[1] > 0
     mapped = has_main and mapping is not None
+    if not has_swa and not has_main:
+        return
     if mapped:
         table, page_size, max_positions, requests, visible = mapping
         table_stride = table.stride(0) if table.shape[0] > 1 else table.shape[1]
@@ -192,8 +204,26 @@ def prepare_cake_indices(
         MAIN_P2=triton.next_power_of_2(main_width),
         HAS_MAIN=has_main,
         MAPPED=mapped,
+        HAS_SWA=bool(has_swa),
         num_warps=4,
     )
+
+
+# int32 main slots shared by the layers of one staging group, per (count, main_width, device).
+# Stream order makes one buffer per shape safe: groups are contiguous layer ranges, and
+# the forward's registry (metadata.csa2_cake_shared) names the group that last wrote it.
+_SHARED_MAIN_SLOTS: dict[tuple, torch.Tensor] = {}
+
+
+def _shared_main_slots(key: tuple) -> torch.Tensor:
+    buffer = _SHARED_MAIN_SLOTS.get(key)
+    if buffer is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm up the CSA2 Cake decode shape before CUDA Graph capture")
+        count, main_width, device = key
+        buffer = torch.full((count, main_width), -1, dtype=torch.int32, device=device)
+        _SHARED_MAIN_SLOTS[key] = buffer
+    return buffer
 
 
 def _flat_pool(pool: torch.Tensor, row_bytes: int) -> torch.Tensor:
@@ -399,12 +429,20 @@ class CakeDecode:
         out,
         mapping=None,
         pdl_consumer=False,
+        swa_ready=None,
+        main_share=None,
     ):
         """``out[i]`` = sink attention of ``q[i]`` over its selected SWA and main rows.
 
         ``pdl_consumer``: the next launch is a PDL kernel that reads ``out`` only after its
         griddepcontrol.wait (csa2_lowm_wo_a), so the fp32 split merge may trigger its
         dependents first (binding ``enable_pdl`` bit 1). Launch attributes only; same math.
+
+        ``swa_ready``: this layer's int32 SWA slots already in Cake form (``-1`` unless
+        0 <= slot < ``swa_pool`` rows), written by the forward's SWA refresh launch, so the
+        prep skips its SWA half. ``main_share = (registry, group)``: layers with one
+        ``group`` in a forward (same KV owner, index source, selections, page mapping and
+        visibility) share one int32 main-slot buffer; the first of them prepares it.
         """
         from flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed import (
             cake_sparse_mla_sm120_dsv41_mixed_decode,
@@ -415,15 +453,37 @@ class CakeDecode:
         has_main = main_slots is not None and main_slots.shape[1] > 0
         main_width = int(main_slots.shape[1]) if has_main else 0
         buffers = self._scratch(count, heads, swa_width, main_width, q.device)
-        prepare_cake_indices(
-            swa_slots,
-            swa_pool.shape[0],
-            buffers["swa"],
-            main_slots if has_main else None,
-            main_pool.shape[0] if has_main else 0,
-            buffers["main"] if has_main else None,
-            mapping if has_main else None,
-        )
+        swa_index = buffers["swa"]
+        prep_swa = True
+        if (
+            swa_ready is not None
+            and swa_ready.dtype == torch.int32
+            and tuple(swa_ready.shape) == (count, swa_width)
+            and swa_ready.is_contiguous()
+            and swa_ready.device == q.device
+        ):
+            swa_index, prep_swa = swa_ready, False
+        main_index = buffers["main"] if has_main else None
+        prep_main = has_main
+        if has_main and main_share is not None:
+            registry, group = main_share
+            slot_key = (count, main_width, q.device)
+            main_index = _shared_main_slots(slot_key)
+            if registry.get(slot_key) == group:
+                prep_main = False  # an earlier layer of this group wrote it in this forward
+            else:
+                registry[slot_key] = group
+        if prep_swa or prep_main:
+            prepare_cake_indices(
+                swa_slots,
+                swa_pool.shape[0],
+                swa_index,
+                main_slots if prep_main else None,
+                main_pool.shape[0] if prep_main else 0,
+                main_index if prep_main else None,
+                mapping if prep_main else None,
+                has_swa=prep_swa,
+            )
         if sink.dtype != torch.float32 or not sink.is_contiguous():
             sink = sink.float().contiguous()
         launch = buffers.get("launch")
@@ -440,9 +500,9 @@ class CakeDecode:
             entry(
                 q,
                 _flat_pool(swa_pool, 528),
-                buffers["swa"],
+                swa_index,
                 _flat_pool(main_pool, 288) if has_main else None,
-                buffers["main"] if has_main else None,
+                main_index,
                 None,
                 None,
                 sink,
@@ -469,13 +529,13 @@ class CakeDecode:
         info = cake_sparse_mla_sm120_dsv41_mixed_decode(
             q,
             swa_pool,
-            buffers["swa"],
+            swa_index,
             out,
             buffers["lse"],
             float(scale),
             attn_sink=sink,
             extra_kv_cache=main_pool if has_main else None,
-            extra_indices=buffers["main"] if has_main else None,
+            extra_indices=main_index,
             mid_out=buffers["mid_out"],
             mid_lse=buffers["mid_lse"],
             variant=variant,
