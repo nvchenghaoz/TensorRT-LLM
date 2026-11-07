@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 _SHAPE = (40, 5120, 384)
 
 
-@routes("DeepseekV41ForCausalLM")
+@routes("DeepseekV41ForCausalLM", "DeepseekV41ForConditionalGeneration")
 def route(
     model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
@@ -63,8 +63,13 @@ def route(
         # fmt: off
         # isort: off
         from .v41_flash_1017__sm_120__tp4_moetp2ep2.modeling import ModelingV2DeepseekV41Flash1017Sm120Tp4Moetp2ep2
+        from .v41_flash_1017__sm_120__tp4_moetp2ep2.modeling import ModelingV2DeepseekV41Flash1017Sm120Tp4Moetp2ep2ConditionalGeneration
         # isort: on
         # fmt: on
+        # The released checkpoint declares the multimodal wrapper; serve it with
+        # this target's text model inside.
+        if (pretrained_config.architectures or [""])[0] == "DeepseekV41ForConditionalGeneration":
+            return ModelingV2DeepseekV41Flash1017Sm120Tp4Moetp2ep2ConditionalGeneration
         return ModelingV2DeepseekV41Flash1017Sm120Tp4Moetp2ep2
 
     spec = "off" if spec_config is None else spec_config.spec_dec_mode.name

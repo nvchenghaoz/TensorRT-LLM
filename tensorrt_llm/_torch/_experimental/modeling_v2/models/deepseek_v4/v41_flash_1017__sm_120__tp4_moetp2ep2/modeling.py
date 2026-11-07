@@ -59,6 +59,7 @@ from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.utils import AuxStreamType
 from . import tail_moe_graph as _tail_moe_graph
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models import modeling_deepseekv41_multimodal as _multimodal
 from ._v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
@@ -2886,3 +2887,12 @@ class ModelingV2DeepseekV41Flash1017Sm120Tp4Moetp2ep2(DeepseekV41ForCausalLM):
     CSA2 attention projections, the mHC hyper-connection kernels, the fused router + shared-expert
     decode chain and the prefill all-reduce pipeline. ``routing.py`` admits only this deployment.
     """
+
+
+class ModelingV2DeepseekV41Flash1017Sm120Tp4Moetp2ep2ConditionalGeneration(
+    _multimodal.DeepseekV41ForConditionalGeneration
+):
+    """The checkpoint's own architecture (``DeepseekV41ForConditionalGeneration``) with this target's
+    text model inside. Vision and alignment stay the built-in ones; the run served text only."""
+
+    text_model_cls = ModelingV2DeepseekV41Flash1017Sm120Tp4Moetp2ep2

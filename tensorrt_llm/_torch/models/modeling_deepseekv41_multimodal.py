@@ -41,6 +41,10 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
     Attention, Engram, and DSpark remain in the text model.
     """
 
+    # The text model class. A Modeling V2 target that keeps this checkpoint's
+    # multimodal wrapper overrides it with its own text model.
+    text_model_cls = DeepseekV41ForCausalLM
+
     def __init__(self, model_config: ModelConfig) -> None:
         config = model_config.pretrained_config
         super().__init__(config)
@@ -51,7 +55,7 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
         text_config.architectures = ["DeepseekV41ForCausalLM"]
         text_config.text_config.use_vision_bias = True
         object.__setattr__(text_model_config, "extra_attrs", model_config.extra_attrs)
-        self.llm = DeepseekV41ForCausalLM(text_model_config)
+        self.llm = self.text_model_cls(text_model_config)
         # Re-share the attention registry after the text constructor clones configs.
         model_config.extra_attrs.update(self.llm.model_config.extra_attrs)
         self.llm.model_config.extra_attrs = model_config.extra_attrs
@@ -115,15 +119,15 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
 
     @classmethod
     def get_model_defaults(cls, llm_args):
-        return DeepseekV41ForCausalLM.get_model_defaults(llm_args)
+        return cls.text_model_cls.get_model_defaults(llm_args)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None):
-        return DeepseekV41ForCausalLM.get_preferred_kv_cache_manager_version(pretrained_config)
+        return cls.text_model_cls.get_preferred_kv_cache_manager_version(pretrained_config)
 
     @classmethod
     def get_preferred_transceiver_runtime(cls, pretrained_config=None):
-        return DeepseekV41ForCausalLM.get_preferred_transceiver_runtime(pretrained_config)
+        return cls.text_model_cls.get_preferred_transceiver_runtime(pretrained_config)
 
     def register_cuda_graph_pre_replay_hooks(self, runner) -> None:
         self.llm.register_cuda_graph_pre_replay_hooks(runner)
