@@ -17,21 +17,15 @@ arrival counter) decodes the index, writes the token to ``out`` and to
 call, so no memset is needed.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 
-__all__ = ["fused_greedy_argmax_scatter", "fused_greedy_argmax_enabled"]
+__all__ = ["fused_greedy_argmax_scatter"]
 
-_BLOCK = int(os.environ.get("TRTLLM_FUSED_GREEDY_ARGMAX_BLOCK", "2048"))
-_NUM_WARPS = int(os.environ.get("TRTLLM_FUSED_GREEDY_ARGMAX_WARPS", "4"))
+_BLOCK = 2048
+_NUM_WARPS = 4
 _SUPPORTED_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
-
-
-def fused_greedy_argmax_enabled() -> bool:
-    return os.environ.get("TRTLLM_FUSED_GREEDY_ARGMAX", "1") != "0"
 
 
 @triton.jit

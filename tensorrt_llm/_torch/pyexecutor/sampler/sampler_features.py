@@ -47,7 +47,7 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 
 from ..llm_request import LlmRequest
-from .ops.greedy_argmax import fused_greedy_argmax_enabled, fused_greedy_argmax_scatter
+from .ops.greedy_argmax import fused_greedy_argmax_scatter
 from .sampler_common import DEFAULT_BEAM_IDX
 
 if sys.version_info[:2] >= (3, 12):
@@ -432,13 +432,12 @@ def fast_greedy_sample_kernel(
     Performs argmax and scatters tokens into the output buffer. All operations
     are in-place.
     """
-    if fused_greedy_argmax_enabled():
-        # One multi-CTA launch: argmax (leftmost max, first NaN), cast and scatter.
-        next_tokens = fused_greedy_argmax_scatter(
-            logits_cuda, new_tokens_cuda, batch_dest_indices, max_beam_width
-        )
-        if next_tokens is not None:
-            return next_tokens
+    # One multi-CTA launch: argmax (leftmost max, first NaN), cast and scatter.
+    next_tokens = fused_greedy_argmax_scatter(
+        logits_cuda, new_tokens_cuda, batch_dest_indices, max_beam_width
+    )
+    if next_tokens is not None:
+        return next_tokens
 
     # Simple argmax for greedy sampling
     next_tokens = torch.argmax(logits_cuda, dim=-1).to(dtype=new_tokens_cuda.dtype)

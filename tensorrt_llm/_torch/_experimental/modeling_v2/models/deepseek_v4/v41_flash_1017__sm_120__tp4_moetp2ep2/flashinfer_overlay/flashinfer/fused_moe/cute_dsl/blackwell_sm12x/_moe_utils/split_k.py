@@ -13,14 +13,10 @@ S = min(grid // T, S_max, k_cycles) slices, one CTA each:
             and sums the S slots in slice order 0..S-1 (a fixed order, so the result is
             run-to-run deterministic), then runs the unchanged SwiGLU + MXFP8 epilogue.
 
-``TRTLLM_SM12X_FI_SPLITK`` = 0 / 1 (default 1) turns it off / on; ``TRTLLM_SM12X_FI_SPLITK_MAX``
-(default 4) caps S and ``TRTLLM_SM12X_FI_SPLITK_MIN`` (default 4) is the smallest S used
-(below it the tile stays whole).  All are read when the kernel is built and are part of its
-compile key.  The choice depends only on the live tile count, so it follows the per-rank
+``MAX_SPLITS`` (4) caps S and ``MIN_SPLITS`` (4) is the smallest S used (below it the tile
+stays whole).  The choice depends only on the live tile count, so it follows the per-rank
 shape (e.g. 18 fc1 tiles/expert at EP4 inter 2304, 9 at EP2xTP2 inter 1152).
 """
-
-import os
 
 import cutlass
 import cutlass.cute as cute
@@ -28,46 +24,12 @@ import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Float32, Int32, Int64, T, dsl_user_op
 
-ENV = "TRTLLM_SM12X_FI_SPLITK"
-ENV_MAX = "TRTLLM_SM12X_FI_SPLITK_MAX"
+#: Largest and smallest split count S (S below MIN_SPLITS keeps the tile whole).
+MAX_SPLITS = 4
+MIN_SPLITS = 4
 #: FP32 accumulator values per thread a slot can hold (fc1 swap (128 x 8) tile: 2 x 4).
 SLOT_VALUES_PER_THREAD = 16
 SLOT_THREADS = 256
-
-
-def enabled() -> bool:
-    return os.environ.get(ENV, "1") == "1"
-
-
-ENV_MIN = "TRTLLM_SM12X_FI_SPLITK_MIN"
-
-
-def max_splits() -> int:
-    return max(1, int(os.environ.get(ENV_MAX, "4")))
-
-
-def min_splits() -> int:
-    return max(2, int(os.environ.get(ENV_MIN, "4")))
-
-
-def debug_nocount() -> bool:
-    """Diagnostic only: keep the split-K kernel but never split (no tile count)."""
-    return os.environ.get("TRTLLM_SM12X_FI_SPLITK_DEBUG_NOCOUNT", "0") == "1"
-
-
-ENV_ACQREL = "TRTLLM_SM12X_FI_SPLITK_ACQREL"
-
-
-def acqrel() -> bool:
-    """CUTLASS-semaphore form of the slice hand-off: bar.sync, then ONE atom.acq_rel.gpu by
-    thread 0 (release of the CTA's partial stores by cumulativity, acquire of the other
-    slices' partials), then bar.red.or; no per-thread membar.gl before the count and none
-    before the slot loads.  Same values, same slice order: the sum is bitwise unchanged."""
-    return os.environ.get(ENV_ACQREL, "1") == "1"
-
-
-def key():
-    return (enabled(), max_splits(), min_splits(), debug_nocount(), acqrel())
 
 
 _WS: dict = {}
@@ -312,9 +274,11 @@ def reduce_partials(
     """All nthreads math threads of a split CTA.  Returns 1 on the CTA that must finish the
     tile (with acc_u / acc_g holding the slice-ordered sum), 0 elsewhere.
 
-    use_acqrel (see acqrel()): bar.sync -> thread 0 atom.acq_rel.gpu -> bar.red.or, the
-    CUTLASS split-K semaphore pattern, instead of per-thread membar.gl before the count and
-    again before the slot loads (two dependent L2 round trips less on the last slice)."""
+    use_acqrel: bar.sync -> thread 0 atom.acq_rel.gpu -> bar.red.or, the CUTLASS split-K
+    semaphore pattern (release of the CTA's partial stores by cumulativity, acquire of the
+    other slices' partials), instead of per-thread membar.gl before the count and again before
+    the slot loads (two dependent L2 round trips less on the last slice).  Same values, same
+    slice order: the sum is bitwise unchanged."""
     nv = cute.size(acc_u)
     slot_bytes = 2 * nv * nthreads * 4
     base = _addr(gScratch)

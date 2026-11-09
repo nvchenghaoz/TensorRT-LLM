@@ -14,7 +14,6 @@ Main's SM120 chain ahead of the grouped 128x128-block FP8 ``o_a_proj`` BMM is
 (same bytes, same scale words, same view/strides), without writing the rotated BF16 back. The RoPE
 arithmetic is ``csa2/b12x_wo.py::_inv_rope_quant128_kernel`` ROPE_VARIANT=0 (bitwise equal to
 ``mla_rope_inplace``); the quant arithmetic is ``_per_token_quant_and_transform_kernel``'s.
-``TRTLLM_DSV4_PREFILL_WO_QUANT=0`` restores main's two-launch chain.
 """
 
 
@@ -23,14 +22,12 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm.quantization.utils.fp8_utils import check_sf_layout
-from ..switches import env_get  # run switches frozen at served values
 
-_ENV = "TRTLLM_DSV4_PREFILL_WO_QUANT"
 # Graph-replay sweep on RTX PRO 6000 (experiments/ascent/prefill_wo_quant/bench.py sweep, jobs
-# 1925/1928): FULL_TILE, BLOCK_M=4, 4 warps is best or within ~2 us of best at M=16..4096.
-_BLOCK_M = int(env_get("TRTLLM_DSV4_PREFILL_WO_QUANT_BLOCK_M", "4"))
-_NUM_WARPS = int(env_get("TRTLLM_DSV4_PREFILL_WO_QUANT_WARPS", "4"))
-_FULL_TILE = env_get("TRTLLM_DSV4_PREFILL_WO_QUANT_FULL_TILE", "1") != "0"
+# 1925/1928): the full [BLOCK_M, 4, 128] tile, BLOCK_M=4, 4 warps is best or within ~2 us of best
+# at M=16..4096.
+_BLOCK_M = 4
+_NUM_WARPS = 4
 _HEAD_DIM = 512
 _WORD = 512  # 4 x 128-column quant groups per int32 scale word
 # per_token_quant_and_transform passes torch.finfo(float8_e4m3fn).max (448.0) the same way.
@@ -38,10 +35,6 @@ _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 # Set after the first eager launch; a CUDA-graph capture never JIT-compiles this kernel.
 _compiled = False
-
-
-def prefill_wo_quant_enabled() -> bool:
-    return env_get(_ENV, "1").strip().lower() not in ("0", "false", "off", "")
 
 
 @triton.jit(do_not_specialize=["positions", "m", "s_stride_g", "s_stride_w"])
@@ -62,7 +55,6 @@ def _inv_rope_quant_permute102_kernel(
     NOPE_DIM: tl.constexpr,
     HALF_ROPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    FULL_TILE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     group = tl.program_id(1)
@@ -74,71 +66,37 @@ def _inv_rope_quant_permute102_kernel(
     in_base = o + rows64[:, None] * O_STRIDE + group * GROUP_WIDTH + w * 512
     v_stride_g = m.to(tl.int64) * GROUP_WIDTH
     out_base = values + group.to(tl.int64) * v_stride_g + rows64[:, None] * GROUP_WIDTH + w * 512
-    if FULL_TILE:
-        # [BLOCK_M, 4, 128]: one 512-wide word (= one head) per row in one shot.
-        d = tl.arange(0, 4)[:, None] * 128 + tl.arange(0, 128)[None, :]
-        d3 = d[None, :, :]
-        in3 = in_base[:, :, None]
-        ok3 = row_ok[:, None, None]
-        src = tl.load(in3 + d3, mask=ok3, other=0.0).to(tl.float32)
-        is_rope = d3 >= NOPE_DIM
-        rmask = ok3 & is_rope
-        partner = tl.load(in3 + (d3 ^ 1), mask=rmask, other=0.0).to(tl.float32)
-        pos = tl.load(positions + rows, mask=row_ok, other=0)
-        ci = tl.maximum((d3 - NOPE_DIM) >> 1, 0)
-        cbase = cos_sin + pos.to(tl.int64)[:, None, None] * cs_stride_pos
-        c = tl.load(cbase + ci, mask=rmask, other=1.0)
-        s = tl.load(cbase + HALF_ROPE + ci, mask=rmask, other=0.0)
-        ns = -s
-        r_even = tl.fma(c, src, -(ns * partner))
-        r_odd = tl.fma(c, src, ns * partner)
-        rot = tl.where((d3 & 1) == 0, r_even, r_odd)
-        rot = rot.to(tl.bfloat16).to(tl.float32)
-        v = tl.where(is_rope, rot, src)
-        amax = tl.maximum(tl.max(tl.abs(v), axis=2), 1e-10)
-        sc = amax / fp8_max
-        sc = tl.exp2(tl.ceil(tl.log2(tl.abs(sc))))
-        q = tl.clamp(v / sc[:, :, None], fp8_min, fp8_max).to(values.dtype.element_ty)
-        tl.store(out_base[:, :, None] + d3, q, mask=ok3)
-        shift = tl.arange(0, 4) * 8
-        word = tl.sum((sc.to(tl.int32, bitcast=True) >> 23) << shift[None, :], axis=1)
-        tl.store(scales + group * s_stride_g + w * s_stride_w + rows, word, mask=row_ok)
-    else:
-        cols = tl.arange(0, 128)
-        word = tl.zeros([BLOCK_M], dtype=tl.int32)
-        for p in tl.static_range(4):
-            # One 512-wide word is exactly one head (HEAD_DIM == 512): d is the in-head dim.
-            d = p * 128 + cols
-            src = tl.load(in_base + d[None, :], mask=row_ok[:, None], other=0.0).to(tl.float32)
-            if p * 128 + 128 > NOPE_DIM:
-                is_rope = d >= NOPE_DIM
-                rmask = row_ok[:, None] & is_rope[None, :]
-                partner = tl.load(in_base + (d ^ 1)[None, :], mask=rmask, other=0.0).to(
-                    tl.float32
-                )
-                pos = tl.load(positions + rows, mask=row_ok, other=0)
-                ci = tl.maximum((d - NOPE_DIM) >> 1, 0)
-                cbase = cos_sin + pos.to(tl.int64)[:, None] * cs_stride_pos
-                c = tl.load(cbase + ci[None, :], mask=rmask, other=1.0)
-                s = tl.load(cbase + HALF_ROPE + ci[None, :], mask=rmask, other=0.0)
-                # mla_rope_inplace (interleaved, inverse): coef = (cos, -sin),
-                # x' = coef.x * x - coef.y * y, y' = coef.x * y + coef.y * x, rounded to BF16.
-                ns = -s
-                r_even = tl.fma(c, src, -(ns * partner))
-                r_odd = tl.fma(c, src, ns * partner)
-                rot = tl.where(((d & 1) == 0)[None, :], r_even, r_odd)
-                rot = rot.to(tl.bfloat16).to(tl.float32)
-                v = tl.where(is_rope[None, :], rot, src)
-            else:
-                v = src
-            # fp8_utils._per_token_quant_and_transform_kernel (SCALE_UE8M0) arithmetic.
-            amax = tl.maximum(tl.max(tl.abs(v), axis=1), 1e-10)
-            sc = amax / fp8_max
-            sc = tl.exp2(tl.ceil(tl.log2(tl.abs(sc))))
-            q = tl.clamp(v / sc[:, None], fp8_min, fp8_max).to(values.dtype.element_ty)
-            tl.store(out_base + d[None, :], q, mask=row_ok[:, None])
-            word += (sc.to(tl.int32, bitcast=True) >> 23) << (8 * p)
-        tl.store(scales + group * s_stride_g + w * s_stride_w + rows, word, mask=row_ok)
+    # [BLOCK_M, 4, 128]: one 512-wide word (= one head) per row in one shot.
+    d = tl.arange(0, 4)[:, None] * 128 + tl.arange(0, 128)[None, :]
+    d3 = d[None, :, :]
+    in3 = in_base[:, :, None]
+    ok3 = row_ok[:, None, None]
+    src = tl.load(in3 + d3, mask=ok3, other=0.0).to(tl.float32)
+    is_rope = d3 >= NOPE_DIM
+    rmask = ok3 & is_rope
+    partner = tl.load(in3 + (d3 ^ 1), mask=rmask, other=0.0).to(tl.float32)
+    pos = tl.load(positions + rows, mask=row_ok, other=0)
+    ci = tl.maximum((d3 - NOPE_DIM) >> 1, 0)
+    cbase = cos_sin + pos.to(tl.int64)[:, None, None] * cs_stride_pos
+    c = tl.load(cbase + ci, mask=rmask, other=1.0)
+    s = tl.load(cbase + HALF_ROPE + ci, mask=rmask, other=0.0)
+    # mla_rope_inplace (interleaved, inverse): coef = (cos, -sin),
+    # x' = coef.x * x - coef.y * y, y' = coef.x * y + coef.y * x, rounded to BF16.
+    ns = -s
+    r_even = tl.fma(c, src, -(ns * partner))
+    r_odd = tl.fma(c, src, ns * partner)
+    rot = tl.where((d3 & 1) == 0, r_even, r_odd)
+    rot = rot.to(tl.bfloat16).to(tl.float32)
+    v = tl.where(is_rope, rot, src)
+    # fp8_utils._per_token_quant_and_transform_kernel (SCALE_UE8M0) arithmetic.
+    amax = tl.maximum(tl.max(tl.abs(v), axis=2), 1e-10)
+    sc = amax / fp8_max
+    sc = tl.exp2(tl.ceil(tl.log2(tl.abs(sc))))
+    q = tl.clamp(v / sc[:, :, None], fp8_min, fp8_max).to(values.dtype.element_ty)
+    tl.store(out_base[:, :, None] + d3, q, mask=ok3)
+    shift = tl.arange(0, 4) * 8
+    word = tl.sum((sc.to(tl.int32, bitcast=True) >> 23) << shift[None, :], axis=1)
+    tl.store(scales + group * s_stride_g + w * s_stride_w + rows, word, mask=row_ok)
 
 
 def supports(
@@ -204,7 +162,6 @@ def inv_rope_quant_permute102(
         NOPE_DIM=nope_dim,
         HALF_ROPE=rope_dim // 2,
         BLOCK_M=_BLOCK_M,
-        FULL_TILE=_FULL_TILE,
         num_warps=_NUM_WARPS,
     )
     if not torch.cuda.is_current_stream_capturing():

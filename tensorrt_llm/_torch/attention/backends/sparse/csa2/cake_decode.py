@@ -25,7 +25,6 @@ so it is CUDA-graph safe once a shape has been warmed up.
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 import triton
@@ -33,28 +32,17 @@ import triton.language as tl
 
 _HEAD_DIM = 512
 
-# (max count, render) buckets for 16-head dual fp32-partials calls under TRTLLM_CSA2_CAKE_F32_VARIANT=auto;
+# (max count, render) buckets for 16-head dual fp32-partials calls with f32_variant="auto";
 # counts above the last bucket keep the plain `default` body.
 _F32_FOLD_BUCKETS = ((16, "sa+pw+lq+el"),)
 
 # Decode counts whose fp32-partials Cake decode body (`default`, or the h16 `sa+lq+el` / `sa+pw+lq+el`
 # fold render) fires its PDL trigger on entry (binding ``enable_pdl`` bit 2), so the PDL merge and
 # csa2_lowm_wo_a behind it launch while the body runs. Launch timing only (every dependent waits for
-# the whole body grid before it reads or writes global memory). TRTLLM_CSA2_CAKE_BODY_TRIGGER_ENTRY=1 / =0
-# forces it on / off for every count. Default ON only at the counts with a measured same-slot win
+# the whole body grid before it reads or writes global memory). ON only at the counts with a measured same-slot win
 # (cold-L2 40-layer chain, experiments/ascent/cake_q1/chain_332.py); other counts launch as before.
 _BODY_TRIGGER_ENTRY_COUNTS: frozenset[int] = frozenset((1, 2, 3, 4))
 _BODY_TRIGGER_ENTRY_VARIANTS = frozenset(("default", "sa+lq+el", "sa+pw+lq+el"))
-
-
-def _body_trigger_entry_mode(value: bool | None) -> bool | None:
-    """None = per-count default (``_BODY_TRIGGER_ENTRY_COUNTS``), True/False = forced."""
-    if value is not None:
-        return bool(value)
-    env = os.environ.get("TRTLLM_CSA2_CAKE_BODY_TRIGGER_ENTRY", "")
-    if env == "":
-        return None
-    return env != "0"
 
 
 # Every runtime argument stays unspecialized: eager mixed steps see new batch shapes
@@ -270,8 +258,6 @@ def _cache_launch(q, swa_pool, main_pool, swa_width, main_width, variant, scale,
 @functools.lru_cache(maxsize=None)
 def cake_available(device_index: int) -> bool:
     """Whether the Cake SM120 DSv4.1 mixed-cache decode can serve this device."""
-    if os.environ.get("TRTLLM_CSA2_CAKE_DECODE", "1") == "0":
-        return False
     if torch.cuda.get_device_capability(device_index)[0] != 12:
         return False
     try:
@@ -348,18 +334,15 @@ class CakeDecode:
 
     def __init__(
         self,
-        f32_partials: bool | None = None,
-        f32_variant: str | None = None,
+        f32_partials: bool = True,
+        f32_variant: str = "auto",
         body_trigger_entry: bool | None = None,
     ) -> None:
+        """``body_trigger_entry``: None = per-count (``_BODY_TRIGGER_ENTRY_COUNTS``), True/False = forced."""
         self._buffers: dict[tuple, dict[str, torch.Tensor]] = {}
-        if f32_partials is None:
-            f32_partials = os.environ.get("TRTLLM_CSA2_CAKE_F32_PARTIALS", "1") != "0"
         self.f32_partials = bool(f32_partials)
-        if f32_variant is None:
-            f32_variant = os.environ.get("TRTLLM_CSA2_CAKE_F32_VARIANT", "auto")
         self.f32_variant = str(f32_variant)
-        self.body_trigger_entry = _body_trigger_entry_mode(body_trigger_entry)
+        self.body_trigger_entry = None if body_trigger_entry is None else bool(body_trigger_entry)
 
     def _entry_trigger_bit(self, count: int, heads: int, plan, enable_pdl) -> int:
         """Binding enable_pdl bit 2: only fp32-partials calls on the bodies that take it, PDL on."""

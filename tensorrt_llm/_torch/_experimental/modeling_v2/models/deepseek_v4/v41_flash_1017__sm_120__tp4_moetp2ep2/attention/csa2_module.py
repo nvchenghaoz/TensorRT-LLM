@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import functools
 from typing import Literal
 
 import torch
@@ -39,14 +38,6 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2Params,
     RowTransform,
 )
-from ..switches import env_get  # run switches frozen at served values
-
-
-@functools.lru_cache(maxsize=None)
-def _attn_pdl_enabled() -> bool:
-    """TRTLLM_CSA2_ATTN_PDL (default on): the last decode attention kernel triggers the output
-    projection's PDL waiter first. Off restores the end-of-grid hand-off (launch attributes only)."""
-    return env_get("TRTLLM_CSA2_ATTN_PDL", "1") != "0"
 
 
 def concat_mxfp8_linears(first: Linear, second: Linear):
@@ -407,7 +398,7 @@ class DeepseekV41Attention(nn.Module):
     def _qb_fused_route(self, hidden_states: torch.Tensor):
         """``(weight, weight_scale, n_split)`` of the fused q_norm + quant + wq_b(||index_wq_b) kernel, or ``None``.
 
-        SM120 decode only (1..8 rows, TRTLLM_CSA2_QB_FUSED != 0, low-M port on). The fused norm reproduces the
+        SM120 decode only (1..8 rows, low-M port on). The fused norm reproduces the
         FlashInfer RMSNorm the q_norm module runs here, so it requires that module path (plain, non-Gemma, BF16).
         """
         m = hidden_states.shape[0]
@@ -450,7 +441,7 @@ class DeepseekV41Attention(nn.Module):
             # SM120 decode attention-input chain: wq_a||wkv triggers its dependents at start, so the fused
             # q_norm + MXFP8 quant + wq_b(||index_wq_b) kernel, launched right after it, stages its weights while
             # wq_a||wkv streams. It reads the rows only after its PDL wait.
-            # It also L2-prefetches B's weight + scale bytes (TRTLLM_CSA2_QB_L2PF; a hint, outputs unchanged).
+            # It also L2-prefetches B's weight + scale bytes (l2pf_setting; a hint, outputs unchanged).
             rows = low_m_mm(hidden_states, *self._wq_a_wkv, trigger_at_start=True, l2_prefetch=chain[:2])
         if rows is not None:
             weight, weight_scale, n_split = chain
@@ -638,10 +629,8 @@ class DeepseekV41Attention(nn.Module):
 
         That kernel stages only its weights/scales before griddepcontrol.wait and reads the
         attention output after it, so the last attention kernel (the Cake fp32 split merge) may
-        call griddepcontrol.launch_dependents first. TRTLLM_CSA2_ATTN_PDL=0 turns this off.
+        call griddepcontrol.launch_dependents first.
         """
-        if not _attn_pdl_enabled():
-            return False
         if self.projection_quantization == "bf16" or not self._o_a_fp8_block128 or inverse_rope_applied:
             return False
         wo = getattr(self, "_b12x_wo", None)
@@ -662,7 +651,7 @@ class DeepseekV41Attention(nn.Module):
             )
             return self.o_b_proj(latent.flatten(1))
         if self._o_a_fp8_block128 and not inverse_rope_applied:
-            # TRTLLM_B12X_WO_PROJECTION (SM120 decode, M <= 8): exact BF16
+            # SM120 decode WO projection (M <= 8): exact BF16
             # inverse RoPE + 1x128 quant in one launch, one grouped b12x wo_a
             # GEMM and o_b_proj as one fused-quant b12x GEMM + its all-reduce,
             # bitwise equal to the chain below.

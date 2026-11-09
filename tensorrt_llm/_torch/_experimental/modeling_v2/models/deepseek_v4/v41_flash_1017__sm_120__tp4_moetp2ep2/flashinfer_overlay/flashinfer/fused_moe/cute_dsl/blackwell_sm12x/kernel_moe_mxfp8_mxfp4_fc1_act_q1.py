@@ -758,10 +758,9 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
         self.grid_x = grid_x
         self.qcfg = qcfg
         # Device-side dynamic split-K (swap-AB decode tile only); see _moe_utils/split_k.py.
-        self.split_k = split_k.enabled() and cfg.mma.swap_ab
-        self.split_max = split_k.max_splits()
-        self.split_min = split_k.min_splits()
-        self.split_nocount = split_k.debug_nocount()
+        self.split_k = cfg.mma.swap_ab
+        self.split_max = split_k.MAX_SPLITS
+        self.split_min = split_k.MIN_SPLITS
         self.epi_q = EPI_CONFIGS[cfg.epi.METHOD](
             cutlass.Float8E4M3FN,
             cfg.mma_threads,
@@ -1124,7 +1123,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
             cute.arch.setmaxregister_decrease(cfg.reg_prod)
 
             if warp_idx == cfg.sched_warp:
-                if cutlass.const_expr(self.split_k and not self.split_nocount):
+                if cutlass.const_expr(self.split_k):
                     # Dynamic split-K: S from the live tile count T (no host sync).
                     prod = moe_scheduler.MoeSchedProducer.create(cfg.sched_stages)
                     # Count loads and the scheduler's own loads are issued back to back,

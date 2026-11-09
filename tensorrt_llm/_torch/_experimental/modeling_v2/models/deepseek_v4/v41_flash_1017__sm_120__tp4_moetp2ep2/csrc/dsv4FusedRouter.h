@@ -47,9 +47,6 @@ struct FusedRouterParams
     int* counter;                // [1] arrival counter, 0 between launches (reset in-kernel)
     float routeScale;
     int numTokens;
-    // Test only (TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT=1, read once per process): skip griddepcontrol.wait, the negative
-    // control of the PDL poison check.
-    int testSkipWait;
 
     // Stage 2 (qOut != nullptr): also write what FlashInfer's mxfp8_q0_route_triton decode branch writes
     // (route_assign_decode_kernel with remap_ids/expert_offset = slotStart and zero_buf, then
@@ -70,7 +67,7 @@ struct FusedRouterParams
 
 void invokeDsv4FusedRouter(FusedRouterParams const& params, cudaStream_t stream);
 
-// K1 fold (decode M <= kMaxFoldTokens; TRTLLM_DSV4_ROUTER_K1_FOLD): the router launch also computes the hc_ffn mHC
+// K1 fold (decode M <= kMaxFoldTokens): the router launch also computes the hc_ffn mHC
 // lagged layer_input (_mhc_lagged_layer_input_kernel's arithmetic, mhc_lagged_split.py, bit for bit for its reducer
 // thread count P) from the boundary's inputs, after griddepcontrol.wait, redundantly in every CTA (shared memory),
 // and runs the GEMV (and the Stage 2 q0) from it. It also writes layer_input to `out` (== x, for the MoE kernels

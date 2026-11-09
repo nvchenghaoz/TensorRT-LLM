@@ -30,14 +30,7 @@ _CAKE_SWA_INT32_MAX_TOKENS = 64
 
 
 def _cake_swa_int32_enabled(device_index: int) -> bool:
-    """Whether the SWA refresh writes the Cake decode's int32 SWA slots on this device.
-
-    ``TRTLLM_CSA2_CAKE_GROUPED_PREP=0`` keeps the per-layer Cake index prep.
-    """
-    import os
-
-    if os.environ.get("TRTLLM_CSA2_CAKE_GROUPED_PREP", "1") == "0":
-        return False
+    """Whether the SWA refresh writes the Cake decode's int32 SWA slots on this device."""
     from .cake_decode import cake_available
 
     return cake_available(device_index)

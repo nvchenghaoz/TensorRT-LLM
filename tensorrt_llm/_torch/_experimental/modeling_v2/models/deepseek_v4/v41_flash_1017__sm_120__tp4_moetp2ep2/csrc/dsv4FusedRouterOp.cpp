@@ -168,7 +168,7 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor> dsv4_fused_router_route(th::Tenso
 namespace
 {
 
-// K1 fold (TRTLLM_DSV4_ROUTER_K1_FOLD): checks the hc_ffn boundary's K1 inputs and fills the fold fields. `out` is the
+// K1 fold: checks the hc_ffn boundary's K1 inputs and fills the fold fields. `out` is the
 // router input x: the launch writes layer_input there (mhc_lagged_layer_input's output for reducer_threads).
 void fillK1Fold(tk::FusedRouterFoldParams& params, th::Tensor const& out, th::Tensor const& x_prev,
     th::Tensor const& residual, th::Tensor const& post, th::Tensor const& comb, th::Tensor const& pre,

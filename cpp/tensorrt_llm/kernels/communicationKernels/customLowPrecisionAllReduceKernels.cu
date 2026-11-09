@@ -1539,24 +1539,6 @@ static __global__ __launch_bounds__(512, 1) void lowPrecisionTwoShotHierAllReduc
     }
 }
 
-// CTAs of lowPrecisionTwoShotAllReduceKernel. TRTLLM_LP_AR_TWOSHOT_CTAS (read on every call, so a sweep can change it
-// between calls; it must be the same on every rank) overrides LP_TWOSHOT_DEFAULT_CTAS, clamped to
-// [1, LP_TWOSHOT_MAX_CTAS].
-static int lowPrecisionTwoShotCtas()
-{
-    int ctas = LP_TWOSHOT_DEFAULT_CTAS;
-    char const* env = std::getenv("TRTLLM_LP_AR_TWOSHOT_CTAS");
-    if (env != nullptr && env[0] != '\0')
-    {
-        int const v = std::atoi(env);
-        if (v >= 1)
-        {
-            ctas = v;
-        }
-    }
-    return ctas < LP_TWOSHOT_MAX_CTAS ? ctas : LP_TWOSHOT_MAX_CTAS;
-}
-
 // TRTLLM_LP_AR_PUSH=1 selects the PUSH kernel for messages >= LP_PUSH_MIN_MESSAGE_BYTES (it needs the larger barrier
 // buffer CustomAllReduceHelper.lowprecision_barrier_bytes sizes); unset or 0 keeps the original PULL two-shot
 // (preprocess + peer reads). Read on every call; it must be the same on every rank.
@@ -1575,7 +1557,7 @@ void lowPrecisionAllReduceDispatchRanksPerNode(kernels::LowPrecisionAllReducePar
     if (RANKS_PER_NODE <= 4)
     {
 
-        int blocks_per_grid = lowPrecisionTwoShotCtas(), threads_per_block = LP_ALLREDUCE_DEFAULT_BLOCK_SIZE;
+        int blocks_per_grid = LP_TWOSHOT_DEFAULT_CTAS, threads_per_block = LP_ALLREDUCE_DEFAULT_BLOCK_SIZE;
 
         params.elts_per_rank = params.elts_total / RANKS_PER_NODE;
         params.rank_offset = params.rank * params.elts_per_rank;

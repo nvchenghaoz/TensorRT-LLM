@@ -108,7 +108,6 @@ def _b12x_gemm_mxfp8_runner(
     from .kernels.dense_blockscaled_gemm_sm120_b12x import (
         Sm120B12xBlockScaledDenseGemmKernel,
         _select_default_dense_gemm_plan,
-        b12x_core_fence_enabled,
     )
 
     from ..cute_dsl.utils import torch_to_cutlass_dtype
@@ -243,7 +242,6 @@ def _b12x_gemm_mxfp8_runner(
                 use_tma_store,
                 enable_pdl,
                 out_dtype,
-                b12x_core_fence_enabled(),
             )
 
             make_kernel = lambda: Sm120B12xBlockScaledDenseGemmKernel(

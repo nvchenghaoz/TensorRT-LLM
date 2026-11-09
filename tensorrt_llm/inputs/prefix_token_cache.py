@@ -89,9 +89,7 @@ SHARED_DIR_ENV = "TLLM_PREFIX_TOKEN_CACHE_SHARED_DIR"
 # nominal cut, and encodes them with ONE ``backend_tokenizer.encode_batch``
 # call, which releases the GIL and runs the pieces on the backend's thread
 # pool. Offsets are read lazily (``_PieceOffsets``): the cache only reads the
-# grid points and the next split. Read once at import; benches flip the module
-# attribute. ``TLLM_PREFIX_TOKEN_CACHE_PARALLEL=0`` keeps the single HF call.
-PARALLEL_TAIL = os.environ.get("TLLM_PREFIX_TOKEN_CACHE_PARALLEL", "1") != "0"
+# grid points and the next split.
 PARALLEL_PIECE_CHARS = 1024
 PARALLEL_CUT_SEARCH = 256
 PARALLEL_MAX_PIECES = 8
@@ -754,8 +752,7 @@ class PrefixTokenCache:
         """``_tokenize``, through one GIL-releasing ``encode_batch`` over exact pieces when on."""
         backend = self._parallel_backend
         if (
-            not PARALLEL_TAIL
-            or backend is None
+            backend is None
             or len(text) < 2 * PARALLEL_PIECE_CHARS
             or getattr(tokenizer, "backend_tokenizer", None) is not backend
             or not _backend_state_is_plain(tokenizer, backend)
@@ -906,7 +903,7 @@ def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
     lcp_splice, why = _lcp_splice_gate(tokenizer)
     fingerprint = _tokenizer_fingerprint(tokenizer) if lcp_splice else None
     parallel_backend, parallel_why = (
-        _parallel_tail_gate(tokenizer) if lcp_splice and PARALLEL_TAIL else (None, "")
+        _parallel_tail_gate(tokenizer) if lcp_splice else (None, "")
     )
     logger.info(
         f"Prefix token cache enabled: {config}; shared-prefix splice "
@@ -914,7 +911,7 @@ def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
         + (f"; cross-process fingerprint {fingerprint}" if fingerprint else "")
         + (
             f"; parallel tail tokenization {'on' if parallel_backend is not None else 'off'} "
-            f"(PARALLEL_TAIL=True, {PARALLEL_MAX_PIECES} pieces of >= {PARALLEL_PIECE_CHARS} "
+            f"({PARALLEL_MAX_PIECES} pieces of >= {PARALLEL_PIECE_CHARS} "
             f"chars: {parallel_why})"
             if parallel_why
             else ""

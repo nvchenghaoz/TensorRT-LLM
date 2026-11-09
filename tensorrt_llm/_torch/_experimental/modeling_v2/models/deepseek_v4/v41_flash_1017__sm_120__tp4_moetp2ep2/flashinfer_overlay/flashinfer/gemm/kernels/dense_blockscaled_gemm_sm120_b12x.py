@@ -76,19 +76,6 @@ def _load_iket():
 
 iket = _load_iket()
 
-
-def b12x_core_fence_enabled() -> bool:
-    """Whether MMA warps fence the async proxy before releasing a smem stage.
-
-    The fence orders the warps' generic-proxy shared-memory reads of a
-    mainloop stage before the producer's next TMA (async-proxy) write into
-    it. Default on; ``FLASHINFER_B12X_CORE_FENCE=0`` opts out. Kernel caches
-    that key compiled b12x kernels include this flag.
-    """
-    import os
-
-    return os.environ.get("FLASHINFER_B12X_CORE_FENCE", "1") != "0"
-
 from flashinfer.cute_dsl.utils import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
@@ -302,8 +289,6 @@ class DenseGemmKernel:
         # IKET is a compile-time diagnostic. Every marker is guarded with
         # const_expr so the default specialization contains no tracing ops.
         self.enable_iket = enable_iket
-        # Compile-time: async-proxy fence before each mainloop consumer_release.
-        self.core_fence = b12x_core_fence_enabled()
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 64), (16, 128)):
             self.atom_shape = (1, 2, 1)
@@ -1718,8 +1703,9 @@ class DenseGemmKernel:
                         )
 
                         if k_block_idx == num_k_blocks - 1:
-                            if cutlass.const_expr(self.core_fence):
-                                cute.arch.fence_proxy("async.shared", space="cta")
+                            # Order the MMA warps' generic-proxy smem reads of this stage
+                            # before the producer's next TMA (async-proxy) write into it.
+                            cute.arch.fence_proxy("async.shared", space="cta")
                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
                             mainloop_consumer_state.advance()
 
@@ -1814,8 +1800,7 @@ class DenseGemmKernel:
                     )
 
                     if k_block_idx == num_k_blocks - 1:
-                        if cutlass.const_expr(self.core_fence):
-                            cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.fence_proxy("async.shared", space="cta")
                         mainloop_pipeline.consumer_release(mainloop_consumer_state)
                         mainloop_consumer_state.advance()
 
@@ -1891,8 +1876,7 @@ class DenseGemmKernel:
                             tCrSvdquantB,
                             accumulators,
                         )
-                        if cutlass.const_expr(self.core_fence):
-                            cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.fence_proxy("async.shared", space="cta")
                         mainloop_pipeline.consumer_release(mainloop_consumer_state)
                         mainloop_consumer_state.advance()
                     if cutlass.const_expr(self.enable_iket):

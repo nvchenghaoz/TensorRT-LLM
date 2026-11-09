@@ -6730,23 +6730,10 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
         )
 
 
-def _parse_fused_quant_pipeline_env() -> Tuple[bool, bool, int]:
-    raw = os.environ.get("B12X_FUSED_QUANT_PIPELINE", "0").strip().lower()
-    if raw in ("", "0", "off", "false"):
-        return (False, False, 0)
-    fields = [f.strip() for f in raw.split(",")]
-    if len(fields) != 3:
-        raise ValueError(
-            "B12X_FUSED_QUANT_PIPELINE must be 0 or 'b_first,wide,prefetch', "
-            f"got {raw!r}"
-        )
-    return (fields[0] == "1", fields[1] == "1", int(fields[2]))
-
-
 # Fused-quant producer pipelining (b_first, wide, prefetch) for
 # dense_gemm_fused_quant_a[_grouped] callers that pass no explicit pipeline.
 # (False, False, 0) is the pinned producer.
-_FUSED_QUANT_PIPELINE_DEFAULT = _parse_fused_quant_pipeline_env()
+_FUSED_QUANT_PIPELINE_DEFAULT = (False, False, 0)
 
 
 def set_fused_quant_pipeline_default(

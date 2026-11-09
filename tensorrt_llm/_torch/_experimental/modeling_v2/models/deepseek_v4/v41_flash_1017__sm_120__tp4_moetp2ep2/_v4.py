@@ -30,6 +30,7 @@
 
 import copy
 import math
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
@@ -99,7 +100,6 @@ from tensorrt_llm._torch.models.modeling_utils import (
     layerwise_moe_quant_config,
 )
 from .native import native_ops  # target-owned C++ ops
-from .switches import env_get  # run switches frozen at served values
 
 # Decode MoE all-reduce early trigger (idea 208). At decode M <= 8 the MoE output all-reduce
 # (DeepseekV4MoE.forward -> self.allreduce) triggers its PDL dependents right after its own
@@ -108,14 +108,12 @@ from .switches import env_get  # run switches frozen at served values
 # while the lamport all-reduce polls its peers. Every consumer still reads the all-reduce output
 # only after its own griddepcontrol.wait (or is a plain, fully ordered launch), so the output is
 # unchanged. Row counts above 8 (prefill, the 128-row tail-MoE replay) keep the end trigger.
-# TRTLLM_DSV4_MOE_AR_EARLY_TRIGGER=0 restores the end trigger everywhere.
-_MOE_AR_EARLY_TRIGGER = env_get("TRTLLM_DSV4_MOE_AR_EARLY_TRIGGER", "1") != "0"
 _MOE_AR_EARLY_TRIGGER_MAX_TOKENS = 8
 
 
 def _moe_ar_trigger_at_end(num_tokens: int) -> bool:
     """``trigger_completion_at_end`` of the MoE output all-reduce for ``num_tokens`` rows."""
-    return not (_MOE_AR_EARLY_TRIGGER and 0 < num_tokens <= _MOE_AR_EARLY_TRIGGER_MAX_TOKENS)
+    return not (0 < num_tokens <= _MOE_AR_EARLY_TRIGGER_MAX_TOKENS)
 
 
 @triton.jit
@@ -348,7 +346,7 @@ def _maybe_view_deepseek_v4_routed_moe_tensor(
 
 def _resolve_enable_fused_hc(config: PretrainedConfig) -> bool:
     """Resolve the DeepSeek-V4 fused HC boundary-fusion knob."""
-    env = env_get("TRTLLM_MHC_ENABLE_FUSED_HC")
+    env = os.environ.get("TRTLLM_MHC_ENABLE_FUSED_HC")
     if env is not None:
         return env not in ("0", "false", "False")
     return bool(getattr(config, "enable_fused_hc", True))
@@ -1523,17 +1521,12 @@ class DeepseekV4Attention(MLA):
 
 
 # Decode (1..8 tokens, top-k routed, no image mask): DeepseekV4Gate.fused_forward runs the router GEMV and the top-6
-# gate in one launch (bitwise dsv3_router_gemm_op + gate_forward). TRTLLM_DSV4_FUSED_ROUTER=0 turns it off.
-_DSV4_FUSED_ROUTER = env_get("TRTLLM_DSV4_FUSED_ROUTER", "1") == "1"
+# gate in one launch (bitwise dsv3_router_gemm_op + gate_forward).
 # Stage 2 at M <= this many tokens: the same launch's last CTA also writes the SM12x FlashInfer decode chain's route
 # (route_assign_decode + MXFP8 q0, native_ops.dsv4_fused_router_route) and Sm12xW4a8DecodeState.run skips
 # its two route kernels. Above it the per-token q_out scatter from one SM costs more than the route kernels
-# (+0.5 us/layer at M8). TRTLLM_DSV4_FUSED_ROUTER_ROUTE=0 turns Stage 2 off (Stage 1 only).
-_DSV4_FUSED_ROUTER_ROUTE_MAX_M = (
-    int(env_get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE_MAX_M", "2"))
-    if env_get("TRTLLM_DSV4_FUSED_ROUTER_ROUTE", "1") == "1"
-    else 0
-)
+# (+0.5 us/layer at M8).
+_DSV4_FUSED_ROUTER_ROUTE_MAX_M = 2
 
 
 class DeepseekV4Gate(nn.Module):
@@ -1635,8 +1628,7 @@ class DeepseekV4Gate(nn.Module):
     def k1_fold_supported(self, num_tokens: int) -> bool:
         """fused_forward can take a K1 fold (k1_fold=) for this many tokens."""
         return (
-            _DSV4_FUSED_ROUTER
-            and not self.is_hashed
+            not self.is_hashed
             and self.top_k == 6
             and 1 <= num_tokens <= 4
             and hasattr(native_ops, "dsv4_fused_router_k1fold")
@@ -1678,8 +1670,7 @@ class DeepseekV4Gate(nn.Module):
         on the state, whose next run() of exactly (hidden_states, ids, weights) skips route().
         """
         if (
-            not _DSV4_FUSED_ROUTER
-            or self.is_hashed
+            self.is_hashed
             or self.top_k != 6
             or not hasattr(native_ops, "dsv4_fused_router")
             or hidden_states.dim() != 2
@@ -1787,11 +1778,10 @@ class DeepseekV4Gate(nn.Module):
 # threshold (eager prefill), the ranks sharing a column shard instead split
 # the rows: each computes its own row range once, unscaled, and adds it into
 # routed_output in place. Every row's shared output is still computed exactly
-# once per column shard across the TP group. TRTLLM_DSV4_SHARED_ROW_SPLIT=0
-# turns it off. The threshold is 256: at M = 128 (host-bound) the split measured
-# ~1% slower on one rank, so those layers keep main's path; decode CUDA graphs
-# (M <= 32) never reach it.
-SHARED_ROW_SPLIT_MIN_TOKENS = int(env_get("TRTLLM_DSV4_SHARED_ROW_SPLIT_MIN_TOKENS", "256"))
+# once per column shard across the TP group. The threshold is 256: at M = 128
+# (host-bound) the split measured ~1% slower on one rank, so those layers keep
+# main's path; decode CUDA graphs (M <= 32) never reach it.
+SHARED_ROW_SPLIT_MIN_TOKENS = 256
 
 # Eager prefill fork/join of the shared expert. maybe_execute_in_parallel runs
 # routed and shared serially on the calling stream whenever do_multi_stream()
@@ -1803,9 +1793,7 @@ SHARED_ROW_SPLIT_MIN_TOKENS = int(env_get("TRTLLM_DSV4_SHARED_ROW_SPLIT_MIN_TOKE
 # global do_multi_stream() flag is NOT touched, so no other
 # maybe_execute_in_parallel site changes. M < threshold (L20-39 at M=128 are
 # host-bound) and decode CUDA graphs keep the serial / captured paths.
-# TRTLLM_DSV4_SHARED_OVERLAP=0 turns it off.
-SHARED_OVERLAP_MIN_TOKENS = int(env_get("TRTLLM_DSV4_SHARED_OVERLAP_MIN_TOKENS", "1024"))
-SHARED_OVERLAP_ENABLED = env_get("TRTLLM_DSV4_SHARED_OVERLAP", "1") != "0"
+SHARED_OVERLAP_MIN_TOKENS = 1024
 
 
 def shared_expert_row_split_layout(tp_rank: int, tp_size: int, shared_tp_size: int):
@@ -1837,8 +1825,7 @@ def shared_expert_row_range(num_rows: int, parts: int, part_index: int):
 # computes blocks shared_expert_row_range(n_blocks, parts, p) of its half
 # (DSV4 TP4: 9 blocks -> [0,5) and [5,9)) with a low-M GEMV kernel
 # (modules/fp8_shared_decode.py), unscaled; the MoE all-reduce sums the parts,
-# so every block is computed once per shard. TRTLLM_DSV4_SHARED_DECODE_SPLIT=0
-# turns it off.
+# so every block is computed once per shard.
 SHARED_DECODE_SPLIT_MAX_TOKENS = 8
 
 
@@ -2018,8 +2005,7 @@ class DeepseekV4MoE(nn.Module):
         self._shared_row_split_parts = 0
         self._shared_row_split_index = 0
         if (
-            env_get("TRTLLM_DSV4_SHARED_ROW_SPLIT", "1") == "0"
-            or self.shared_output_scale is None
+            self.shared_output_scale is None
             or self.use_dp
             or self.mapping.tp_size <= 1
             or self.mapping.pp_size != 1
@@ -2068,8 +2054,7 @@ class DeepseekV4MoE(nn.Module):
     def _use_shared_overlap(self, hidden_states, use_row_split: bool) -> bool:
         """Fork/join the row-split shared expert onto the aux stream (eager, M >= T)."""
         use = (
-            SHARED_OVERLAP_ENABLED
-            and use_row_split
+            use_row_split
             and getattr(self, "aux_stream", None) is not None
             and hidden_states.shape[0] >= SHARED_OVERLAP_MIN_TOKENS
             and not do_multi_stream()
@@ -2114,8 +2099,7 @@ class DeepseekV4MoE(nn.Module):
         self._shared_decode_split = False
         se = self.shared_experts
         if (
-            env_get("TRTLLM_DSV4_SHARED_DECODE_SPLIT", "1") == "0"
-            or not is_sm_120f()
+            not is_sm_120f()
             or self.shared_output_scale is None
             or self.use_dp
             or self.mapping.tp_size <= 1
@@ -2365,8 +2349,7 @@ class DeepseekV4MoE(nn.Module):
         whose stash is then not consumed (any other path) drops it at its next run(): the stash only matches
         the exact tensors it was made for."""
         if (
-            _DSV4_FUSED_ROUTER_ROUTE_MAX_M <= 0
-            or hidden_states_fp4 is not None
+            hidden_states_fp4 is not None
             or not do_finalize
             or hidden_states.dim() != 2
             or hidden_states.shape[0] > _DSV4_FUSED_ROUTER_ROUTE_MAX_M
@@ -3279,17 +3262,15 @@ class DeepseekV4Model(DecoderModel):
             config.hidden_size,
             dtype=config.torch_dtype,
             # One Triton gather launch (bitwise the masked F.embedding path) instead of 9 ATen launches;
-            # its first data consumer is the fused mHC seed in forward (or the ATen repeat when
-            # TRTLLM_DSV4_HC_SEED_FAST=0). TRTLLM_DSV4_EMBED_GATHER=0 restores the masked path.
-            use_gather_kernel=env_get("TRTLLM_DSV4_EMBED_GATHER", "1") == "1",
+            # its first data consumer is the fused mHC seed in forward.
+            use_gather_kernel=True,
         )
         # Fused mHC stream seed: the gather kernel stores each embedding row hc_mult times
         # ([T, hc_mult, hidden], bitwise the unsqueeze(1).repeat seed) and, for V4.1, the one-hot
-        # pre_mix in the same launch. TRTLLM_DSV4_HC_SEED_FAST=0 restores the separate repeat.
+        # pre_mix in the same launch.
         self._hc_seed_fast = (
             self.embed_tokens.use_gather_kernel
             and self.embed_tokens.tp_size == 1
-            and env_get("TRTLLM_DSV4_HC_SEED_FAST", "1") == "1"
         )
 
         self.hc_head = HCHead(config.hc_mult, config.hidden_size) if self.uses_hc_head else None

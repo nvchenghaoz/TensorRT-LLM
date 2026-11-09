@@ -10,7 +10,7 @@ reduction. It replaces ``mxfp8_quantize`` + ``flashinfer_mm_mxfp8`` (b12x) at de
 math in another summation order (reordered output class).
 
 Only the (N, K) projections where the port measured faster than quantize + b12x are routed here; everything else
-returns ``None`` and the caller keeps the existing path. ``TRTLLM_LOW_M_MXFP8=0`` disables it.
+returns ``None`` and the caller keeps the existing path.
 Every configuration of a projection's table is launched once eagerly on first use outside stream capture, so each
 kernel instance has its shared-memory attributes set before any CUDA graph is captured.
 """
@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import torch
 from ..native import native_ops  # target-owned C++ ops
-from ..switches import env_get  # run switches frozen at served values
 
 MAX_M = 8
 
@@ -35,7 +34,7 @@ _CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int, int]]] = {
                    7: (8, 4, 1), 8: (8, 4, 1)},
 }
 
-# Attention-input chain (TRTLLM_CSA2_QB_FUSED, idea 232): wq_a||wkv is launched with its dependents triggered at
+# Attention-input chain (idea 232): wq_a||wkv is launched with its dependents triggered at
 # start so the fused q_norm + MXFP8 quant + wq_b(||index_wq_b) kernel (``native_ops.csa2_qnorm_low_m_gemm``)
 # stages its weight slice while wq_a||wkv streams. Measured in a 40-layer cold-L2 PDL CUDA-graph chain on RTX PRO 6000
 # (experiments/ascent/qb_fused/bench.py, jobs 1087/1097), us/layer main -> chain:
@@ -57,33 +56,21 @@ _QNORM_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int, int]]] = {
 _TRIGGER_AT_START = 2  # csa2_mxfp8_low_m_gemm debug_flags bit 1: trigger dependents at start
 _L2PF = 4  # debug_flags bit 2: L2-prefetch pf_w / pf_sf (bits 3-4 position, bit 5 evict_last)
 
-# Attention-input chain L2 prefetch (TRTLLM_CSA2_QB_L2PF, idea 272): wq_a||wkv (A) prefetches the tail of the fused
+# Attention-input chain L2 prefetch (idea 272): wq_a||wkv (A) prefetches the tail of the fused
 # q_norm + wq_b(||index_wq_b) kernel's (B) weight + scale bytes into L2, so B's CTAs that only become resident once
 # A's CTAs exit stage from L2 instead of DRAM. Per M: (position, evict_last, frac/256); position 0 = after A's own
 # bulk copies (before its trigger), 1 = after A's weights landed, 2 = after A's PDL wait. A prefetch is a hint, so
-# outputs are bitwise unchanged. TRTLLM_CSA2_QB_L2PF=0 disables it; "pos,evict_last,frac" overrides every M.
+# outputs are bitwise unchanged.
 # Measured in the 40-layer cold-L2 chain with the real hc_attn K1 (experiments/ascent/qb_l2pf/bench.py arms, job
 # 1592), us/layer vs off: M=1 every arm slower (+0.5..+2.1: all of B's CTAs are co-resident there, so the prefetch
 # only lengthens A) -> off; M=2 pos 1 frac 154 -0.73 (25.48 vs 26.21); M=4 pos 2 frac 102 -1.58 (25.91 vs 27.49).
 # M=3 shares M=4's A/B configurations; M>=5 was not measured and stays off.
 _L2PF_DEFAULT: dict[int, tuple[int, int, int]] = {2: (1, 0, 154), 3: (2, 0, 102), 4: (2, 0, 102)}
-_l2pf_cache: dict = {}
 
 
 def l2pf_setting(m: int):
     """``(position, evict_last, frac)`` of the attention-input chain's L2 prefetch at ``m`` rows, or ``None``."""
-    env = env_get("TRTLLM_CSA2_QB_L2PF", "1")
-    key = (env, m)
-    if key not in _l2pf_cache:
-        if env == "0":
-            val = None
-        elif env == "1":
-            val = _L2PF_DEFAULT.get(m)
-        else:
-            pos, last, frac = (int(v) for v in env.split(","))
-            val = (pos, last, frac)
-        _l2pf_cache[key] = val
-    return _l2pf_cache[key]
+    return _L2PF_DEFAULT.get(m)
 
 
 _state: dict = {}
@@ -93,8 +80,7 @@ def _available(device: torch.device) -> bool:
     ok = _state.get(device.index)
     if ok is None:
         ok = (
-            env_get("TRTLLM_LOW_M_MXFP8", "1") != "0"
-            and torch.cuda.get_device_capability(device) == (12, 0)
+            torch.cuda.get_device_capability(device) == (12, 0)
             and hasattr(native_ops, "csa2_mxfp8_low_m_gemm")
         )
         _state[device.index] = ok
@@ -168,8 +154,7 @@ def _qnorm_available(device: torch.device) -> bool:
     ok = _state.get(key)
     if ok is None:
         ok = (
-            env_get("TRTLLM_CSA2_QB_FUSED", "1") != "0"
-            and _available(device)
+            _available(device)
             and hasattr(native_ops, "csa2_qnorm_low_m_gemm")
         )
         _state[key] = ok

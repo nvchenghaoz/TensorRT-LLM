@@ -21,8 +21,8 @@ For decode row counts this module runs
 
 Every stage is byte-identical to main's (checked bitwise at M=1..8).
 
-With ``TRTLLM_CSA2_LOWM_WO`` (default on) the decode rows M=1..8 instead run the SM120 low-M MXFP8 kernel family
-(``LowMWOProjection``), with no b12x kernel on the route:
+The decode rows M=1..8 instead run the SM120 low-M MXFP8 kernel family (``LowMWOProjection``), with no b12x kernel
+on the route (the b12x chain above is the fallback when the low-M kernels are unavailable):
 
 1. ``trtllm::csa2_lowm_wo_a`` (cpp/tensorrt_llm/kernels/minimaxM3/csa2LowMWo.cu): the same BF16 inverse RoPE and
    1x128 UE8M0 quantization as step 1 above (byte-equal, same instruction sequence) fused with the grouped wo_a
@@ -43,59 +43,29 @@ import triton.language as tl
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from ..native import native_ops  # target-owned C++ ops
-from ..switches import env_get  # run switches frozen at served values
 
-_ENV = "TRTLLM_B12X_WO_PROJECTION"
-_ENV_WO_B = "TRTLLM_B12X_WO_B_FUSED"
 # wo_b fused-quant producer layout (FlashInfer b12x fq_pipeline wide=True: 16 lanes
 # per row, 2 rows per pass, packed sA stores). Bitwise equal to the pinned
 # producer; used only at the decode row counts where it is faster in main's chain.
-_ENV_WO_B_WIDE_ROWS = "TRTLLM_B12X_WO_B_WIDE_ROWS"
-_WO_B_WIDE_ROWS_DEFAULT = "2,3,4"
+_WO_B_WIDE_ROWS = frozenset((2, 3, 4))
 MAX_DECODE_ROWS = 8
-_ENV_LOWM = "TRTLLM_CSA2_LOWM_WO"
 # (warps, cluster_k, row_tiles) per decode row count. RTX PRO 6000 (SM120, 188 SMs), 40-layer cold-L2 PDL graph
 # chain sweep at the TP4 rank shapes (experiments/ascent/lowm_wo/bench.py, job 1104).
 _LOWM_WO_A_CONFIGS = {m: ((4, 2, 2) if m <= 2 else (8, 4, 2)) for m in range(1, MAX_DECODE_ROWS + 1)}
 _LOWM_WO_B_CONFIGS = {m: ((4, 1, 1) if m <= 2 else (8, 1, 2)) for m in range(1, MAX_DECODE_ROWS + 1)}
 # Attention all-reduce early trigger (decode M <= 4, idea 313): the AR launches its dependents at its start, so the
 # next main-stream kernel (with the K1 fold, the MoE's fused router, which reads nothing upstream before its
-# griddepcontrol.wait) stages its weights while the AR polls. Default: on exactly when the K1 fold is on.
-_ATTN_AR_EARLY_TRIGGER = (
-    env_get(
-        "TRTLLM_DSV4_ATTN_AR_EARLY_TRIGGER", env_get("TRTLLM_DSV4_ROUTER_K1_FOLD", "1")
-    )
-    != "0"
-)
+# griddepcontrol.wait) stages its weights while the AR polls.
 _ATTN_AR_EARLY_TRIGGER_MAX_M = 4
 
 
 def _attn_all_reduce_params(m: int):
     """None (the default all-reduce params) or AllReduceParams with trigger_completion_at_end=False."""
-    if not _ATTN_AR_EARLY_TRIGGER or not 1 <= m <= _ATTN_AR_EARLY_TRIGGER_MAX_M:
+    if not 1 <= m <= _ATTN_AR_EARLY_TRIGGER_MAX_M:
         return None
     from tensorrt_llm._torch.distributed import AllReduceParams
 
     return AllReduceParams(trigger_completion_at_end=False)
-
-
-def _env_on(name: str) -> bool:
-    return env_get(name, "1").strip().lower() not in ("0", "false", "off", "")
-
-
-def _wo_b_wide_rows() -> frozenset:
-    raw = env_get(_ENV_WO_B_WIDE_ROWS, _WO_B_WIDE_ROWS_DEFAULT).strip().lower()
-    if raw in ("", "0", "off", "none", "false"):
-        return frozenset()
-    return frozenset(int(x) for x in raw.split(",") if x.strip())
-
-
-def b12x_wo_projection_enabled() -> bool:
-    return _env_on(_ENV)
-
-
-def lowm_wo_projection_enabled() -> bool:
-    return _env_on(_ENV_LOWM)
 
 
 @triton.jit
@@ -296,7 +266,7 @@ class B12xWOProjection:
         self.alpha = W._cached_alpha_one(weight.device)
         self.o_b_proj = module.o_b_proj
         self.wo_b = None
-        if _env_on(_ENV_WO_B) and _direct_wo_b_supported(self.o_b_proj):
+        if _direct_wo_b_supported(self.o_b_proj):
             wb, wsf = self.o_b_proj.weight, self.o_b_proj.weight_scale
             n, k = wb.shape
             sfb = (
@@ -309,7 +279,7 @@ class B12xWOProjection:
                 raise RuntimeError("b12x wo_b must view the live o_b_proj weight scales")
             self.wo_b = W.MXFP8Rows(values=wb, scale_rows=sfb, scale_mma=sfb)
             self.hidden = n
-        self._wo_b_wide = _wo_b_wide_rows()
+        self._wo_b_wide = _WO_B_WIDE_ROWS
         self._warm_rows = set()
 
     def _wo_b(self, tmp: torch.Tensor, out: torch.Tensor, m: int) -> None:
@@ -540,19 +510,16 @@ def build_b12x_wo_projection(module, prewarm: bool = True):
         return None
     if module.inverse_rotary_emb.is_neox or module.o_a_proj.dtype != torch.float8_e4m3fn:
         return None
-    if lowm_wo_projection_enabled():
-        try:
-            projection = LowMWOProjection(module)
-            if prewarm:
-                projection.prewarm(module.o_a_proj.device)
-            return projection
-        except Exception as error:  # pragma: no cover - optional kernels
-            logger.warning_once(
-                f"low-M WO projection unavailable ({error!r}); trying the b12x WO projection.",
-                key="csa2_lowm_wo_unavailable",
-            )
-    if not b12x_wo_projection_enabled():
-        return None
+    try:
+        projection = LowMWOProjection(module)
+        if prewarm:
+            projection.prewarm(module.o_a_proj.device)
+        return projection
+    except Exception as error:  # pragma: no cover - optional kernels
+        logger.warning_once(
+            f"low-M WO projection unavailable ({error!r}); trying the b12x WO projection.",
+            key="csa2_lowm_wo_unavailable",
+        )
     try:
         projection = B12xWOProjection(module)
         if prewarm:

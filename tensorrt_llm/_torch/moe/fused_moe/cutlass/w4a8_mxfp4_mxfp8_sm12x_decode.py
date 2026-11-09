@@ -30,7 +30,6 @@ re-laid out (TRT-LLM 128x4 swizzle -> FlashInfer MN-major int32 packs), once at 
 
 from __future__ import annotations
 
-import os
 import threading
 
 import torch
@@ -40,25 +39,20 @@ from tensorrt_llm.logger import logger
 #: Calls with at most this many tokens take the FlashInfer chain; larger ones (prefill)
 #: stay on CUTLASS. 32 tokens x top-6 = 192 pairs keeps the route on its decode kernel
 #: (<= 256 pairs) and the GEMMs on the small-M tiles.
-FI_DECODE_MAX_TOKENS = int(os.environ.get("TRTLLM_SM12X_W4A8_FI_DECODE_MAX_TOKENS", "32"))
+FI_DECODE_MAX_TOKENS = 32
 
 #: Prefill calls (FI_DECODE_MAX_TOKENS < M <= FI_PREFILL_MAX_TOKENS) take the chain too, as the
 #: two-kernel fc1_act_q1 -> fc2_finalize (never the persistent decode fc12 kernel) at the tiles of
-#: prefill_tiles(), with a per-call route workspace. TRTLLM_SM12X_W4A8_FI_PREFILL selects when:
-#: "graph" (default) only while a CUDA graph is being captured (the host cost of the chain's ~10
-#: enqueues is then paid once at capture), "1" also in eager forwards, "0" never (main's CUTLASS
-#: prefill, byte-identical).
-FI_PREFILL_MODE = os.environ.get("TRTLLM_SM12X_W4A8_FI_PREFILL", "graph")
-FI_PREFILL_MAX_TOKENS = int(os.environ.get("TRTLLM_SM12X_W4A8_FI_PREFILL_MAX_TOKENS", "8192"))
+#: prefill_tiles(), with a per-call route workspace, only while a CUDA graph is being captured (the
+#: host cost of the chain's ~10 enqueues is then paid once at capture); eager prefill stays on CUTLASS.
+FI_PREFILL_MAX_TOKENS = 8192
 
 
 def fi_prefill_takes(m: int) -> bool:
     """Whether a BF16 call of m > FI_DECODE_MAX_TOKENS tokens takes the FlashInfer chain."""
-    if FI_PREFILL_MODE == "0" or not FI_DECODE_MAX_TOKENS < m <= FI_PREFILL_MAX_TOKENS:
+    if not FI_DECODE_MAX_TOKENS < m <= FI_PREFILL_MAX_TOKENS:
         return False
-    if FI_PREFILL_MODE == "1":
-        return True
-    return FI_PREFILL_MODE == "graph" and torch.cuda.is_current_stream_capturing()
+    return torch.cuda.is_current_stream_capturing()
 
 
 #: (max tokens, fc1 tile bm, fc2 tile bm) per prefill bucket; tiles are (bm, 128, BK). None = the
@@ -81,8 +75,6 @@ def prefill_warm_tokens() -> list:
     """Token counts the prefill warmup runs: every Triton int specialization of the route's two
     paths (<= 256 pairs: route_assign_decode; above: count/prefix/assign) and one call per tile
     bucket, so no request JITs."""
-    if FI_PREFILL_MODE == "0" or FI_PREFILL_MAX_TOKENS <= FI_DECODE_MAX_TOKENS:
-        return []
     lo, hi = FI_DECODE_MAX_TOKENS + 1, FI_PREFILL_MAX_TOKENS
     ms = set(range(lo, min(hi, lo + 23) + 1))
     prev = FI_DECODE_MAX_TOKENS
@@ -96,13 +88,10 @@ def prefill_warm_tokens() -> list:
     return sorted(m for m in ms if lo <= m <= hi)
 
 
-_ENABLE_ENV = "TRTLLM_SM12X_W4A8_FI_DECODE"
-
-#: Run fc1_act_q1 + fc2_finalize as ONE persistent kernel (FlashInfer SM12x
+#: Decode runs fc1_act_q1 + fc2_finalize as ONE persistent kernel (FlashInfer SM12x
 #: kernel_moe_mxfp8_mxfp4_fc12_fused.py: one atomic work counter, all fc1 units before any fc2
 #: tile, per-expert release/acquire counters) when the FlashInfer build has it and the route
-#: zero-fills the outputs itself; "0" keeps the two-kernel chain.
-FC12_FUSED = os.environ.get("TRTLLM_SM12X_FI_FC12_FUSED", "1") == "1"
+#: zero-fills the outputs itself; otherwise the two-kernel chain.
 
 _LOCK = threading.Lock()
 _OPS = None  # (route, make_ws, fc1, out_sf_shape, fc2, FiActivation) once imported
@@ -120,15 +109,14 @@ def _fused_op():
     global _FUSED_OP
     if _FUSED_OP is None:
         _FUSED_OP = False
-        if FC12_FUSED:
-            try:
-                from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.kernel_moe_mxfp8_mxfp4_fc12_fused import (
-                    cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4,
-                )
+        try:
+            from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.kernel_moe_mxfp8_mxfp4_fc12_fused import (
+                cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4,
+            )
 
-                _FUSED_OP = cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4
-            except ImportError as e:
-                logger.info(f"SM12x fused fc1+fc2 decode kernel unavailable: {e!r}")
+            _FUSED_OP = cute_dsl_sm12x_fc12_fused_mxfp8_mxfp4
+        except ImportError as e:
+            logger.info(f"SM12x fused fc1+fc2 decode kernel unavailable: {e!r}")
     return _FUSED_OP
 
 
@@ -170,17 +158,12 @@ def _route_fuses_prologue() -> bool:
         import inspect
 
         params = inspect.signature(_load_ops()[0]).parameters
-        _ROUTE_FUSES_PROLOGUE = (
-            os.environ.get("TRTLLM_SM12X_W4A8_FI_FUSED_PROLOGUE", "1") == "1"
-            and "expert_offset" in params and "zero_buf" in params
-        )
+        _ROUTE_FUSES_PROLOGUE = "expert_offset" in params and "zero_buf" in params
     return _ROUTE_FUSES_PROLOGUE
 
 
 def fi_decode_available(device: torch.device | None = None) -> tuple[bool, str]:
     """The SM12x runner's ``_check_support`` conditions that do not depend on the layer."""
-    if os.environ.get(_ENABLE_ENV, "1") == "0":
-        return False, f"disabled by {_ENABLE_ENV}=0"
     if not torch.cuda.is_available():
         return False, "no CUDA"
     major, minor = torch.cuda.get_device_capability(device)
@@ -453,7 +436,7 @@ class Sm12xW4a8DecodeState:
             _WARMED.add(key)
             logger.info(
                 f"SM12x W4A8 MXFP4xMXFP8 FlashInfer PREFILL chain warmed up for {len(ms)} token counts in "
-                f"{ms[0]}..{ms[-1]} (mode={FI_PREFILL_MODE}, tiles={_PREFILL_TILE_TABLE}, hidden={self.hidden}, "
+                f"{ms[0]}..{ms[-1]} (tiles={_PREFILL_TILE_TABLE}, hidden={self.hidden}, "
                 f"inter={self.inter}, experts={self.num_experts})"
             )
 
@@ -464,14 +447,8 @@ class Sm12xW4a8DecodeState:
         layer and every decode batch; the Triton route kernels specialize on scalar
         arguments, so each batch size up to the threshold is run once.
         """
-        # The FlashInfer SM12x kernels read their TRTLLM_SM12X_FI_* knobs (split-K, fused
-        # fc12 KACQ / EARLY_W2 / prefetch / debug) into their compile keys at call time, so a
-        # knob changed after warmup must warm again rather than JIT inside a graph capture.
-        fi_env = tuple(sorted((k, v) for k, v in os.environ.items()
-                              if k.startswith("TRTLLM_SM12X_FI_")))
         key = (self.hidden, self.inter, self.num_experts, top_k, self.enable_pdl,
-               self.swiglu_limit, self.slot_start, bool(_route_fuses_prologue() and _fused_op()),
-               fi_env)
+               self.swiglu_limit, self.slot_start, bool(_route_fuses_prologue() and _fused_op()))
         with _LOCK:
             if key in _WARMED:
                 return

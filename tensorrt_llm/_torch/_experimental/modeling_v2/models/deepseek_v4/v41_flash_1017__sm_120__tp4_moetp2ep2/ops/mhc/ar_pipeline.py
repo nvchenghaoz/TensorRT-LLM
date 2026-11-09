@@ -14,14 +14,11 @@ Chunk size: ~1024 rows. On SM120 (188 SMs) the M=1024 fused_hc tactic (mtile_v3,
 CTAs, which leaves SMs for the 16-CTA two-shot all-reduce; 2048-row chunks fill every SM and the AR and mHC chunks
 then serialize (branch 199 Stage 0, job 1840).
 
-Env:
-  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE``: ``0``/``1``/``off`` = off (bitwise main); unset/``auto`` = k(T) =
-      max(2, round(T / CHUNK_ROWS)); an integer N >= 2 = always N chunks.
-  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_CHUNK_ROWS`` (default 1024).
-  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_MIN_ROWS``: smallest boundary T that is pipelined (default 4096: each pipelined
-      boundary adds ~0.1-0.3 ms of host launch work, which the host-paced c1 prefill (T=2048) would pay 1:1).
-  ``TRTLLM_DSV41_PREFILL_AR_PIPELINE_MAX_ROWS``: largest boundary T that is pipelined (default 8192 =
-      max_num_tokens of the served engine).
+Chunking:
+  k(T) = max(2, round(T / PIPELINE_CHUNK_ROWS)) chunks, PIPELINE_CHUNK_ROWS = 1024.
+  ``PIPELINE_MIN_ROWS``: smallest boundary T that is pipelined (4096: each pipelined boundary adds ~0.1-0.3 ms of
+      host launch work, which the host-paced c1 prefill (T=2048) would pay 1:1).
+  ``PIPELINE_MAX_ROWS``: largest boundary T that is pipelined (8192 = max_num_tokens of the served engine).
 
 Stream roles by T (constant ``SWAP_ABOVE_ROWS`` = 6144):
   T <= 6144: chunk all-reduces on the priority -1 comm stream, chunk mHCs on the caller (main) stream.
@@ -41,7 +38,6 @@ from .mhc_cuda import (
     _fused_hc_call,
     mhc_fused_hc_tactic,
 )
-from ...switches import env_get  # run switches frozen at served values
 
 # A chunk below 2 MiB (205 rows x 5120 bf16) would leave LOWPRECISION for AUTO/NCCL inside one boundary.
 MIN_CHUNK_ROWS = 256
@@ -49,33 +45,19 @@ MIN_CHUNK_ROWS = 256
 ROW_ALIGN = 128
 
 
-def _env_int(name: str, default: int) -> int:
-    v = env_get(name)
-    if v is None or v.strip() == "":
-        return default
-    return int(v)
-
-
-_RAW = env_get("TRTLLM_DSV41_PREFILL_AR_PIPELINE", "auto").strip().lower()
-PIPELINE_ON = _RAW not in ("0", "1", "off", "false", "no")
-PIPELINE_K = 0 if _RAW in ("", "auto") or not PIPELINE_ON else int(_RAW)  # 0 = k(T)
-PIPELINE_CHUNK_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_CHUNK_ROWS", 1024)
-PIPELINE_MIN_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_MIN_ROWS", 4096)
+PIPELINE_CHUNK_ROWS = 1024
+PIPELINE_MIN_ROWS = 4096
 # Largest boundary T that is pipelined: the served engine's max_num_tokens (8192). Above SWAP_ABOVE_ROWS the boundary
 # runs with swapped stream roles (_run_swap), which allocate only on the main stream; the comm-stream roles' chunk
 # outputs (~T x hidden x 2 bytes in the comm stream's pool) pushed the T=8192 activation peak out of memory (branch
 # 199, job 1898).
-PIPELINE_MAX_ROWS = _env_int("TRTLLM_DSV41_PREFILL_AR_PIPELINE_MAX_ROWS", 8192)
+PIPELINE_MAX_ROWS = 8192
 # Boundaries with more rows than this run the swapped roles (chunk ARs on main, chunk mHCs on a side stream).
 SWAP_ABOVE_ROWS = 6144
 
 
 def k_for(T: int) -> int:
-    if not PIPELINE_ON:
-        return 1
-    if PIPELINE_K >= 2:
-        return PIPELINE_K
-    return max(2, int(round(T / max(1, PIPELINE_CHUNK_ROWS))))
+    return max(2, int(round(T / PIPELINE_CHUNK_ROWS)))
 
 
 def chunk_bounds(T: int, k: int, min_chunk_rows: int = MIN_CHUNK_ROWS, align: int = ROW_ALIGN):
@@ -101,7 +83,7 @@ def chunk_bounds(T: int, k: int, min_chunk_rows: int = MIN_CHUNK_ROWS, align: in
 
 def plan(T: int):
     """The shape part of the pipelining decision: chunk bounds for a T-row boundary, or None (unpipelined)."""
-    if not PIPELINE_ON or T < max(PIPELINE_MIN_ROWS, 2 * MIN_CHUNK_ROWS) or T > PIPELINE_MAX_ROWS:
+    if T < max(PIPELINE_MIN_ROWS, 2 * MIN_CHUNK_ROWS) or T > PIPELINE_MAX_ROWS:
         return None
     return chunk_bounds(T, k_for(T))
 

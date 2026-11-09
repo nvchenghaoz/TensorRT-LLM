@@ -159,16 +159,9 @@ if IS_FLASHINFER_AVAILABLE:
                     None)
 
         def _b12x_cache_key(tile_n: int, output_dtype: torch.dtype):
-            # Mirrors the cache_key built in B12xMxfp8GemmRunner.forward,
-            # including the compile-time core-fence flag when it has one.
-            key = (32, (_B12X_TILE_M, tile_n), (1, 1), False, False, "sm120",
-                   None, True, output_dtype)
-            try:
-                from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import \
-                    b12x_core_fence_enabled
-            except ImportError:  # pinned FlashInfer without the fence
-                return key
-            return key + (b12x_core_fence_enabled(), )
+            # Mirrors the cache_key built in B12xMxfp8GemmRunner.forward.
+            return (32, (_B12X_TILE_M, tile_n), (1, 1), False, False, "sm120",
+                    None, True, output_dtype)
 
         def _b12x_get_runner(device: torch.device, output_dtype: torch.dtype):
             """Return (runner, sm_count) or None when b12x is unusable here."""
@@ -181,12 +174,9 @@ if IS_FLASHINFER_AVAILABLE:
                 return None
             entry = None
             try:
-                import os
                 major, minor = torch.cuda.get_device_capability(device)
                 if (major == 12 and output_dtype
-                        in (torch.bfloat16, torch.float16) and
-                        os.environ.get("TRTLLM_FLASHINFER_MXFP8_B12X",
-                                       "1") != "0"):
+                        in (torch.bfloat16, torch.float16)):
                     from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import (
                         _b12x_gemm_mxfp8_runner, _b12x_mxfp8_dsl_supported)
                     from flashinfer.jit.cpp_ext import get_cuda_version
@@ -304,7 +294,6 @@ if IS_FLASHINFER_AVAILABLE:
             deps = _cutlass_memo_state[1]
             if deps is None:
                 try:
-                    import os
                     from flashinfer.autotuner import AutoTuner
                     from flashinfer.gemm.gemm_base import (
                         _MM_MXFP8_TUNING_CONFIG, DEFAULT_WORKSPACE_SIZE,
@@ -322,9 +311,6 @@ if IS_FLASHINFER_AVAILABLE:
                             DEFAULT_WORKSPACE_SIZE,
                             _load_gemm_sm120_mxfp8_module,
                             get_cutlass_mxfp8_gemm_module, _get_cache_buf)
-                    if os.environ.get("TRTLLM_FLASHINFER_MXFP8_MEMO",
-                                      "1") == "0":
-                        deps = False
                 except Exception:  # pragma: no cover - other flashinfer
                     deps = False
                 _cutlass_memo_state[1] = deps

@@ -12,8 +12,6 @@ rounds once to the output dtype (same math as cuBLAS, another summation order).
 ``maybe_small_n_gemv`` returns ``None`` whenever the route does not apply
 (prefill M > ``MAX_M``, other GPUs, other dtypes, bias, strided operands), so
 callers fall back to their normal path unchanged.
-
-Switch: ``TRTLLM_SMALL_N_BF16_GEMV=0`` (read at import) disables the route.
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-from ..switches import env_get  # run switches frozen at served values
 
 try:
     import triton
@@ -35,7 +32,7 @@ MAX_M = 8
 # its slow one-warp wmma pick is at small N.
 MAX_N = 128
 MAX_K = 16384
-_ENABLED = env_get("TRTLLM_SMALL_N_BF16_GEMV", "1") != "0" and triton is not None
+_ENABLED = triton is not None
 _SM_OK: dict = {}
 
 

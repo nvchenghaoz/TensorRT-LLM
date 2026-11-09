@@ -29,16 +29,13 @@ from .base import CutlassFusedMoEBase, FusedMoeOpFlags, quantize_input_mxfp8
 from .eligibility import HP_DTYPES, SmSupport, check_cutlass_leaf
 from .identity import cutlass_descriptor
 
-#: CUTLASS calls (more tokens than the FlashInfer decode chain takes) of at most this many host-known
+#: CUTLASS calls (more tokens than the FlashInfer decode chain takes) of at least this many host-known
 #: tokens hand the BF16 activations straight to ``fused_moe``: its row expansion (expandInputRowsKernel,
 #: need_mxfp8_quant) quantizes them to MXFP8 with the same cvt_warp_fp16_to_mxfp8 the standalone
 #: ``mxfp8_quantize`` kernel uses, so one launch per layer (and the FP8 copy's write + re-read) goes away,
-#: bitwise. Negative (the default) folds at every CUTLASS token count; 0 disables the fold.
-_MXFP8_FOLD_MAX_TOKENS = int(os.environ.get("TRTLLM_MOE_MXFP8_QUANT_FOLD_MAX_TOKENS", "-1"))
-#: ... and of at least this many: below it the fold's measured gain is within run-to-run noise
-#: (SM120 EP4 rank, M=128 paired runs read 2-4% slower cross-process), so small prefill chunks keep the
-#: standalone quant.
-_MXFP8_FOLD_MIN_TOKENS = int(os.environ.get("TRTLLM_MOE_MXFP8_QUANT_FOLD_MIN_TOKENS", "1024"))
+#: bitwise. Below it the fold's measured gain is within run-to-run noise (SM120 EP4 rank, M=128 paired
+#: runs read 2-4% slower cross-process), so small prefill chunks keep the standalone quant.
+_MXFP8_FOLD_MIN_TOKENS = 1024
 
 
 @register_moe_impl
@@ -171,7 +168,7 @@ class TrtllmCutlassW4a8Mxfp4Mxfp8Impl(CutlassFusedMoEBase):
 
     def _takes_fi_chain(self, x) -> bool:
         """Decode calls the FlashInfer chain takes (_takes_fi_decode), plus the prefill calls its
-        gate (fi_prefill_takes: token range and TRTLLM_SM12X_W4A8_FI_PREFILL mode) sends there."""
+        gate (fi_prefill_takes: token range, graph capture only) sends there."""
         if self._takes_fi_decode(x):
             return True
         if (
@@ -189,13 +186,12 @@ class TrtllmCutlassW4a8Mxfp4Mxfp8Impl(CutlassFusedMoEBase):
 
     def _folds_quant_into_cutlass(self, x) -> bool:
         """BF16 call above the FlashInfer decode range whose MXFP8 quant ``fused_moe`` does in-kernel."""
-        if _MXFP8_FOLD_MAX_TOKENS == 0 or not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
+        if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
             return False
         m = x.shape[0] if x.dim() == 2 else 0
         return (
             m > self._fi_max_tokens()
             and m >= _MXFP8_FOLD_MIN_TOKENS
-            and (_MXFP8_FOLD_MAX_TOKENS < 0 or m <= _MXFP8_FOLD_MAX_TOKENS)
             and x.shape[1] == self.hidden_size
             and x.shape[1] % self.quant_method.weight_alignment == 0
             and self.unpadded_hidden_size in (None, self.hidden_size)

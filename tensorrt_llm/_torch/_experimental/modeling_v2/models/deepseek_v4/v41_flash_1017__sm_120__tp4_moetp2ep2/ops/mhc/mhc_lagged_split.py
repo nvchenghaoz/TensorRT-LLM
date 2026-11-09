@@ -30,6 +30,7 @@ sequential adds over reloaded pairs, the butterfly is an explicit 31-add tree ov
 partials staged in a scratch row, and the warp sum is sequential scalar adds.
 """
 
+import os
 from typing import Optional
 
 import torch
@@ -37,7 +38,6 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
-from ...switches import env_get  # run switches frozen at served values
 
 # Fastest for every P in graph replays at M=1..8 (job 793: 3.9-4.2 us; 5.1 us at P=96).
 _DEFAULT_NUM_WARPS = 4
@@ -249,7 +249,7 @@ def _mhc_lagged_layer_input_kernel(
 
 
 # ---------------------------------------------------------------------------------------------
-# Fast K1 (TRTLLM_MHC_K1_FAST, default on): the same values, the same adds in the same order as
+# Fast K1 (the default): the same values, the same adds in the same order as
 # _mhc_lagged_layer_input_kernel, but the lane-0 butterfly and the warp sum run in registers
 # (reshape / permute / tl.split are pure data movement, every add is an explicit elementwise
 # fp32 add), so there is no global scratch round trip and no debug_barrier; and the constant
@@ -464,37 +464,25 @@ def _mhc_lagged_layer_input_fast_kernel(
             tl.store(obase + offs, _k1_norm(lik, nwk, rstd3, DEBUG), mask=m3)
 
 
-# TRTLLM_MHC_K1_FAST=0 selects _mhc_lagged_layer_input_kernel (main's K1, unchanged compile key).
-K1_FAST = env_get("TRTLLM_MHC_K1_FAST", "1") != "0"
 # Fast-K1 num_warps per P (graph replays at M=1..8); P not listed -> _DEFAULT_NUM_WARPS.
 _FAST_NUM_WARPS = {}
 
 
-_SPLIT_ENV_ON = env_get("TRTLLM_MHC_SPLIT_LAGGED", "1") != "0"
 _SPLIT_MAX_TOKENS = 8
 # K1 trigger-first (idea 208), used only where the caller asks for it (the hc_attn boundary, whose
-# PDL dependent is the attention-input wq_a||wkv low-M GEMM). 0 keeps the wait-then-trigger K1
-# (the old compile key: TRIGGER_FIRST is then not passed at all).
-K1_TRIGGER_FIRST_ENV = env_get("TRTLLM_MHC_K1_TRIGGER_FIRST", "1") != "0"
+# PDL dependent is the attention-input wq_a||wkv low-M GEMM).
 # Per-M rule (idea 208 gate, 1-GPU chain at the last arriver's AR window W_crit): trigger-first
 # pays only from this row count up. Below it, A's early launch costs more than its staging hides
-# inside a ~3 us all-reduce, so K1 keeps wait-then-trigger there. Read at call (capture) time.
-K1_TRIGGER_FIRST_MIN_TOKENS = int(env_get("TRTLLM_MHC_K1_TRIGGER_FIRST_MIN_TOKENS", "4"))
-# Test-only race probe (default 0, never set in timed or serving runs): cycles of
-# torch.cuda._sleep on the aux stream before every K2. Read at capture time.
-TEST_AUX_SLEEP_CYCLES = int(env_get("TRTLLM_MHC_SPLIT_TEST_SLEEP_CYCLES", "0"))
-# Test-only: keep K2's (discarded) layer_input on the join object for comparison.
-TEST_KEEP_K2_LAYER_INPUT = env_get("TRTLLM_MHC_SPLIT_TEST_KEEP_K2", "0") == "1"
+# inside a ~3 us all-reduce, so K1 keeps wait-then-trigger there.
+K1_TRIGGER_FIRST_MIN_TOKENS = 4
 
 
 # K1 fold (decode M <= 4, SM120): at the hc_ffn boundary K1 is not launched; the MoE's fused router launch
 # (native_ops.dsv4_fused_router[_route]_k1fold) computes layer_input itself after its PDL wait and writes it
 # into the boundary's layer_input tensor, and the shared expert (aux stream) runs its own K1 into its own buffer.
-# TRTLLM_DSV4_ROUTER_K1_FOLD=0 turns it off (K1 on the main stream as before).
-K1_FOLD_ENV_ON = env_get("TRTLLM_DSV4_ROUTER_K1_FOLD", "1") != "0"
-# The kernel takes 1..4 tokens. Default 2: in the 40-layer cold-L2 chain (job 1601) the fold saves 4.1 / 3.1
+# The kernel takes 1..4 tokens; folded up to 2: in the 40-layer cold-L2 chain (job 1601) the fold saves 4.1 / 3.1
 # us/layer at M=1 / 2 but costs +3.1 us/layer at M=4 (every CTA reads M x 50 KB of K1 inputs).
-K1_FOLD_MAX_TOKENS = min(4, int(env_get("TRTLLM_DSV4_ROUTER_K1_FOLD_MAX_M", "2")))
+K1_FOLD_MAX_TOKENS = 2
 
 
 class K1FoldPending:
@@ -527,8 +515,6 @@ class K1FoldPending:
         return self.out
 
     def run_copy(self):
-        if TEST_AUX_SLEEP_CYCLES > 0:
-            torch.cuda._sleep(TEST_AUX_SLEEP_CYCLES)
         return mhc_lagged_layer_input(*self.args, self.norm_eps, self.reducer_threads)
 
 
@@ -541,12 +527,11 @@ class MhcSplitJoin:
     ``k1_fold``: the boundary's K1 when it was deferred to the consumer (K1 fold), else None.
     """
 
-    __slots__ = ("event", "keep", "k2_layer_input", "k1_fold")
+    __slots__ = ("event", "keep", "k1_fold")
 
-    def __init__(self, event, keep, k2_layer_input=None, k1_fold=None):
+    def __init__(self, event, keep, k1_fold=None):
         self.event = event
         self.keep = keep
-        self.k2_layer_input = k2_layer_input
         self.k1_fold = k1_fold
 
     def join(self):
@@ -557,10 +542,10 @@ class MhcSplitJoin:
 
 
 def split_supported_here(num_tokens: int) -> bool:
-    """Host-side gate: SM120, multi-stream (graph capture/warmup), 1 <= M <= 8, env on."""
-    if not _SPLIT_ENV_ON or not (1 <= num_tokens <= _SPLIT_MAX_TOKENS):
+    """Host-side gate: SM120, multi-stream (graph capture/warmup), 1 <= M <= 8."""
+    if not (1 <= num_tokens <= _SPLIT_MAX_TOKENS):
         return False
-    if env_get("FORCE_DETERMINISTIC", "0") == "1":
+    if os.environ.get("FORCE_DETERMINISTIC", "0") == "1":
         return False
     from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 
@@ -584,7 +569,7 @@ def _is_sm120() -> bool:
 
 
 def _pdl_enabled() -> bool:
-    if env_get("TRTLLM_ENABLE_PDL", "1") == "0":
+    if os.environ.get("TRTLLM_ENABLE_PDL", "1") == "0":
         return False
     return torch.cuda.get_device_capability()[0] >= 9
 
@@ -623,7 +608,7 @@ def mhc_lagged_layer_input(
     num_warps: Optional[int] = None,
     trigger_first: bool = False,
     _test_skip_wait: bool = False,
-    fast: Optional[bool] = None,
+    fast: bool = True,
     test_floor: bool = False,
 ) -> torch.Tensor:
     """K1: post update + lagged collapse + RMSNorm -> layer_input [M, hidden] bf16.
@@ -632,12 +617,11 @@ def mhc_lagged_layer_input(
     tactic whose phase-2 thread count is ``reducer_threads`` (see module docstring).
     ``debug`` (test-only, fp32 [M, 2]) receives (sum of squares, rstd); with ``debug_li`` the
     output is the unnormalized collapse.
-    ``trigger_first`` (honoured when TRTLLM_MHC_K1_TRIGGER_FIRST != 0, PDL is on and
-    M >= K1_TRIGGER_FIRST_MIN_TOKENS) launches
+    ``trigger_first`` (honoured when PDL is on and M >= K1_TRIGGER_FIRST_MIN_TOKENS) launches
     the PDL dependents before this kernel's own wait; its successor must read nothing produced
     upstream before its own griddepcontrol.wait. ``_test_skip_wait`` is a test-only negative
     control (trigger, no wait).
-    ``fast`` (default ``K1_FAST``) picks the register K1 (same bits, no scratch round trip);
+    ``fast`` (default on) picks the register K1 (same bits, no scratch round trip);
     ``test_floor`` (test-only, fast K1, wrong numerics) skips the reduction.
     """
     M, hidden = x_prev.shape
@@ -663,12 +647,10 @@ def mhc_lagged_layer_input(
         out = torch.empty_like(x_prev)
     if M == 0:
         return out
-    if fast is None:
-        fast = K1_FAST
     if fast and W_PAD in (4, 8, 16):
         if enable_pdl and _test_skip_wait:
             tf = 2
-        elif enable_pdl and trigger_first and K1_TRIGGER_FIRST_ENV and M >= K1_TRIGGER_FIRST_MIN_TOKENS:
+        elif enable_pdl and trigger_first and M >= K1_TRIGGER_FIRST_MIN_TOKENS:
             tf = 1
         else:
             tf = 0
@@ -700,7 +682,7 @@ def mhc_lagged_layer_input(
     extra = {}
     if enable_pdl and _test_skip_wait:
         extra["TRIGGER_FIRST"] = 2
-    elif enable_pdl and trigger_first and K1_TRIGGER_FIRST_ENV and M >= K1_TRIGGER_FIRST_MIN_TOKENS:
+    elif enable_pdl and trigger_first and M >= K1_TRIGGER_FIRST_MIN_TOKENS:
         extra["TRIGGER_FIRST"] = 1
     _mhc_lagged_layer_input_kernel[(M,)](
         x_prev,

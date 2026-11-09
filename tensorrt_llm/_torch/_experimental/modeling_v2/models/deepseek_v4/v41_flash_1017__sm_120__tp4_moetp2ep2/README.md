@@ -33,8 +33,8 @@ measured with (`__init__.py`, see `NATIVE_OPS.md`); an explicit setting in the e
 
 FlashInfer: the run's FlashInfer changes are full copies of FlashInfer v0.7.2 (`d84335d8`) files,
 kept verbatim under `flashinfer_overlay/` at FlashInfer's own paths. Install FlashInfer v0.7.2 with
-that directory copied over its tree (the optimization run's FlashInfer commit `a42be7c3` is exactly
-that).
+that directory copied over its tree (the optimization run's FlashInfer commit `a42be7c3` is that,
+plus the run's environment switches, which this copy hard-codes at their served values).
 
 ## Layout
 
@@ -49,37 +49,24 @@ that).
 | `attention/prefill_wo_quant.py`, `sparse_output.py` | `deepseek_v4/prefill_wo_quant.py`, `deepseek_v4/module.py` | SM120 prefill output projection |
 | `ops/mhc/*` | `_torch/modules/mhc/*` | mHC kernels: lagged split, final collapse, prefill all-reduce pipeline |
 | `ops/fp8_shared_decode.py`, `ops/small_n_gemv.py` | `_torch/modules/` | shared-expert decode chain, small-N GEMV |
-| `switches.py` | (new) | the run's environment switches, frozen at their served values |
 | `native.py`, `fake_ops.py`, `csrc/` | `cpp/` | target C++ ops (`NATIVE_OPS.md`) |
 | `flashinfer_overlay/` | `experiments/ascent-flashinfer/` | FlashInfer file copies |
 
 The built-in `modeling_deepseekv4.py`, `modeling_deepseekv41.py` and `modules/mhc/` are upstream
 again: `modeling_v2: off` builds the stock model.
 
-## Environment switches
+## Environment
 
-Every run change carried a kill switch whose default was the shipped behaviour, and the served
-configuration set none. `switches.env_get` answers each run-added name with that default and ignores
-the process environment, so no switch can select an unvalidated path; names TensorRT-LLM itself
-defines still read the environment. The code that reads them is unchanged from the run, so the
-values below are the in-code defaults:
+During the optimization run every change carried an environment kill switch or tuning knob whose
+default was the served behaviour. They are gone: each path is hard-coded at the value the run served
+with, and the alternatives those switches selected (and their debug, verify and sleep hooks) are
+removed. What still reads the environment:
 
-| Switch | Served value |
-|---|---|
-| `TRTLLM_DSV4_FUSED_ROUTER`, `_ROUTE` | on; route fused up to M = 2 |
-| `TRTLLM_DSV4_ROUTER_K1_FOLD` | on, M <= 2 |
-| `TRTLLM_DSV4_MOE_AR_EARLY_TRIGGER`, `TRTLLM_DSV4_ATTN_AR_EARLY_TRIGGER` | on |
-| `TRTLLM_DSV4_SHARED_ROW_SPLIT` / `_OVERLAP` / `_DECODE_SPLIT` | on (row split from 256 tokens, overlap from 1024) |
-| `TRTLLM_DSV4_TAIL_MOE_GRAPH`, `TRTLLM_DSV4_EMBED_GATHER`, `TRTLLM_DSV4_HC_SEED_FAST` | on |
-| `TRTLLM_DSV4_PREFILL_WO_QUANT` | on (block M 4, 4 warps, full tile) |
-| `TRTLLM_DSV41_PREFILL_AR_PIPELINE` | auto |
-| `TRTLLM_MHC_SPLIT_LAGGED`, `TRTLLM_MHC_K1_FAST`, `TRTLLM_MHC_K1_TRIGGER_FIRST` | on (trigger-first from 4 tokens) |
-| `TRTLLM_FUSED_FINAL_HC`, `TRTLLM_SMALL_N_BF16_GEMV`, `TRTLLM_LOW_M_MXFP8` | on |
-| `TRTLLM_CSA2_ATTN_PDL`, `TRTLLM_CSA2_QB_FUSED`, `TRTLLM_CSA2_QB_L2PF` | on |
-| `TRTLLM_B12X_WO_PROJECTION` | on, wide rows 2,3,4 |
-| `TRTLLM_SHARED_DECODE_*` | v2 kernels, PDL on, the tile sizes in `ops/fp8_shared_decode.py` |
-| `TRTLLM_ENGRAM_KV_SHARD` | on |
-
-The attention-backend and MoE-backend switches (`TRTLLM_CSA2_*` in `csa2/backend.py`,
-`TRTLLM_SM12X_W4A8_FI_*`, `TRTLLM_FUSED_GREEDY_ARGMAX`, ...) live in shared runtime code and keep
-reading the environment; their defaults are the served values too.
+- the six shared-kernel opt-ins listed in `NATIVE_OPS.md`, which `__init__.py` sets with
+  `os.environ.setdefault` (they keep other models on the upstream kernels);
+- names TensorRT-LLM itself defines: `TRTLLM_ENABLE_PDL`, `FORCE_DETERMINISTIC`,
+  `TRTLLM_MHC_ENABLE_FUSED_HC`, `TRTLLM_V41_MHC_DEFER`, `TRTLLM_DISAGG_ROLE`;
+- `TLLM_NCCL_PCIE_DEFAULTS=0` (`distributed/nccl_tuning.py`), the opt-out of the PCIe NCCL defaults,
+  and `TLLM_PREFIX_TOKEN_CACHE_SHARED_DIR`, which `trtllm-serve` uses to hand the shared prefix token
+  cache directory to its frontend processes;
+- in `flashinfer_overlay/`, only the variables FlashInfer v0.7.2 itself reads.

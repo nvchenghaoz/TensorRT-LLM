@@ -1,24 +1,52 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Target Triton ops against their PyTorch references, plus the frozen run switches.
+"""Target Triton ops against their PyTorch references, plus the target's environment surface.
 
 ``mhc_final_collapse`` replaces ``mHC.collapse`` on the last layer and must be bit-identical to it;
 ``small_n_gemv`` replaces cuBLAS for small-N decode Linears and differs only in summation order.
 """
 
+import re
+from pathlib import Path
+
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v4.v41_flash_1017__sm_120__tp4_moetp2ep2 import (  # noqa: E501
-    switches,
-)
+import tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v4.v41_flash_1017__sm_120__tp4_moetp2ep2 as target  # noqa: E501
+
+# The only environment variables the target's own code reads: names TensorRT-LLM itself defines.
+# The run's kill switches and tuning knobs are hard-coded at their served values.
+_UPSTREAM_ENV = {
+    "FORCE_DETERMINISTIC",
+    "TRTLLM_DISAGG_ROLE",
+    "TRTLLM_ENABLE_PDL",
+    "TRTLLM_MHC_ENABLE_FUSED_HC",
+    "TRTLLM_V41_MHC_DEFER",
+}
+# The shared-kernel opt-ins __init__.py sets (NATIVE_OPS.md).
+_SHARED_KERNEL_OPT_INS = {
+    "TLLM_AR_SM120_CTAS_PER_TOKEN",
+    "TLLM_AR_SM120_PDL",
+    "TLLM_PCIE_CUSTOM_AR_MAX_BYTES",
+    "TRTLLM_LP_AR_PUSH",
+    "TRTLLM_SM120_FP8_BLOCKSCALE_TILE_HEURISTIC",
+    "TRTLLM_GATE_FORWARD_FAST_BODY",
+}
 
 
-def test_run_switches_ignore_the_environment(monkeypatch):
-    monkeypatch.setenv("TRTLLM_DSV4_FUSED_ROUTER", "0")
-    assert switches.env_get("TRTLLM_DSV4_FUSED_ROUTER", "1") == "1"
-    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "0")
-    assert switches.env_get("TRTLLM_ENABLE_PDL", "1") == "0"
+def test_target_reads_only_upstream_environment():
+    root = Path(target.__file__).parent
+    read = set()
+    for path in root.rglob("*.py"):
+        if "flashinfer_overlay" in path.parts:  # FlashInfer v0.7.2's own variables
+            continue
+        text = path.read_text()
+        assert "getenv" not in text, path
+        read |= set(re.findall(r"os\.environ\.get\(\s*\"(\w+)\"", text))
+        assert not re.search(r"os\.environ\.get\(\s*[^\s\"]", text), path
+        assert not re.search(r"os\.environ\[", text), path
+    assert read == _UPSTREAM_ENV
+    assert set(target._SERVED_SHARED_KERNEL_ENV) == _SHARED_KERNEL_OPT_INS
 
 
 _needs_sm120 = pytest.mark.skipif(

@@ -30,8 +30,7 @@ def _sm120_project(self, attn_output_tensor, position_ids):
     attn_output_tensor = attn_output_tensor.view(num_tokens, self.num_heads_tp, -1)
     cos_sin = self.inverse_rotary_emb.rotary_cos_sin
     if not (
-        pwq.prefill_wo_quant_enabled()
-        and not self.inverse_rotary_emb.is_neox
+        not self.inverse_rotary_emb.is_neox
         and pwq.supports(
             attn_output_tensor,
             cos_sin,

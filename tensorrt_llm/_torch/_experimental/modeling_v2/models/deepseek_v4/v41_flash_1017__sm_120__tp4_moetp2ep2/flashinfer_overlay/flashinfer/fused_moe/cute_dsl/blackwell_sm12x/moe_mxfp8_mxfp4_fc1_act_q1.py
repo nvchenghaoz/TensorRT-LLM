@@ -33,7 +33,6 @@ from ....tllm_enums import (
     ActivationType,
 )
 from ....utils import ceil_div
-from ._moe_utils import split_k
 from ._moe_utils.heuristic import select_fc1_act_tile
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
@@ -226,7 +225,6 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
         op.situ_linear_beta,
         grid_x,
         sm_version,
-        split_k.key(),
     )
     hit = _COMPILED.get(key)
     if hit is None:

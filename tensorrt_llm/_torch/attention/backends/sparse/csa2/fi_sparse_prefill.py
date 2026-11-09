@@ -21,7 +21,6 @@ masked instead of compacted): the same math in another order.
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 import triton
@@ -264,8 +263,6 @@ def _launch_index_kernel(count, args, consts, direct):
 @functools.lru_cache(maxsize=None)
 def fi_prefill_available(device_index: int) -> bool:
     """Whether FlashInfer's SM120 DSv4.1 FullBF16 sparse prefill can serve this device."""
-    if os.environ.get("TRTLLM_CSA2_FI_SPARSE_PREFILL", "1") == "0":
-        return False
     if torch.cuda.get_device_capability(device_index)[0] != 12:
         return False
     try:
@@ -330,15 +327,13 @@ class FISharedPrefill:
         self._wrappers: dict[tuple, object] = {}
         # (PreparedCall, mid, mlse) per call-signature key, LRU like the index scratch.
         self._prepared: dict[tuple, tuple] = {}
-        self._direct = os.environ.get("TRTLLM_CSA2_FI_DIRECT_EXECUTE", "1") != "0"
         self._views: dict[str, tuple] = {}
         self.direct_calls = 0
         self.wrapper_calls = 0
-        if self._direct:
-            from flashinfer.mla._sparse_mla_sm120 import _calibration, _prepared
+        from flashinfer.mla._sparse_mla_sm120 import _calibration, _prepared
 
-            self._calibration = _calibration
-            self._tuning_enabled = _prepared.tuning_enabled
+        self._calibration = _calibration
+        self._tuning_enabled = _prepared.tuning_enabled
 
     def _view(self, name, pool, row_bytes):
         # The page_size=1 cache view of a persistent pool, reused while the pool is.
@@ -390,7 +385,6 @@ class FISharedPrefill:
         has_main = main_logical is not None and main_logical.shape[1] > 0
         main_width = int(main_logical.shape[1]) if has_main else 0
         buffers = self._scratch(count, heads, swa_width, main_width, q.device)
-        direct = self._direct
         prepare_shared_prefill_indices(
             swa_pool,
             swa_slots,
@@ -400,61 +394,56 @@ class FISharedPrefill:
             plan,
             buffers["swa"],
             buffers["main"] if has_main else None,
-            direct=direct,
+            direct=True,
         )
         if sink.dtype != torch.float32 or not sink.is_contiguous():
             sink = sink.float().contiguous()
-        if direct:
-            cache = self._view("swa", swa_pool, 528)
-            extra = self._view("main", main_pool, 288) if has_main else None
-        else:
-            cache = swa_pool.view(swa_pool.shape[0], 1, 528)
-            extra = main_pool.view(main_pool.shape[0], 1, 288) if has_main else None
+        cache = self._view("swa", swa_pool, 528)
+        extra = self._view("main", main_pool, 288) if has_main else None
         extra_indices = buffers["main"] if has_main else None
-        if direct:
-            # Every component of FlashInfer's per-call signature key (shape, stride, dtype,
-            # device of q, caches, indices, output, sink, LSE) is fixed by this key: q,
-            # the pools and the scratch are contiguous (``supported``/``_pool_ok``).
-            key = (
-                has_main,
-                count,
-                heads,
-                swa_width,
-                main_width,
-                q.device,
-                cache.shape[0],
-                extra.shape[0] if has_main else 0,
-                out.dtype,
-                out.stride(),
-                sink.shape,
-                float(scale),
+        # Every component of FlashInfer's per-call signature key (shape, stride, dtype,
+        # device of q, caches, indices, output, sink, LSE) is fixed by this key: q,
+        # the pools and the scratch are contiguous (``supported``/``_pool_ok``).
+        key = (
+            has_main,
+            count,
+            heads,
+            swa_width,
+            main_width,
+            q.device,
+            cache.shape[0],
+            extra.shape[0] if has_main else 0,
+            out.dtype,
+            out.stride(),
+            sink.shape,
+            float(scale),
+        )
+        entry = self._prepared.pop(key, None)
+        if (
+            entry is not None
+            and entry[0].epoch == self._calibration._constants_version
+            and not self._tuning_enabled(False)
+        ):
+            self._prepared[key] = entry
+            prepared, mid, mlse = entry
+            prepared.execute(
+                q,
+                cache,
+                buffers["swa"],
+                out,
+                scale,
+                None,
+                sink,
+                extra,
+                extra_indices,
+                None,
+                mid,
+                mlse,
+                buffers["lse"],
+                1.0,
             )
-            entry = self._prepared.pop(key, None)
-            if (
-                entry is not None
-                and entry[0].epoch == self._calibration._constants_version
-                and not self._tuning_enabled(False)
-            ):
-                self._prepared[key] = entry
-                prepared, mid, mlse = entry
-                prepared.execute(
-                    q,
-                    cache,
-                    buffers["swa"],
-                    out,
-                    scale,
-                    None,
-                    sink,
-                    extra,
-                    extra_indices,
-                    None,
-                    mid,
-                    mlse,
-                    buffers["lse"],
-                    1.0,
-                )
-                self.direct_calls += 1
-                return out
+            self.direct_calls += 1
+            return out
         wrapper = self._wrapper(has_main, q.device)
         wrapper.run(
             q,
@@ -468,7 +457,7 @@ class FISharedPrefill:
             out_lse=buffers["lse"],
         )
         self.wrapper_calls += 1
-        if direct and not torch.cuda.is_current_stream_capturing():
+        if not torch.cuda.is_current_stream_capturing():
             last = getattr(wrapper, "_last_prepared", None)
             wrapper._last_prepared = None
             if last is not None:

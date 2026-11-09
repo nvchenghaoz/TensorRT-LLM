@@ -15,7 +15,7 @@ no mul+add contracts into an FMA. It is bitwise equal to ``mHC.collapse``.
 
 Only V4.1's ``_finalize_hc_state`` uses it, under :func:`final_collapse_supported` (decode shape:
 1 <= M <= 8, mult == 4, contiguous bf16 residual ``[M, 4, hidden]``, fp32 pre_mix ``[M, 4, 1]``
-of any strides); every other shape keeps ``mHC.collapse``. ``TRTLLM_FUSED_FINAL_HC=0`` turns it off.
+of any strides); every other shape keeps ``mHC.collapse``.
 Plain launch (no PDL): its producer, ``mhc_post_mapping`` / the last sublayer, launches without PDL.
 """
 
@@ -23,9 +23,7 @@ Plain launch (no PDL): its producer, ``mhc_post_mapping`` / the last sublayer, l
 import torch
 import triton
 import triton.language as tl
-from ...switches import env_get  # run switches frozen at served values
 
-FUSED_FINAL_HC_ENV_ON = env_get("TRTLLM_FUSED_FINAL_HC", "1") != "0"
 _MAX_TOKENS = 8
 _BLOCK = 1024
 _NUM_WARPS = 4
@@ -63,8 +61,6 @@ def _hc_final_collapse_kernel(
 
 def final_collapse_supported(x: torch.Tensor, pre_mix: torch.Tensor) -> bool:
     """Host gate: decode shape and layouts the kernel covers; anything else keeps mHC.collapse."""
-    if not FUSED_FINAL_HC_ENV_ON:
-        return False
     if x.dim() != 3 or not x.is_cuda:
         return False
     M, mult, hidden = x.shape

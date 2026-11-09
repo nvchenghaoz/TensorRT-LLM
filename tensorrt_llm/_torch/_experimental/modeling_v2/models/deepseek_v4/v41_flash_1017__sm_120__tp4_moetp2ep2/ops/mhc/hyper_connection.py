@@ -522,8 +522,6 @@ class mHC(nn.Module):
             )
 
         def k2():
-            if _split.TEST_AUX_SLEEP_CYCLES > 0:
-                torch.cuda._sleep(_split.TEST_AUX_SLEEP_CYCLES)
             return self.fused_hc_lagged(
                 x_prev_flat,
                 residual_prev_flat,
@@ -556,7 +554,6 @@ class mHC(nn.Module):
                 norm_weight,
                 k2_layer_input,
             ),
-            k2_layer_input if _split.TEST_KEEP_K2_LAYER_INPUT else None,
             k1_fold,
         )
         outputs = (

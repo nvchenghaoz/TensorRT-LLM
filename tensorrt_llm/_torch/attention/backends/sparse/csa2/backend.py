@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -832,10 +831,6 @@ class CSA2FlashInfer:
         self._plans: dict[tuple[int, int, int, torch.device, float], CSA2FlashInfer._Plan] = {}
         self._workspaces: dict[torch.device, torch.Tensor] = {}
         self._paged_plans: dict[tuple, CSA2FlashInfer._Plan] = {}
-        # Fused mask/rows staging and sink epilogue (bitwise equal to _forward).
-        self.fused_glue = os.environ.get("TRTLLM_CSA2_FLASHINFER_FUSED_GLUE", "1") != "0"
-        # Generation-only rows: two-launch Triton split-KV sink attention.
-        self.split_sink_decode = os.environ.get("TRTLLM_CSA2_SPLIT_SINK_DECODE", "1") != "0"
         self._decode_workspaces: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
         # Generation-only rows on SM120/SM121: FlashInfer's Cake DeepSeek-V4.1
         # mixed-cache decode reads the packed SWA/main pools in place (no staging).
@@ -919,8 +914,7 @@ class CSA2FlashInfer:
         count, heads, dim = q.shape
         width = swa.shape[1] + (0 if extra is None else extra.shape[1])
         if (
-            not self.split_sink_decode
-            or dim != 512
+            dim != 512
             or q.dtype != torch.bfloat16
             or swa.dtype != torch.bfloat16
             or (extra is not None and extra.dtype != torch.bfloat16)
@@ -1070,8 +1064,7 @@ class CSA2FlashInfer:
         plan.protected |= protect or torch.cuda.is_current_stream_capturing()
         pages = bank.view(-1, 1, 1, dim)
         if (
-            self.fused_glue
-            and indices.shape[0] == count
+            indices.shape[0] == count
             and indices.dtype == torch.int32
             and indices.stride(1) == 1
             and plan.indices.dtype == torch.int32
@@ -1137,14 +1130,10 @@ class CSA2FlashInfer:
         owner and index source, hence the same selections, page mapping and, through the
         owner's compression ratio, the same visible lengths) share one main-slot prep.
         """
-        import os
-
         source = getattr(inputs.state, "metadata", None)
         layer_idx = getattr(self.attention, "layer_idx", None)
         group = inputs.stage_group
         if source is None or layer_idx is None or group is None:
-            return None, None
-        if os.environ.get("TRTLLM_CSA2_CAKE_GROUPED_PREP", "1") == "0":
             return None, None
         start = int(group[2])
 
@@ -1273,7 +1262,7 @@ class CSA2FlashInfer:
     def _use_fi_prefill(self, q, metadata, forward_args) -> bool:
         if forward_args.attention_input_type != AttentionInputType.context_only:
             return False
-        if not self.fused_glue or self.attention is None or not q.is_cuda:
+        if self.attention is None or not q.is_cuda:
             return False
         if self.attention.sparse_params.use_packed_sparse_attention:
             return False
@@ -1353,7 +1342,7 @@ class CSA2FlashInfer:
     def _use_cake_decode(self, q, metadata, forward_args) -> bool:
         if forward_args.attention_input_type != AttentionInputType.generation_only:
             return False
-        if metadata.shared_plan is not None or not self.fused_glue or not self.split_sink_decode:
+        if metadata.shared_plan is not None:
             return False
         if self.attention is None or self.attention.sparse_params.use_packed_sparse_attention:
             return False
@@ -1371,7 +1360,7 @@ class CSA2FlashInfer:
         shared = metadata.shared_plan is not None
         if shared and self._use_fi_prefill(q, metadata, forward_args):
             return self._forward_fi_prefill(q, metadata, forward_args)
-        if not shared and self.fused_glue:
+        if not shared:
             query, swa, extra, lengths, sink, scale = self.attention.prepare_selected_pools(
                 q, metadata, forward_args
             )

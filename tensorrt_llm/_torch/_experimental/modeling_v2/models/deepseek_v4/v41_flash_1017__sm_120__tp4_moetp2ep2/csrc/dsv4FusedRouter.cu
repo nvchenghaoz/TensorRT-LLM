@@ -216,10 +216,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void dsv4FusedRouterKernel(
                      : "memory");
     }
 
-    if (!p.testSkipWait)
-    {
-        gridDependencyWait();
-    }
+    gridDependencyWait();
 
     if constexpr (kFoldK1)
     {
@@ -736,16 +733,8 @@ void launch(FusedRouterParams const& params, cudaStream_t stream)
 
 } // namespace
 
-void invokeDsv4FusedRouter(FusedRouterParams const& paramsIn, cudaStream_t stream)
+void invokeDsv4FusedRouter(FusedRouterParams const& params, cudaStream_t stream)
 {
-    FusedRouterParams params = paramsIn;
-    // Test only: read once per process (set it before the first launch, e.g. in a dedicated subprocess).
-    static bool const kTestSkipWait = []
-    {
-        char const* skipWait = std::getenv("TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT");
-        return skipWait != nullptr && skipWait[0] == '1';
-    }();
-    params.testSkipWait = kTestSkipWait ? 1 : 0;
     switch (params.numTokens)
     {
     case 1: launch<1>(params, stream); break;
@@ -760,15 +749,8 @@ void invokeDsv4FusedRouter(FusedRouterParams const& paramsIn, cudaStream_t strea
     }
 }
 
-void invokeDsv4FusedRouterK1Fold(FusedRouterFoldParams const& paramsIn, cudaStream_t stream)
+void invokeDsv4FusedRouterK1Fold(FusedRouterFoldParams const& params, cudaStream_t stream)
 {
-    FusedRouterFoldParams params = paramsIn;
-    static bool const kTestSkipWait = []
-    {
-        char const* skipWait = std::getenv("TRTLLM_DSV4_FUSED_ROUTER_TEST_SKIP_WAIT");
-        return skipWait != nullptr && skipWait[0] == '1';
-    }();
-    params.testSkipWait = kTestSkipWait ? 1 : 0;
     int const P = params.k1ReducerThreads;
     TLLM_CHECK_WITH_INFO(P == 96 || P == 224 || P == 256 || P == 480, "K1 fold: reducer threads must be 96/224/256/480");
     TLLM_CHECK_WITH_INFO(params.k1Out == params.x, "K1 fold: out must be the router input x");

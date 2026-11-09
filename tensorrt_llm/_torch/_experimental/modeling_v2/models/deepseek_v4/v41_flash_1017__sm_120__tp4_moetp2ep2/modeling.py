@@ -15,6 +15,7 @@ MoE routing, n-gram hashing and collapsed-logit processing reuse the shared code
 """
 
 import copy
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, cast
 
@@ -70,15 +71,11 @@ from ._v4 import (
     _remap_deepseek_v4_checkpoint_keys,
     weight_dequant,
 )
-from .switches import env_get  # run switches frozen at served values
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-
-# TRTLLM_DSV4_TAIL_MOE_GRAPH=1 (read once at import; unset/0 = main's eager path).
-_TAIL_MOE_GRAPH = _tail_moe_graph.ENABLED
 
 
 def _engram_history_text_mask(request: "LlmRequest", start: int, end: int) -> list[bool] | None:
@@ -358,8 +355,7 @@ class DeepseekV41Engram(Engram):
         proj = getattr(self, "kv_proj", None)
         method = getattr(proj, "quant_method", None)
         if (
-            env_get("TRTLLM_ENGRAM_KV_SHARD", "1") == "0"
-            or self.mapping is None
+            self.mapping is None
             or self.tp_size <= 1
             or self.enable_attention_dp
             or not isinstance(proj, EngramFp8Projection)
@@ -378,8 +374,7 @@ class DeepseekV41Engram(Engram):
         logger.info(
             f"Engram layer {self.layer_id}: WKV [{proj.out_features}, {proj.in_features}] "
             f"N-sharded over TP{self.tp_size} for decode T<={self._KV_SHARD_MAX_TOKENS} "
-            f"({proj.out_features // self.tp_size} columns per rank, then all-gather); "
-            "TRTLLM_ENGRAM_KV_SHARD=0 disables."
+            f"({proj.out_features // self.tp_size} columns per rank, then all-gather)"
         )
         return True
 
@@ -643,7 +638,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         """Chunk bounds for a pipelined prefill boundary over ``rows`` [T, hidden], or None (unpipelined)."""
         from .ops.mhc import ar_pipeline as _arp
 
-        if self._v41_ar_pipe is None or not _arp.PIPELINE_ON or image_mask is not None:
+        if self._v41_ar_pipe is None or image_mask is not None:
             return None
         if rows.dim() != 2 or rows.shape[0] < max(_arp.PIPELINE_MIN_ROWS, 2 * _arp.MIN_CHUNK_ROWS):
             return None
@@ -702,7 +697,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         router can take it (DeepseekV4MoE.k1_fold_supported)."""
         from .ops.mhc import mhc_lagged_split as _split
 
-        if not _split.K1_FOLD_ENV_ON or self._mhc_split_stream is None or image_mask is not None:
+        if self._mhc_split_stream is None or image_mask is not None:
             return False
         m = x_attn.shape[0] if x_attn.dim() == 2 else -1
         if not 1 <= m <= _split.K1_FOLD_MAX_TOKENS or self.mapping.enable_attention_dp:
@@ -885,7 +880,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         if attn_join is not None:
             attn_join.join()
             attn_join = None
-        if attn_bounds is None and _TAIL_MOE_GRAPH and _tail_moe_graph.eligible(
+        if attn_bounds is None and _tail_moe_graph.eligible(
             self, x_attn, attn_metadata, spec_metadata, image_mask
         ):
             # 128-row eager replay tail: replay this layer's captured MoE window.
@@ -1191,7 +1186,7 @@ class DeepseekV41Model(DeepseekV4Model):
             # otherwise their MoE collectives diverge. Pruned context workers
             # force source routing even for warmup and dummy batches; generation
             # workers always execute every layer, including remote-tail batches.
-            role = env_get("TRTLLM_DISAGG_ROLE")
+            role = os.environ.get("TRTLLM_DISAGG_ROLE")
             if role != "generation" and not disagg_context_decoder_skipping_enabled(
                 model_config.extra_attrs.get("bounded_replay_on_generation", False)
             ):
@@ -1510,8 +1505,7 @@ class DeepseekV41Model(DeepseekV4Model):
         hc_state = self._resolve_hc_state(hc_state)
         # Decode shapes (M <= 8, mult 4, contiguous bf16, fp32 pre): one exact Triton launch instead of
         # mHC.collapse's 12 ATen launches (bitwise equal). The gate is shape-based, so every caller
-        # (including _enter_remote_tail_boundary's 'source' path) stays exact. TRTLLM_FUSED_FINAL_HC=0
-        # keeps mHC.collapse.
+        # (including _enter_remote_tail_boundary's 'source' path) stays exact.
         if final_collapse_supported(hc_state.residual, hc_state.pre_mix):
             return mhc_final_collapse(hc_state.residual, hc_state.pre_mix)
         return mHC.collapse(hc_state.residual, hc_state.pre_mix)
@@ -2651,7 +2645,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         # entry (mHC.fused_hc_lagged): one fewer kernel per layer at decode. Not across an
         # engram entry, the CED boundary (both need a materialized residual), or the final layer;
         # TRTLLM_V41_MHC_DEFER=0 turns it off for A/B.
-        defer_ok = env_get("TRTLLM_V41_MHC_DEFER", "1").lower() not in ("0", "false")
+        defer_ok = os.environ.get("TRTLLM_V41_MHC_DEFER", "1").lower() not in ("0", "false")
         defer_ok = defer_ok and not self.model_config.mapping.has_pp()
         layers = self._post_load_decoder_layers()
         for idx, layer in enumerate(layers):
@@ -2670,7 +2664,7 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         from .ops.mhc import ar_pipeline as _arp
 
         split = self.model.decoder_replay_split
-        if _arp.PIPELINE_ON and split is not None and not self.model_config.mapping.has_pp():
+        if split is not None and not self.model_config.mapping.has_pp():
             pipe = _arp.ArFusedHcPipeline()
             for idx, layer in enumerate(layers):
                 if not isinstance(layer, DeepseekV41DecoderLayer) or idx >= split:
