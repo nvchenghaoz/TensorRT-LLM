@@ -17,18 +17,18 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime_api.h>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
-namespace kernels::qwen35
+namespace kernels
 {
 
-// SM120 NVFP4 W4A4 gate_up GEMM + SwiGLU + NVFP4 quantize epilogue (see qwen35Nvfp4GateUpSwigluSm120.cu for the
+// SM120 NVFP4 W4A4 gate_up GEMM + SwiGLU + NVFP4 quantize epilogue (see nvfp4GateUpSwigluSm120.cu for the
 // gate_up weight-row layout it expects). A: [m, k / 2] packed E2M1 activations with inputSf (128x4-swizzled), B:
 // [n, k / 2] packed E2M1 permuted gate_up weights with weightSf, alpha: the GEMM's global scale, outScale: down_proj's
 // global input scale. Writes fp4Out [m, n / 4] bytes and sfOut (128x4-swizzled, padding rows zeroed).
@@ -38,6 +38,6 @@ size_t nvfp4GateUpSwigluSm120(void const* A, void const* B, void const* inputSf,
     float const* alpha, float const* outScale, uint8_t* fp4Out, uint8_t* sfOut, int m, int n, int k, int tile,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, bool enablePdl);
 
-} // namespace kernels::qwen35
+} // namespace kernels
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

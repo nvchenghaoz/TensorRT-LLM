@@ -66,7 +66,7 @@ class MarlinNvfp4Weight(NamedTuple):
 
 
 class GemvNvfp4Weight(NamedTuple):
-    """What ``trtllm::nvfp4_w4a16_gemv[_conv]`` takes: ``weight`` uint8 ``[N, K/2]``,
+    """What ``native_ops.nvfp4_w4a16_gemv[_conv]`` takes: ``weight`` uint8 ``[N, K/2]``,
     ``weight_sf`` uint8 ``[N, K/16]`` linear E4M3, ``global_scale`` a Python float."""
 
     weight: torch.Tensor

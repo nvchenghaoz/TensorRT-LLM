@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
+#include "qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1/csrc/nvfp4GateUpSwigluSm120.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/kernels/qwen35/qwen35Nvfp4GateUpSwigluSm120.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
+#include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -30,12 +32,12 @@
 #include <cstdint>
 #include <vector>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
-namespace torch_ext
+namespace
 {
 
-// gate_up NVFP4 W4A4 GEMM (rows pre-permuted, see kernels/qwen35/qwen35Nvfp4GateUpSwigluSm120.cu)
+// gate_up NVFP4 W4A4 GEMM (rows pre-permuted, see nvfp4GateUpSwigluSm120.cu)
 // + SwiGLU + NVFP4 quantize with down_proj's global input scale `outScale`.
 // Returns (fp4 [m, n/4] uint8, swizzled SF [ceil128(m) * ceil4(n/32)] uint8),
 // bitwise equal to nvfp4_gemm (BF16) + fused_silu_mul_nvfp4 on the unpermuted
@@ -44,10 +46,10 @@ std::vector<at::Tensor> nvfp4_gate_up_swiglu_nvfp4(at::Tensor const& mat1, at::T
     at::Tensor const& mat1Scale, at::Tensor const& mat2Scale, at::Tensor const& alpha, at::Tensor const& outScale,
     int64_t tile)
 {
-    CHECK_INPUT(mat1, FLOAT4_E2M1X2);
-    CHECK_INPUT(mat2, FLOAT4_E2M1X2);
-    CHECK_INPUT(mat1Scale, SF_DTYPE);
-    CHECK_INPUT(mat2Scale, SF_DTYPE);
+    CHECK_INPUT(mat1, torch_ext::FLOAT4_E2M1X2);
+    CHECK_INPUT(mat2, torch_ext::FLOAT4_E2M1X2);
+    CHECK_INPUT(mat1Scale, torch_ext::SF_DTYPE);
+    CHECK_INPUT(mat2Scale, torch_ext::SF_DTYPE);
     CHECK_INPUT(alpha, at::ScalarType::Float);
     CHECK_INPUT(outScale, at::ScalarType::Float);
     TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "mat1 and mat2 must be matrices");
@@ -70,31 +72,31 @@ std::vector<at::Tensor> nvfp4_gate_up_swiglu_nvfp4(at::Tensor const& mat1, at::T
     }
     auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
     int const tileId = static_cast<int>(tile);
-    size_t const wsBytes = tensorrt_llm::kernels::qwen35::nvfp4GateUpSwigluSm120(nullptr, nullptr, nullptr, nullptr,
-        nullptr, nullptr, nullptr, nullptr, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), tileId,
-        nullptr, 0, stream, false);
+    size_t const wsBytes
+        = kernels::nvfp4GateUpSwigluSm120(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), tileId, nullptr, 0, stream, false);
     at::Tensor workspace = at::detail::empty_cuda(
         {static_cast<int64_t>(std::max<size_t>(wsBytes, 16))}, at::ScalarType::Char, mat1.device(), std::nullopt);
-    tensorrt_llm::kernels::qwen35::nvfp4GateUpSwigluSm120(mat1.const_data_ptr(), mat2.const_data_ptr(),
-        mat1Scale.const_data_ptr(), mat2Scale.const_data_ptr(), alpha.data_ptr<float>(), outScale.data_ptr<float>(),
-        fp4.data_ptr<uint8_t>(), sf.data_ptr<uint8_t>(), static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
-        tileId, reinterpret_cast<char*>(workspace.data_ptr()), workspace.numel(), stream,
+    kernels::nvfp4GateUpSwigluSm120(mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
+        mat2Scale.const_data_ptr(), alpha.data_ptr<float>(), outScale.data_ptr<float>(), fp4.data_ptr<uint8_t>(),
+        sf.data_ptr<uint8_t>(), static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), tileId,
+        reinterpret_cast<char*>(workspace.data_ptr()), workspace.numel(), stream,
         tensorrt_llm::common::getEnvEnablePDL());
     return {fp4, sf};
 }
 
-} // namespace torch_ext
+} // namespace
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
 
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
+TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "nvfp4_gate_up_swiglu_nvfp4(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor alpha, "
         "Tensor outScale, int tile=0) -> Tensor[]");
 }
 
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
-    m.impl("nvfp4_gate_up_swiglu_nvfp4", &tensorrt_llm::torch_ext::nvfp4_gate_up_swiglu_nvfp4);
+    m.impl("nvfp4_gate_up_swiglu_nvfp4", &TRTLLM_MV2_NS::nvfp4_gate_up_swiglu_nvfp4);
 }

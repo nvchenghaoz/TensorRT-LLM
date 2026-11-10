@@ -116,6 +116,7 @@ def _in_tree_op(args):
         True,
         section[1],
         section[2],
+        False,  # enable_tiling: the per-token kernel, the arithmetic the target's op matches
     )
 
 

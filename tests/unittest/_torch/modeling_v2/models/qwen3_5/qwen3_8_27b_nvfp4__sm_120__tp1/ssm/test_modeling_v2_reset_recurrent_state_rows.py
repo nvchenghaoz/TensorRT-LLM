@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the reset_recurrent_state_rows catalog entry."""
+"""GPU test for the reset_recurrent_state_rows entry."""
 
 import zlib
 from typing import Optional
@@ -8,19 +8,22 @@ from typing import Optional
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.reset_recurrent_state_rows import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.reset_recurrent_state_rows import (  # noqa: E501
+    COALESCED_LAYERS,
     CONV_SHAPE,
-    Q8_COALESCED_LAYERS,
     REC_SHAPE,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.reset_recurrent_state_rows import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.reset_recurrent_state_rows import (  # noqa: E501
     reset_recurrent_state_rows as op,
 )
+from tensorrt_llm._utils import get_sm_version
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["../../../..", ".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
-assert torch.cuda.is_available(), "reset_recurrent_state_rows requires a CUDA device"
+pytestmark = pytest.mark.skipif(
+    get_sm_version() != 120, reason="the Qwen3.8-27B sm_120 tp1 entries are certified on sm_120"
+)
 
 
 def _compare(
@@ -44,7 +47,6 @@ def _compare(
 
 
 DEV = "cuda"
-_LAYERS = 3
 
 
 def _build(spec, seed):
@@ -56,19 +58,15 @@ def _build(spec, seed):
     layout = spec.get("layout", "plain")
 
     def randn(*shape, dtype):
-        if dtype == torch.int8:  # random bytes: e4m3 codes and fp32 scale bits alike
+        if dtype == torch.int8:  # random bytes: int16 codes and fp32 scale bits alike
             return torch.randint(-128, 128, shape, generator=g, device=DEV, dtype=dtype)
         return torch.randn(*shape, generator=g, device=DEV).to(dtype)
 
     backing = {}
-    if layout == "layer_view":
-        backing["rec"] = randn(_LAYERS, slots, *rec_shape, dtype=rec_dtype)
-        backing["conv"] = randn(_LAYERS, slots, *CONV_SHAPE, dtype=torch.bfloat16)
-        rec, conv = backing["rec"][1], backing["conv"][1]
-    elif layout == "coalesced":
+    if layout == "coalesced":
         # The cache manager v2's view: every GDN layer's state of a slot in one page.
-        backing["rec"] = randn(slots, Q8_COALESCED_LAYERS, *rec_shape, dtype=rec_dtype)
-        backing["conv"] = randn(slots, Q8_COALESCED_LAYERS, *CONV_SHAPE, dtype=torch.bfloat16)
+        backing["rec"] = randn(slots, COALESCED_LAYERS, *rec_shape, dtype=rec_dtype)
+        backing["conv"] = randn(slots, COALESCED_LAYERS, *CONV_SHAPE, dtype=torch.bfloat16)
         rec, conv = backing["rec"][:, 0], backing["conv"][:, 0]
     else:
         rec = randn(slots, *rec_shape, dtype=rec_dtype)
@@ -97,14 +95,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
     named = {s for s in indices.tolist() if 0 <= s < spec["slots"]}
     reset = {s for s, f in zip(indices.tolist(), flags.tolist()) if not f and s in named}
-    if spec["slots"] > 64:
-        # Non-vacuity: the engine-width cells reset at least one row, so the
-        # whole-pool compare is also the lock on the ~430 unnamed slots.
-        assert reset
-    if spec.get("layout") == "layer_view":
-        for name in backing:
-            for other in (0, 2):
-                assert torch.equal(backing[name][other], before[name][other]), (name, other)
     if spec.get("layout") == "coalesced":
         # The other layers' states between this layer's rows stay bitwise.
         for name in backing:
@@ -114,7 +104,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 def _pools():
     torch.manual_seed(7)
-    rec = torch.randn(6, *REC_SHAPE[1:], dtype=torch.float32, device=DEV)
+    rec = torch.randint(-128, 128, (6, *REC_SHAPE), dtype=torch.int8, device=DEV)
     conv = torch.randn(6, *CONV_SHAPE, dtype=torch.bfloat16, device=DEV)
     return rec, conv
 

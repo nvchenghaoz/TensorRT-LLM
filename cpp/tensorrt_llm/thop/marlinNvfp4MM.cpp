@@ -143,8 +143,8 @@ int* getPersistentMarlinWorkspace(Tensor const& like, int device, int sms, cudaS
 // workspace_mode:     0 = persistent lock workspace, PDL launch when TRTLLM_ENABLE_PDL allows it;
 //                     2 = as 0, plus split-K partials reduced in FP32 (per-call FP32 C_tmp) so each
 //                     output is rounded to BF16 once.
-// launch_hint:        0 = the stock launch configuration; 1 = the Qwen3.8 decode launch tables
-//                     (marlin_nvfp4::kMarlinNvfp4LaunchHintQwen38).
+// launch_hint:        0 = the stock launch configuration; 1 = the tuned decode launch tables
+//                     (marlin_nvfp4::kMarlinNvfp4LaunchHintDecodeTables).
 Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional<Tensor> const& scale_a,
     Tensor const& scale_b, std::optional<Tensor> const& alpha, Tensor const& weight_global_scale,
     std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t size_n, int64_t size_k,
@@ -153,7 +153,7 @@ Tensor marlin_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, std::optional
 {
     TORCH_CHECK(workspace_mode == 0 || workspace_mode == 2, "workspace_mode must be 0 or 2, got ", workspace_mode);
     TORCH_CHECK(launch_hint == ::marlin_nvfp4::kMarlinNvfp4LaunchHintDefault
-            || launch_hint == ::marlin_nvfp4::kMarlinNvfp4LaunchHintQwen38,
+            || launch_hint == ::marlin_nvfp4::kMarlinNvfp4LaunchHintDecodeTables,
         "launch_hint must be 0 or 1, got ", launch_hint);
     CHECK_TH_CUDA(mat_a);
     TORCH_CHECK(mat_a.scalar_type() == FLOAT4_E2M1X2 || mat_a.scalar_type() == at::ScalarType::BFloat16,

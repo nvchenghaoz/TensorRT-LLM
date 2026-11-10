@@ -271,10 +271,10 @@ void run_skip_softmax_bf16_d256_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
 void run_skip_softmax_bf16_d128_causal_sm120(
     Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
-// Launcher of the Qwen3.5-family target's e4m3 head-256 causal paged-KV context FMHA, defined in
-// kernels/qwen35/qwen35ContextFmhaSm120.cu (built with the sm_120 kernels). Returns false (nothing launched) unless
-// kernelName is the generated kernel it replaces.
-bool runQwen35ContextFmhaSm120(Fused_multihead_attention_params_v2& params, Launch_params const& launch_params,
+// Launcher of the e4m3 head-256 causal paged-KV context FMHA, defined in
+// e4m3_head256_sm120/contextFmhaE4m3Head256Sm120.cu (built with the sm_120 kernels). Returns false (nothing launched)
+// unless kernelName is the generated kernel it replaces.
+bool runContextFmhaE4m3Head256Sm120(Fused_multihead_attention_params_v2& params, Launch_params const& launch_params,
     char const* kernelName, cudaStream_t stream);
 #endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
 
@@ -370,8 +370,8 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     if (kernelMeta.launcher != nullptr)
     {
 #if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
-        if (launch_params.sm120_target_fmha && (mSM == kSM_120 || mSM == kSM_121)
-            && runQwen35ContextFmhaSm120(params, launch_params, kernelMeta.mFuncName, stream))
+        if (launch_params.sm120_e4m3_head256_fmha && (mSM == kSM_120 || mSM == kSM_121)
+            && runContextFmhaE4m3Head256Sm120(params, launch_params, kernelMeta.mFuncName, stream))
         {
             return;
         }

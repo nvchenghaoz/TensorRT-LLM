@@ -35,7 +35,6 @@ add_subdirectory(kimiK3AttnRes)
 add_subdirectory(mhcKernels)
 add_subdirectory(compressorKernels)
 add_subdirectory(fusedSampling)
-add_subdirectory(qwen35)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
@@ -95,10 +94,6 @@ list(FILTER SRC_CU EXCLUDE REGEX
 # The MiniMax-M3 sm_107 decode kernels are built as their own sm_107-only OBJECT
 # library below.
 list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Sm107(Tp[248])?/.*")
-# The Qwen3.5-family target kernels build their own sm_120 OBJECT library
-# (qwen35/CMakeLists.txt) and the context FMHA target.
-list(FILTER SRC_CPP EXCLUDE REGEX "/kernels/qwen35/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "/kernels/qwen35/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
@@ -178,13 +173,9 @@ set_property(TARGET minimax_m3_sm107_src PROPERTY CUDA_ARCHITECTURES
 
 add_library(
   kernels_src STATIC
-  ${SRC_CPP}
-  ${SRC_CU}
-  ${MOE_KERNELS_SRC}
+  ${SRC_CPP} ${SRC_CU} ${MOE_KERNELS_SRC}
   $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>
-  $<TARGET_OBJECTS:minimax_m3_attn_src>
-  $<TARGET_OBJECTS:minimax_m3_sm107_src>
-  $<TARGET_OBJECTS:qwen35_kernels_src>)
+  $<TARGET_OBJECTS:minimax_m3_attn_src> $<TARGET_OBJECTS:minimax_m3_sm107_src>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(

@@ -25,25 +25,25 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
-namespace qwen35
+namespace e4m3Head256Sm120Fmha
 {
 
-// Context FMHA of the qwen3_5 modeling_v2 target on SM120/121: the e4m3-input, BF16-output, head-256, causal,
+// SM120/121 context FMHA for the e4m3-input, BF16-output, head-256, causal,
 // Q_PAGED_KV tiled flash kernel (64-row q-tiles, 128-key KV tiles), compiled with the base-2 softmax
 // (Kernel_traits::USE_EXP2_SOFTMAX). When dropping the last q-tile from its grid saves a whole wave (1 to
 // kContextFmhaSm120MaxBatch sequences), the last q-tile runs split along KV in pieces plus a fixed-order merge. The
-// launcher is reached through Launch_params::sm120_target_fmha (see fused_multihead_attention_v2.cpp) and lives in
-// qwen35ContextFmhaSm120.cu, which is only built with the SM120 FMHA kernels (TLLM_ENABLE_SKIP_SOFTMAX_SM120).
+// launcher is reached through Launch_params::sm120_e4m3_head256_fmha (see fused_multihead_attention_v2.cpp) and lives
+// in contextFmhaE4m3Head256Sm120.cu, which is only built with the SM120 FMHA kernels (TLLM_ENABLE_SKIP_SOFTMAX_SM120).
 
 // The largest batch the last q-tile split runs for.
 constexpr int kContextFmhaSm120MaxBatch = 3;
 // The most pieces the split uses in total; each piece needs 128 threads x (32 + 1) float4 of FP32 accumulators and
 // row max / sum.
 constexpr int kContextFmhaSm120MaxPiecesTotal = 384;
-// The workspace of the split (Launch_params::sm120_target_fmha_workspace): 25 952 256 bytes.
+// The workspace of the split (Launch_params::sm120_e4m3_head256_fmha_workspace): 25 952 256 bytes.
 constexpr size_t kContextFmhaSm120WorkspaceBytes = size_t{kContextFmhaSm120MaxPiecesTotal} * 128 * (32 + 1) * 16;
 
-} // namespace qwen35
+} // namespace e4m3Head256Sm120Fmha
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

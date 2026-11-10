@@ -33,6 +33,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SamplingParams
 
 from .....conftest import llm_models_root
 from ....accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ..._env import scoped_env_overrides
 
 skip_not_sm120 = pytest.mark.skipif(
     get_sm_version() != 120, reason="the qwen3_5 target is certified on sm_120 only"
@@ -40,17 +41,6 @@ skip_not_sm120 = pytest.mark.skipif(
 
 # Check the target's step contract on the first forward; the flag has to reach the worker.
 _VALIDATE = {MODELING_V2_VALIDATE_ENV: "1"}
-
-
-def _require_target(monkeypatch: pytest.MonkeyPatch, **env: str) -> dict:
-    """``LLM(...)`` kwargs that build the target, with ``env`` on the ranks.
-
-    ``LLM`` applies ``env_overrides`` to this process and never restores it, so
-    ``monkeypatch`` sets it too, keeping it from leaking into later tests.
-    """
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
-    return dict(modeling_v2="require", env_overrides=dict(env))
 
 
 # ------------------------------------------------------- long shared prefix ---
@@ -142,13 +132,16 @@ class TestModelingV2Qwen3827BNvfp4Sm120Tp1(LlmapiAccuracyTestHarness):
         cuda_graph_config=CudaGraphConfig(max_batch_size=128),
     )
 
-    def test_gsm8k(self, monkeypatch):
-        with LLM(
-            self.MODEL_PATH, **self.ENGINE, **_require_target(monkeypatch, **_VALIDATE)
-        ) as llm:
+    def test_gsm8k(self):
+        with (
+            scoped_env_overrides(_VALIDATE) as rank_env,
+            LLM(
+                self.MODEL_PATH, **self.ENGINE, modeling_v2="require", env_overrides=rank_env
+            ) as llm,
+        ):
             GSM8K(self.MODEL_NAME).evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def test_shared_prefix_retrieval(self, monkeypatch):
+    def test_shared_prefix_retrieval(self):
         """Every planted code is retrieved from one ~32K-token document.
 
         48 questions are in flight at once after the prefix is cached.
@@ -164,7 +157,10 @@ class TestModelingV2Qwen3827BNvfp4Sm120Tp1(LlmapiAccuracyTestHarness):
         )
         engine = dict(self.ENGINE, kv_cache_config=kv)
         params = SamplingParams(max_tokens=_ANSWER_TOKENS, temperature=0)
-        with LLM(self.MODEL_PATH, **engine, **_require_target(monkeypatch)) as llm:
+        with (
+            scoped_env_overrides({}) as rank_env,
+            LLM(self.MODEL_PATH, **engine, modeling_v2="require", env_overrides=rank_env) as llm,
+        ):
             # Prime the shared prefix, then send every question at once.
             llm.generate([prompts[0][0]], params)
             outputs = llm.generate([prompt for prompt, _ in prompts], params)

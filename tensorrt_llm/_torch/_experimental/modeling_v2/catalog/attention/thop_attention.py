@@ -365,7 +365,7 @@ class ThopAttention(OpWrapper):
     256-token tiles whose pages every request shares are attended once for all
     requests with e4m3 Q (two terms) and e4m3 probabilities (448 p), then folded
     into each request's suffix pass; with nothing shared it is the plain path
-    plus one scan launch. `context_fmha_sm120_target` runs the e4m3 head-256
+    plus one scan launch. `context_fmha_sm120_e4m3_head256` runs the e4m3 head-256
     causal paged-context kernel with a base-2 softmax (ex2.approx) and, for 1
     to 3 contexts whose last q-tile would make a tail wave, splits that q-tile
     along KV with a fixed-order merge; it reserves 25 952 256 bytes of context
@@ -503,7 +503,7 @@ class ThopAttention(OpWrapper):
         skip_correction_threshold: float = 0.0,
         xqa_one_wave_multi_block: bool = False,
         xqa_shared_prefix_min_batch: int = 0,
-        context_fmha_sm120_target: bool = False,
+        context_fmha_sm120_e4m3_head256: bool = False,
         context_fmha_skip_leading_q_tiles: bool = False,
     ) -> torch.Tensor:
         """Writes `output` in place and returns it -- the op destroys its
@@ -629,7 +629,7 @@ class ThopAttention(OpWrapper):
             skip_correction_threshold=skip_correction_threshold,
             xqa_one_wave_multi_block=xqa_one_wave_multi_block,
             xqa_shared_prefix_min_batch=xqa_shared_prefix_min_batch,
-            context_fmha_sm120_target=context_fmha_sm120_target,
+            context_fmha_sm120_e4m3_head256=context_fmha_sm120_e4m3_head256,
             context_fmha_skip_leading_q_tiles=context_fmha_skip_leading_q_tiles,
         )
         return output
@@ -654,7 +654,7 @@ class ThopAttention(OpWrapper):
         e4m3_probabilities: bool = False,
         xqa_one_wave_multi_block: bool = False,
         xqa_shared_prefix_min_batch: int = 0,
-        context_fmha_sm120_target: bool = False,
+        context_fmha_sm120_e4m3_head256: bool = False,
         context_fmha_skip_leading_q_tiles: bool = False,
     ) -> torch.Tensor:
         """Masked softmax attention over explicit per-sequence K/V, in fp32.
@@ -697,7 +697,7 @@ class ThopAttention(OpWrapper):
         with sinks.
 
         The SM120 opt-ins (`xqa_one_wave_multi_block`, `xqa_shared_prefix_min_batch`,
-        `context_fmha_sm120_target`) change where the kernels round, not what
+        `context_fmha_sm120_e4m3_head256`) change where the kernels round, not what
         they compute, so the fp32 result is the same. With
         `context_fmha_skip_leading_q_tiles` only each context's last row is
         defined; the rows before its last 64-row q-tile are returned NaN here.
@@ -825,7 +825,7 @@ class ThopAttention(OpWrapper):
         num_contexts: int = 0,
         xqa_one_wave_multi_block: bool = False,
         xqa_shared_prefix_min_batch: int = 0,
-        context_fmha_sm120_target: bool = False,
+        context_fmha_sm120_e4m3_head256: bool = False,
         context_fmha_skip_leading_q_tiles: bool = False,
         **unused_kwargs: object,
     ) -> None:

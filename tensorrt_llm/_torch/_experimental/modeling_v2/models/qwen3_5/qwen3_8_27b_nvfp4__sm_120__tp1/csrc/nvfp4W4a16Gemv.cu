@@ -15,15 +15,14 @@
  * limitations under the License.
  */
 
-#include "qwen35Nvfp4W4a16Gemv.h"
-#include "tensorrt_llm/common/config.h"
+#include "qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1/csrc/nvfp4W4a16Gemv.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
-// Cuda-core W4A16 NVFP4 GEMV for decode rows (see qwen35Nvfp4W4a16Gemv.h).
+// Cuda-core W4A16 NVFP4 GEMV for decode rows (see nvfp4W4a16Gemv.h).
 //
 // A CTA owns kGemvRows output rows across the whole K; thread t owns the 32
 // K-elements [32 t, 32 t + 32) (K == 32 * BLOCK), i.e. 16 weight bytes and two
@@ -33,9 +32,9 @@
 // summation order is fixed (per 16-block FP32 partials, warp xor-shuffle tree,
 // warps in index order), so repeated calls are bitwise identical.
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
-namespace kernels::qwen35
+namespace kernels
 {
 namespace
 {
@@ -555,6 +554,6 @@ bool nvfp4W4a16GemvConv(void const* x, void const* w, void const* sf, void* out,
     return launchNvfp4W4a16GemvConv<160>(x, w, sf, out, g, m, n, k, conv, enablePdl, stream);
 }
 
-} // namespace kernels::qwen35
+} // namespace kernels
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

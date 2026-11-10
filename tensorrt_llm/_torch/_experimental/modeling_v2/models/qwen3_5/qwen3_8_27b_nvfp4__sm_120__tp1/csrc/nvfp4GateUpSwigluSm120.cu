@@ -38,7 +38,7 @@
 //   quant tail (cvt_warp_fp16_to_fp4): rcp.approx.ftz, mul.rn,
 //   cvt.rn.satfinite.e4m3x2, cvt.rn.satfinite.e2m1x2.
 
-#include "qwen35Nvfp4GateUpSwigluSm120.h"
+#include "qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1/csrc/nvfp4GateUpSwigluSm120.h"
 #include "tensorrt_llm/common/assert.h"
 
 #ifndef PLACEHOLDER_KERNELS
@@ -239,9 +239,9 @@ struct Sm120BlockScaledLowerHalfM : Base
 };
 } // namespace cutlass::gemm::collective
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
-namespace kernels::qwen35
+namespace kernels
 {
 namespace swigluNvfp4Sm120
 {
@@ -610,15 +610,15 @@ size_t runSwigluNvfp4GemmSm120(void const* A, void const* B, void const* input_s
 }
 
 } // namespace swigluNvfp4Sm120
-} // namespace kernels::qwen35
+} // namespace kernels
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
 
 #endif // PLACEHOLDER_KERNELS
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
-namespace kernels::qwen35
+namespace kernels
 {
 
 size_t nvfp4GateUpSwigluSm120(void const* A, void const* B, void const* inputSf, void const* weightSf,
@@ -644,6 +644,6 @@ size_t nvfp4GateUpSwigluSm120(void const* A, void const* B, void const* inputSf,
 #endif
 }
 
-} // namespace kernels::qwen35
+} // namespace kernels
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

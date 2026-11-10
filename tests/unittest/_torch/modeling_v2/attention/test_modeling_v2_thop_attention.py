@@ -7498,7 +7498,7 @@ _QWEN35 = dict(
     max_blocks_per_seq=96,
 )
 _QWEN35_DECODE = dict(xqa_one_wave_multi_block=True, xqa_shared_prefix_min_batch=8)
-_QWEN35_PREFILL = dict(_QWEN35_DECODE, context_fmha_sm120_target=True)
+_QWEN35_PREFILL = dict(_QWEN35_DECODE, context_fmha_sm120_e4m3_head256=True)
 _QWEN35_LAST_LAYER = dict(_QWEN35_PREFILL, context_fmha_skip_leading_q_tiles=True)
 
 

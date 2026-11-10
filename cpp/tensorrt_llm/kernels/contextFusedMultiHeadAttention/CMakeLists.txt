@@ -38,6 +38,10 @@ endif()
 # only compiles for the sm_120 family; it is added explicitly to the sm_120 arch
 # target below, not to the all-arch source list.
 list(FILTER SRC_CU EXCLUDE REGEX "skip_softmax_sm120/.*")
+# The launcher of the generated e4m3 head-256 sm_120 kernel
+# (e4m3_head256_sm120/) includes the fmha_v2 headers, so it is likewise added to
+# the sm_120 arch target only.
+list(FILTER SRC_CU EXCLUDE REGEX "e4m3_head256_sm120/.*")
 
 add_library(context_attention_src STATIC)
 
@@ -88,14 +92,15 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
   file(GLOB arch_files "${TRTLLM_FMHA_GEN_DIR}/fmha_v2_cu/*_sm${arch}.cu")
   # Compile the hand-written skip_softmax warp-specialized FMHA into the sm_120
   # family target. It uses sm_120-only TMA + sync-MMA, so it must never be
-  # compiled for other architectures. The Qwen3.5-family target's launcher of
-  # the generated e4m3 head-256 kernel (kernels/qwen35) is built with them.
+  # compiled for other architectures. The launcher of the generated e4m3
+  # head-256 kernel (e4m3_head256_sm120/) is built with them.
   if(${arch} EQUAL 120)
     list(
       APPEND
       arch_files
       "${CMAKE_CURRENT_SOURCE_DIR}/skip_softmax_sm120/fused_multihead_flash_attention_ws_sm120.cu"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../qwen35/qwen35ContextFmhaSm120.cu")
+      "${CMAKE_CURRENT_SOURCE_DIR}/e4m3_head256_sm120/contextFmhaE4m3Head256Sm120.cu"
+    )
   endif()
   if(arch_files)
     set(TARGET_NAME _context_attention_kernels_${arch})

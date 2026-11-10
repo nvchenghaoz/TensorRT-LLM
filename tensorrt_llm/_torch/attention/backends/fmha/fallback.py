@@ -442,7 +442,7 @@ class FallbackFmha(PhasedFmha):
         uses_spcompress: Optional[bool] = None,
         xqa_one_wave_multi_block: bool = False,
         xqa_shared_prefix_min_batch: int = 0,
-        context_fmha_sm120_target: bool = False,
+        context_fmha_sm120_e4m3_head256: bool = False,
         context_fmha_skip_leading_q_tiles: bool = False,
     ) -> None:
         """Shared MHA/MLA replacement for the removed monolithic ``thop.attention``.

@@ -12,11 +12,12 @@ fails with an error that names `modeling_v2='off'`.
 
 Every projection is routed by the step's row count: the FP8 projections run load-time NVFP4
 copies of their weights (a CUDA-core W4A16 GEMV at the fewest rows, W4A16 Marlin up to 32 or 64
-rows, W4A4 above), and the producers before a W4A4 GEMM quantize in their own epilogue. Its CUDA
-kernels live in `cpp/tensorrt_llm/kernels/qwen35/` and `cpp/tensorrt_llm/thop/qwen35/`; the
+rows, W4A4 above), and the producers before a W4A4 GEMM quantize in their own epilogue. Its own
+CUDA kernels (the W4A16 GEMV, plain and with the fused conv1d update, and the gate_up GEMM with
+the SwiGLU + NVFP4 epilogue) live in `csrc/` and build into `libth_modeling_v2_qwen3_5.so`; the
 shared attention op and Marlin GEMM gained arguments, off by default, that only this target
-sets: the one-wave XQA multi-block cap, the shared-prefix (cascade) XQA decode, the target's
-SM120 context FMHA and Marlin's launch tables for this checkpoint's shapes.
+sets: the one-wave XQA multi-block cap, the shared-prefix (cascade) XQA decode, the SM120 e4m3
+head-256 context FMHA launcher and Marlin's launch tables for this checkpoint's shapes.
 
 Where it differs from the built-in `Qwen3_5VLModel` at the same settings:
 

@@ -515,8 +515,8 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     mLaunchParams.enableSkipSoftmax = runnerParams.skipSoftmaxThresholdScaleFactor > 0 && isSm90
         && mLaunchParams.warp_specialization && mLaunchParams.flash_attention;
 
-    mLaunchParams.sm120_target_fmha = runnerParams.sm120TargetFmha;
-    mLaunchParams.sm120_target_fmha_workspace = runnerParams.sm120TargetFmhaWorkspace;
+    mLaunchParams.sm120_e4m3_head256_fmha = runnerParams.sm120E4m3Head256Fmha;
+    mLaunchParams.sm120_e4m3_head256_fmha_workspace = runnerParams.sm120E4m3Head256FmhaWorkspace;
     mLaunchParams.skip_leading_q_tiles = runnerParams.skipLeadingQTiles;
 }
 

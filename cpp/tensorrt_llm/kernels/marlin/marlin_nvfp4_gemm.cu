@@ -130,8 +130,8 @@ struct m16_table_entry_t
     m16_launch_t launch;
 };
 
-// Decode rows 9-16 (one 16-row m block) launch shapes per (N, K) of the Qwen3.8 decode GEMMs on
-// 188-SM SM120 GPUs (launch hint kMarlinNvfp4LaunchHintQwen38). Exact (N, K) match only.
+// Decode rows 9-16 (one 16-row m block) launch shapes per (N, K) of the tuned decode GEMM shapes on
+// 188-SM SM120 GPUs (launch hint kMarlinNvfp4LaunchHintDecodeTables). Exact (N, K) match only.
 //  - (5120, 6144) GDN out_proj / attn o_proj: 160 CTAs = 2 stripes per 64-wide column, one
 //    BF16 reduction step, no stripe wrap.
 //  - (16384, 5120) GDN in_proj_qkvz: one full-K CTA per 128-wide column.
@@ -175,8 +175,8 @@ MarlinFuncPtr get_m32_kernel(thread_config_t const& th, int stages)
 }
 
 // Decode rows 17-32 (one 32-row m block, FP32 split-K reduce, workspace_mode 2) launch
-// shapes per (N, K) of the Qwen3.8 decode GEMMs on 188-SM SM120 GPUs (launch hint
-// kMarlinNvfp4LaunchHintQwen38). Exact (N, K) match only; without an entry, rows 17-32 keep
+// shapes per (N, K) of the tuned decode GEMM shapes on 188-SM SM120 GPUs (launch hint
+// kMarlinNvfp4LaunchHintDecodeTables). Exact (N, K) match only; without an entry, rows 17-32 keep
 // the generic launch.
 //  - (5120, 6144) GDN out_proj / attn o_proj: 160 CTAs = 2 stripes per 64-wide column, one
 //    FP32 reduce step through C_tmp.
@@ -271,9 +271,9 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
     int prob_n, int prob_k, int* locks, int num_groups, int group_size, bool use_fp32_reduce, int dev,
     cudaStream_t stream, bool enable_pdl, int launch_hint)
 {
-    // The Qwen3.8 decode launch tables (full-K and per-(N, K) launches, pre-wait weight prefetch) apply only when
+    // The decode launch tables (full-K and per-(N, K) launches, pre-wait weight prefetch) apply only when
     // the caller asks for them; otherwise this is the stock dispatcher.
-    bool const qwen38_launches = launch_hint == ::marlin_nvfp4::kMarlinNvfp4LaunchHintQwen38;
+    bool const decode_table_launches = launch_hint == ::marlin_nvfp4::kMarlinNvfp4LaunchHintDecodeTables;
     constexpr int num_bits = 4;
 
     int group_blocks = group_size == -1 ? -1 : group_size / 16;
@@ -296,7 +296,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
     if (prob_n <= 4096)
         max_par_val = 16 * 8;
     int max_shared_mem_new = max_shared_mem;
-    // The pre-wait flag goes only to the pre-wait instances (only the Qwen3.8 launches pick
+    // The pre-wait flag goes only to the pre-wait instances (only the decode-table launches pick
     // them); every other launch gets exactly the stock flag word.
     int const prewait_flags = enable_pdl ? kMarlinNvfp4PreWaitFlag : 0;
     int rest_m = prob_m;
@@ -364,7 +364,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
         // output is bitwise equal to it.
         int grid = blocks;
         int full_k_flags = 0;
-        if (qwen38_launches && m_block_size_8 && thread_m_blocks == 1 && num_threads == 128 && thread_n == 64
+        if (decode_table_launches && m_block_size_8 && thread_m_blocks == 1 && num_threads == 128 && thread_n == 64
             && thread_k == 128 && group_blocks == 1 && prob_n == 5120 && prob_k == 6144 && exec_cfg.blocks_per_sm == 1
             && !use_fp32_reduce && blocks <= kMarlinNvfp4FullKGridMask && prob_n / thread_n <= blocks
             && max_shared_mem_new < (1 << kMarlinNvfp4FullKGridShift)
@@ -383,7 +383,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
         // of `blocks` split-K CTAs whose partial sums chain through the BF16 output.
         // Reordered: each column's fp32 sum is rounded to BF16 once.
         thread_config_t const in_proj_cfg = {64, 128, 128};
-        if (qwen38_launches && full_k_flags == 0 && prob_m <= 8 && m_block_size_8 && thread_m_blocks == 1
+        if (decode_table_launches && full_k_flags == 0 && prob_m <= 8 && m_block_size_8 && thread_m_blocks == 1
             && group_blocks == 1 && exec_cfg.blocks_per_sm == 1 && !use_fp32_reduce && prob_k == 5120
             && (prob_n == 16384 || prob_n == 14336) && prob_n / in_proj_cfg.thread_n <= blocks
             && is_valid_config(
@@ -398,7 +398,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
         // cp.async stages (kM16Table). With grid == n_tiles each CTA streams one full-K
         // column (no split-K BF16 chain through C, no stripe wrap). Reordered.
         m16_launch_t m16;
-        if (qwen38_launches && full_k_flags == 0 && !m_block_size_8 && thread_m_blocks == 1 && prob_m_split > 8
+        if (decode_table_launches && full_k_flags == 0 && !m_block_size_8 && thread_m_blocks == 1 && prob_m_split > 8
             && group_blocks == 1 && exec_cfg.blocks_per_sm == 1 && !use_fp32_reduce
             && get_m16_launch(prob_n, prob_k, sms, m16) && m16.blocks >= 1 && m16.blocks <= sms
             && is_valid_config(
@@ -415,7 +415,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
         // full-K column per CTA (no reduce); a larger grid splits each column into stripes
         // that reduce in FP32 through C_tmp (one lock / C_tmp slot per column < sms).
         m16_launch_t m32;
-        if (qwen38_launches && full_k_flags == 0 && !m_block_size_8 && thread_m_blocks == 2 && prob_m_split > 16
+        if (decode_table_launches && full_k_flags == 0 && !m_block_size_8 && thread_m_blocks == 2 && prob_m_split > 16
             && group_blocks == 1 && exec_cfg.blocks_per_sm == 1 && use_fp32_reduce
             && get_m32_launch(prob_n, prob_k, sms, m32) && m32.blocks >= 1 && m32.blocks <= sms
             && is_valid_config(

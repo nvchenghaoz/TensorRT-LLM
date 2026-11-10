@@ -496,12 +496,10 @@
 # DeepSeek and GPT-OSS examples retain the Modeling V2 team ownership above.
 # Other model implementations and their tests belong to their submitting authors.
 
-# Qwen3.5 (Qwen3.8-27B) and its target-only native kernels and bindings
+# Qwen3.5 (Qwen3.8-27B), including its native code in csrc/
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/qwen3_5 @nvchenghaoz
 /tests/unittest/_torch/modeling_v2/models/qwen3_5 @nvchenghaoz
 /tests/integration/defs/accuracy/modeling_v2/qwen3_5 @nvchenghaoz
-/cpp/tensorrt_llm/kernels/qwen35 @NVIDIA/trt-llm-kernels-devs @nvchenghaoz
-/cpp/tensorrt_llm/thop/qwen35/ @NVIDIA/trt-llm-kernels-devs @nvchenghaoz
 
 # Qwen4
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/qwen4_exp @Wanli-Jiang

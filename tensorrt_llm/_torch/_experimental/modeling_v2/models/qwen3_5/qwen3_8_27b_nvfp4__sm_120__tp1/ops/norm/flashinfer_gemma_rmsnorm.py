@@ -7,12 +7,7 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-
-from .._op import Arch, Cell, OpWrapper
-
-#: qwen3.8-flash-next's hyper-connection residual: hc_count 4 streams of hidden 2560, row
-#: stride 10240.
-_STREAM = dict(row_width=10240, dtype=torch.bfloat16, eps=1e-6)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 
 class FlashinferGemmaRmsnorm(OpWrapper):
@@ -28,33 +23,17 @@ class FlashinferGemmaRmsnorm(OpWrapper):
     the plain-`w` form is `flashinfer_rmsnorm`.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_120})
+    ARCHS = frozenset({Arch.SM_120})
 
-    # qwen3.8-flash-next (qwen4_exp, sm_103): the grouped norm is one call per
-    # 2560-wide stream of the 10240-wide residual, each a column slice at row stride
-    # 10240 -- that, not a contiguous row, is what the strided-kernel cells certify --
-    # plus the MTP pre_e_norm. qwen3.8-27b (qwen3_5, sm_120): the first layer's
-    # input_layernorm, which has no residual to add, on the contiguous [T, 5120]
-    # embedding output.
+    # The first layer's input_layernorm, which has no residual to add, on the
+    # contiguous [T, 5120] embedding output.
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="decode batch 33: stream 1, row stride 10240 > width 2560",
-            spec=dict(shape=(33, 2560), col_offset=2560, **_STREAM),
-        ),
-        Cell(
-            why="prefill 2048 tokens: stream 2 at row stride 10240",
-            spec=dict(shape=(2048, 2560), col_offset=5120, **_STREAM),
-        ),
-        Cell(
-            why="MTP pre_e_norm: the contiguous [T, 2560] embedding",
-            spec=dict(shape=(4, 2560), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="qwen3.8-27b layer-0 input norm, decode 1 token: contiguous [1, 5120]",
+            why="layer-0 input norm, decode 1 token: contiguous [1, 5120]",
             spec=dict(shape=(1, 5120), dtype=torch.bfloat16, eps=1e-6),
         ),
         Cell(
-            why="qwen3.8-27b layer-0 input norm, prefill 8192 tokens: contiguous [8192, 5120]",
+            why="layer-0 input norm, prefill 8192 tokens: contiguous [8192, 5120]",
             spec=dict(shape=(8192, 5120), dtype=torch.bfloat16, eps=1e-6),
         ),
     )
@@ -62,15 +41,12 @@ class FlashinferGemmaRmsnorm(OpWrapper):
     note = """
     Metadata consumed: none. Registered only when flashinfer is importable.
     Certified path: flashinfer's CuTe DSL `rmsnorm_cute` kernel for 2-D bf16
-    `x` (`weight_bias=1.0`) at hidden 2560: a stream slice at the residual's
-    10240 row stride (33 and 2048 rows; a strided row selects a strided kernel
-    variant) and a contiguous `[4, 2560]` (MTP `pre_e_norm`); at hidden 5120 a
-    contiguous `[1, 5120]` and `[8192, 5120]`. Not certified: a single strided
-    row, other widths, other row counts, the 3-D per-head kernel
-    (`qk_rmsnorm_cute`) and fp16/fp32 operands. The CUDA-JIT fallback (`FLASHINFER_USE_CUDA_NORM=1`,
-    or a DSL that cannot target the device) is a different implementation and
-    is not certified. PDL (`TRTLLM_ENABLE_PDL`, default on) changes scheduling,
-    not results.
+    `x` (`weight_bias=1.0`), contiguous `[1, 5120]` and `[8192, 5120]`. Not
+    certified: strided rows, other widths, other row counts, the 3-D per-head
+    kernel (`qk_rmsnorm_cute`) and fp16/fp32 operands. The CUDA-JIT fallback
+    (`FLASHINFER_USE_CUDA_NORM=1`, or a DSL that cannot target the device) is a
+    different implementation and is not certified. PDL (`TRTLLM_ENABLE_PDL`,
+    default on) changes scheduling, not results.
 
     Loud (measured), so not guarded: 1-D and 4-D `x`, `x.stride(-1) != 1`, a weight of
     the wrong length, dtype or device, and a CPU `x` raise ValueError;
@@ -78,14 +54,10 @@ class FlashinferGemmaRmsnorm(OpWrapper):
     and float8_e5m2 are in that table and return a plausible fp8 tensor --
     `is_valid` refuses them.
 
-    Row stride is free; the strided kernel declares it divisible by the vector
-    width (8 elements for bf16/fp16, 4 for fp32) and assumes 16-byte aligned
-    pointers, so odd row strides and misaligned slices were not measured.
-
     Numerics: default tolerance holds for bf16, nothing loosened; the
-    largest deviation measured is one bf16 ulp (0.03125) at 2048 and 8192 rows
-    of 5120. The `+ 1` is measured: against a plain-`w` reference the output is
-    ~4 away, so the cells tell the two apart.
+    largest deviation measured is one bf16 ulp (0.03125) at 8192 rows of 5120.
+    The `+ 1` is measured: against a plain-`w` reference the output is ~4 away,
+    so the cells tell the two apart.
 
     Hard limits
       T * H  contiguous inputs above 2^31 - 1 elements route to the strided

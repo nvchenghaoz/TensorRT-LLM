@@ -17,14 +17,14 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include <cstdint>
 #include <cuda_runtime.h>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
-namespace kernels::qwen35
+namespace kernels
 {
 
 // Cuda-core W4A16 NVFP4 GEMV for decode rows (1 <= m <= kNvfp4W4a16GemvMaxRows):
@@ -70,6 +70,6 @@ constexpr int kNvfp4W4a16GemvConvMaxRows = 3;
 bool nvfp4W4a16GemvConv(void const* x, void const* w, void const* sf, void* out, float g, int m, int n, int k,
     Nvfp4GemvConvParams const& conv, bool enablePdl, cudaStream_t stream);
 
-} // namespace kernels::qwen35
+} // namespace kernels
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

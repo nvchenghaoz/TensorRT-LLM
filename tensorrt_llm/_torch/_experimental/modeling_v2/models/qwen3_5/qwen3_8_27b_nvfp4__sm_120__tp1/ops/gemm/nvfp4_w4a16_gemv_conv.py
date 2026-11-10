@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GDN in_proj_qkvz decode GEMV with the causal conv1d update in its epilogue
-(``torch.ops.trtllm.nvfp4_w4a16_gemv_conv``).
+(``native_ops.nvfp4_w4a16_gemv_conv``, built from the target's ``csrc/``).
 
 The `nvfp4_w4a16_gemv` kernel, plus, for output columns ``[0, conv_dim)`` (the
 ``q|k|v`` channels the GDN conv runs over), the single-step width-4 causal conv
@@ -19,7 +19,7 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from . import _cpp_fakes  # noqa: F401 — fake for torch.compile tracing
+from ... import native_ops
 from .nvfp4_w4a16_gemv import nvfp4_w4a16_gemv
 
 #: This checkpoint's GDN conv width: 2 * 16 key heads * 128 + 48 value heads * 128.
@@ -84,7 +84,7 @@ class Nvfp4W4a16GemvConv(OpWrapper):
         conv_dim: int,
         pad_slot_id: int,
     ) -> torch.Tensor:
-        return torch.ops.trtllm.nvfp4_w4a16_gemv_conv(
+        return native_ops.nvfp4_w4a16_gemv_conv(
             x,
             weight,
             weight_sf,

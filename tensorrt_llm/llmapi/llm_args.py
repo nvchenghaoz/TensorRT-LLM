@@ -5433,7 +5433,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             description=
             "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config. "
             "'int8' allocates an int8-typed byte pool that a modeling_v2 target fills with its own quantized row "
-            "layout (Qwen3.8-27B: int16 row codes plus one fp32 scale per row); only modeling_v2 targets that read "
+            "layout (int16 row codes plus one fp32 scale per row); only modeling_v2 targets that read "
             "that layout accept it.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.

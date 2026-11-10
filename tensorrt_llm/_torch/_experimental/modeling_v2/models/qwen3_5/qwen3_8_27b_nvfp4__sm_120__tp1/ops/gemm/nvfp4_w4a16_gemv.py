@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Decode-row W4A16 NVFP4 GEMV on CUDA cores (``torch.ops.trtllm.nvfp4_w4a16_gemv``).
+"""Decode-row W4A16 NVFP4 GEMV on CUDA cores (``native_ops.nvfp4_w4a16_gemv``, built from the target's ``csrc/``).
 
 At one to three rows the decode copies of the FP8 per-tensor projections run a
 GEMV instead of Marlin: each CTA owns two output rows over the whole K, issues its
@@ -22,8 +22,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     true_fp32_matmul,
 )
 
+from ... import native_ops
 from ..quantization._nvfp4_reference import dequantize
-from . import _cpp_fakes  # noqa: F401 — fake for torch.compile tracing
 
 
 def _cell(why: str, n: int, k: int, m: int) -> Cell:
@@ -76,7 +76,7 @@ class Nvfp4W4a16Gemv(OpWrapper):
     def __call__(
         self, x: torch.Tensor, weight: torch.Tensor, weight_sf: torch.Tensor, global_scale: float
     ) -> torch.Tensor:
-        return torch.ops.trtllm.nvfp4_w4a16_gemv(x, weight, weight_sf, global_scale)
+        return native_ops.nvfp4_w4a16_gemv(x, weight, weight_sf, global_scale)
 
     def reference(
         self, x: torch.Tensor, weight: torch.Tensor, weight_sf: torch.Tensor, global_scale: float

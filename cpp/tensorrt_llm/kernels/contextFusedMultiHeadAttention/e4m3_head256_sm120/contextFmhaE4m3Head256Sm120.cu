@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
-// Launcher of the Qwen3.5-family target's SM120 context FMHA (see qwen35ContextFmhaSm120.h). It replaces the launcher
+// Launcher of the SM120 e4m3 head-256 context FMHA (see contextFmhaE4m3Head256Sm120.h). It replaces the launcher
 // of the generated fmha_v2_flash_attention_e4m3_fp32_64_128_S_q_paged_kv_256_causal_output_bf16_sm120_kernel_nl_tiled
-// when Launch_params::sm120_target_fmha is set. The kernel is the generated one's device_flash_attention_nl_tiled with
-// the same traits plus USE_EXP2_SOFTMAX, so it takes the softmax in base 2 (ex2.approx).
+// when Launch_params::sm120_e4m3_head256_fmha is set. The kernel is the generated one's device_flash_attention_nl_tiled
+// with the same traits plus USE_EXP2_SOFTMAX, so it takes the softmax in base 2 (ex2.approx).
 //
 // That kernel runs 2 CTAs/SM with one CTA per (64-row q-tile, head, sequence), and all CTAs of a long-prefix prefill
 // do about the same work. A 1 x 2048-token prefill with 24 heads is 768 CTAs = 2 x 376 + 16 on 188 SMs: the last 16
@@ -27,7 +27,7 @@
 //      caller reads only each sequence's last row (Launch_params::skip_leading_q_tiles);
 //   B) the last q-tile of every (head, sequence) runs as `pieces` CTAs over contiguous KV ranges (one wave);
 //   C) the pieces are merged in a fixed order and O is stored with the unchanged epilogue.
-// The device code of B and C is in qwen35ContextFmhaLastTileSplit.cuh.
+// The device code of B and C is in contextFmhaLastTileSplit.cuh.
 
 #include <cstdint>
 #include <fmha/kernel_traits.h>
@@ -35,17 +35,17 @@
 #include <fused_multihead_attention_kernel.h>
 #include <fused_multihead_flash_attention_kernel_noloop_tiled.h>
 
-#include "qwen35ContextFmhaLastTileSplit.cuh"
+#include "contextFmhaLastTileSplit.cuh"
 
-#include "../contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
-#include "qwen35ContextFmhaSm120.h"
+#include "../fused_multihead_attention_common.h"
+#include "contextFmhaE4m3Head256Sm120.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include <cstring>
 
-namespace qwen35ContextFmhaSm120
+namespace contextFmhaE4m3Head256Sm120
 {
 
 // The causal kernel traits of the generated kernel (setup.py flash_attention_kernel_template,
@@ -64,14 +64,14 @@ constexpr char kGeneratedKernelName[]
 constexpr int kStepQ = 64;
 // At most this many pieces per (head, sequence).
 constexpr int kMaxPieces = 16;
-constexpr int kMaxPiecesTotal = tensorrt_llm::kernels::qwen35::kContextFmhaSm120MaxPiecesTotal;
-constexpr int kMaxBatch = tensorrt_llm::kernels::qwen35::kContextFmhaSm120MaxBatch;
+constexpr int kMaxPiecesTotal = tensorrt_llm::kernels::e4m3Head256Sm120Fmha::kContextFmhaSm120MaxPiecesTotal;
+constexpr int kMaxBatch = tensorrt_llm::kernels::e4m3Head256Sm120Fmha::kContextFmhaSm120MaxBatch;
 
 static_assert(Kt::STORE_O_FROM_REGS, "");
 static_assert(Kt::USE_EXP2_SOFTMAX, "");
 static_assert(Kt::Cta_tile_p::M == kStepQ, "");
 static_assert(sizeof(float4) * (Ws::ACC_FLOAT4S_PER_PIECE + Ws::STATS_FLOAT4S_PER_PIECE) * kMaxPiecesTotal
-        == tensorrt_llm::kernels::qwen35::kContextFmhaSm120WorkspaceBytes,
+        == tensorrt_llm::kernels::e4m3Head256Sm120Fmha::kContextFmhaSm120WorkspaceBytes,
     "kContextFmhaSm120WorkspaceBytes does not match the split workspace");
 
 __global__ void contextFmhaE4m3D256CausalPagedKvSm120Kernel(bert::Fused_multihead_attention_params_v2 params)
@@ -122,7 +122,7 @@ int pieceKernelOccupancy()
     return sOccupancy[device];
 }
 
-} // namespace qwen35ContextFmhaSm120
+} // namespace contextFmhaE4m3Head256Sm120
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -131,11 +131,11 @@ namespace kernels
 
 // Runs the kernel named kernelName when it is the generated kernel this launcher replaces and returns true; returns
 // false (nothing launched) otherwise.
-bool runQwen35ContextFmhaSm120(Fused_multihead_attention_params_v2& params, Launch_params const& launch_params,
+bool runContextFmhaE4m3Head256Sm120(Fused_multihead_attention_params_v2& params, Launch_params const& launch_params,
     char const* kernelName, cudaStream_t stream)
 {
     namespace lts = fused_multihead_attention::last_tile_split;
-    namespace ns = qwen35ContextFmhaSm120;
+    namespace ns = contextFmhaE4m3Head256Sm120;
 
     if (kernelName == nullptr || std::strcmp(kernelName, ns::kGeneratedKernelName) != 0 || params.d != 256
         || params.dv != 256 || !launch_params.flash_attention || !launch_params.granular_tiling
@@ -148,7 +148,7 @@ bool runQwen35ContextFmhaSm120(Fused_multihead_attention_params_v2& params, Laun
 
     // The last q-tile split: only for the plain causal prefill of 1 to kMaxBatch unpadded sequences, and only with
     // the split workspace.
-    bool const splittable = launch_params.sm120_target_fmha_workspace != nullptr && params.b >= 1
+    bool const splittable = launch_params.sm120_e4m3_head256_fmha_workspace != nullptr && params.b >= 1
         && params.b <= ns::kMaxBatch && !params.is_s_padded && !params.has_alibi
         && !launch_params.enableAttnLogitSoftcapping && !launch_params.interleaved
         && params.softmax_stats_ptr == nullptr && params.attention_sinks_ptr == nullptr
@@ -178,7 +178,7 @@ bool runQwen35ContextFmhaSm120(Fused_multihead_attention_params_v2& params, Laun
     }
 
     // B) + C) The last q-tile.
-    auto* const wsAcc = static_cast<float4*>(launch_params.sm120_target_fmha_workspace);
+    auto* const wsAcc = static_cast<float4*>(launch_params.sm120_e4m3_head256_fmha_workspace);
     auto* const wsStats = wsAcc + static_cast<size_t>(ns::Ws::ACC_FLOAT4S_PER_PIECE) * ns::kMaxPiecesTotal;
     int const qLoopLast = (params.s + ns::kStepQ - 1) / ns::kStepQ - 1;
     cudaError_t const err = lts::launch_last_tile_split<ns::Kt>(bertParams, qLoopLast, pieces, wsAcc, wsStats, stream);

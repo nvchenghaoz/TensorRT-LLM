@@ -10,11 +10,11 @@ import torch
 # tensorrt_llm._torch.custom_ops` alone, torch.ops.trtllm has no
 # `fused_sigmoid_mul_inplace` (measured).
 import tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate  # noqa: F401
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .._op import Arch, Cell, OpWrapper
-
-#: qwen3.8-flash-next's gated attention: 24 q heads of 256, q projection [T, 24, 512].
-_CKPT = dict(heads=24, head_dim=256, dtype=torch.bfloat16, gate="interleaved")
+#: The gated attention: 24 q heads of 256, the gate the 3-D view of the interleaved
+#: `[T, 14336]` qkv projection (strides (14336, 512, 1)).
+_QKV_VIEW = dict(heads=24, head_dim=256, dtype=torch.bfloat16, gate="qkv_view")
 
 
 class FusedSigmoidMulInplace(OpWrapper):
@@ -22,41 +22,25 @@ class FusedSigmoidMulInplace(OpWrapper):
 
     Returns `attention_output`, the tensor it wrote. Both operands are widened to
     fp32 and the product is rounded once to `attention_output.dtype`. `gate` is
-    read through its own token and head strides, so the gate half of an
-    interleaved `[T, heads, 2 * D]` q projection is passed as a strided view with
-    no repack (bitwise equal to its compacted copy, measured). A 2-D `gate` of
-    `attention_output`'s shape is one head spanning the row.
+    read through its own token and head strides, so the gate halves of the
+    interleaved qkv projection are passed as a strided view with no repack.
 
     Fusion boundary: sigmoid and multiply only. The caller owns producing both
     operands and everything downstream (the o projection). `gate` is read-only.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_120})
+    ARCHS = frozenset({Arch.SM_120})
 
-    # qwen3.8-flash-next (qwen4_exp, sm_103): the 2-D gate window of its fused input
-    # projection row, and the MTP layer's strided q_proj half. qwen3.8-27b (qwen3_5,
-    # sm_120): at decode rows up to 32 the gate is the 3-D view the rope-gate prologue
-    # hands back -- the g_i halves of the interleaved [T, 14336] qkv projection.
+    # At decode rows up to 32 the gate is the 3-D view the rope-gate prologue hands
+    # back -- the g_i halves of the interleaved [T, 14336] qkv projection.
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="decode 128 tokens: 2-D gate off the fused projection row (stride 14080)",
-            spec=dict(tokens=128, heads=24, head_dim=256, dtype=torch.bfloat16, gate="fused_row"),
+            why="decode 1 token: gate the [1, 24, 256] view of the qkv projection",
+            spec=dict(tokens=1, **_QKV_VIEW),
         ),
         Cell(
-            why="prefill 8192 tokens: 2-D gate off the fused projection row, 2048-wide blocks",
-            spec=dict(tokens=8192, heads=24, head_dim=256, dtype=torch.bfloat16, gate="fused_row"),
-        ),
-        Cell(
-            why="MTP decode: 1 token, 24x256 gate as the strided half of q_proj",
-            spec=dict(tokens=1, **_CKPT),
-        ),
-        Cell(
-            why="qwen3.8-27b decode 1 token: gate the [1, 24, 256] view of the qkv projection",
-            spec=dict(tokens=1, heads=24, head_dim=256, dtype=torch.bfloat16, gate="qkv_view"),
-        ),
-        Cell(
-            why="qwen3.8-27b decode 32 tokens: token stride 14336, head stride 512",
-            spec=dict(tokens=32, heads=24, head_dim=256, dtype=torch.bfloat16, gate="qkv_view"),
+            why="decode 32 tokens: token stride 14336, head stride 512",
+            spec=dict(tokens=32, **_QKV_VIEW),
         ),
     )
 
@@ -77,24 +61,16 @@ class FusedSigmoidMulInplace(OpWrapper):
 
     Numerics: bf16 bitwise equal to the fp32 reference except ~1e-6 of
     elements one ulp off (`tl.sigmoid`'s fast exp); default tolerance holds,
-    nothing loosened. Feeding the q half instead of the gate half moves the
-    result by ~2.15 max abs at [17, 6144] (measured), so the per-head indexing
-    is under test.
+    nothing loosened.
 
-    Certified: bf16 operands at hidden 6144 (both checkpoints), a compact
-    `attention_output`; the 2-D window of the fused projection row at 128
-    tokens (decode, 1024-wide blocks) and 8192 tokens (prefill, 2048-wide
-    blocks), the strided q_proj half (MTP) at 1 token, and the 3-D gate view of
-    the interleaved `[T, 14336]` qkv projection at 1 and 32 tokens.
-
-    Hard limits
-      T * row stride  token offset computed in int64  boundary 2^63  not probed
-      (largest run 8192 rows)
+    Certified: bf16 operands at hidden 6144, a compact `attention_output`, and
+    the 3-D gate view of the interleaved `[T, 14336]` qkv projection at 1 and 32
+    tokens.
 
     CUDA-graph replay is certified for the qkv view at 32 tokens (the replay reads
     the operands' contents at replay time).
 
-    Not certified: 0 tokens, the strided q_proj half above 1 token, a strided
+    Not certified: 0 tokens, more than 32 tokens, a 2-D gate, a strided
     `attention_output`, a gate dtype other than `attention_output.dtype`,
     fp16/fp32 operands, other hidden sizes, torch.compile.
     """

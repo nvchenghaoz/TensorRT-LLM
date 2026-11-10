@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Dense-MLP gate_up NVFP4 GEMM with SwiGLU + NVFP4 quantize in its epilogue
-(``torch.ops.trtllm.nvfp4_gate_up_swiglu_nvfp4``).
+(``native_ops.nvfp4_gate_up_swiglu_nvfp4``, built from the target's ``csrc/``).
 
 An SM120 CUTLASS block-scaled GEMM whose epilogue writes down_proj's NVFP4 input
 (packed E2M1 and swizzled E4M3 scales) instead of the ``[M, 2I]`` BF16 gate_up
@@ -28,9 +28,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
     fp4_quantize,
 )
 
+from ... import native_ops
 from ..quantization._nvfp4_recipes import gate_up_swiglu_row_permutation
 from ..quantization._nvfp4_reference import SF_VEC, dequantize, swizzled_sf_numel, unswizzle_sf
-from . import _cpp_fakes  # noqa: F401 — fake for torch.compile tracing
 
 
 def _cell(why: str, m: int, tile: int) -> Cell:
@@ -94,7 +94,7 @@ class Nvfp4GateUpSwigluNvfp4(OpWrapper):
         out_scale: torch.Tensor,
         tile: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        fp4, sf = torch.ops.trtllm.nvfp4_gate_up_swiglu_nvfp4(
+        fp4, sf = native_ops.nvfp4_gate_up_swiglu_nvfp4(
             act_fp4, weight, act_sf, weight_scale, alpha, out_scale, tile
         )
         return fp4, sf

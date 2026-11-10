@@ -54,24 +54,24 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
-    fused_sigmoid_mul_inplace,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     QM_FP8_KV_CACHE,
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_gemma_rmsnorm import (
-    flashinfer_gemma_rmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (  # noqa: E501
-    rms_norm_gated_token_major,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.reset_recurrent_state_rows import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
+    fused_sigmoid_mul_inplace,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm.flashinfer_gemma_rmsnorm import (  # noqa: E501
+    flashinfer_gemma_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
+    rms_norm_gated_token_major,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.ssm.reset_recurrent_state_rows import (  # noqa: E501
     reset_recurrent_state_rows,
 )
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
@@ -837,7 +837,7 @@ class PrefillTarget:
             quant_mode=core.quant_mode,
             kv_scale_orig_quant=core.kv_scale_orig_quant,
             kv_scale_quant_orig=core.kv_scale_quant_orig,
-            context_fmha_sm120_target=True,
+            context_fmha_sm120_e4m3_head256=True,
             context_fmha_skip_leading_q_tiles=L.is_last and step.skip_leading_q_tiles,
             **step.attn,
             **_CALL_CONSTANTS,
@@ -1000,7 +1000,7 @@ class DecodeTarget:
             quant_mode=core.quant_mode,
             kv_scale_orig_quant=core.kv_scale_orig_quant,
             kv_scale_quant_orig=core.kv_scale_quant_orig,
-            context_fmha_sm120_target=False,
+            context_fmha_sm120_e4m3_head256=False,
             context_fmha_skip_leading_q_tiles=False,
             **self._attn,
             **_CALL_CONSTANTS,

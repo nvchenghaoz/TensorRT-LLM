@@ -297,12 +297,12 @@ public:
         return feature<torch_ext::SageAttnFeature>().isHopperLayout();
     }
 
-    /// Whether the context FMHA runs through the SM120 target launcher (see
-    /// `AttentionBase::context_fmha_sm120_target`), which needs its last q-tile split workspace in the
+    /// Whether the context FMHA runs through the SM120 e4m3 head-256 launcher (see
+    /// `AttentionBase::context_fmha_sm120_e4m3_head256`), which needs its last q-tile split workspace in the
     /// context workspace.
-    [[nodiscard]] bool useContextFmhaSm120Target() const
+    [[nodiscard]] bool useContextFmhaSm120E4m3Head256() const
     {
-        return context_fmha_sm120_target && (mSM == 120 || mSM == 121) && mFP8ContextFMHA && mHeadSize == 256;
+        return context_fmha_sm120_e4m3_head256 && (mSM == 120 || mSM == 121) && mFP8ContextFMHA && mHeadSize == 256;
     }
 
 private:

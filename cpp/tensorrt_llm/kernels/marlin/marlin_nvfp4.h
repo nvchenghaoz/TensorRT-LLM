@@ -40,11 +40,11 @@ void dequantFp4Activations(
 
 // launch_hint of marlinNvfp4Gemm: the stock launch configuration.
 constexpr int kMarlinNvfp4LaunchHintDefault = 0;
-// launch_hint of marlinNvfp4Gemm: the launch tables of the Qwen3.8 decode GEMMs. One full-K CTA per column for
+// launch_hint of marlinNvfp4Gemm: the tuned SM120 decode launch tables. One full-K CTA per column for
 // (N, K) = (5120, 6144) (bitwise equal to the split-K launch) and (16384 or 14336, 5120) at rows <= 8, per-(N, K)
 // launches at rows 9-16 and, with use_fp32_reduce, 17-32 on 188-SM GPUs, and with PDL an L2 prefetch of the first
 // pipeline stages' weights before the grid-dependency wait of the in_proj instances.
-constexpr int kMarlinNvfp4LaunchHintQwen38 = 1;
+constexpr int kMarlinNvfp4LaunchHintDecodeTables = 1;
 
 // enable_pdl: launch with programmatic stream serialization (the kernel waits on
 // its predecessor with griddepcontrol.wait before any global memory access).

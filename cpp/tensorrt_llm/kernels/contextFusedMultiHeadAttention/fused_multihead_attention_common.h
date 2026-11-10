@@ -366,14 +366,14 @@ struct MHARunnerParams
     uint32_t* skipSoftmaxSkippedBlocks;
 #endif
 
-    // Run the SM120/121 e4m3 head-256 causal paged-KV context FMHA through the Qwen3.5-family target's launcher
-    // (kernels/qwen35/qwen35ContextFmhaSm120.cu: base-2 softmax, last q-tile KV split). See Launch_params.
-    bool sm120TargetFmha = false;
-    // With sm120TargetFmha: workspace of the last q-tile KV split (qwen35::kContextFmhaSm120WorkspaceBytes); nullptr
-    // never splits.
-    void* sm120TargetFmhaWorkspace = nullptr;
-    // With sm120TargetFmha: when the last q-tile split runs, leave the output rows of the q-tiles before the last one
-    // unwritten (for callers that read only each sequence's last row, all in the last q-tile).
+    // Run the SM120/121 e4m3 head-256 causal paged-KV context FMHA through its own launcher
+    // (e4m3_head256_sm120/contextFmhaE4m3Head256Sm120.cu: base-2 softmax, last q-tile KV split). See Launch_params.
+    bool sm120E4m3Head256Fmha = false;
+    // With sm120E4m3Head256Fmha: workspace of the last q-tile KV split
+    // (e4m3Head256Sm120Fmha::kContextFmhaSm120WorkspaceBytes); nullptr never splits.
+    void* sm120E4m3Head256FmhaWorkspace = nullptr;
+    // With sm120E4m3Head256Fmha: when the last q-tile split runs, leave the output rows of the q-tiles before the last
+    // one unwritten (for callers that read only each sequence's last row, all in the last q-tile).
     bool skipLeadingQTiles = false;
 };
 
@@ -604,13 +604,13 @@ struct Launch_params
     bool supportReturnSoftmaxStats;
     // enable skip softmax attention feature
     bool enableSkipSoftmax = false;
-    // Run the SM120/121 e4m3 head-256 causal paged-KV kernel through the Qwen3.5-family target's launcher (base-2
+    // Run the SM120/121 e4m3 head-256 causal paged-KV kernel through its own launcher (base-2
     // softmax, last q-tile KV split) instead of the generated launcher.
-    bool sm120_target_fmha = false;
-    // With sm120_target_fmha: workspace of the last q-tile KV split (nullptr: never split).
-    void* sm120_target_fmha_workspace = nullptr;
-    // With sm120_target_fmha: when the last q-tile split runs, leave the output rows of the q-tiles before the last
-    // one unwritten.
+    bool sm120_e4m3_head256_fmha = false;
+    // With sm120_e4m3_head256_fmha: workspace of the last q-tile KV split (nullptr: never split).
+    void* sm120_e4m3_head256_fmha_workspace = nullptr;
+    // With sm120_e4m3_head256_fmha: when the last q-tile split runs, leave the output rows of the q-tiles before the
+    // last one unwritten.
     bool skip_leading_q_tiles = false;
 };
 
