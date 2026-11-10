@@ -9,10 +9,12 @@ g < 0, beta a sigmoid):
 * `o` in the band the chunked kernels are certified at (rtol 1.6e-2, atol 2e-3): a
   64-token WY reformulation with bf16 MMA operands, the same class of sum on every
   architecture (measured against fp64 on sm_103 at 1 x 8192 tokens: max abs 1.26e-3).
-* the final states per value row: each pool within `sqrt(K) * scale * 448 * 2^-4` of
-  its own fp32 row (one e4m3 rounding a side), and the two fp32 rows within
-  `1e-3 * |row| + 1e-5` -- the chunk-versus-sequential slack the 8-bit pool's
-  acceptance check derived and held at 4 x 2048 tokens.
+* the final states per value row: each pool within `sqrt(K) * scale / 2` of
+  its own fp32 row (one int16 rounding a side), and the two fp32 rows within
+  `1.5e-2 * |row| + 1e-5` -- the chunk-versus-sequential slack of the bf16-MMA chunked
+  recurrence against the fp64 sequential reference. Measured on sm_120 over these cells:
+  0.71-0.94% of the row norm beyond the int16 rounding. (The earlier `1e-3` never held;
+  the int8 pool's rounding band, ~2.2% of the row norm, hid it.)
 * slots the call did not name bitwise; `out` written in place.
 
 At 188 SMs the cell's kernel (CP / V-split / fully fused) is asserted from the host
@@ -115,7 +117,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     assert torch.equal(extras["step_out"][:, sum(seqlens) :], tail_before), "rider rows written"
     assert torch.isfinite(o.float()).all()
     torch.testing.assert_close(o.float(), ref_o.float(), rtol=RTOL, atol=ATOL_OUTPUT)
-    assert_q8_rows_close(pool, ref_pool, extras["slots"], row_rel=1e-3, abs_slack=1e-5)
+    assert_q8_rows_close(pool, ref_pool, extras["slots"], row_rel=1.5e-2, abs_slack=1e-5)
     assert_untouched(pool, pool_before, extras["slots"])
     if cell.spec.get("pool") == "coalesced":
         assert not extras["backing"][:, 1:].any(), "another layer's states were written"

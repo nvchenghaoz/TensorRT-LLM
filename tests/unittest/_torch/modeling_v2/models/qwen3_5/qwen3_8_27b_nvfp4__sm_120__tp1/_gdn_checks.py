@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inputs and checks shared by this target's Gated-DeltaNet entry tests.
 
-* `q8_pool`: the 8-bit state pool `[S, 48, 132, 128]`, compact or as the cache manager
+* `q8_pool`: the quantized state pool `[S, 48, 260, 128]` (int16 rows), compact or as the cache manager
   v2 hands a layer its view (every GDN layer's state of a slot in one page, so the slot
   stride is 48 layers' states), with chosen slots holding quantized random states.
 * `decode_inputs`: q/k/v/z views of one `[N, 16384]` in_proj_qkvz block and a/b views of
   one `[N, 96]` in_proj_ba block, as the decode step hands them over.
-* `assert_q8_states_close` / `assert_q8_rows_close`: two 8-bit pools against each other
+* `assert_q8_states_close` / `assert_q8_rows_close`: two quantized pools against each other
   on the named slots, in the band two independent quantizations of (nearly) the same
   fp32 state allow -- element by element, or per state row.
 """
@@ -34,14 +34,13 @@ QKVZ_DIM = CONV_DIM + VAL_DIM
 ROWS8 = q8_state_rows(V, K)
 #: GDN layers whose states the cache manager v2 coalesces into one slot page.
 LAYERS = 48
-#: e4m3 has 3 mantissa bits: round-to-nearest of a value up to the row maximum (448 after
-#: scaling) errs by at most half an ulp of the top binade, 16 = 448 * 2^-4.75; the bound
-#: uses 448 * 2^-4 per unit of scale.
-E4M3_ELEM_BOUND = Q8_QMAX * 2.0**-4
+#: int16 rows: round-to-nearest of `h / scale` errs by at most half a code, i.e. 0.5 per
+#: unit of the row's scale (`amax / 32767`).
+Q8_ELEM_BOUND = 0.5
 
 
 def q8_pool(slots: int, layout: str, filled, gen: torch.Generator, std: float = 0.2):
-    """`(backing, pool)`: an int8 pool view `[slots, 48, 132, 128]` (`layout` "compact"
+    """`(backing, pool)`: an int8-typed pool view `[slots, 48, 260, 128]` (`layout` "compact"
     or "coalesced") whose `filled` slots hold quantized `std * randn` states; every other
     byte is zero (a zero state)."""
     if layout == "coalesced":
@@ -60,29 +59,28 @@ def q8_pool(slots: int, layout: str, filled, gen: torch.Generator, std: float = 
 def scales_of(pool: torch.Tensor, slots) -> torch.Tensor:
     """fp32 row scales `[len(slots), HV, V]` of the named slots."""
     return torch.stack(
-        [pool[s, :, V:].contiguous().view(torch.float32).reshape(HV, V) for s in slots]
+        [pool[s, :, 2 * V :].contiguous().view(torch.float32).reshape(HV, V) for s in slots]
     )
 
 
 def assert_q8_states_close(got_pool, want_pool, slots, *, fp32_slack: float = 1e-6) -> None:
     """The named slots' dequantized states, element by element: each pool is within one
-    e4m3 rounding of its own fp32 state (`scale * 448 * 2^-4` per element, the row's
-    scale), and the two fp32 states differ by at most `fp32_slack` (absolute: the
+    int16 rounding of its own fp32 state (`scale / 2` per element, the row's scale), and the two fp32 states differ by at most `fp32_slack` (absolute: the
     reorder of one step's fp32 sums, ~2^-20 of states of magnitude < 4) -- so the pools
-    differ by at most the sum. The row scales (`amax / 448`) then agree to 1e-5 relative
-    plus `fp32_slack / 448`."""
+    differ by at most the sum. The row scales (`amax / 32767`) then agree to 1e-5 relative
+    plus `fp32_slack / 32767`."""
     slots = [s for s in slots if s >= 0]
     got, want = dequantize_slots(got_pool, slots), dequantize_slots(want_pool, slots)
     s_got, s_want = scales_of(got_pool, slots), scales_of(want_pool, slots)
-    bound = (s_got + s_want)[..., None] * E4M3_ELEM_BOUND * 1.001 + fp32_slack
+    bound = (s_got + s_want)[..., None] * Q8_ELEM_BOUND * 1.001 + fp32_slack
     worst = ((got - want).abs() - bound).amax().item()
-    assert worst <= 0, f"state off by {worst:.3e} past the e4m3 band"
+    assert worst <= 0, f"state off by {worst:.3e} past the int16 band"
     torch.testing.assert_close(s_got, s_want, rtol=1e-5, atol=fp32_slack / Q8_QMAX)
 
 
 def assert_q8_rows_close(got_pool, want_pool, slots, *, row_rel: float, abs_slack: float) -> None:
     """The named slots' dequantized states, per value row (L2 over K): each pool is
-    within `sqrt(K) * scale * 448 * 2^-4` of its own fp32 row, and the two fp32 rows
+    within `sqrt(K) * scale / 2` of its own fp32 row, and the two fp32 rows
     differ by at most `row_rel * |row| + abs_slack` (the chunked kernel's reordered sum
     against the sequential recurrence)."""
     slots = [s for s in slots if s >= 0]
@@ -90,7 +88,7 @@ def assert_q8_rows_close(got_pool, want_pool, slots, *, row_rel: float, abs_slac
     s_got, s_want = scales_of(got_pool, slots), scales_of(want_pool, slots)
     err = (got - want).pow(2).sum(-1).sqrt()
     norm = want.pow(2).sum(-1).sqrt()
-    bound = math.sqrt(K) * (s_got + s_want) * E4M3_ELEM_BOUND * 1.001 + row_rel * norm + abs_slack
+    bound = math.sqrt(K) * (s_got + s_want) * Q8_ELEM_BOUND * 1.001 + row_rel * norm + abs_slack
     worst = (err - bound).amax().item()
     assert worst <= 0, f"a state row off by {worst:.3e} past the band"
 

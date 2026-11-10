@@ -6,9 +6,9 @@ Each cell against the entry's float64 reference from the same dequantized states
 
 * `o` in torch's default bf16 band: both compute `o` from the unrounded state, so they
   differ by the fp32 sums' reorder (~2^-20 of `|h| |q|`) under one bf16 rounding.
-* the pool, element by element, within two e4m3 roundings (each side's own,
-  `scale * 448 * 2^-4`) plus 1e-6 of fp32 reorder; scales to 1e-5 relative. This is the
-  derivation of the 8-bit pool's acceptance check, applied to one step.
+* the pool, element by element, within two int16 roundings (each side's own,
+  `scale / 2`) plus 1e-6 of fp32 reorder; scales to 1e-5 relative. This is the
+  derivation of the quantized pool's acceptance check, applied to one step.
 * every slot the call did not name -- the pad row's included -- bitwise unchanged; with
   `out` given, the step output's other rows too.
 
@@ -151,7 +151,7 @@ def test_guard_refuses_shared_slots() -> None:
 
 
 def test_guard_refuses_a_bf16_pool() -> None:
-    """A bf16 `[S, 48, 128, 128]` pool would be read as e4m3 codes and scales; refused."""
+    """A bf16 `[S, 48, 128, 128]` pool would be read as int8 codes and scales; refused."""
     args, _ = _build(dict(rows=2), seed=8)
     args[7] = torch.zeros(8, HV, V, 128, dtype=torch.bfloat16, device=DEV)
     args[8] = torch.tensor([1, 2], dtype=torch.int32, device=DEV)

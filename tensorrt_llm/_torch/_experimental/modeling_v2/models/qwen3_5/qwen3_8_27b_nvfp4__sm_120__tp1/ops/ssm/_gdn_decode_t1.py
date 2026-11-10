@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Single-token (one token per sequence) Gated-DeltaNet decode kernels over the 8-bit
+"""Single-token (one token per sequence) Gated-DeltaNet decode kernels over the quantized
 state pool, and the same step with the gated RMS norm folded in.
 
 Both are specializations of the generic ``fused_sigmoid_gating_delta_rule_update_kernel``
@@ -67,8 +67,8 @@ def _gdn_decode_t1_kernel(
     idx = tl.load(h0_indices + i_n).to(tl.int64)
     has_state = idx >= 0
     tl.device_assert(idx < h0_dim0, "idx out of bounds in h0_source access")
-    # 8-bit pool [slots, HV, V + 4, K]: V e4m3 rows + V fp32 row scales.
-    p_head = h0_source + idx * s_h0_0 + i_hv * (V + (V * 4) // K) * K
+    # pool [slots, HV, 2V + 4, K] int8 bytes: V int16 rows + V fp32 row scales.
+    p_head = h0_source + idx * s_h0_0 + i_hv * (2 * V + (V * 4) // K) * K
     b_h = q8_load_rows(p_head, o_v, o_k, has_state, K, V)
 
     b_q = tl.load(q + i_n * stride_q + i_h * K + o_k).to(tl.float32)
@@ -192,7 +192,7 @@ def _gdn_decode_t1_gated_norm_kernel(
     idx = tl.load(h0_indices + i_n).to(tl.int64)
     has_state = idx >= 0
     tl.device_assert(idx < h0_dim0, "idx out of bounds in h0_source access")
-    p_head = h0_source + idx * s_h0_0 + i_hv * (V + (V * 4) // K) * K
+    p_head = h0_source + idx * s_h0_0 + i_hv * (2 * V + (V * 4) // K) * K
     b_h = q8_load_rows(p_head, o_v, o_k, has_state, K, V)
 
     b_q = tl.load(q + i_n * stride_q + i_h * K + o_k).to(tl.float32)
@@ -354,7 +354,7 @@ def check_operands(q, k, v, a, b, A_log, dt_bias, pool, slots) -> None:
     rows = q8_state_rows(vd, kd)
     assert pool.dtype == torch.int8 and pool.dim() == 4, "int8 pool [S, HV, V + 4, K]"
     assert tuple(pool.shape[1:]) == (hv, rows, kd), (
-        f"pool [S, {hv}, {rows}, {kd}]: V e4m3 rows then 4 rows of fp32 row scales"
+        f"pool [S, {hv}, {rows}, {kd}]: V int8 rows then 4 rows of fp32 row scales"
     )
     assert pool.stride()[1:] == (rows * kd, kd, 1), "each slot's [HV, V + 4, K] block contiguous"
     assert pool.stride(0) % 16 == 0 and pool.data_ptr() % 16 == 0, (

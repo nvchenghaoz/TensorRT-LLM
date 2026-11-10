@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""One Gated-DeltaNet decode step per row over the 8-bit state pool: gates, q/k L2
+"""One Gated-DeltaNet decode step per row over the quantized state pool: gates, q/k L2
 norm, the delta rule, and the state dequantized and requantized in place.
 
 Triton (``_gdn_decode_t1``): the generic single-warp recurrent kernel specialized for
 one token per sequence, with a flat ``N * HV * (V / BV)`` grid whose ``[BV, K]`` state
-tiles are laid out like the pool so the 8-bit rows load as full vectors.
+tiles are laid out like the pool so the int16 rows load as full vectors.
 """
 
 from __future__ import annotations
@@ -31,14 +31,14 @@ def _cell(why: str, rows: int, **spec) -> Cell:
 
 class GdnDecodeT1(OpWrapper):
     """One gated-delta-rule step for each of N sequences (one token each), state in the
-    8-bit pool. Row `n` uses slot `s = slots[n]`, value head `i` key head `i // (HV // H)`:
+    quantized pool. Row `n` uses slot `s = slots[n]`, value head `i` key head `i // (HV // H)`:
 
         g = -exp(A_log) * softplus(a + dt_bias);  beta = sigmoid(b)
         q = q / (|q| + 1e-6) * K^-0.5;  k = k / (|k| + 1e-6)
         h = deq(pool[s]) * exp(g);  u = (v - h k) * beta;  h += u k^T;  o = h q
         pool[s] = quant(h)
 
-    `deq` / `quant` are the pool's e4m3 rows with one fp32 scale (`amax / 448`) per row
+    `deq` / `quant` are the pool's int16 rows with one fp32 scale (`amax / 32767`) per row
     (see `_gdn_state_q8`). A slot of -1 reads a zero state and writes nothing.
 
     Fusion boundary: both gates, the q/k L2 norm, the recurrence, the state's
@@ -76,7 +76,7 @@ class GdnDecodeT1(OpWrapper):
     Call site (modeling): q, k `[1, N, 16, 128]` and v `[1, N, 48, 128]` views of the
     conv output rows (any token stride, heads packed: head stride 128, unit inner
     stride); a, b `[N, 48]` column views of the in_proj_ba output (unit column
-    stride); A_log, dt_bias `[48]`; the layer's whole int8 pool `[slots, 48, 132, 128]`
+    stride); A_log, dt_bias `[48]`; the layer's whole int8-typed pool `[slots, 48, 260, 128]`
     unsliced; `out` None at a pure decode step, `output[0, P:]` (the riders' rows of the
     contiguous `[1, T, 48, 128]` step output) at a mixed step.
 
@@ -89,8 +89,8 @@ class GdnDecodeT1(OpWrapper):
     (every reduction in the generic single-warp kernel's order), one stage, grid
     `N * HV * (V / BV)`. No PDL.
 
-    Numerics: fp32 inside, the state rounded once per step to e4m3 rows (relative
-    rounding <= 2^-4 of the row maximum), `o` from the unrounded state and rounded
+    Numerics: fp32 inside, the state rounded once per step to int8 rows (absolute
+    rounding <= 1/254 of the row maximum), `o` from the unrounded state and rounded
     once to bf16. The q/k L2 norm is `x / (sqrt(sum x^2) + 1e-6)` -- the generic decode
     kernel's form before upstream aligned it with the prefill front end
     (`x / sqrt(sum x^2 + 1e-6)`); kept so decode reproduces the target's reference run.
@@ -135,8 +135,8 @@ class GdnDecodeT1(OpWrapper):
         out: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`(o, pool_after)`: the float64 step from the dequantized states, `o` rounded
-        once to `q.dtype`, the new states quantized into a copy of the pool (e4m3 rows,
-        `amax / 448` scales). Mutates nothing; `out` is ignored."""
+        once to `q.dtype`, the new states quantized into a copy of the pool (int16 rows,
+        `amax / 32767` scales). Mutates nothing; `out` is ignored."""
         slot_list = slots.tolist()
         h = dequantize_slots(pool, slot_list)
         o, h_after = reference_step(q, k, v, a, b, A_log, dt_bias, h)

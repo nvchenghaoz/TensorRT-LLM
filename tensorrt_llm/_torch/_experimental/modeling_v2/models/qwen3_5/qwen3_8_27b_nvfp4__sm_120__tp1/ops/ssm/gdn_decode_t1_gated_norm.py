@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""One Gated-DeltaNet decode step per row over the 8-bit state pool with the GDN gated
+"""One Gated-DeltaNet decode step per row over the quantized state pool with the GDN gated
 RMS norm (silu gate, norm before gate) applied to its output in the same kernel.
 
 Triton (``_gdn_decode_t1``): one program of 4 or 8 warps owns a (row, value head)'s

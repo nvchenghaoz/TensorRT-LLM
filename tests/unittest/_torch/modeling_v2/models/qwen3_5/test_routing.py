@@ -18,8 +18,8 @@ pytestmark = pytest.mark.cpu_only
 _SM120 = (12, 0)
 _DUMMY_MODEL = "/tmp/dummy_model"
 _TARGET = "models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.modeling.ModelingV2Qwen3827BNvfp4Sm120Tp1"
-# The engine settings the target serves: an fp8-e4m3 KV pool and the 8-bit
-# recurrent-state pool.
+# The engine settings the target serves: an fp8-e4m3 KV pool and the quantized
+# recurrent-state pool (int16 rows in an int8-typed pool).
 _SERVED_KV = dict(dtype="fp8", mamba_ssm_cache_dtype="int8")
 
 

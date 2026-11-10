@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Chunked gated delta rule over whole context sequences, their states in the 8-bit pool:
+"""Chunked gated delta rule over whole context sequences, their states in the quantized pool:
 the GDN prefill core.
 
 One call: ``g -> exp(g)``; a Triton gather that dequantizes the named slots into a
@@ -37,7 +37,7 @@ def _cell(why: str, seqlens: tuple[int, ...], route: str, **spec) -> Cell:
 
 class FlashinferChunkGatedDeltaRuleQ8(OpWrapper):
     """Run the gated delta rule over N context sequences packed in one row, starting
-    from and returning to their 8-bit pool slots; writes `o` into `out`.
+    from and returning to their quantized pool slots; writes `o` into `out`.
 
     Per token `t` of sequence `n` and value head `i` (key head `i // (HV // H)`),
     `h` the `[V, K]` state starting at `deq(pool[slots[n]])`, fp32 accumulation:
@@ -98,12 +98,12 @@ class FlashinferChunkGatedDeltaRuleQ8(OpWrapper):
     `num_long_seqs * 48 * 2 <= SMs` (one sequence), else fully fused. V-split and fully
     fused are bitwise equal; CP sums in another order.
 
-    Pool contract: as `gdn_decode_t1` (int8 `[S, 48, 132, 128]`, 16-byte aligned
+    Pool contract: as `gdn_decode_t1` (int8-typed `[S, 48, 260, 128]`, 16-byte aligned
     slots, any slot stride). The gather / scatter address `slot * stride(0)` in int64.
 
-    Numerics: the initial states dequantized exactly (e4m3 x fp32 scale, one rounding),
+    Numerics: the initial states dequantized exactly (int16 x fp32 scale, one rounding),
     the chunked recurrence with bf16 MMA operands and fp32 state, `o` rounded to bf16,
-    the final states requantized once per row (e4m3, `amax / 448`).
+    the final states requantized once per row (int16, `amax / 32767`).
 
     JIT and streams: the first call per kernel variant compiles in-process (seconds);
     FlashInfer keeps one TMA descriptor workspace per device, so two streams must not

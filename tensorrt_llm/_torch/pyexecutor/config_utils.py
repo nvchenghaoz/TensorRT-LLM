@@ -300,12 +300,14 @@ def resolve_hf_torch_dtype(config):
 def ssm_state_rows(head_dim: int, d_state: int, ssm_dtype) -> int:
     """Rows of ``d_state`` elements per SSM head in the recurrent-state pool.
 
-    An 8-bit pool (``mamba_ssm_cache_dtype="int8"``) appends the ``head_dim``
-    fp32 row scales as ``head_dim * 4 / d_state`` extra int8 rows.
+    An int8-typed pool (``mamba_ssm_cache_dtype="int8"``, used by the Qwen3.8-27B
+    modeling_v2 target) stores int16 row codes, two int8 rows per state row, and
+    appends the ``head_dim`` fp32 row scales as ``head_dim * 4 / d_state`` extra
+    int8 rows (layout: that target's ``ops/ssm/_gdn_state_q8.py``).
     """
     if ssm_dtype == torch.int8:
         assert (head_dim * 4) % d_state == 0, (head_dim, d_state)
-        return head_dim + (head_dim * 4) // d_state
+        return 2 * head_dim + (head_dim * 4) // d_state
     return head_dim
 
 

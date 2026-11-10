@@ -72,7 +72,7 @@ def _check_engine(kv_cache_quant_algo, engine: EngineChoices) -> None:
     if engine.mamba_ssm_cache_dtype not in _SSM_STATE_DTYPES:
         raise NoTarget(
             f"a {engine.mamba_ssm_cache_dtype} recurrent-state cache; the target's Gated-DeltaNet "
-            "kernels read an 8-bit pool (kv_cache_config.mamba_ssm_cache_dtype='int8')"
+            "kernels read an int8-typed pool (kv_cache_config.mamba_ssm_cache_dtype='int8')"
         )
     if engine.prefill_cuda_graph_backend != "disabled":
         raise NoTarget(

@@ -12,7 +12,7 @@ Two gates per cell:
    rounded to bf16, then the gated norm's fp32 reference): `y` in torch's default bf16
    band -- the two `o` differ by the fp32 sums' reorder, which flips a bf16 rounding of
    `o` now and then, and the norm carries that one ulp into `y`; the pool as in
-   `gdn_decode_t1`'s test (two e4m3 roundings plus 1e-6). Slots the call did not name,
+   `gdn_decode_t1`'s test (two int16 roundings plus 1e-6). Slots the call did not name,
    the pad row's included, stay bitwise.
 
 Then the guard on z's layout.

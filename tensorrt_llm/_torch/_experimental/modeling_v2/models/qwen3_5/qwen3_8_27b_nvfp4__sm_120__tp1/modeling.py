@@ -22,9 +22,9 @@ MLP runs a SwiGLU-epilogue gate_up GEMM from 41 rows. The thresholds are the
 capacity.
 
 **Engine settings the target serves** (`routing.py` declines others): an fp8-e4m3 paged
-KV cache (`kv_cache_config.dtype='fp8'`) and the 8-bit recurrent-state pool
-(`kv_cache_config.mamba_ssm_cache_dtype='int8'`: per slot `[48, 132, 128]` int8, 128 e4m3
-rows plus four rows of fp32 row scales), on the V2 hybrid cache manager; no speculative
+KV cache (`kv_cache_config.dtype='fp8'`) and the quantized recurrent-state pool
+(`kv_cache_config.mamba_ssm_cache_dtype='int8'`: per slot `[48, 260, 128]` int8 bytes, 128
+rows of int16 codes (two byte rows each) plus four rows of fp32 row scales), on the V2 hybrid cache manager; no speculative
 decoding; eager prefill steps.
 
 **Attention** runs on the engine's attention op (`catalog/attention/thop_attention`) with
@@ -39,7 +39,7 @@ logits processor reads; every op on those rows routes and tunes as the full step
 rows are the ones an unsliced step computes.
 
 Numerics relative to the built-in model: the FP8 projections run NVFP4 copies of their
-weights; attention reads an fp8 KV cache; the recurrent state is 8-bit; the context
+weights; attention reads an fp8 KV cache; the recurrent state is int16 rows; the context
 softmax is base-2 `ex2.approx`; the cascade prefix pass runs FP8 Q/P; the GDN decode
 normalizes q/k as `x / (sqrt(sum x^2) + 1e-6)`. The accuracy gate in
 `tests/integration/defs/accuracy/modeling_v2/test_qwen3_5.py` certifies the whole.
@@ -467,11 +467,11 @@ class Qwen3827BTp1ModelingV2(DecoderModel):
         ssm0 = ssm[self.gdn_layers[0]]
         assert ssm0.dtype == torch.int8 and tuple(ssm0.shape[1:]) == (
             self.num_v_heads,
-            self.head_v_dim + 4 * self.head_v_dim // self.head_k_dim,
+            2 * self.head_v_dim + 4 * self.head_v_dim // self.head_k_dim,
             self.head_k_dim,
         ), (
             f"the recurrent pool is {ssm0.dtype} {tuple(ssm0.shape)}; this target reads the "
-            "8-bit row layout (mamba_ssm_cache_dtype='int8')"
+            "int16-row layout in an int8-typed pool (mamba_ssm_cache_dtype='int8')"
         )
         conv0 = conv[self.gdn_layers[0]]
         assert conv0.dtype == torch.bfloat16 and tuple(conv0.shape[1:]) == (
@@ -1139,7 +1139,7 @@ class ModelingV2Qwen3827BNvfp4Sm120Tp1(
 ):
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
-        """The 8-bit recurrent-state pool exists only on the V2 hybrid manager."""
+        """The quantized recurrent-state pool exists only on the V2 hybrid manager."""
         return "V2"
 
     def __init__(self, model_config: ModelConfig):
