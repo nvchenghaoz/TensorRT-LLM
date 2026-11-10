@@ -26,6 +26,10 @@ prompt, over the whole span up to the next checkpoint, which must also start a
 re-tokenized token). Otherwise the prompt is tokenized in full. Tokenizers that alter
 every text they are called on, such as those whose normalizer prepends a
 ``▁``, are probed for once when the cache is created and get no cache.
+The cache tokenizes with ``add_special_tokens=False``; a tokenizer that adds no
+special tokens to a single sequence (Qwen, GPT-2 style) is found at creation, and
+its cache then also serves requests that ask for special tokens
+(``serves_special_tokens``), such as ``/v1/completions`` by default.
 
 Off by default; enable with the ``enable_tokenization_cache`` LLM argument.
 Each ``DefaultInputProcessor`` owns its own cache, so cached ids are never
@@ -54,6 +58,7 @@ __all__ = [
     "RouteFailed",
     "create_prefix_token_cache",
     "tokenization_routing_key",
+    "tokenizer_adds_no_special_tokens",
 ]
 
 # Log the hit rate every this many cache-eligible requests, so an operator can
@@ -208,6 +213,9 @@ class PrefixTokenCache:
         # Read and written without the lock: a bool flip is atomic, and the
         # worst case of a race is two threads each logging the disable warning.
         self.disabled = False
+        # Set by create_prefix_token_cache when the tokenizer adds no special
+        # tokens, so add_special_tokens=True gives the ids the cache returns.
+        self.serves_special_tokens = False
         # Counters, reported by periodic log lines and read by tests.
         self.hits = 0
         self.misses = 0
@@ -594,4 +602,36 @@ def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
         )
         return None
     logger.info(f"Prefix token cache enabled: {config}")
-    return PrefixTokenCache(config)
+    cache = PrefixTokenCache(config)
+    cache.serves_special_tokens = tokenizer_adds_no_special_tokens(tokenizer)
+    return cache
+
+
+def tokenizer_adds_no_special_tokens(tokenizer: object) -> bool:
+    """Whether ``add_special_tokens=True`` gives the same ids as False for ``tokenizer``.
+
+    True when the tokenizer's post-processor adds no special tokens to a single
+    sequence (Qwen, GPT-2 style), checked on a probe string as well. The prefix
+    token cache tokenizes with ``add_special_tokens=False``, so for such a
+    tokenizer it can also serve requests that ask for special tokens, such as
+    ``/v1/completions`` by default. Evaluated once, when a processor is built.
+    """
+    # A wrapper such as TransformersTokenizer delegates to ``.tokenizer``; ask
+    # the wrapped tokenizer first, since the wrapper's inherited
+    # num_special_tokens_to_add need not work.
+    inner = getattr(tokenizer, "tokenizer", None)
+    for candidate in (inner, tokenizer):
+        count = getattr(candidate, "num_special_tokens_to_add", None)
+        if candidate is None or not callable(count):
+            continue
+        try:
+            if count() != 0:
+                return False
+            probe = "Hello world, tokenization probe."
+            with_special = candidate(probe, add_special_tokens=True)["input_ids"]
+            without = candidate(probe, add_special_tokens=False)["input_ids"]
+        except Exception as e:  # noqa: BLE001 - any failure means "not known safe"
+            logger.debug(f"Special-token probe failed on {type(candidate).__name__}: {e!r}")
+            continue
+        return list(with_special) == list(without)
+    return False

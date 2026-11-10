@@ -408,6 +408,25 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
 
+#: The longest history `_compare` holds an e4m3 call to; see `_compare_fp8_long_history`.
+FP8_ROW_MAX_MODEL_KEYS = 256
+
+
+def _compare_fp8_long_history(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """An e4m3 call attending over more than `FP8_ROW_MAX_MODEL_KEYS` keys.
+
+    The kernels round the softmax probabilities to e4m3 against each KV tile's running
+    max; `reference(e4m3_probabilities=True)` rounds against the row's max, which
+    reproduces that within one tile and drifts as tiles accumulate. Measured on sm_120
+    over the qwen3_5 cells (histories of 300 to 2047 keys, decode and paged-context
+    prefill): up to 16.8 ulp element-wise and 10.4 ulp relative RMS, the stock kernels
+    and the SM120 opt-ins alike (the opt-ins move neither gate by more than 1 ulp RMS).
+    24 and 14 ulp keep that headroom; a misaddressed page or a wrong merge partition is
+    off by the values themselves, hundreds of ulp.
+    """
+    assert_within_ulp(out, ref, element_ulp=24.0, rms_ulp=14.0, ulp=ULP[torch.bfloat16])
+
+
 def _compare_fp8_mla(out: torch.Tensor, ref: torch.Tensor) -> None:
     """The MLA context cells' band: the fp8 MLA band per element, and
     `_compare`'s 4 ulp of relative RMS in aggregate.
@@ -5669,11 +5688,13 @@ def _op_reference(
     e4m3: bool = False,
     layer: Optional[int] = None,
     nvfp4: bool = False,
+    skip_leading_q_tiles: bool = False,
 ) -> torch.Tensor:
     """`op.reference` over the history the env mirrored for these requests.
 
     nvfp4=True reads K and V as an NVFP4 pool returns them (the history
     through `_nvfp4_roundtrip`) before the e4m3 arithmetic `e4m3` selects.
+    skip_leading_q_tiles=True leaves the rows the op does not write NaN.
 
     Call it after the op call, so each history ends with this call's K/V:
     `reference`'s bottom-right alignment then puts this call's q rows at the
@@ -5701,6 +5722,7 @@ def _op_reference(
         causal=causal,
         e4m3_inputs=e4m3,
         e4m3_probabilities=e4m3,
+        context_fmha_skip_leading_q_tiles=skip_leading_q_tiles,
     )
 
 
@@ -7221,6 +7243,32 @@ def _seed(cell) -> None:
     torch.manual_seed(zlib.crc32(cell.why.encode()))
 
 
+def _fill_history(env, rids, lens, paged) -> None:
+    """One uncertified context call appending `lens` tokens to each of `rids`."""
+    env.call_op(
+        env.random_qkv(sum(lens)),
+        lens,
+        len(rids),
+        rids,
+        MASK_CAUSAL,
+        ctx_lens_override=lens,
+        use_paged_context_fmha=paged,
+    )
+
+
+def _share_prefix(env, rids, tokens) -> None:
+    """Point every sequence after the first at the first one's leading `tokens` (whole
+    pages) and mirror them into its history: one physical prefix in every page table,
+    as KV-cache block reuse leaves it."""
+    assert tokens % env.tokens_per_block == 0, "a shared prefix is whole pages"
+    first = rids[0]
+    k, v = torch.cat(env.k_history[first]), torch.cat(env.v_history[first])
+    for rid in rids[1:]:
+        env.pages[rid] = env.pages[first][: tokens // env.tokens_per_block]
+        env.k_history[rid] = [k[:tokens]]
+        env.v_history[rid] = [v[:tokens]]
+
+
 def _cell_paged(cell, arm) -> None:
     """A standard-configuration cell over a single-layer paged pool.
 
@@ -7229,6 +7277,11 @@ def _cell_paged(cell, arm) -> None:
     row) and is gated against `op.reference` over the history it should have
     attended. Over an fp8 or NVFP4 pool every operand that call reads went through
     e4m3, except on the packed context path, which never reads the pool.
+
+    With `shared_prefix`, the first sequence's history is filled first and its
+    leading pages become every other sequence's prefix, whose own tokens follow.
+    `opt_ins` are passed to the certified call only; with leading q-tiles
+    skipped, the rows `reference` leaves undefined are not compared.
     """
     spec = cell.spec
     arm(op)
@@ -7242,30 +7295,29 @@ def _cell_paged(cell, arm) -> None:
         tokens_per_block=spec["tokens_per_block"],
         num_blocks=spec["num_blocks"],
         max_batch=spec["max_num_requests"],
-        max_blocks_per_seq=16,
+        max_blocks_per_seq=spec.get("max_blocks_per_seq", 16),
         pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         quant_mode=spec["quant_mode"],
         kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
     )
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
     p, paged = spec["predicted_tokens_per_seq"], spec["use_paged_context_fmha"]
+    opt_ins = dict(spec.get("opt_ins", {}))
+    shared = spec.get("shared_prefix", 0)
     assert all(n == p for n in new[nc:]), "a generation row carries P q rows"
     assert paged or not any(cached[:nc]), "a cached prefix needs the paged-context path"
     rids = list(range(len(new)))
     for rid in rids:
         env.add_request(rid, cached[rid] + (new[rid] if rid < nc else 0))
-    prior = [rid for rid in rids if cached[rid]]
-    if prior:
-        hist = [cached[rid] for rid in prior]
-        env.call_op(
-            env.random_qkv(sum(hist)),
-            hist,
-            len(prior),
-            prior,
-            MASK_CAUSAL,
-            ctx_lens_override=hist,
-            use_paged_context_fmha=paged,
-        )
+    if shared:
+        assert paged and all(c > shared for c in cached), "every sequence extends the prefix"
+        _fill_history(env, rids[:1], [cached[0]], paged)
+        _share_prefix(env, rids, shared)
+        _fill_history(env, rids[1:], [cached[rid] - shared for rid in rids[1:]], paged)
+    else:
+        prior = [rid for rid in rids if cached[rid]]
+        if prior:
+            _fill_history(env, prior, [cached[rid] for rid in prior], paged)
     qkv = env.random_qkv(sum(new))
     out = env.call_op(
         qkv,
@@ -7276,6 +7328,7 @@ def _cell_paged(cell, arm) -> None:
         ctx_lens_override=[new[i] if i < nc else env.prompt_lens[i] for i in rids],
         use_paged_context_fmha=paged,
         predicted_tokens_per_seq=p,
+        op_overrides=opt_ins,
     )
     # One e4m3 flag covers the whole call: the packed path's context rows read
     # bf16, its generation rows e4m3, so a cell never mixes the two there.
@@ -7283,7 +7336,20 @@ def _cell_paged(cell, arm) -> None:
     assert not (nvfp4 and not paged), "an NVFP4 cell runs the paged-context path"
     e4m3 = (fp8 or nvfp4) and (paged or nc == 0)
     causal = spec["mask_type"] == MASK_CAUSAL
-    _compare(out, _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3, nvfp4=nvfp4))
+    ref = _op_reference(
+        env,
+        qkv,
+        list(new),
+        rids,
+        causal=causal,
+        e4m3=e4m3,
+        nvfp4=nvfp4,
+        skip_leading_q_tiles=opt_ins.get("context_fmha_skip_leading_q_tiles", False),
+    )
+    defined = ~ref.isnan().any(dim=1)
+    longest = max(c + n for c, n in zip(cached, new))
+    long_e4m3 = e4m3 and longest > FP8_ROW_MAX_MODEL_KEYS
+    (_compare_fp8_long_history if long_e4m3 else _compare)(out[defined], ref[defined])
     for rid in rids:
         env.check_cache(rid)
     env.check_unwritten_pool_zero()
@@ -7408,6 +7474,32 @@ _QWEN4_NVFP4 = dict(QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
 #: needs 133 of the 144).
 _QWEN4_DENSE_G32 = dict(QWEN4_DENSE, max_num_requests=32, num_blocks=144)
 _QWEN4_FP8_G32 = dict(_QWEN4_FP8, max_num_requests=32, num_blocks=144)
+
+
+#: qwen3_5's full-attention call (Qwen3.8-27B on sm_120): GQA 24/4/256 over an
+#: fp8-e4m3 pool at the production kv scale 1.0, on the paged-context path with the
+#: SM120 opt-ins its decode and prefill steps pass. Pools sized for 2048-token
+#: histories and contexts; `max_blocks_per_seq` is a test-side page-table width.
+_QWEN35 = dict(
+    input_type=STANDARD,
+    num_heads=24,
+    num_kv_heads=4,
+    head_size=256,
+    v_head_dim=256,
+    sinks=False,
+    window=None,
+    quant_mode=QM_FP8_KV_CACHE,
+    kv_scale=1.0,
+    mask_type=1,
+    tokens_per_block=32,
+    use_paged_context_fmha=True,
+    num_blocks=256,
+    max_num_requests=8,
+    max_blocks_per_seq=96,
+)
+_QWEN35_DECODE = dict(xqa_one_wave_multi_block=True, xqa_shared_prefix_min_batch=8)
+_QWEN35_PREFILL = dict(_QWEN35_DECODE, context_fmha_sm120_target=True)
+_QWEN35_LAST_LAYER = dict(_QWEN35_PREFILL, context_fmha_skip_leading_q_tiles=True)
 
 
 def _spread(batch: int, longest: int) -> tuple[int, ...]:
@@ -7547,6 +7639,136 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
                 sinks=True,
                 window=128,
                 quant_mode=0,
+            ),
+        ),
+    ),
+    # qwen3_5 (Qwen3.8-27B) on sm_120: 24/4/256 over an fp8 pool with the SM120 opt-ins.
+    # `opt_ins` are the call's extra arguments; `shared_prefix` tokens (whole pages) are
+    # one physical copy in every sequence's page table, as block reuse leaves them.
+    "qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1": (
+        Cell(
+            why="qwen3_5 decode, one sequence over 2047 keys: the one-wave multi-block cap",
+            spec=dict(
+                _QWEN35,
+                cached=(2047,),
+                new=(1,),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_DECODE,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 decode, 4 sequences over 1500 to 31 keys: multi-block per sequence",
+            spec=dict(
+                _QWEN35,
+                cached=(1500, 900, 300, 31),
+                new=(1, 1, 1, 1),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_DECODE,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 decode batch 8 sharing a 512-token prefix: the shared-prefix pass "
+            "over two 256-token tiles, then each sequence's own suffix",
+            spec=dict(
+                _QWEN35,
+                shared_prefix=512,
+                cached=(552, 612, 519, 576, 513, 712, 545, 640),
+                new=(1,) * 8,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_DECODE,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 decode batch 8 with nothing shared: the plain decode after the "
+            "shared-prefix scan",
+            spec=dict(
+                _QWEN35,
+                cached=(64, 300, 31, 128, 512, 7, 200, 96),
+                new=(1,) * 8,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_DECODE,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 prefill, one fresh 2048-row context: the target context FMHA",
+            spec=dict(
+                _QWEN35,
+                cached=(0,),
+                new=(2048,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_PREFILL,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 prefill, a 1024-row chunk over a 1024-token cached prefix",
+            spec=dict(
+                _QWEN35,
+                cached=(1024,),
+                new=(1024,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_PREFILL,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 prefill, three contexts of 1024, 1000 and 970 rows",
+            spec=dict(
+                _QWEN35,
+                cached=(0, 0, 0),
+                new=(1024, 1000, 970),
+                num_contexts=3,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_PREFILL,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 mixed step: a 700-row context ahead of two decode rows",
+            spec=dict(
+                _QWEN35,
+                cached=(0, 300, 200),
+                new=(700, 1, 1),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_PREFILL,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 last layer, one 2048-row context: leading q-tiles skipped",
+            spec=dict(
+                _QWEN35,
+                cached=(0,),
+                new=(2048,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_LAST_LAYER,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 last layer, three contexts ending in one q-tile: leading q-tiles skipped",
+            spec=dict(
+                _QWEN35,
+                cached=(0, 0, 0),
+                new=(1024, 1000, 970),
+                num_contexts=3,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_LAST_LAYER,
+            ),
+        ),
+        Cell(
+            why="qwen3_5 last layer, a mixed step: contexts of 130 and 150 rows over a "
+            "cached 64 and a decode row, leading q-tiles skipped",
+            spec=dict(
+                _QWEN35,
+                cached=(0, 64, 300),
+                new=(130, 150, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+                opt_ins=_QWEN35_LAST_LAYER,
             ),
         ),
     ),

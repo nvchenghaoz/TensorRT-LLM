@@ -81,6 +81,9 @@ CubinObj::CubinObj(CubinObj&& other)
         this->mKernel = other.mKernel;
         this->mSharedMemBytes = other.mSharedMemBytes;
         this->mKernelType = other.mKernelType;
+        this->mPrefixKernel = other.mPrefixKernel;
+        this->mPrefixSharedMemBytes = other.mPrefixSharedMemBytes;
+        this->mPrefixCtaSize = other.mPrefixCtaSize;
 
         other.mInitialized = false;
     }
@@ -106,6 +109,9 @@ CubinObj& CubinObj::operator=(CubinObj&& other)
         this->mKernel = other.mKernel;
         this->mSharedMemBytes = other.mSharedMemBytes;
         this->mKernelType = other.mKernelType;
+        this->mPrefixKernel = other.mPrefixKernel;
+        this->mPrefixSharedMemBytes = other.mPrefixSharedMemBytes;
+        this->mPrefixCtaSize = other.mPrefixCtaSize;
 
         other.mInitialized = false;
     }
@@ -146,6 +152,18 @@ void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kern
     TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&cfg, kernel(), kernelParams, /*extra=*/nullptr));
 }
 
+void CubinObj::launchPrefix(dim3 gridDim, CUstream hStream, void** kernelParams) const
+{
+    TLLM_CHECK(hasPrefixKernel());
+    CUlaunchAttribute pdlAttr;
+    pdlAttr.id = CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    pdlAttr.value.programmaticStreamSerializationAllowed = (tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0);
+    CUlaunchConfig const cfg{
+        gridDim.x, gridDim.y, gridDim.z, mPrefixCtaSize, 1, 1, mPrefixSharedMemBytes, hStream, &pdlAttr, 1};
+    TLLM_CU_CHECK(
+        mDriver->cuLaunchKernelEx(&cfg, reinterpret_cast<CUfunction>(mPrefixKernel), kernelParams, /*extra=*/nullptr));
+}
+
 void CubinObj::initialize()
 {
     if (!mInitialized)
@@ -172,6 +190,31 @@ void CubinObj::initialize()
             mDriver->cuCtxGetDevice(&device);
             TLLM_CU_CHECK(mDriver->cuKernelSetAttribute(
                 CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, mSharedMemBytes, mKernel, device));
+        }
+
+        // Optional shared-prefix (cascade) decode kernel, only in some mha.cu variants.
+        mPrefixKernel = nullptr;
+        mPrefixSharedMemBytes = 0;
+        auto const prefixSmem = getGlobalVar<uint32_t>(mDriver, mLibrary, kPrefixSmemName, false);
+        auto const prefixCta = getGlobalVar<uint32_t>(mDriver, mLibrary, kPrefixCtaSizeName, false);
+        if (prefixSmem.has_value() && prefixCta.has_value()
+            && mDriver->cuLibraryGetKernel(&mPrefixKernel, mLibrary, kPrefixFuncName) == CUDA_SUCCESS
+            && mPrefixKernel != nullptr)
+        {
+            mPrefixSharedMemBytes = prefixSmem.value();
+            mPrefixCtaSize = prefixCta.value();
+            CUdevice device;
+            mDriver->cuCtxGetDevice(&device);
+            if (mDriver->cuKernelSetAttribute(
+                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, mPrefixSharedMemBytes, mPrefixKernel, device)
+                != CUDA_SUCCESS)
+            {
+                mPrefixKernel = nullptr;
+            }
+        }
+        else
+        {
+            mPrefixKernel = nullptr;
         }
 
         mInitialized = true;

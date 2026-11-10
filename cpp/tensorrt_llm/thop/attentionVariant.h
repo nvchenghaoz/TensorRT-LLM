@@ -297,6 +297,14 @@ public:
         return feature<torch_ext::SageAttnFeature>().isHopperLayout();
     }
 
+    /// Whether the context FMHA runs through the SM120 target launcher (see
+    /// `AttentionBase::context_fmha_sm120_target`), which needs its last q-tile split workspace in the
+    /// context workspace.
+    [[nodiscard]] bool useContextFmhaSm120Target() const
+    {
+        return context_fmha_sm120_target && (mSM == 120 || mSM == 121) && mFP8ContextFMHA && mHeadSize == 256;
+    }
+
 private:
     /// One per phase, instantiated per activation dtype.
     template <typename T>

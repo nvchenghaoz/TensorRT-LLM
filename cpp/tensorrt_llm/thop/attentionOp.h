@@ -680,7 +680,8 @@ protected:
             self.is_mla_enable, self.q_lora_rank, self.kv_lora_rank, self.qk_nope_head_dim, self.qk_rope_head_dim,
             self.v_head_dim, self.predicted_tokens_per_seq, self.mla_layer_num, self.rope_append,
             self.sage_attn_num_elts_per_blk_q, self.sage_attn_num_elts_per_blk_k, self.sage_attn_num_elts_per_blk_v,
-            self.sage_attn_qk_int8, self.sage_attn_smooth_k, self.skip_correction_threshold);
+            self.sage_attn_qk_int8, self.sage_attn_smooth_k, self.skip_correction_threshold,
+            self.xqa_one_wave_multi_block, self.xqa_shared_prefix_min_batch, self.context_fmha_sm120_target);
     }
 
     int device = 0;
@@ -722,6 +723,14 @@ protected:
     bool sage_attn_qk_int8 = false;
     bool sage_attn_smooth_k = false;
     double skip_correction_threshold = 0.0;
+    // SM120/121 XQA HMMA decode with head size 256: cap the multi-block sub-sequence count at one CTA wave.
+    bool xqa_one_wave_multi_block = false;
+    // SM120/121 XQA HMMA decode with head size 256: run the shared-prefix (cascade) pass from this batch size on
+    // (0 disables it).
+    std::int64_t xqa_shared_prefix_min_batch = 0;
+    // SM120/121 FP8 context FMHA with head size 256: run the e4m3 causal paged-KV kernel through the Qwen3.5-family
+    // target's launcher (kernels/qwen35: base-2 softmax, last q-tile KV split).
+    bool context_fmha_sm120_target = false;
 
     // Op state, derived from the device and the key members; not part of the key. Set by
     // the `TrtllmAttention` constructor. MLA overrides the head geometry for its latent KV

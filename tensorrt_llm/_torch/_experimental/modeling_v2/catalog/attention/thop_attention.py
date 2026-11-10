@@ -92,14 +92,15 @@ class ThopAttention(OpWrapper):
     ``FallbackFmha.attention``: gpt-oss uses attention sinks and an alternating
     sliding window, deepseek uses MLA's two phases, and qwen4_exp uses packed
     GQA over a bf16 or an fp8-e4m3 pool for its full-attention and MTP layers
-    and uncached MHA for vision.
+    and uncached MHA for vision. qwen3_5 runs GQA 24/4/256 over an fp8-e4m3
+    pool on the paged-context path with the SM120 opt-ins.
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
     without allocating.
     """
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_120})
 
     # The shipped targets' cells are in this entry's test. gpt-oss alternates its
     # two window classes inside one engine, so both of its cells are live every
@@ -353,6 +354,31 @@ class ThopAttention(OpWrapper):
     tensorrt_llm`: a `pip` on PATH that cannot see the install fails every
     generation call, and the first failure poisons the process ("Jitify fatal
     error: Uninitialized").
+
+    Four SM120/121 kernel opt-ins default to the stock kernels and are inert on
+    every other GPU and configuration. `xqa_one_wave_multi_block` caps the HMMA
+    XQA decode's multi-block sub-sequence count at one CTA wave (SMs / (batch x
+    kv heads)) at head size 256: a different merge partition, so a different
+    rounding. `xqa_shared_prefix_min_batch` (0 = off) runs XQA's shared-prefix
+    pass from that decode batch on (at least 2) at head size 256 over an
+    fp8-e4m3 pool with bf16 q and at most 8 q heads per kv head: the leading
+    256-token tiles whose pages every request shares are attended once for all
+    requests with e4m3 Q (two terms) and e4m3 probabilities (448 p), then folded
+    into each request's suffix pass; with nothing shared it is the plain path
+    plus one scan launch. `context_fmha_sm120_target` runs the e4m3 head-256
+    causal paged-context kernel with a base-2 softmax (ex2.approx) and, for 1
+    to 3 contexts whose last q-tile would make a tail wave, splits that q-tile
+    along KV with a fixed-order merge; it reserves 25 952 256 bytes of context
+    workspace. `context_fmha_skip_leading_q_tiles` (needs the previous one)
+    leaves every output row before the last 64-row q-tile unwritten whenever
+    that split runs: only for a caller that reads each context's last row and
+    whose contexts all end in the same q-tile.
+
+    On sm_120 the qwen3_5 cells are the ones driven (24/4/256 over an fp8 pool, decode
+    and paged-context prefill, with and without the opt-ins). The others were measured
+    on sm_100 / sm_103 and are not claimed there: on sm_120 the packed fp8 prefill finds
+    no FMHA kernel, and the fp8 verify blocks (P > 1) leave `reference` by hundreds of
+    ulp.
     """
 
     def __call__(
@@ -475,6 +501,10 @@ class ThopAttention(OpWrapper):
         kv_norm_weight: Optional[torch.Tensor] = None,
         kv_norm_eps: float = 1e-6,
         skip_correction_threshold: float = 0.0,
+        xqa_one_wave_multi_block: bool = False,
+        xqa_shared_prefix_min_batch: int = 0,
+        context_fmha_sm120_target: bool = False,
+        context_fmha_skip_leading_q_tiles: bool = False,
     ) -> torch.Tensor:
         """Writes `output` in place and returns it -- the op destroys its
         prior contents in rows `[:num_tokens]`, so a caller that wants them
@@ -597,6 +627,10 @@ class ThopAttention(OpWrapper):
             kv_norm_weight=kv_norm_weight,
             kv_norm_eps=kv_norm_eps,
             skip_correction_threshold=skip_correction_threshold,
+            xqa_one_wave_multi_block=xqa_one_wave_multi_block,
+            xqa_shared_prefix_min_batch=xqa_shared_prefix_min_batch,
+            context_fmha_sm120_target=context_fmha_sm120_target,
+            context_fmha_skip_leading_q_tiles=context_fmha_skip_leading_q_tiles,
         )
         return output
 
@@ -618,6 +652,10 @@ class ThopAttention(OpWrapper):
         e4m3_inputs: bool = False,
         out_scale: float = 1.0,
         e4m3_probabilities: bool = False,
+        xqa_one_wave_multi_block: bool = False,
+        xqa_shared_prefix_min_batch: int = 0,
+        context_fmha_sm120_target: bool = False,
+        context_fmha_skip_leading_q_tiles: bool = False,
     ) -> torch.Tensor:
         """Masked softmax attention over explicit per-sequence K/V, in fp32.
 
@@ -657,6 +695,12 @@ class ThopAttention(OpWrapper):
         rounded unscaled. At kv scale 2.0 it is bitwise exact on a one-tile
         decode; at 1.5 nothing tried fits (4.2 ulp RMS at best). Not modelled
         with sinks.
+
+        The SM120 opt-ins (`xqa_one_wave_multi_block`, `xqa_shared_prefix_min_batch`,
+        `context_fmha_sm120_target`) change where the kernels round, not what
+        they compute, so the fp32 result is the same. With
+        `context_fmha_skip_leading_q_tiles` only each context's last row is
+        defined; the rows before its last 64-row q-tile are returned NaN here.
         """
         rep = num_heads // num_kv_heads
         total_q = sum(q_lens)
@@ -703,6 +747,8 @@ class ThopAttention(OpWrapper):
             out[q_start : q_start + q_len] = (
                 torch.einsum("hij,jhd->ihd", probs, v_seq).reshape(q_len, -1) * out_scale
             )
+            if context_fmha_skip_leading_q_tiles and q_len > 1:
+                out[q_start : q_start + 64 * ((q_len - 1) // 64)] = float("nan")
             q_start += q_len
             kv_start += kv_len
         return out.to(q.dtype)
@@ -775,6 +821,12 @@ class ThopAttention(OpWrapper):
         num_heads: int,
         num_kv_heads: int,
         attention_sinks: Optional[torch.Tensor] = None,
+        host_context_lengths: Optional[torch.Tensor] = None,
+        num_contexts: int = 0,
+        xqa_one_wave_multi_block: bool = False,
+        xqa_shared_prefix_min_batch: int = 0,
+        context_fmha_sm120_target: bool = False,
+        context_fmha_skip_leading_q_tiles: bool = False,
         **unused_kwargs: object,
     ) -> None:
         """Keyword-only, because every call site passes keywords.
@@ -807,6 +859,20 @@ class ThopAttention(OpWrapper):
                 f"({num_heads}) elements, got shape "
                 f"{tuple(attention_sinks.shape)} contiguous="
                 f"{attention_sinks.is_contiguous()}"
+            )
+        # Skipping the leading q-tiles leaves those output rows unwritten, so
+        # every context's last row must lie in the last 64-row q-tile of the
+        # longest context; the op cannot check what the caller reads.
+        if (
+            context_fmha_skip_leading_q_tiles
+            and host_context_lengths is not None
+            and num_contexts > 0
+        ):
+            ctx_lens = [int(n) for n in host_context_lengths[:num_contexts].tolist()]
+            last_tile_start = 64 * ((max(ctx_lens) - 1) // 64)
+            assert min(ctx_lens) > last_tile_start, (
+                f"context_fmha_skip_leading_q_tiles needs every context to end in the "
+                f"last 64-row q-tile (lengths > {last_tile_start}), got {ctx_lens}"
             )
 
 

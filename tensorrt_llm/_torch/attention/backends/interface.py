@@ -1103,6 +1103,21 @@ class AttentionForwardArgs:
     # Subtract the per-channel V mean before quantizing V. Applied by FMHA libraries that add
     # the mean back to the output; the others quantize V unsmoothed.
     sage_attn_smooth_v: bool = False
+    # SM120/121 kernel opt-ins of the native attention op (the qwen3_5 modeling_v2
+    # target passes them; the defaults keep the stock kernels, and they are inert on
+    # every other GPU and configuration). The first three are part of the native
+    # op's configuration. xqa_one_wave_multi_block caps the HMMA XQA decode's
+    # multi-block sub-sequence count at one CTA wave at head size 256;
+    # xqa_shared_prefix_min_batch (0 = off) runs XQA's shared-prefix pass from that
+    # decode batch on; context_fmha_sm120_target runs the e4m3 head-256 causal
+    # paged-context FMHA through the target's launcher (base-2 softmax, last q-tile
+    # KV split). context_fmha_skip_leading_q_tiles (needs context_fmha_sm120_target)
+    # leaves the output rows before each context's last 64-row q-tile unwritten when
+    # that split runs, for a caller that reads only each context's last row.
+    xqa_one_wave_multi_block: bool = False
+    xqa_shared_prefix_min_batch: int = 0
+    context_fmha_sm120_target: bool = False
+    context_fmha_skip_leading_q_tiles: bool = False
     # SageAttention inputs that the attention core quantized for the FMHA libraries
     # taking quantized inputs; the attention op quantizes inside its kernels.
     sage_quantized: Optional["SageQuantized"] = None

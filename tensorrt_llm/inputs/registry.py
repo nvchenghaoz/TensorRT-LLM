@@ -308,14 +308,17 @@ class BaseMultimodalInputProcessor(ABC):
         """Cached ids of `prompt`, or None to tokenize it in full.
 
         `adds_no_special_tokens`: the caller verified that its tokenizer adds no
-        special tokens, so `add_special_tokens=True` does not change the ids.
+        special tokens, so `add_special_tokens=True` does not change the ids. The
+        cache also serves `add_special_tokens=True` on its own when it found, at
+        creation, that its tokenizer adds none (`serves_special_tokens`).
         """
-        if (self._prefix_token_cache is None or sampling_params is None or
-            (sampling_params.add_special_tokens and not adds_no_special_tokens)
+        cache = getattr(self, "_prefix_token_cache", None)
+        if (cache is None or sampling_params is None or
+            (sampling_params.add_special_tokens
+             and not (adds_no_special_tokens or cache.serves_special_tokens))
                 or sampling_params.truncate_prompt_tokens is not None):
             return None
-        return self._prefix_token_cache.encode(
-            self._prefix_token_cache_tokenizer, prompt)
+        return cache.encode(self._prefix_token_cache_tokenizer, prompt)
 
     def attach_multimodal_embeddings(
         self,

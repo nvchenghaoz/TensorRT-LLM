@@ -50,6 +50,15 @@ public:
     void initialize();
     void launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams) const;
 
+    // Shared-prefix (cascade) decode pass of mha.cu (kernel_mha_prefix); absent from other kernel variants.
+    bool hasPrefixKernel() const
+    {
+        return mInitialized && mPrefixKernel != nullptr;
+    }
+
+    // Block size is the cubin's prefixCtaSize.
+    void launchPrefix(dim3 gridDim, CUstream hStream, void** kernelParams) const;
+
     // It is safe to call getSerializeSize()/serialize() before calling initialize().
     size_t getSerializationSize() const noexcept;
     void serialize(void* buffer, size_t buffer_size) const noexcept;
@@ -73,6 +82,9 @@ private:
     static constexpr char const* kFuncName = "kernel_mha";
     static constexpr char const* kSmemName = "smemSize";
     static constexpr char const* kKernelTypeName = "kernelType";
+    static constexpr char const* kPrefixFuncName = "kernel_mha_prefix";
+    static constexpr char const* kPrefixSmemName = "prefixSmemSize";
+    static constexpr char const* kPrefixCtaSizeName = "prefixCtaSize";
     // Constructors should populate mContent.
     std::string mContent;
 
@@ -83,6 +95,9 @@ private:
     CUkernel mKernel;
     unsigned int mSharedMemBytes;
     XQAKernelType mKernelType;
+    CUkernel mPrefixKernel = nullptr;
+    unsigned int mPrefixSharedMemBytes = 0;
+    unsigned int mPrefixCtaSize = 0;
 };
 
 } // namespace jit

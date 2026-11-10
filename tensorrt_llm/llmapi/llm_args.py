@@ -5428,11 +5428,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
-        "auto", "float16", "bfloat16", "float32"] = Field(
+        "auto", "float16", "bfloat16", "float32", "int8"] = Field(
             default="auto",
             description=
-            "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
-        )
+            "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config. "
+            "'int8' allocates an int8-typed byte pool that a modeling_v2 target fills with its own quantized row "
+            "layout (Qwen3.8-27B: int16 row codes plus one fp32 scale per row); only modeling_v2 targets that read "
+            "that layout accept it.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_stochastic_rounding: bool = Field(
@@ -7455,7 +7457,7 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_tokenization_cache: bool = Field(
         default=False,
         description=
-        "Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt.",
+        "Cache the tokenization of recent prompts so that a prompt extending a cached one, or sharing a long prefix with one, only tokenizes its tail, which speeds up multi-turn and shared-prefix serving with long prompts. Requires a fast tokenizer and applies only to prompts without truncation, tokenized with add_special_tokens=False or by a tokenizer that adds no special tokens. The output is identical to tokenizing the whole prompt.",
         status="prototype")
 
     enable_iter_req_stats: bool = Field(

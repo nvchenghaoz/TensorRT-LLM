@@ -49,6 +49,49 @@
 namespace MARLIN_NAMESPACE_NAME
 {
 
+// Or-ed into the dense kernel's (otherwise unread) max_shared_mem argument when the
+// host launches it with programmatic dependent launch: the kernel then triggers its
+// dependents right after its griddepcontrol.wait instead of at grid completion.
+constexpr int kMarlinNvfp4PdlLaunchFlag = 1 << 30;
+
+// full_k kernels (template flag): the host launches one CTA per n-tile column
+// (gridDim.x == n_tiles, a single m block) and stores, in bits
+// [kMarlinNvfp4FullKGridShift, +13) of max_shared_mem, the grid size G of the
+// default launch it replaces. The default launch splits every column's k tiles
+// at multiples of iters(G) over several CTAs and chains their partial sums
+// through the BF16 output (highest k stripe first, each step fp32 add of the
+// BF16 partial, then BF16 rounding). A full_k CTA streams its column without
+// draining its pipeline, parks each warp's partial sums of every stripe in
+// shared memory at those same boundaries (accumulators restart from zero, as in
+// a new CTA), and replays the in-CTA warp reduction and the BF16 chain at the
+// end, so its output is bitwise equal to the default launch's.
+constexpr int kMarlinNvfp4FullKGridShift = 17;
+constexpr int kMarlinNvfp4FullKGridMask = (1 << 13) - 1;
+// Pre-wait weight prefetch is compiled only into the in_proj qkv/qkvz decode instances
+// (marlin_prewait_instance: 128 threads, 128-wide n tile, 64-deep k tile, 6 stages,
+// never full_k); every other instance compiles the stock wait-first prologue. The host
+// or-s the flag below in only when it launches such an instance, so bit 29 never
+// reaches a full_k kernel's grid field.
+// Or-ed in (PDL launches only): before griddepcontrol.wait, every thread issues
+// prefetch.global.L2 for the B (weight) and weight-scale addresses of its first
+// (stages - 1) k-tiles, so the weight stream starts while the predecessor grid finishes.
+// B, the weight scales and the weight global scale are constant model weights,
+// never written by the predecessor; A, the locks, C and C_tmp are only touched
+// after the wait. A prefetch moves no data into the SM (shared memory, cp.async
+// groups and the arithmetic are unchanged), so the output is bitwise unchanged.
+constexpr int kMarlinNvfp4PreWaitFlag = 1 << 29;
+constexpr int kMarlinNvfp4FullKMaxStripes = 4;
+
+// Instances that compile the pre-wait weight prefetch (kMarlinNvfp4PreWaitFlag): the
+// in_proj qkv (14336, 5120) / qkvz (16384, 5120) decode kernels, i.e. 128 threads, 128-wide
+// n tile, 64-deep k tile, 6 stages, not full_k (rows <= 8 full-K, kM16Table rows 9-16,
+// kM32Table rows 17-32). Must match marlin_prewait_kernel() on the host.
+template <int threads, int thread_n_blocks, int thread_k_blocks, int stages, bool full_k>
+constexpr bool marlin_prewait_instance()
+{
+    return threads == 128 && thread_n_blocks == 8 && thread_k_blocks == 4 && stages == 6 && !full_k;
+}
+
 // Empty kernel stub outside the architectures supported by dense Marlin.
 #if defined(__CUDA_ARCH__) && !MARLIN_NVFP4_DENSE_DEVICE_SUPPORTED
 
@@ -63,8 +106,9 @@ template <typename scalar_t,   // compute dtype, nv_bfloat16
                                // only works when thread_m_blocks == 1
     int const stages,          // number of stages for the async global->shared
                                // fetch pipeline
-    int group_blocks           // number of consecutive 16x16 blocks
+    int const group_blocks,    // number of consecutive 16x16 blocks
                                // with a separate quantization scale
+    bool full_k                // see kMarlinNvfp4FullKGridShift
                                // (implicit const: trailing NTTP)
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS)
@@ -163,6 +207,24 @@ __device__ inline void scale_float(float* c, typename MarlinType<scalar_t>::Frag
     c[1] = __fmul_rn(c[1], MarlinType<scalar_t>::num2float(s_ptr[1]));
 }
 
+// L2 prefetch of the cache line holding `ptr` (no data returned to the SM).
+__device__ inline void prefetch_l2(void const* ptr)
+{
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(ptr));
+}
+
+// PDL wait and early trigger, for the pre-wait instances only.
+__device__ __forceinline__ void marlin_prewait_pdl_wait_and_trigger(int flags)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (flags & kMarlinNvfp4PdlLaunchFlag)
+    {
+        asm volatile("griddepcontrol.launch_dependents;");
+    }
+#endif
+}
+
 // Wait until barrier reaches `count`, then lock for current threadblock.
 __device__ inline void barrier_acquire(int* lock, int count)
 {
@@ -224,8 +286,9 @@ template <typename scalar_t,                        // compute dtype, nv_bfloat1
                                                     // only works when thread_m_blocks == 1
     int const stages,                               // number of stages for the async global->shared
                                                     // fetch pipeline
-    int group_blocks                                // number of consecutive 16x16 blocks
+    int const group_blocks,                         // number of consecutive 16x16 blocks
                                                     // with a separate quantization scale
+    bool full_k                                     // see kMarlinNvfp4FullKGridShift
                                                     // (implicit const: trailing NTTP)
     >
 __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shape mxk
@@ -254,8 +317,41 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
     bool use_fp32_reduce, // whether to use fp32 global reduce
+    // Dynamic shared memory size (informational, not read by this kernel) with
+    // kMarlinNvfp4PdlLaunchFlag or-ed in when the host launched it with PDL.
     int max_shared_mem)
 {
+    constexpr bool prewait_instance
+        = marlin_prewait_instance<threads, thread_n_blocks, thread_k_blocks, stages, full_k>();
+    if constexpr (!prewait_instance)
+    {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        // PDL: order every A / scale / lock read and every C write after the
+        // immediate predecessor grid (a no-op when launched without the
+        // programmatic-serialization attribute).
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+        // Only a PDL launch triggers dependents early, so a non-PDL launch keeps the
+        // implicit trigger at grid completion. The grid is a single wave (one CTA per
+        // SM), so an early trigger cannot delay this kernel; dependents must issue
+        // their own griddepcontrol.wait before touching C or the lock workspace.
+        if (max_shared_mem & kMarlinNvfp4PdlLaunchFlag)
+        {
+            asm volatile("griddepcontrol.launch_dependents;");
+        }
+#endif
+    }
+    // Pre-wait instances: with kMarlinNvfp4PreWaitFlag the wait moves below the L2
+    // prefetch of the first stages' weights (see pdl_prewait); nothing else moves.
+    // A, the locks, C and C_tmp are touched only after the wait.
+    [[maybe_unused]] bool const pdl_prewait
+        = prewait_instance && (max_shared_mem & kMarlinNvfp4PreWaitFlag) != 0 && !use_atomic_add;
+    if constexpr (prewait_instance)
+    {
+        if (!pdl_prewait)
+        {
+            marlin_prewait_pdl_wait_and_trigger(max_shared_mem);
+        }
+    }
     // Each threadblock processes one "stripe" of the B matrix with (roughly) the
     // same size, which might involve multiple column "slices" (of width 16 *
     // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -342,6 +438,26 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
             // in the middle of group.
             iters = (group_blocks / thread_k_blocks) * div_ceil(iters, (group_blocks / thread_k_blocks));
         }
+    }
+
+    // full_k: stripe length of the replaced default launch (the host guarantees a
+    // single m block and n_tiles <= G, so that launch has no part1 tiles), and the
+    // tiles left in the current stripe of this CTA's column.
+    int fk_iters = 0;
+    int fk_left = 0;
+    int fk_stripe = 0;
+    if constexpr (full_k)
+    {
+        static_assert(m_block_size_8 && thread_m_blocks == 1 && threads == 128 && thread_n_blocks == 4 && !has_act_order
+                && group_blocks != -1 && group_blocks != 0,
+            "full_k is only instantiated for the 128-thread 8-row 64-wide tile");
+        int const fk_grid = (max_shared_mem >> kMarlinNvfp4FullKGridShift) & kMarlinNvfp4FullKGridMask;
+        fk_iters = div_ceil(k_tiles * n_tiles, fk_grid);
+        if constexpr (group_blocks >= thread_k_blocks)
+        {
+            fk_iters = (group_blocks / thread_k_blocks) * div_ceil(fk_iters, (group_blocks / thread_k_blocks));
+        }
+        fk_left = fk_iters - (k_tiles * static_cast<int>(blockIdx.x)) % fk_iters;
     }
 
     int slice_row = 0;
@@ -731,6 +847,11 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
     constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride) : (stages * s_sh_stage);
     int4* sh_s = sh_zp + (stages * zp_sh_stage);
     int4* sh_a = sh_s + sh_s_size;
+    // full_k only: every warp's partial sums of every stripe, [stripe][16 accumulators][threads] fp32.
+    float* sh_fk = reinterpret_cast<float*>(sh_a + stages * a_sh_stage);
+    // full_k only: the replayed result, [16 accumulators][32 lanes] fp32, in the drained B buffers.
+    float* sh_fk_out = reinterpret_cast<float*>(sh_b);
+    static_assert(!full_k || 16 * 32 * 4 <= sh_b_size * 16, "full_k result must fit in the B pipeline buffers");
 
     // Register storage for double buffer of shared memory reads.
     FragA frag_a[2][thread_m_blocks];
@@ -1391,6 +1512,69 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
         }
     };
 
+    // full_k: for each parked stripe, replay the replaced launch's in-CTA warp
+    // reduction (thread_block_reduce with 4 k-warps leaves w0 + (w1 + (w3 + w2)) in
+    // warp 0), then its global chain (global_reduce_fp16, slice_idx 0 = highest-k
+    // stripe first): every stripe but the highest adds the BF16 partial of the
+    // stripe above it in fp32, and every stripe but the lowest (the "last" block,
+    // which hands fp32 to write_result) rounds its sum to BF16. Leaves the result in
+    // warp 0's frag_c, as thread_block_reduce + global_reduce_fp16 would.
+    auto full_k_reduce = [&]()
+    {
+        if constexpr (full_k)
+        {
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+#pragma unroll
+                for (int g = 0; g < 4; g++)
+                {
+                    sh_fk[((fk_stripe * 4 + j) * 4 + g) * threads + threadIdx.x] = frag_c[0][j][0][g];
+                }
+            }
+            // Also: every warp is past its last shared-memory read of the pipeline.
+            __syncthreads();
+            // Warp q replays accumulators 4q .. 4q+3 of every lane (the chains are independent).
+            int const fk_lane = threadIdx.x % 32;
+            int const fk_f0 = 4 * (threadIdx.x / 32);
+            float acc[4] = {};
+            for (int s = fk_stripe; s >= 0; s--)
+            {
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+                {
+                    float const* p = &sh_fk[(s * 16 + fk_f0 + i) * threads + fk_lane];
+                    float r = p[0] + (p[32] + (p[96] + p[64]));
+                    if (s != fk_stripe)
+                    {
+                        r += acc[i];
+                    }
+                    acc[i] = s != 0 ? MarlinType<scalar_t>::num2float(MarlinType<scalar_t>::float2num(r)) : r;
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                sh_fk_out[(fk_f0 + i) * 32 + fk_lane] = acc[i];
+            }
+            __syncthreads();
+            if (threadIdx.x < 32)
+            {
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                {
+#pragma unroll
+                    for (int g = 0; g < 4; g++)
+                    {
+                        frag_c[0][j][0][g] = sh_fk_out[(j * 4 + g) * 32 + threadIdx.x];
+                    }
+                }
+            }
+            // write_result reuses these bytes (sh_red aliases sh_b).
+            __syncthreads();
+        }
+    };
+
     // Since multiple threadblocks may process parts of the same column slice, we
     // finally have to globally reduce over the results. As the striped
     // partitioning minimizes the number of such reductions and our outputs are
@@ -1750,6 +1934,53 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
             slice_k_start_shared_fetch += tb_k * (stages - 1);
         }
     };
+    // pdl_prewait: before griddepcontrol.wait, prefetch into L2 the B / weight-scale
+    // addresses that the first slice's first k-tiles will cp.async, using the same
+    // index math as fetch_to_shared on local copies of b_gl_rd / s_gl_rd (no state
+    // changes). Prefetches return no data to the SM, so the A copies issued after
+    // the wait do not queue behind weight traffic; the later B cp.asyncs hit L2.
+    // Compiled into the pre-wait instances only (marlin_prewait_instance).
+    if constexpr (prewait_instance)
+    {
+        if (pdl_prewait)
+        {
+            if constexpr (!has_act_order)
+            {
+                int const depth = stages - 1;
+                int const n_pref = slice_iters < depth ? slice_iters : depth;
+                int b_rd = b_gl_rd;
+                int s_rd = 0;
+                if constexpr (group_blocks != -1)
+                {
+                    s_rd = s_gl_rd;
+                }
+                for (int p = 0; p < n_pref; p++)
+                {
+#pragma unroll
+                    for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++)
+                    {
+                        constexpr int count = div_ceil(b_sh_stride, threads);
+                        int b_gl_idx
+                            = b_rd + (i % count) * threads + b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
+                        prefetch_l2(&B[b_gl_idx]);
+                    }
+                    b_rd += b_gl_rd_delta_o;
+                    if constexpr (group_blocks != -1)
+                    {
+                        if (p % div_ceil(group_blocks, thread_k_blocks) == 0)
+                        {
+                            if (s_sh_wr_pred)
+                            {
+                                prefetch_l2(&scales_ptr[s_rd]);
+                            }
+                            s_rd += s_gl_rd_delta * s_tb_groups;
+                        }
+                    }
+                }
+            }
+            marlin_prewait_pdl_wait_and_trigger(max_shared_mem);
+        }
+    }
     if (slice_iters)
     {
         start_pipes();
@@ -1791,6 +2022,27 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                 }
             }
             slice_iters--;
+            if constexpr (full_k)
+            {
+                // This tile ends a stripe of the replaced launch: park this thread's
+                // partial sums and restart the accumulators from zero, as that
+                // launch's next CTA would. The pipeline keeps streaming.
+                if (--fk_left == 0 && slice_iters != 0)
+                {
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                    {
+#pragma unroll
+                        for (int g = 0; g < 4; g++)
+                        {
+                            sh_fk[((fk_stripe * 4 + j) * 4 + g) * threads + threadIdx.x] = frag_c[0][j][0][g];
+                        }
+                    }
+                    fk_stripe++;
+                    fk_left = fk_iters;
+                    zero_accums();
+                }
+            }
             if (slice_iters == 0)
             {
                 break;
@@ -1890,7 +2142,14 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                 }
             }
 
-            thread_block_reduce();
+            if constexpr (full_k)
+            {
+                full_k_reduce();
+            }
+            else
+            {
+                thread_block_reduce();
+            }
 
             if (has_bias && last)
             {

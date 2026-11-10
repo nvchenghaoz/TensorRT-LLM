@@ -88,13 +88,14 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
   file(GLOB arch_files "${TRTLLM_FMHA_GEN_DIR}/fmha_v2_cu/*_sm${arch}.cu")
   # Compile the hand-written skip_softmax warp-specialized FMHA into the sm_120
   # family target. It uses sm_120-only TMA + sync-MMA, so it must never be
-  # compiled for other architectures.
+  # compiled for other architectures. The Qwen3.5-family target's launcher of
+  # the generated e4m3 head-256 kernel (kernels/qwen35) is built with them.
   if(${arch} EQUAL 120)
     list(
       APPEND
       arch_files
       "${CMAKE_CURRENT_SOURCE_DIR}/skip_softmax_sm120/fused_multihead_flash_attention_ws_sm120.cu"
-    )
+      "${CMAKE_CURRENT_SOURCE_DIR}/../qwen35/qwen35ContextFmhaSm120.cu")
   endif()
   if(arch_files)
     set(TARGET_NAME _context_attention_kernels_${arch})

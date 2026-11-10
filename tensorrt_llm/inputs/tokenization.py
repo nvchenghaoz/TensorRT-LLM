@@ -103,12 +103,16 @@ def tokenize_prompt(
             (BOS/EOS and the like) on top of what the text already contains.
         truncate_prompt_tokens: Keep at most this many tokens, or ``None``.
         prefix_token_cache: Optional prefix cache. It is consulted only when the
-            tokenizer would be called exactly as the cache calls it: no special
-            tokens added and no truncation.
+            tokenizer would return what the cache returns: no truncation, and
+            either no special tokens added or a tokenizer that adds none.
     """
     if tokenizer is None:
         raise ValueError("tokenizer is required to tokenize string prompt")
-    if prefix_token_cache is not None and not add_special_tokens and truncate_prompt_tokens is None:
+    if (
+        prefix_token_cache is not None
+        and (not add_special_tokens or prefix_token_cache.serves_special_tokens)
+        and truncate_prompt_tokens is None
+    ):
         with nvtx_range_debug("tokenize prompt"), nvtx_range_debug("prefix cache"):
             return prefix_token_cache.encode(tokenizer, prompt)
     kwargs = {}

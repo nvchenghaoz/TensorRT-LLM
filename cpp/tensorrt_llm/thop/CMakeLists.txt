@@ -177,6 +177,9 @@ add_th_common_family(
   mhcOp.cpp
   compressorOp.cpp)
 
+# qwen3_5 modeling_v2 target bindings; they keep their existing family target.
+add_subdirectory(qwen35)
+
 add_library(
   th_common SHARED
   $<TARGET_OBJECTS:th_common_attention>

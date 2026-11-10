@@ -29,6 +29,7 @@
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/qwen35/qwen35ContextFmhaSm120.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/prepareCustomMask.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
@@ -523,6 +524,8 @@ bool MHA::convertMMHAParamsToXQAParams(
     xqaParams.tp_size = 1;
     xqaParams.tp_rank = 0;
     xqaParams.multi_block_mode = common::getEnvForceDeterministicAttention() ? false : mMultiBlockMode;
+    xqaParams.one_wave_multi_block = xqa_one_wave_multi_block;
+    xqaParams.shared_prefix_min_batch = static_cast<int32_t>(xqa_shared_prefix_min_batch);
     xqaParams.layer_idx = static_cast<int>(p.local_layer_idx);
 
     applyFeatures(xqaParams);
@@ -867,6 +870,9 @@ tensorrt_llm::common::op::AttentionContextWorkspaceLayout MHA::contextWorkspaceL
     size_t const fmha_bmm2_scale_size = mFP8ContextFMHA ? sizeof(float) : 0;
 
     size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize(p) : 0;
+    size_t const context_fmha_sm120_target_size = mEnableContextFMHA && useContextFmhaSm120Target()
+        ? tensorrt_llm::kernels::qwen35::kContextFmhaSm120WorkspaceBytes
+        : 0;
 
     AttentionContextWorkspaceSizes workspaceSizes{};
     workspaceSizes.attentionMask = attention_mask_size;
@@ -896,6 +902,7 @@ tensorrt_llm::common::op::AttentionContextWorkspaceLayout MHA::contextWorkspaceL
     workspaceSizes.sageKMean = sage_k_mean_buffer_size;
     workspaceSizes.sageKMeanSum = sage_k_mean_sum_buffer_size;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
+    workspaceSizes.contextFmhaSm120Target = context_fmha_sm120_target_size;
     return AttentionWorkspaceManager::buildContextLayout(workspaceSizes);
 }
 
@@ -1403,6 +1410,14 @@ int MHA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
         if (p.attn.attention_chunk_size)
         {
             fmhaParams.chunkedAttentionSize = *p.attn.attention_chunk_size;
+        }
+
+        // The SM120 target launcher of the e4m3 head-256 causal paged-KV kernel.
+        if (useContextFmhaSm120Target())
+        {
+            fmhaParams.sm120TargetFmha = true;
+            fmhaParams.sm120TargetFmhaWorkspace = workspaceViews.contextFmhaSm120Target;
+            fmhaParams.skipLeadingQTiles = p.fwd.context_fmha_skip_leading_q_tiles;
         }
 
         // Run the fmha kernel.
@@ -4064,6 +4079,14 @@ AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
     c.sage_attn_qk_int8 = fwd.sage_attn_qk_int8;
     c.sage_attn_smooth_k = fwd.sage_attn_smooth_k;
     c.skip_correction_threshold = attn.skip_correction_threshold;
+    // SM120/121 opt-ins of the qwen3_5 modeling_v2 target; the defaults keep the stock kernels.
+    TORCH_CHECK(fwd.xqa_shared_prefix_min_batch >= 0, "xqa_shared_prefix_min_batch must be >= 0 (0 disables it), got ",
+        fwd.xqa_shared_prefix_min_batch);
+    TORCH_CHECK(!fwd.context_fmha_skip_leading_q_tiles || fwd.context_fmha_sm120_target,
+        "context_fmha_skip_leading_q_tiles requires context_fmha_sm120_target.");
+    c.xqa_one_wave_multi_block = fwd.xqa_one_wave_multi_block;
+    c.xqa_shared_prefix_min_batch = fwd.xqa_shared_prefix_min_batch;
+    c.context_fmha_sm120_target = fwd.context_fmha_sm120_target;
     return c;
 }
 
@@ -4111,6 +4134,9 @@ std::string AttentionBase::toString() const
     TRTLLM_DUMP_FIELD(sage_attn_qk_int8)
     TRTLLM_DUMP_FIELD(sage_attn_smooth_k)
     TRTLLM_DUMP_FIELD(skip_correction_threshold)
+    TRTLLM_DUMP_FIELD(xqa_one_wave_multi_block)
+    TRTLLM_DUMP_FIELD(xqa_shared_prefix_min_batch)
+    TRTLLM_DUMP_FIELD(context_fmha_sm120_target)
 #undef TRTLLM_DUMP_FIELD
     return ss.str();
 }
@@ -4407,7 +4433,9 @@ std::size_t std::hash<tensorrt_llm::torch_ext::AttentionBase>::operator()(
             std::int64_t{c.use_nvfp4_mla_kv_cache}, std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank,
             c.qk_nope_head_dim, c.qk_rope_head_dim, c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num,
             std::int64_t{c.rope_append}, c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k,
-            c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}})
+            c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k},
+            std::int64_t{c.xqa_one_wave_multi_block}, c.xqa_shared_prefix_min_batch,
+            std::int64_t{c.context_fmha_sm120_target}})
     {
         h = hashCombine(h, v);
     }

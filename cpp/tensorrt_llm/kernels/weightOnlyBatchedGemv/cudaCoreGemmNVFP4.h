@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,6 +56,9 @@ struct Params
     float const* alpha_ptr;
     // Optional per-N bias broadcast: shape [n], same dtype as output. May be nullptr.
     void const* bias;
+    // scale_a layout: false = linear [m, k / 16]; true = the 128x4 swizzled layout written by
+    // fp4_quantize(isSfSwizzledLayout=True), read in place (no block_scale_interleave_reverse).
+    bool act_sf_swizzled = false;
 
     // used by torch flow
     Params(void const* _act, void const* _weight, void* _output, SizeType32 _m, SizeType32 _n, SizeType32 _k,

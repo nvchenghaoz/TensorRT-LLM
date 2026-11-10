@@ -440,12 +440,18 @@ class FallbackFmha(PhasedFmha):
         kv_norm_eps: float = 1e-6,
         skip_correction_threshold: float = 0.0,
         uses_spcompress: Optional[bool] = None,
+        xqa_one_wave_multi_block: bool = False,
+        xqa_shared_prefix_min_batch: int = 0,
+        context_fmha_sm120_target: bool = False,
+        context_fmha_skip_leading_q_tiles: bool = False,
     ) -> None:
         """Shared MHA/MLA replacement for the removed monolithic ``thop.attention``.
 
         Builds native FMHA parameters and dispatches to the phased
         ``AttentionOp.run_context`` / ``run_generation`` / ``run_mla_generation``
         ops. Direct callers supply the flat attention arguments and workspace.
+        The SM120 kernel opt-ins (``xqa_*``, ``context_fmha_*``) reach the native op
+        through the ``AttentionForwardArgs`` fields of the same names.
         """
         arguments = locals().copy()
         del host_request_types
