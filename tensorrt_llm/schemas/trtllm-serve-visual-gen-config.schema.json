@@ -895,6 +895,29 @@
       "title": "SolAttentionConfig",
       "type": "object"
     },
+    "StepPrecisionConfig": {
+      "additionalProperties": false,
+      "description": "Per-denoising-step precision gates.\n\nOne controller on the transformer holds the index of the current denoising forward.\nEach low-precision consumer runs its BF16 path on forwards with index below its own\ncount and its configured low-precision recipe on the rest. An absent (None) count\nleaves that consumer on its configured path for every forward.",
+      "properties": {
+        "attention_bf16_forwards": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of leading denoising forwards whose attention runs unquantized BF16 (main's VANILLA torch SDPA path) before attention_config.quant_attention_config takes over. Early forwards fix the subject and layout. Supported for the FLASHINFER per-tensor fp8/fp8 recipe on SM120 with MiniMax-H3.",
+          "status": "prototype",
+          "title": "Attention Bf16 Forwards"
+        }
+      },
+      "title": "StepPrecisionConfig",
+      "type": "object"
+    },
     "TeaCacheConfig": {
       "additionalProperties": false,
       "description": "TeaCache step-caching acceleration config.",
@@ -1150,6 +1173,19 @@
       ],
       "default": null,
       "description": "Startup-preloaded LoRA adapter fused into VisualGen transformer weights.",
+      "status": "prototype"
+    },
+    "step_precision": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StepPrecisionConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Per-denoising-step precision gates (BF16 leading forwards per consumer).",
       "status": "prototype"
     },
     "torch_compile_config": {
