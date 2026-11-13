@@ -17,14 +17,20 @@ def main():
     cur = con.cursor()
     names = dict(cur.execute("select id, value from StringIds"))
     ev = []
-    for s, e, d, sid, stream in cur.execute(
-            "select start, end, deviceId, coalesce(shortName, demangledName), streamId from CUPTI_ACTIVITY_KIND_KERNEL"):
-        ev.append((s, e, d, "K", names.get(sid, str(sid))[:60], stream))
-    for s, e, d, kind, nbytes, stream in cur.execute(
-            "select start, end, deviceId, copyKind, bytes, streamId from CUPTI_ACTIVITY_KIND_MEMCPY"):
-        ev.append((s, e, d, "M", f"memcpy kind={kind} bytes={nbytes}", stream))
+    for s, e, d, sid, stream, gp in cur.execute(
+            "select start, end, deviceId, coalesce(shortName, demangledName), streamId, globalPid "
+            "from CUPTI_ACTIVITY_KIND_KERNEL"):
+        ev.append((s, e, (gp >> 24, d), "K", names.get(sid, str(sid))[:60], stream))
+    for s, e, d, kind, nbytes, stream, gp in cur.execute(
+            "select start, end, deviceId, copyKind, bytes, streamId, globalPid from CUPTI_ACTIVITY_KIND_MEMCPY"):
+        ev.append((s, e, (gp >> 24, d), "M", f"memcpy kind={kind} bytes={nbytes}", stream))
     devs = sorted({x[2] for x in ev})
-    print("devices:", devs, flush=True)
+    print("(pid, device) keys:", devs, flush=True)
+    for k in devs:
+        sub = [x for x in ev if x[2] == k]
+        print(k, "events", len(sub), "dtod", sum(1 for x in sub if x[3] == "M" and "kind=8" in x[4]),
+              "nccl", sum(1 for x in sub if "AllReduce" in x[4]), flush=True)
+    dev = devs[dev] if dev is not None and dev < len(devs) else devs[0]
     if dev is None:
         dev = devs[0]
     seq = sorted(x for x in ev if x[2] == dev)
