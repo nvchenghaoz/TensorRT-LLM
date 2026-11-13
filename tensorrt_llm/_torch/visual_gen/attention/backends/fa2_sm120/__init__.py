@@ -182,11 +182,14 @@ _TAGS = tuple(
 
 @torch.library.custom_op("trtllm_vg::fa2_sm120_fwd", mutates_args=(), tags=_TAGS)
 def fa2_sm120_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
-    """q, k, v: [B, H, S, D] (SDPA layout). Returns the output as [B, S, H, D] contiguous."""
+    """q, k, v: [B, H, S, D] (SDPA layout). Returns the output as [B, S, H, D], strided like
+    q.transpose(1, 2) (contiguous for the usual NHD-contiguous q), as torch's FA2 does."""
     global _calls
     ext = _load_ext()
     b, h, s, d = q.shape
-    out = torch.empty((b, s, h, d), dtype=q.dtype, device=q.device)
+    # torch's mha_fwd allocates out = empty_like(q) on the [B, S, H, D] view, so the strides
+    # follow q's (e.g. a q-slice of a larger buffer keeps its batch stride).
+    out = torch.empty_like(q.transpose(1, 2))
     lse = torch.empty((b, h, s), dtype=torch.float32, device=q.device)
     launches = ext.fwd(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), out, lse, scale, _MAX_REM_FRAC
@@ -201,13 +204,23 @@ def fa2_sm120_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: floa
 
 @fa2_sm120_fwd.register_fake
 def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
-    b, h, s, d = q.shape
-    return q.new_empty((b, s, h, d))
+    return torch.empty_like(q.transpose(1, 2))
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
     """SDPA-layout in and out: returns [B, H, S, D] with SDPA FA2's strides (physical [B, S, H, D])."""
     return fa2_sm120_fwd(q, k, v, scale).transpose(1, 2)
+
+
+_taken = 0
+
+
+def take_calls() -> int:
+    """Op calls in this process since the previous take_calls() (host counter, for logs)."""
+    global _taken
+    n = _calls - _taken
+    _taken = _calls
+    return n
 
 
 def try_attention(
