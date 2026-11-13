@@ -140,7 +140,7 @@ def main():
     ar = run([py, os.path.join(HERE, "ar_inplace_bench.py"), "--mode", "envsweep", "--checkpoint", ckpt,
               "--m", "37966", "--warmup", "5", "--iters", "30", "--quick", "--no-rsag",
               "--configs", cfgs], {}, "ar_quick", timeout=900)
-    if ar.get("wrong_pair"):
+    if ar.get("wrong_pair") or (NCH8_ONLY and "PIX" not in str(ar.get("label"))):
         print(json.dumps({"wrong_pair": True, "pair": ar.get("pair")}), flush=True)
         return
     out["ar_quick"] = ar
