@@ -141,7 +141,7 @@ def worker(rank, ckpt, mode, port, q):
 
     def set_arm(arm):
         if not has_prefetch or slot is None:
-            assert arm == "main"
+            assert arm.startswith("main")
             return
         for b, sid in zip(blocks, slot_ids):
             b._adaln_slot_id = None if arm == "main" else sid
@@ -156,6 +156,8 @@ def worker(rank, ckpt, mode, port, q):
             return compiled[1](y, temb, idx, rot, None, None, valid_seq_len=None)
 
     arms = ["main", "off", "on"] if slot is not None else ["main"]
+    if mode == "span" and slot is None:
+        arms = ["main", "main_x", "main_y"]  # same per-round load as the branch's 3 arms
     out = dict(info)
     from torch._dynamo.utils import counters
 
@@ -165,7 +167,85 @@ def worker(rank, ckpt, mode, port, q):
     torch.cuda.synchronize()
     stats_after_warmup = dict(counters["stats"])
 
-    if mode == "time":
+    if mode == "span":
+        # Untimed-by-events, GPU-timestamped span of the block boundary per iteration (kineto):
+        #   anchor = end of block 0's last down_proj GEMM (chunk 3, the last compute kernel that
+        #            starts before block 0's last all-reduce),
+        #   end    = start of block 1's norm1 kernel (first _minimax_h3_adaln_kernel after it).
+        # The span holds the all-reduce drain (AR c2 tail + AR c3), block 0's final gated residual,
+        # block 1's silu and, on main, block 1's AdaLN GEMV; with the prefetch the GEMV runs inside
+        # the drain, so any all-reduce slowdown it causes is inside the span too.
+        import time as _time
+
+        from torch.profiler import ProfilerActivity, profile
+
+        t_end = _time.time() + float(os.environ.get("BP2_PREHEAT_S", "20"))
+        while _time.time() < t_end:
+            for a in arms:
+                pair(a)
+        torch.cuda.synchronize()
+
+        def is_gemv(n):
+            return "64x8x64" in n or "gemv" in n.lower() or "Memset" in n
+
+        spans = {a: {"span": [], "ar_c3": [], "tail": [], "ar_c2_c3": []} for a in arms}
+        bad = 0
+        for r in range(ROUNDS):
+            for a in arms:
+                dist.barrier()
+                torch.cuda.synchronize()
+                with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    pair(a)
+                    torch.cuda.synchronize()
+                kev = sorted((e.time_range.start, e.time_range.end, e.name) for e in prof.events()
+                             if str(e.device_type).endswith("CUDA"))
+                nccl = [k for k in kev if "nccl" in k[2].lower()]
+                if len(nccl) < 16:
+                    bad += 1
+                    continue
+                ar_c3, ar_c2 = nccl[7], nccl[6]
+                cands = [k for k in kev if "nccl" not in k[2].lower() and k[0] < ar_c3[0] and not is_gemv(k[2])]
+                nxt = [k for k in kev if k[2] == "_minimax_h3_adaln_kernel" and k[0] > ar_c3[0]]
+                if not cands or not nxt:
+                    bad += 1
+                    continue
+                anchor = cands[-1][1]
+                s = spans[a]
+                s["span"].append((nxt[0][0] - anchor) / 1000.0)
+                s["ar_c3"].append((ar_c3[1] - ar_c3[0]) / 1000.0)
+                s["ar_c2_c3"].append((ar_c3[1] - ar_c2[0]) / 1000.0)
+                s["tail"].append((nxt[0][0] - ar_c3[1]) / 1000.0)
+            if rank == 0 and r % 10 == 9:
+                log(f"span round {r + 1}/{ROUNDS}: " + ", ".join(
+                    f"{a} {statistics.median(spans[a]['span']):.3f}" for a in arms if spans[a]["span"]))
+
+        def summ(v):
+            v = sorted(v)
+            med = statistics.median(v)
+            lo, hi = v[int(0.1 * (len(v) - 1))], v[int(0.9 * (len(v) - 1) + 0.5)]
+            return {"median_ms": med, "p10": lo, "p90": hi, "noise": (hi - lo) / med, "n": len(v)}
+
+        out["span"] = {a: {k: summ(v) for k, v in d.items() if v} for a, d in spans.items()}
+        out["span_bad_iters"] = bad
+        if slot is not None:
+            n = min(len(spans[a]["span"]) for a in arms)
+            for x1, x2 in (("main", "on"), ("off", "on"), ("main", "off")):
+                d = sorted(spans[x1]["span"][i] - spans[x2]["span"][i] for i in range(n))
+                out.setdefault("span_paired_delta_ms", {})[f"{x1}-{x2}"] = {
+                    "median": statistics.median(d), "p10": d[int(0.1 * (n - 1))], "p90": d[int(0.9 * (n - 1) + 0.5)]}
+        else:
+            n = min(len(spans[a]["span"]) for a in arms)
+            d = sorted(spans["main"]["span"][i] - spans["main_x"]["span"][i] for i in range(n))
+            out["span_aa_delta_ms"] = {"median": statistics.median(d), "p10": d[int(0.1 * (n - 1))],
+                                       "p90": d[int(0.9 * (n - 1) + 0.5)]}
+        if rank == 0:
+            log(f"span: {json.dumps(out['span'])}")
+            log(f"span deltas: {out.get('span_paired_delta_ms') or out.get('span_aa_delta_ms')}")
+        key = "on" if slot is not None else "main"
+        t = out["span"][key]["span"]
+        out["batch"] = {"1": {"kernel_ms": t["median_ms"], "noise_floor": t["noise"]}}
+        out["output"] = {"class": "exact"}
+    elif mode == "time":
         times = {f"{a}_{c}": [] for a in arms for c in "AB"}
         for r in range(ROUNDS):
             for c in "AB":
@@ -339,7 +419,7 @@ def main():
     ap.add_argument("--mode", default="time")
     a = ap.parse_args()
     topo = topo_check()
-    if a.mode == "time" and topo.get("link") != "PIX":
+    if a.mode in ("time", "span") and topo.get("link") != "PIX":
         print(json.dumps({"wrong_pair": True, "topology": topo}), flush=True)
         return 0
     with socket.socket() as s:
@@ -356,7 +436,7 @@ def main():
     outs.sort(key=lambda o: o["rank"])
     r0 = outs[0]
     final = {"ranks": outs, "topology": topo}
-    if a.mode == "time":
+    if a.mode in ("time", "span"):
         final.update(batch=r0["batch"], output=r0["output"])
     else:
         final["passed"] = all(o.get("passed") for o in outs)
