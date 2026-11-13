@@ -1,6 +1,0 @@
-{
-  "quant_config": {
-    "quant_algo": "NVFP4",
-    "dynamic": true
-  }
-}
