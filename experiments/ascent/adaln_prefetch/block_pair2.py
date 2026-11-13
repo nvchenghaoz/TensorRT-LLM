@@ -299,11 +299,49 @@ def worker(rank, ckpt, mode, port, q):
     dist.destroy_process_group()
 
 
+def topo_check():
+    """PCI bus ids of the two visible GPUs and their nvidia-smi topo link (pitfall 960)."""
+    import re
+    import subprocess
+
+    info = {"visible": os.environ.get("CUDA_VISIBLE_DEVICES", "")}
+    try:
+        q = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id", "--format=csv,noheader"],
+                           capture_output=True, text=True).stdout
+        rows = [[c.strip() for c in line.split(",")] for line in q.strip().splitlines()]
+        info["gpus"] = rows
+        vis = [v.strip() for v in info["visible"].split(",") if v.strip()]
+        idx = []
+        for v in vis:
+            for r in rows:
+                if v in (r[0], r[1]):
+                    idx.append(int(r[0]))
+        if len(idx) != 2:
+            idx = [int(r[0]) for r in rows[:2]]
+        info["host_index"] = idx
+        topo = subprocess.run(["nvidia-smi", "topo", "-m"], capture_output=True, text=True).stdout
+        topo = re.sub(r"\x1b\[[0-9;]*m", "", topo)
+        log(topo)
+        lines = [ln for ln in topo.splitlines() if ln.strip()]
+        header = lines[0].split()
+        row = next(ln.split() for ln in lines[1:] if ln.split() and ln.split()[0] == f"GPU{idx[0]}")
+        info["link"] = row[1 + header.index(f"GPU{idx[1]}")]
+    except Exception as e:  # noqa: BLE001
+        info["error"] = repr(e)
+        info["link"] = None
+    log(f"topology: {info}")
+    return info
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt")
     ap.add_argument("--mode", default="time")
     a = ap.parse_args()
+    topo = topo_check()
+    if a.mode == "time" and topo.get("link") != "PIX":
+        print(json.dumps({"wrong_pair": True, "topology": topo}), flush=True)
+        return 0
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -317,7 +355,7 @@ def main():
         p.join()
     outs.sort(key=lambda o: o["rank"])
     r0 = outs[0]
-    final = {"ranks": outs}
+    final = {"ranks": outs, "topology": topo}
     if a.mode == "time":
         final.update(batch=r0["batch"], output=r0["output"])
     else:
