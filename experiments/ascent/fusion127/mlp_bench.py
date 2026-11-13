@@ -33,6 +33,9 @@ def build():
         mlp = GatedMLP(hidden_size=H, intermediate_size=I_LOCAL, bias=False,
                        dtype=torch.bfloat16, config=ModelConfig(), reduce_output=False,
                        layer_idx=0, fuse_bf16_gate_up_swiglu=True)
+    # as MiniMaxH3TransformerBlock does on SM120 (landing 44): the trtllm::cublas_mm tile pin
+    for lin in (mlp.gate_up_proj, mlp.down_proj):
+        lin.use_custom_cublas_mm = True
     g = torch.Generator(device="cuda").manual_seed(1234)
     with torch.no_grad():
         mlp.gate_up_proj.weight.copy_(
@@ -53,9 +56,10 @@ def inputs(m, kind=0, seed=7):
 
 
 def reference(mlp, x):
-    h1 = F.linear(x, mlp.gate_up_proj.weight)
+    """Main's chain, written out: pinned cublas_mm gate_up -> silu_and_mul -> pinned down."""
+    h1 = torch.ops.trtllm.cublas_mm(x, mlp.gate_up_proj.weight.t(), None, None)
     h2 = torch.ops.trtllm.silu_and_mul(h1)
-    return F.linear(h2, mlp.down_proj.weight), h2
+    return torch.ops.trtllm.cublas_mm(h2, mlp.down_proj.weight.t(), None, None), h2
 
 
 def bench(mlp):
@@ -91,7 +95,14 @@ def bench(mlp):
                        "p10": round(t.quantile(0.1).item(), 4), "p90": round(t.quantile(0.9).item(), 4)}
         log(f"M={m}: {res[str(m)]}")
     fused = getattr(mlp, "fuse_bf16_gate_up_swiglu_sm120", False)
-    return {"batch": res, "output": {"class": "exact"}, "fused_path": bool(fused)}
+    from torch.profiler import ProfilerActivity, profile
+    with torch.inference_mode(), profile(activities=[ProfilerActivity.CUDA]) as prof:
+        mlp(xs[9600])
+        torch.cuda.synchronize()
+    names = [e.name[:90] for e in prof.events() if e.device_type.name == "CUDA"]
+    log("kernels in one forward:", names)
+    return {"batch": res, "output": {"class": "exact"}, "fused_path": bool(fused),
+            "kernels": names[:6]}
 
 
 def check(mlp):

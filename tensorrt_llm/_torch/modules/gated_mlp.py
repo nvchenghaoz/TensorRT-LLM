@@ -434,9 +434,11 @@ class GatedMLP(nn.Module):
     def _can_fuse_gate_up_swiglu_sm120(self, x) -> bool:
         """Whether this call takes the SM120 BF16 gate/up GEMM + SwiGLU epilogue.
 
-        Exactly the calls whose unfused chain is F.linear (cuBLAS nvjet) -> swiglu with plain
-        SwiGLU: unquantized BF16 gate_up_proj and down_proj, no bias, no other GEMM provider,
-        no limit, at >= MIN_ROWS rows (where F.linear runs nvjet's in-order K chain).
+        Exactly the calls whose unfused chain is a split-K-free cuBLAS nvjet GEMM -> swiglu with
+        plain SwiGLU: unquantized BF16 gate_up_proj and down_proj, no bias, no CuTe DSL GEMM
+        provider, no limit, at >= MIN_ROWS rows. The trtllm::cublas_mm SM120 pin
+        (use_custom_cublas_mm) stays eligible: its pinned nvjet tiles are bitwise to F.linear,
+        and so is this kernel (one in-order K chain of mma.sync m16n8k16 per element).
         """
         if not self.fuse_bf16_gate_up_swiglu_sm120:
             return False
@@ -450,7 +452,7 @@ class GatedMLP(nn.Module):
         proj = self.gate_up_proj
         if (proj.has_any_quant or self.down_proj.has_any_quant
                 or proj.bias is not None or proj.weight.dtype != torch.bfloat16
-                or proj.use_cute_dsl_bf16_gemm or proj.use_custom_cublas_mm):
+                or proj.use_cute_dsl_bf16_gemm):
             return False
         k = x.shape[-1]
         if x.numel() // k < _sm120_gate_up.MIN_ROWS:
