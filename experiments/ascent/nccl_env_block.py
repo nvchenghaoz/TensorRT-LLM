@@ -80,19 +80,60 @@ def run(cmd, env_add, tag, timeout=900):
     return res
 
 
+def chan_phase(ckpt, py, bp, dbg, out):
+    """CE hang probe, then channel-count winners in the chunked block regime."""
+    probe = os.path.join(HERE, "nccl_ce_hang_probe.py")
+    out["probe"] = {}
+    for v, env in (("plain", ENV_WIN), ("async4", ENV_WIN), ("sync", ENV_WIN), ("malloc", ENV_WIN),
+                   ("free", ENV_WIN), ("free_noCE", {})):
+        r = run([py, probe, v.replace("_noCE", "")], {**env, **dbg}, f"probe_{v}", timeout=100)
+        out["probe"][v] = {"ok": bool(r.get("ok")), "rc": r["_rc"], "wall_s": r["_wall_s"]}
+    n16 = {"NCCL_MIN_NCHANNELS": "16", "NCCL_MAX_NCHANNELS": "16"}
+    n8 = {"NCCL_MIN_NCHANNELS": "8", "NCCL_MAX_NCHANNELS": "8"}
+    arms = [("default", dbg), ("nch16", {**n16, **dbg}), ("nch8", {**n8, **dbg}), ("default_aa", dbg),
+            ("nch16_rep", {**n16, **dbg})]
+    out["block"] = {}
+    for tag, env in arms:
+        r = run([py, bp, ckpt, "--mode", "time"], env, tag)
+        out["block"][tag] = {"step_ms": r.get("batch", {}).get("1", {}).get("step_ms"),
+                             "noise": r.get("batch", {}).get("1", {}).get("noise_floor"),
+                             "detail": r.get("detail"), "rc": r["_rc"], "key_lines": r.get("_key_lines")}
+    chk = run([py, bp, ckpt, "--mode", "check", "--chunks", "4"], {**n16, **dbg}, "check_nch16")
+    out["check_nch16"] = chk
+    b = out["block"]
+    d = [b[k]["step_ms"] for k in ("default", "default_aa") if b[k]["step_ms"]]
+    s = {}
+    if d:
+        dm = sum(d) / len(d)
+        s = {"default_ms": d, "aa_delta": abs(d[0] - d[-1]) / dm,
+             "rel_vs_default": {k: (round(v["step_ms"] / dm - 1, 4) if v["step_ms"] else None) for k, v in b.items()},
+             "noise": {k: v["noise"] for k, v in b.items()}}
+    out["summary"] = s
+    with open(os.path.join(ART, "nccl_env_block_chan.json"), "w") as f:
+        json.dump(out, f, indent=1)
+    print(json.dumps({"passed": bool(chk.get("passed")), "label": out["ar_quick"].get("label"),
+                      "ar_table": out["ar_quick"].get("table"), "probe": out["probe"], "summary": s,
+                      "block": {k: {"step_ms": v["step_ms"], "noise": v["noise"]} for k, v in b.items()},
+                      "check_nch16": {k: chk.get(k) for k in ("passed", "rank0")}}), flush=True)
+
+
 def main():
     ckpt = sys.argv[1]
     py = sys.executable
     out = {}
+    cfgs = "default,nch16,nch8,default_rep" if (len(sys.argv) > 2 and sys.argv[2] == "chan") \
+        else "default,p2p_cuda_memcpy,default_rep"
     ar = run([py, os.path.join(HERE, "ar_inplace_bench.py"), "--mode", "envsweep", "--checkpoint", ckpt,
               "--m", "37966", "--warmup", "5", "--iters", "30", "--quick", "--no-rsag",
-              "--configs", "default,p2p_cuda_memcpy,default_rep"], {}, "ar_quick", timeout=900)
+              "--configs", cfgs], {}, "ar_quick", timeout=900)
     if ar.get("wrong_pair"):
         print(json.dumps({"wrong_pair": True, "pair": ar.get("pair")}), flush=True)
         return
     out["ar_quick"] = ar
     bp = os.path.join(HERE, "tp_overlap", "block_pair.py")
     dbg = {"NCCL_DEBUG": "WARN"}
+    if len(sys.argv) > 2 and sys.argv[2] == "chan":
+        return chan_phase(ckpt, py, bp, dbg, out)
     arms = [("ce", {**ENV_WIN, **dbg}), ("default", dbg), ("ce_rep", {**ENV_WIN, **dbg}), ("default_aa", dbg)]
     out["block"] = {}
     for tag, env in arms:
