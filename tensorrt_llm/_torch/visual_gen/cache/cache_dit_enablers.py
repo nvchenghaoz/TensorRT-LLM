@@ -541,26 +541,63 @@ def enable_cache_dit_for_minimax_h3(
         calibrator_config=calibrator,
     )
 
+    full_mask_len = None
+    if cache_dit_cfg.scm_compute_bins is not None:
+        full_mask_len = sum(cache_dit_cfg.scm_compute_bins) + sum(cache_dit_cfg.scm_cache_bins or [])
+    rank = int(getattr(pipeline, "rank", 0) or 0)
+
+    def _log_resolved(n: int) -> None:
+        # Every rank logs what cache-dit resolved, so TP ranks can be compared.
+        manager = getattr(transformer, "_context_manager", None)
+        for name in getattr(transformer, "_context_names", None) or []:
+            try:
+                ctx = manager.get_context(name)
+                cfg = ctx.cache_config
+                live_mask = cfg.steps_computation_mask
+                mask_str = "".join(str(int(v)) for v in live_mask) if live_mask is not None else None
+                warm = list(getattr(ctx, "warmup_steps", []) or [])
+                logger.info(
+                    f"Cache-DiT refresh rank={rank}: n={n} Fn={cfg.Fn_compute_blocks} "
+                    f"Bn={cfg.Bn_compute_blocks} max_warmup_steps={cfg.max_warmup_steps} "
+                    f"resolved_warmup={len(warm)} mcc={cfg.max_continuous_cached_steps} "
+                    f"max_cached={cfg.max_cached_steps} R={cfg.residual_diff_threshold} "
+                    f"policy={cfg.steps_computation_policy} mask={mask_str}"
+                )
+            except Exception as exc:  # logging only; never fail a request on it
+                logger.info(f"Cache-DiT refresh rank={rank}: n={n} (resolve log failed: {exc})")
+
     def refresh_h3(num_inference_steps: int, **_kwargs) -> None:
-        mask = h3_steps_computation_mask(cache_dit_cfg, num_inference_steps)
+        n = num_inference_steps
+        mask = h3_steps_computation_mask(cache_dit_cfg, n)
         if mask is None:
-            cache_dit.refresh_context(
-                transformer, num_inference_steps=num_inference_steps, verbose=False
-            )
+            cache_dit.refresh_context(transformer, num_inference_steps=n, verbose=False)
             return
+        if (
+            full_mask_len is not None
+            and n < full_mask_len
+            and cache_dit_cfg.scm_steps_policy == "static"
+        ):
+            # Short request (server warmup): compute forward 0, cache forward 1, so the
+            # cached path is warmed before the first full request (pitfall 637).
+            mask = ([1, 0] + [1] * n)[:n]
         logger.info(
             f"Cache-DiT: MiniMax-H3 step mask ({sum(mask)}/{len(mask)} computed, "
             f"{cache_dit_cfg.scm_steps_policy}): {''.join(map(str, mask))}"
         )
+        # refresh_context merges into the live config and overrides persist, so pass
+        # every DBCache field on every refresh.
+        reset_kw = db_cache_kwargs_from_cache_dit_config(cache_dit_cfg, enable_separate_cfg=separate)
+        reset_kw.update(
+            num_inference_steps=n,
+            steps_computation_mask=mask,
+            steps_computation_policy=cache_dit_cfg.scm_steps_policy,
+        )
         cache_dit.refresh_context(
             transformer,
-            cache_config=DBCacheConfig().reset(
-                num_inference_steps=num_inference_steps,
-                steps_computation_mask=mask,
-                steps_computation_policy=cache_dit_cfg.scm_steps_policy,
-            ),
+            cache_config=DBCacheConfig().reset(**reset_kw),
             verbose=False,
         )
+        _log_resolved(n)
 
     return CacheDiTEnableResult(
         refresh=refresh_h3,
