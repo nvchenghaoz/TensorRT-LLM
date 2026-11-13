@@ -57,6 +57,32 @@ if _MNNVL_ONE_SHOT_THRESHOLD_BYTES < 0:
         "TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES must be a non-negative integer, got "
         f"{_MNNVL_ONE_SHOT_THRESHOLD_BYTES}")
 
+
+def _pg_nccl_fallback_min_bytes() -> Optional[int]:
+    """Message bytes above which the native AllreduceOp always runs NCCL (or NCCL_SYMMETRIC, which on a
+    ProcessGroup is the same c10d all-reduce) for plain AUTO/NCCL/NCCL_SYMMETRIC all-reduces: larger than the
+    custom all-reduce workspace (getMaxRequiredWorkspaceSize / ifFallbackToNCCL in thop/allreduceOp.cpp).
+    None where the deterministic-all-reduce overrides change that choice."""
+    truthy = ("1", "true", "on", "yes")
+    if os.environ.get("TLLM_ALLREDUCE_INPLACE_PRIVATE_INPUT",
+                      "1").strip().lower() not in truthy:
+        return None  # kill switch: always run the native op
+    if any(
+            os.environ.get(name, "").strip().lower() in truthy
+            for name in ("FORCE_DETERMINISTIC",
+                         "FORCE_ALL_REDUCE_DETERMINISTIC")):
+        return None
+    try:
+        return int(
+            os.environ.get("TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE",
+                           64 * 1024 * 1024))
+    except ValueError:
+        return None
+
+
+# Evaluated once at import, so the gate is a constant inside torch.compile.
+_PG_NCCL_FALLBACK_MIN_BYTES: Optional[int] = _pg_nccl_fallback_min_bytes()
+
 # Allocating these workspaces is a TP-wide collective, so whether a rank
 # allocates must not depend on which thread builds its model: RpcWorker builds
 # rank 0 on an RPC executor thread and the other ranks on their main thread.
@@ -1342,6 +1368,10 @@ class AllReduce(nn.Module):
 
         self.all_reduce_op = (torch.ops.trtllm.allreduce_pg_by_name if
                               self._disable_mpi else torch.ops.trtllm.allreduce)
+        # Set by an owner whose input is a private temporary nothing else reads (e.g. the output a row-parallel
+        # Linear just produced): a large plain all-reduce on a ProcessGroup then runs in place on it, instead of
+        # the native op's input.clone() + in-place c10d all-reduce. Same c10d NCCL all-reduce, so bitwise equal.
+        self.inplace_private_input = False
 
         # Propagate model-level prealloc config to AllReduceRunner once per
         # process.  extra_attrs is only active during model __init__, so we
@@ -1482,6 +1512,26 @@ class AllReduce(nn.Module):
                 if self.uses_nccl_symmetric_memory_window() else int(
                     BufferKind.DEFAULT))
 
+    def _inplace_pg_allreduce_applies(
+            self, input: torch.Tensor, params: AllReduceParams,
+            strategy: AllReduceStrategy) -> bool:
+        """Whether this call is a plain all-reduce the native op would run as clone + c10d NCCL all-reduce
+        on the ProcessGroup, and the owner allows reducing ``input`` in place."""
+        return (self.inplace_private_input and self._disable_mpi
+                and bool(self._group_name)
+                and _PG_NCCL_FALLBACK_MIN_BYTES is not None
+                and self.symm_mem_allreduce is None
+                and self.mnnvl_allreduce is None
+                and not isinstance(params, MoEAllReduceParams)
+                and params.fusion_op == AllReduceFusionOp.NONE
+                and params.residual is None and params.norm_weight is None
+                and params.scale is None and params.bias is None
+                and strategy in (AllReduceStrategy.AUTO,
+                                 AllReduceStrategy.NCCL,
+                                 AllReduceStrategy.NCCL_SYMMETRIC)
+                and input.numel() * input.element_size()
+                > _PG_NCCL_FALLBACK_MIN_BYTES)
+
     def forward(
         self,
         input: torch.Tensor,
@@ -1542,6 +1592,20 @@ class AllReduce(nn.Module):
             output = input.clone()
             torch.distributed.all_reduce(output, group=self.mapping.tp_group_pg)
             return output
+
+        if self._inplace_pg_allreduce_applies(input, all_reduce_params,
+                                              allreduce_strategy):
+            # The native ProcessGroup NCCL / NCCL_SYMMETRIC branches clone the input and all-reduce the copy
+            # in place with the same c10d ProcessGroup; skip the clone. Under torch.compile the functional
+            # all_reduce is traced (the in-place op has no functionalization) and Inductor reinplaces it on
+            # the dead input buffer.
+            if torch.compiler.is_compiling():
+                output = torch.ops._c10d_functional.all_reduce(
+                    input, "sum", self._group_name)
+                return torch.ops._c10d_functional.wait_tensor(output)
+            torch.ops._c10d_functional.all_reduce_(input, "sum",
+                                                   self._group_name)
+            return torch.ops._c10d_functional.wait_tensor(input)
 
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)

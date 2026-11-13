@@ -657,6 +657,11 @@ class MiniMaxH3TransformerBlock(nn.Module):
         )
         # Fused RMSNorm + gathered modulation (and the gated residual before norm2).
         self._fused_adaln = h3_adaln_supported(hidden_size, model_config.torch_dtype)
+        # The row-parallel outputs these all-reduce are private GEMM results: reduce them in place
+        # (no [M, D] input clone per all-reduce on the ProcessGroup NCCL path).
+        for linear in (self.attn.to_out[0], self.ff.down_proj):
+            if getattr(linear, "all_reduce", None) is not None:
+                linear.all_reduce.inplace_private_input = True
 
     def forward(
         self,
@@ -1058,13 +1063,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         packed_hidden_states = text_embeds.new_zeros(
             (text_embeds.shape[0], sequence_length, text_embeds.shape[-1])
         )
-        packed_hidden_states = packed_hidden_states.index_copy(1, text_indices, text_embeds)
-        packed_hidden_states = packed_hidden_states.index_copy(
-            1, video_indices, video_embeds.to(text_embeds.dtype)
-        )
-        packed_hidden_states = packed_hidden_states.index_copy(
-            1, audio_indices, audio_embeds.to(text_embeds.dtype)
-        )
+        # Fill the fresh buffer in place (the out-of-place index_copy cloned [1, M, D] three times).
+        packed_hidden_states.index_copy_(1, text_indices, text_embeds)
+        packed_hidden_states.index_copy_(1, video_indices, video_embeds.to(text_embeds.dtype))
+        packed_hidden_states.index_copy_(1, audio_indices, audio_embeds.to(text_embeds.dtype))
 
         temb = self.time_proj(conditioning_timesteps)
         temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
