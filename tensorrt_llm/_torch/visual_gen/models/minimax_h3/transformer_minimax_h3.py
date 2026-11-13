@@ -636,11 +636,80 @@ def _tp_overlap_num_chunks() -> int:
         return 4
 
 
-def _row_chunks(rows: int, num_chunks: int, align: int = 128) -> list[tuple[int, int]]:
-    """Split ``rows`` into at most ``num_chunks`` ranges whose starts are ``align``-aligned."""
+def _row_chunks(
+    rows: int,
+    num_chunks: int,
+    align: int = 128,
+    weights: Optional[tuple[float, ...]] = None,
+) -> list[tuple[int, int]]:
+    """Split ``rows`` into at most ``num_chunks`` ranges whose starts are ``align``-aligned.
+
+    ``weights`` (one per chunk) gives tapered chunk sizes: chunk i gets about
+    ``rows * weights[i] / sum(weights)`` rows, rounded to ``align``; the last chunk takes the rest.
+    """
+    if weights:
+        total = float(sum(weights))
+        bounds, start, acc = [], 0, 0.0
+        for w in weights[:-1]:
+            acc += w
+            end = min(rows, int(round(rows * acc / total / align)) * align)
+            if end > start:
+                bounds.append((start, end))
+                start = end
+        if start < rows:
+            bounds.append((start, rows))
+        return bounds
     step = -(-rows // num_chunks)
     step = -(-step // align) * align
     return [(start, min(rows, start + step)) for start in range(0, rows, step)]
+
+
+# Dedicated NCCL communicator for the chunked TP all-reduces (read once at model build).
+# 8 CTAs (channels) instead of NCCL's default 4 on the 2-GPU PCIe pair; normal stream priority.
+# 0 CTAs or a non-NCCL setup keeps the shared TP group.
+_TP_OVERLAP_PG_CTAS = 8
+_TP_OVERLAP_PG_HIGH_PRIORITY = False
+# Per-chunk row weights for the chunked overlap (None = uniform _tp_overlap_num_chunks() chunks).
+_TP_OVERLAP_CHUNK_WEIGHTS: Optional[tuple[float, ...]] = None
+_H3_TP_GROUPS: dict = {}
+
+
+def h3_dedicated_tp_group(
+    base_group_name: str, ctas: int = 0, high_priority: bool = False
+) -> Optional["dist.ProcessGroup"]:
+    """A dedicated NCCL process group over the ranks of ``base_group_name``, built once per setting.
+
+    The communicator config pins NCCL's CTA (channel) count to ``ctas`` when > 0 and can put its
+    stream at high priority, without touching any other communicator or the NCCL env. ``new_group``
+    is collective over the world, so the group is only built when the TP group spans the whole
+    world (every rank then asks for the same ranks in the same order); otherwise None (callers
+    keep the shared group). The all-reduce math is unchanged: a two-rank sum per element.
+    """
+    key = (base_group_name, int(ctas), bool(high_priority))
+    if key in _H3_TP_GROUPS:
+        return _H3_TP_GROUPS[key]
+    pg = None
+    if dist.is_available() and dist.is_initialized() and dist.is_nccl_available():
+        base = dist.distributed_c10d._resolve_process_group(base_group_name)
+        ranks = sorted(dist.get_process_group_ranks(base))
+        if len(ranks) == dist.get_world_size():
+            opts = dist.ProcessGroupNCCL.Options()
+            opts.is_high_priority_stream = bool(high_priority)
+            if ctas > 0:
+                opts.config.min_ctas = int(ctas)
+                opts.config.max_ctas = int(ctas)
+            pg = dist.new_group(ranks, backend="nccl", pg_options=opts)
+            from tensorrt_llm.logger import logger
+
+            logger.info(
+                f"[rank {dist.get_rank()}] MiniMax-H3 TP overlap: dedicated NCCL group over ranks "
+                f"{ranks}, min_ctas=max_ctas={ctas or 'default'}, high_priority_stream="
+                f"{bool(high_priority)}; NCCL_MIN_NCHANNELS="
+                f"{os.environ.get('NCCL_MIN_NCHANNELS')} NCCL_MAX_NCHANNELS="
+                f"{os.environ.get('NCCL_MAX_NCHANNELS')}"
+            )
+    _H3_TP_GROUPS[key] = pg
+    return pg
 
 
 def _pad_rotary_emb(
@@ -658,6 +727,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
     # TP all-reduce/compute overlap (see setup_tp_overlap and _post_attn_overlap); off until
     # the owning model enables it.
     _tp_overlap_chunks = 0
+    _tp_overlap_weights = None
     _tp_overlap_group_name = None
     _tp_overlap_pg = None
 
@@ -819,6 +889,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         scale (FP8/NVFP4 amax over all rows) would become a per-chunk scale.
         """
         self._tp_overlap_chunks = 0
+        self._tp_overlap_weights = None
         self._tp_overlap_group_name = None
         self._tp_overlap_pg = None
         to_out = self.attn.to_out[0]
@@ -847,8 +918,24 @@ class MiniMaxH3TransformerBlock(nn.Module):
             and getattr(to_out_ar, "_group_name", None) is not None
             and to_out_ar._group_name == getattr(down_ar, "_group_name", None)
         ):
-            self._tp_overlap_chunks = num_chunks
+            weights = _TP_OVERLAP_CHUNK_WEIGHTS
+            self._tp_overlap_chunks = len(weights) if weights else num_chunks
+            self._tp_overlap_weights = tuple(weights) if weights else None
             self._tp_overlap_group_name = to_out_ar._group_name
+            if _TP_OVERLAP_PG_CTAS > 0 or _TP_OVERLAP_PG_HIGH_PRIORITY:
+                self._tp_overlap_pg = h3_dedicated_tp_group(
+                    to_out_ar._group_name, _TP_OVERLAP_PG_CTAS, _TP_OVERLAP_PG_HIGH_PRIORITY
+                )
+            if "logged" not in _H3_TP_GROUPS:
+                from tensorrt_llm.logger import logger
+
+                _H3_TP_GROUPS["logged"] = True
+                logger.info(
+                    f"[rank {dist.get_rank() if dist.is_initialized() else 0}] MiniMax-H3 TP "
+                    f"overlap: chunks {self._tp_overlap_chunks} weights {self._tp_overlap_weights}, "
+                    f"dedicated group {self._tp_overlap_pg is not None} (ctas "
+                    f"{_TP_OVERLAP_PG_CTAS}, high priority {_TP_OVERLAP_PG_HIGH_PRIORITY})"
+                )
 
     @torch.compiler.disable
     def _post_attn_overlap(
@@ -879,7 +966,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         no_reduce = AllReduceParams(enable_allreduce=False)
         hidden_size = hidden_states.shape[-1]
         rows = hidden_states.shape[1]
-        bounds = _row_chunks(rows, self._tp_overlap_chunks)
+        bounds = _row_chunks(rows, self._tp_overlap_chunks, weights=self._tp_overlap_weights)
         attn_rows = attn_hidden.reshape(rows, attn_hidden.shape[-1])
         to_out = self.attn.to_out[0]
 

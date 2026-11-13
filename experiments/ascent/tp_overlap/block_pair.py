@@ -30,7 +30,7 @@ import torch.multiprocessing as mp
 M = 37966
 block_vgm = []  # the VisualGenMapping build() made (one per process)
 WARMUP = 5
-ITERS = 20
+ITERS = int(os.environ.get("BLOCK_PAIR_ITERS", "20"))
 
 
 def log(*a):
@@ -129,7 +129,8 @@ def worker(rank, ckpt, mode, chunks, q):
             ts.append(s.elapsed_time(e))
         ts.sort()
         med = statistics.median(ts)
-        return {"median_ms": med, "p10": ts[2], "p90": ts[17], "noise": (ts[17] - ts[2]) / med}
+        lo, hi = ts[int(0.1 * (len(ts) - 1))], ts[int(0.9 * (len(ts) - 1) + 0.5)]
+        return {"median_ms": med, "p10": lo, "p90": hi, "noise": (hi - lo) / med, "n": len(ts)}
 
     out = {"rank": rank, "has_overlap": has_overlap, "default_chunks": default_chunks}
     compiled = torch.compile(block, mode="default", dynamic=None)
@@ -254,9 +255,339 @@ def worker(rank, ckpt, mode, chunks, q):
             if rank == 0:
                 log(f"check chunks={k}: {out['check'][f'k{k}']}")
         out["passed"] = ok
+    elif mode == "arms":
+        out.update(arms_phase(rank, block, compiled, call, (x, temb, idx, rot), pristine))
     q.put(out)
     dist.barrier()
     dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------------------------
+# Idea 72 stage 0b: dedicated TP PG (CTAs, stream priority) and tapered splits, all in-process.
+# ---------------------------------------------------------------------------------------------
+SPLITS = {
+    "u4": None,  # main: ceil-aligned uniform 4 (9600/9600/9600/9166)
+    "u6": (1, 1, 1, 1, 1, 1),
+    "u8": (1,) * 8,
+    "t1331": (1, 3, 3, 1),
+    "t1555": (1, 5, 5, 5),
+    "k6s": (2, 2, 2, 2, 2, 1),
+}
+PGS = {  # name -> (ctas, high_priority); "shared" = main's TP group
+    "shared": None,
+    "ded": (0, False),
+    "ded_hp": (0, True),
+    "c8": (8, False),
+    "c8_hp": (8, True),
+    "c6": (6, False),
+    "c6_hp": (6, True),
+}
+ARMS = [
+    ("main", "shared", "u4"), ("main_aa", "shared", "u4"),
+    ("ded", "ded", "u4"), ("ded_hp", "ded_hp", "u4"),
+    ("c8", "c8", "u4"), ("c8_hp", "c8_hp", "u4"),
+    ("c6", "c6", "u4"), ("c6_hp", "c6_hp", "u4"),
+    ("c8_t1331", "c8", "t1331"), ("c8_t1555", "c8", "t1555"),
+    ("c8_u6", "c8", "u6"), ("c8_u8", "c8", "u8"), ("c8_k6s", "c8", "k6s"),
+    ("shared_t1331", "shared", "t1331"),
+]
+PROFILE_ARMS = ["main", "c8", "c8_hp", "ded_hp", "c6", "c8_t1331", "c8_u6", "c8_k6s"]
+
+
+def _union(iv):
+    iv = sorted(iv)
+    out = []
+    for s, e in iv:
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def _measure(u):
+    return sum(e - s for s, e in u)
+
+
+def _minus(a, b):
+    """|a \\ b| for unions a, b."""
+    tot = 0.0
+    j = 0
+    for s, e in a:
+        cur = s
+        while j < len(b) and b[j][1] <= cur:
+            j += 1
+        k = j
+        while k < len(b) and b[k][0] < e:
+            if b[k][0] > cur:
+                tot += b[k][0] - cur
+            cur = max(cur, b[k][1])
+            k += 1
+        if cur < e:
+            tot += e - cur
+    return tot
+
+
+def _is_gemm(n):
+    n = n.lower()
+    return ("nvjet" in n or "gemm" in n or "cutlass" in n) and "flash" not in n and "fmha" not in n
+
+
+def _analyze_trace(path):
+    """Per-iteration exposure metrics from a kineto chrome trace (times in ms)."""
+    with open(path) as f:
+        tr = json.load(f)
+    evs = tr["traceEvents"] if isinstance(tr, dict) else tr
+    kern, launch = [], {}
+    for e in evs:
+        cat = e.get("cat", "")
+        a = e.get("args", {}) or {}
+        if cat == "kernel":
+            kern.append((float(e["ts"]), float(e["ts"]) + float(e.get("dur", 0)), e.get("name", ""),
+                         a.get("correlation"), a.get("stream"), tuple(a.get("grid", []) or [])))
+        elif cat == "cuda_runtime" and "Launch" in e.get("name", ""):
+            launch[a.get("correlation")] = float(e["ts"])
+    kern.sort()
+    iters, cur = [], []
+    for k in kern:
+        if cur and k[0] - max(c[1] for c in cur[-50:]) > 5000:
+            iters.append(cur)
+            cur = []
+        cur.append(k)
+    if cur:
+        iters.append(cur)
+    res = []
+    for ks in iters:
+        nc = [k for k in ks if "nccl" in k[2].lower()]
+        cp = [k for k in ks if "nccl" not in k[2].lower()]
+        if not cp:
+            continue
+        uc = _union([(k[0], k[1]) for k in cp])
+        un = _union([(k[0], k[1]) for k in nc])
+        wall = max(k[1] for k in ks) - min(k[0] for k in ks)
+        last_c = max(k[1] for k in cp)
+        drain = max(0.0, (max(k[1] for k in nc) - last_c)) if nc else 0.0
+        busy = _measure(uc)
+        # NCCL launch-to-start delay: start - max(CPU launch, previous AR end, producer end)
+        delays = []
+        comp_by_launch = sorted((launch.get(k[3], k[0]), k[1]) for k in cp)
+        prev_end = None
+        for k in sorted(nc):
+            lt = launch.get(k[3])
+            ready = lt if lt is not None else k[0]
+            # producer: the last compute kernel the CPU launched before this AR (its input GEMM)
+            prod = [ce for (cl, ce) in comp_by_launch if lt is not None and cl < lt]
+            if prod:
+                ready = max(ready, prod[-1])
+            if prev_end is not None:
+                ready = max(ready, prev_end)
+            delays.append(k[0] - ready)
+            prev_end = k[1]
+        res.append({
+            "wall": wall / 1e3,
+            "ar_n": len(nc),
+            "ar_sum": sum(k[1] - k[0] for k in nc) / 1e3,
+            "ar_each": [round((k[1] - k[0]) / 1e3, 3) for k in sorted(nc)],
+            "ar_uncovered": _minus(un, uc) / 1e3,
+            "compute_sum": sum(k[1] - k[0] for k in cp) / 1e3,
+            "gemm_sum": sum(k[1] - k[0] for k in cp if _is_gemm(k[2])) / 1e3,
+            "compute_busy": busy / 1e3,
+            "compute_idle_in_block": (wall - busy - drain) / 1e3,
+            "drain": drain / 1e3,
+            "nccl_delay_ms": [round(d / 1e3, 3) for d in delays],
+            "nccl_grids": sorted({str(k[5]) for k in nc}),
+            "nccl_names": sorted({k[2][:60] for k in nc}),
+        })
+    return res
+
+
+def arms_phase(rank, block, compiled, call, inputs, pristine):
+    from torch._dynamo.utils import counters
+
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
+
+    art = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp")
+    x = inputs[0]
+    gname = block._tp_overlap_group_name
+    base_chunks = block._tp_overlap_chunks
+    res = {"group_name": str(gname), "base_chunks": base_chunks,
+           "splits": {k: h3._row_chunks(M, 4, weights=w) for k, w in SPLITS.items()}}
+    # Process groups. Each dedicated group is created (world-collective) in the same order on
+    # both ranks; device memory before/after shows the cost of a second communicator.
+    torch.cuda.synchronize()
+    free0 = torch.cuda.mem_get_info()[0]
+    pgs = {"shared": dist.distributed_c10d._resolve_process_group(gname)}
+    mem = {}
+    for name, spec in PGS.items():
+        if spec is None:
+            continue
+        f0 = torch.cuda.mem_get_info()[0]
+        opts = dist.ProcessGroupNCCL.Options()
+        opts.is_high_priority_stream = spec[1]
+        if spec[0]:
+            opts.config.min_ctas = spec[0]
+            opts.config.max_ctas = spec[0]
+        pgs[name] = dist.new_group([0, 1], backend="nccl", pg_options=opts)
+        t = torch.ones(1 << 20, device="cuda", dtype=torch.bfloat16)
+        dist.all_reduce(t, group=pgs[name])
+        torch.cuda.synchronize()
+        mem[name] = round((f0 - torch.cuda.mem_get_info()[0]) / 2**20, 1)
+    # the shipped helper (default setting) must hand back an equivalent group
+    helper_pg = h3.h3_dedicated_tp_group(gname, h3._TP_OVERLAP_PG_CTAS, h3._TP_OVERLAP_PG_HIGH_PRIORITY) \
+        if hasattr(h3, "h3_dedicated_tp_group") else None
+    res["helper_pg_built"] = helper_pg is not None
+    res["pg_mem_mib"] = mem
+    res["pg_mem_total_mib"] = round((free0 - torch.cuda.mem_get_info()[0]) / 2**20, 1)
+
+    def set_arm(arm):
+        _, pgn, sp = arm
+        block._tp_overlap_pg = pgs[pgn]
+        block._tp_overlap_weights = SPLITS[sp]
+        block._tp_overlap_chunks = base_chunks
+
+    # Reference: eager serialized block (overlap off), computed once.
+    block._tp_overlap_chunks = 0
+    with torch.inference_mode():
+        ref = call(block).clone()
+    block._tp_overlap_chunks = base_chunks
+    torch.cuda.synchronize()
+    if rank == 0:
+        log("reference (eager serial) ready")
+
+    # ---- timing: interleaved rounds, every arm in every round, rotated order -------------------
+    ROUNDS, WU, TI = 4, 2, 8
+    times = {a[0]: [] for a in ARMS}
+    for arm in ARMS:  # compile/warm every arm once (no recompiles expected: pg/weights not guarded)
+        set_arm(arm)
+        for _ in range(WARMUP):
+            call(compiled)
+    torch.cuda.synchronize()
+    for r in range(ROUNDS):
+        order = ARMS[r % len(ARMS):] + ARMS[:r % len(ARMS)]
+        if r % 2:
+            order = order[::-1]
+        for arm in order:
+            set_arm(arm)
+            for _ in range(WU):
+                call(compiled)
+            for _ in range(TI):
+                dist.barrier()
+                torch.cuda.synchronize()
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record()
+                call(compiled)
+                e.record()
+                e.synchronize()
+                times[arm[0]].append(s.elapsed_time(e))
+        if rank == 0:
+            log(f"round {r} done: " + ", ".join(f"{k}={statistics.median(v):.2f}" for k, v in times.items()))
+
+    def st(ts):
+        ts = sorted(ts)
+        n = len(ts)
+        med = statistics.median(ts)
+        p10, p90 = ts[int(0.1 * (n - 1))], ts[int(0.9 * (n - 1) + 0.5)]
+        return {"median_ms": round(med, 3), "p10": round(p10, 3), "p90": round(p90, 3),
+                "noise": round((p90 - p10) / med, 4), "n": n}
+
+    res["timing"] = {k: st(v) for k, v in times.items()}
+
+    # ---- untimed repeat check: same warmup/iteration counts, bitwise vs reference ---------------
+    check = {}
+    ok = True
+    for arm in ARMS:
+        set_arm(arm)
+        counters.clear()
+        bad = []
+        stats_wu = None
+        for it in range(WARMUP + ITERS):
+            poison = torch.full_like(x, float("nan"))
+            del poison
+            y = call(compiled)
+            torch.cuda.synchronize()
+            if not torch.equal(y, ref):
+                bad.append(it)
+            peer = y.clone()
+            dist.broadcast(peer, src=0)
+            if not torch.equal(peer, y):
+                bad.append(f"rank_mismatch@{it}")
+            for t, p in zip((inputs[0], inputs[1], inputs[2], inputs[3][0], inputs[3][1]), pristine):
+                if not torch.equal(t, p):
+                    bad.append(f"input_changed@{it}")
+            if it == WARMUP - 1:
+                stats_wu = dict(counters["stats"])
+            del y, peer
+        rec = dict(counters["stats"]) != stats_wu
+        check[arm[0]] = {"bitwise_all_iters": not bad, "bad": bad[:6], "recompiled_after_warmup": rec}
+        ok = ok and not bad and not rec
+    res["check"] = check
+    res["check_passed"] = ok
+    if rank == 0:
+        log(f"check passed={ok}: {[(k, v['bitwise_all_iters']) for k, v in check.items()]}")
+    res["peak_mem_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+
+    # ---- untimed torch.profiler pass, ~3 iterations per arm ------------------------------------
+    from torch.profiler import ProfilerActivity, profile
+
+    prof_res = {}
+    arms_by_name = {a[0]: a for a in ARMS}
+    plist = [(n, arms_by_name[n]) for n in PROFILE_ARMS] + [("serial", None)]
+    for name, arm in plist:
+        if arm is None:
+            block._tp_overlap_chunks = 0
+        else:
+            set_arm(arm)
+        for _ in range(3):
+            call(compiled)
+        torch.cuda.synchronize()
+        dist.barrier()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            for _ in range(3):
+                dist.barrier()
+                torch.cuda.synchronize()
+                call(compiled)
+                torch.cuda.synchronize()
+                time.sleep(0.03)
+        path = os.path.join(art, f"trace_{name}.r{rank}.json")
+        prof.export_chrome_trace(path)
+        try:
+            it = _analyze_trace(path)
+            prof_res[name] = it
+        except Exception as ex:
+            prof_res[name] = {"error": repr(ex)}
+        if rank == 0:
+            log(f"profiled {name}: {len(prof_res[name]) if isinstance(prof_res[name], list) else prof_res[name]}")
+    block._tp_overlap_chunks = base_chunks
+    # summarize: median over iterations
+    summ = {}
+    ser = prof_res.get("serial")
+    ser_gemm = statistics.median([i["gemm_sum"] for i in ser]) if isinstance(ser, list) and ser else None
+    ser_comp = statistics.median([i["compute_sum"] for i in ser]) if isinstance(ser, list) and ser else None
+    ser_ar = statistics.median([e for i in ser for e in i["ar_each"]]) if isinstance(ser, list) and ser else None
+    for name, its in prof_res.items():
+        if not isinstance(its, list) or not its:
+            continue
+        md = lambda k: round(statistics.median([i[k] for i in its]), 3)
+        d = {k: md(k) for k in ("wall", "ar_sum", "ar_uncovered", "compute_sum", "gemm_sum", "compute_busy",
+                                "compute_idle_in_block", "drain")}
+        d["ar_n"] = its[0]["ar_n"]
+        d["ar_each_med"] = [round(statistics.median([i["ar_each"][j] for i in its if len(i["ar_each"]) > j]), 3)
+                            for j in range(its[0]["ar_n"])]
+        dl = sorted(x for i in its for x in i["nccl_delay_ms"])
+        d["nccl_delay_med_ms"] = round(statistics.median(dl), 3) if dl else None
+        d["nccl_delay_max_ms"] = round(max(dl), 3) if dl else None
+        d["nccl_grids"] = its[0]["nccl_grids"]
+        d["nccl_names"] = its[0]["nccl_names"][:3]
+        if ser_gemm:
+            d["stretch_gemm"] = round(d["gemm_sum"] / ser_gemm, 4)
+            d["stretch_compute_ms"] = round(d["compute_sum"] - ser_comp, 3)
+            d["stretch_compute"] = round(d["compute_sum"] / ser_comp, 4)
+        if ser_ar:
+            d["serial_ar_full_M_ms"] = ser_ar
+        summ[name] = d
+    res["profile"] = summ
+    return res
 
 
 def main():
@@ -264,8 +595,27 @@ def main():
     ap.add_argument("ckpt")
     ap.add_argument("--mode", default="time")
     ap.add_argument("--chunks", default="2,4,8")
+    ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--pair-check", action="store_true")
     args = ap.parse_args()
+    global ITERS
+    ITERS = args.iters
+    os.environ["BLOCK_PAIR_ITERS"] = str(args.iters)  # spawned workers re-import this module
     chunks = [int(c) for c in args.chunks.split(",") if c]
+    pair = None
+    if args.pair_check:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from ar_inplace_bench import pair_check
+
+        pair = pair_check()
+        if pair.get("wrong_pair") or pair.get("relation") != "PIX":
+            print(json.dumps({"wrong_pair": True, "pair": pair}), flush=True)
+            return
+    if args.mode == "arms":
+        art = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp")
+        os.environ.setdefault("NCCL_DEBUG", "INFO")
+        os.environ.setdefault("NCCL_DEBUG_SUBSYS", "INIT,ENV")
+        os.environ.setdefault("NCCL_DEBUG_FILE", os.path.join(art, "nccl_debug.%h.%p.log"))
     # A fixed rendezvous port collides with sibling jobs (shared network namespace).
     import socket
 
@@ -293,6 +643,37 @@ def main():
         }))
     elif args.mode == "trace":
         print(json.dumps({"ms_per_block": r0["trace"], "rank1": res[1]["trace"]}))
+    elif args.mode == "arms":
+        import glob
+
+        art = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp")
+        nccl_lines = []
+        for fn in sorted(glob.glob(os.path.join(art, "nccl_debug.*.log"))):
+            with open(fn, errors="replace") as f:
+                for ln in f:
+                    if any(k in ln for k in ("coll channels", "CTA", "NCHANNELS", "set by environment",
+                                             "minCTAs", "maxCTAs", "Config")):
+                        nccl_lines.append(ln.strip()[-220:])
+        t0m = r0["timing"]
+        base = t0m["main"]["median_ms"]
+        rel = {k: round(v["median_ms"] / base - 1, 4) for k, v in t0m.items()}
+        full = {"pair": pair, "rank0": r0, "rank1": res[1], "nccl_debug_lines": nccl_lines[:80]}
+        with open(os.path.join(art, "arms_result.json"), "w") as f:
+            json.dump(full, f, indent=1)
+        print(json.dumps({
+            "passed": bool(r0["check_passed"] and res[1]["check_passed"]),
+            "pair": {k: (pair or {}).get(k) for k in ("physical_ids", "relation", "link_width_current")},
+            "rel_vs_main": rel, "aa": rel.get("main_aa"),
+            "timing_rank0": t0m,
+            "check_rank0": {k: v["bitwise_all_iters"] for k, v in r0["check"].items()},
+            "check_rank1": {k: v["bitwise_all_iters"] for k, v in res[1]["check"].items()},
+            "pg_mem_mib": [r0["pg_mem_mib"], res[1]["pg_mem_mib"]],
+            "peak_mem_gib": [r0["peak_mem_gib"], res[1]["peak_mem_gib"]],
+            "helper_pg_built": [r0["helper_pg_built"], res[1]["helper_pg_built"]],
+            "profile_rank0": r0["profile"], "profile_rank1": res[1]["profile"],
+            "splits": r0["splits"],
+            "nccl_debug_lines": nccl_lines[:30],
+        }))
     else:
         print(json.dumps({
             "passed": bool(r0["passed"] and res[1]["passed"]),
