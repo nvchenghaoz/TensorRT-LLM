@@ -97,7 +97,14 @@ def main():
                     "recompil", "wait_tensor", "cache_size_limit", "memcpy")
             hits = [i for i, ln in enumerate(lines) if any(k in ln for k in keys)]
             shown = set()
-            for i in hits[:400]:
+            # Full call() body of the first rank-0 graph and of the last graph compiled.
+            starts = [i for i, ln in enumerate(lines) if "def call(" in ln and "[rank0]" in ln]
+            for st in starts[:1] + starts[-1:]:
+                for j in range(st, min(len(lines), st + 260)):
+                    print(f"[call {j}] {lines[j][lines[j].find('[__output_code]') + 15:][:260]}", flush=True)
+                    if "return (" in lines[j]:
+                        break
+            for i in hits[:0]:
                 for j in range(max(0, i - 2), min(len(lines), i + 3)):
                     if j not in shown:
                         shown.add(j)
