@@ -459,7 +459,13 @@ class MiniMaxH3Pipeline(BasePipeline):
         steps = getattr(self, "_fastvideo_inference", {}).get("dmd_denoising_steps")
         if steps is not None:
             return len(steps) + 1
-        return super().default_warmup_steps
+        steps = super().default_warmup_steps
+        # H3 runs num_inference_steps - 1 forwards, so the base 2-step warmup is
+        # one forward and can never reach a step cache's cached path. With a
+        # cache configured, warm up 2 forwards (the enabler caches the second).
+        if getattr(self.pipeline_config, "cache", None) is not None:
+            steps = max(steps, 3)
+        return steps
 
     @property
     def default_warmup_resolutions(self) -> list[tuple[int, int]]:

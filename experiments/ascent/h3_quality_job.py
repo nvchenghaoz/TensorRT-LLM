@@ -154,7 +154,10 @@ def main() -> None:
     try:
         for tag in tags:
             if tag != "engine":  # "engine": run with the committed engine.json as is
-                ENGINE.write_text(json.dumps({"visual_gen_args": {"cache_config": CONFIGS[tag]}, "env": {}}))
+                # Replace cache_config only; keep main's other keys (attention, step_precision).
+                eng = json.loads(original) if original else {}
+                eng.setdefault("visual_gen_args", {})["cache_config"] = CONFIGS[tag]
+                ENGINE.write_text(json.dumps(eng))
             art = root / tag
             print(f"[quality] === {tag}: {ENGINE.read_text()}", flush=True)
             check = run_check(h, art)

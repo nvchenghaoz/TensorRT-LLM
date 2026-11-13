@@ -4,11 +4,11 @@
       "cache_backend": "cache_dit",
       "Fn_compute_blocks": 8,
       "Bn_compute_blocks": 0,
-      "max_warmup_steps": 14,
-      "max_continuous_cached_steps": 2,
+      "max_warmup_steps": 8,
+      "max_continuous_cached_steps": -1,
       "residual_diff_threshold": 0.08,
-      "scm_compute_bins": [14, 1, 1, 1, 1, 1, 1, 1, 1, 1, 6],
-      "scm_cache_bins": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+      "scm_compute_bins": [8, 1, 1, 1, 1, 1, 2],
+      "scm_cache_bins": [9, 9, 9, 4, 2, 1],
       "scm_steps_policy": "static"
     },
     "attention_config": {
