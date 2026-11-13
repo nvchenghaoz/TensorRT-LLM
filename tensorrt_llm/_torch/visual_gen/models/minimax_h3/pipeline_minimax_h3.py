@@ -110,6 +110,37 @@ def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3) -> None:
     vae.calibrate_tile_decode_memory()
 
 
+# Frames per chunk of the uint8 post in ``_video_to_uint8``. Any value gives the same bits; 4 frames of
+# 768x1344x3 fp32 is ~50 MB, so each chunk's fp32 passes stay in the 128 MB L2 of an RTX PRO 6000.
+_POST_CHUNK_FRAMES = 4
+
+
+def _video_to_uint8(
+    video: torch.Tensor,
+    pixel_mean: torch.Tensor,
+    pixel_std: torch.Tensor,
+    chunk_frames: int = _POST_CHUNK_FRAMES,
+) -> torch.Tensor:
+    """Map a decoded ``[B, C, T, H, W]`` video to a contiguous ``[B, T, H, W, C]`` uint8 video.
+
+    Bitwise equal to ``(video.float() * pixel_std + pixel_mean).clamp(0, 1)`` followed by
+    ``(video.permute(0, 2, 3, 4, 1) * 255).round().to(torch.uint8)``: the same eager fp32 ops in the
+    same order, one kernel each (no contraction), run in place on one temporal chunk at a time. That
+    avoids the two full-video fp32 transients (1.54 GB each at 124x768x1344), and the result is
+    contiguous in the rgb24 order the encoder wants, so its ``reshape(-1)`` is a view. ``video`` is
+    never written (``copy=True`` also covers an fp32 decoder output).
+    """
+    b, c, t, h, w = video.shape
+    out = torch.empty((b, t, h, w, c), dtype=torch.uint8, device=video.device)
+    for t0 in range(0, t, chunk_frames):
+        t1 = min(t0 + chunk_frames, t)
+        x = video[:, :, t0:t1].to(torch.float32, copy=True)
+        x.mul_(pixel_std).add_(pixel_mean).clamp_(0, 1).mul_(255).round_()
+        out[:, t0:t1].copy_(x.permute(0, 2, 3, 4, 1))
+        del x
+    return out
+
+
 def _component_skipped(
     skip_components: list[str | PipelineComponent],
     component: PipelineComponent,
@@ -592,10 +623,14 @@ class MiniMaxH3Pipeline(BasePipeline):
     def _log_peak_memory(self, phase: str) -> None:
         """Host-only allocator counters for this rank (no device sync)."""
         gib = 1024**3
+        stats = torch.cuda.memory_stats()
         print(
             f"[step_precision] rank={self.rank} peak_memory {phase}: "
             f"max_allocated={torch.cuda.max_memory_allocated() / gib:.2f} GiB "
             f"max_reserved={torch.cuda.max_memory_reserved() / gib:.2f} GiB "
+            f"num_alloc_retries={stats.get('num_alloc_retries', 0)} "
+            f"num_ooms={stats.get('num_ooms', 0)} "
+            f"free_device={torch.cuda.mem_get_info()[0] / gib:.3f} GiB "
             f"total={torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / gib:.2f} GiB",
             flush=True,
         )
@@ -1247,8 +1282,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             video = self.vae.decode(latents, return_dict=False)[0]
         pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=self.device).view(1, -1, 1, 1, 1)
         pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=self.device).view(1, -1, 1, 1, 1)
-        video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
-        return (video.permute(0, 2, 3, 4, 1) * 255).round().to(torch.uint8)
+        return _video_to_uint8(video, pixel_mean, pixel_std)
 
     def _decode_audio(
         self,
