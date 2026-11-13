@@ -91,11 +91,15 @@ def run_check(h: dict, art: Path) -> dict:
 def decision_lines(path: Path) -> list:
     if not path.is_file():
         return []
+    import re
+
     out = []
     for ln in path.read_text(errors="replace").splitlines():
-        if "Cache-DiT decisions" in ln:
-            i = ln.find("rank=")
-            out.append(ln[i:i + 240] if i >= 0 else ln[-240:])
+        # The context name embeds a per-process object id; compare only the decisions.
+        m = re.search(r"Cache-DiT decisions rank=\d+: context=\S+ (steps=\d+ cached=\d+ "
+                      r"cached_steps=\[[^\]]*\])", ln)
+        if m:
+            out.append(m.group(1))
     return out
 
 
@@ -111,9 +115,9 @@ def summarize(tag: str, check: dict, art: Path) -> dict:
         out["server_cache_config"] = yaml.safe_load(yaml_path.read_text()).get("cache_config")
     r0 = decision_lines(art / "logs" / "server-check.log")
     r1 = decision_lines(art / "logs" / "server-check-rank1.log")
-    strip = [ln.replace("rank=0", "rank=X") for ln in r0]
     out["decisions_rank0"] = r0
-    out["ranks_identical"] = bool(r0) and strip == [ln.replace("rank=1", "rank=X") for ln in r1]
+    out["decisions_rank1"] = r1
+    out["ranks_identical"] = bool(r0) and r0 == r1
     floor = {}
     for p in check.get("variation_pairs", []):
         if p.get("lpips") is not None and p.get("key"):
@@ -149,7 +153,8 @@ def main() -> None:
     results = {}
     try:
         for tag in tags:
-            ENGINE.write_text(json.dumps({"visual_gen_args": {"cache_config": CONFIGS[tag]}, "env": {}}))
+            if tag != "engine":  # "engine": run with the committed engine.json as is
+                ENGINE.write_text(json.dumps({"visual_gen_args": {"cache_config": CONFIGS[tag]}, "env": {}}))
             art = root / tag
             print(f"[quality] === {tag}: {ENGINE.read_text()}", flush=True)
             check = run_check(h, art)
@@ -165,10 +170,11 @@ def main() -> None:
             ENGINE.write_text(original)
 
     sys.path.insert(0, str(BENCH))
-    from ab_common import decode_video
+    from ab_common import decode_video, ensure_ffmpeg
     from ab_judge import Judge, sample_frames
     from PIL import Image
 
+    ensure_ffmpeg(str(store))  # the parent process has no ffmpeg on PATH (job 210)
     prompts = json.loads((BENCH / "prompts.json").read_text())
     judge = Judge(ckpt)
     refs = {k: decode_video(store / manifest["reference"][k])[0] for k in manifest["check_keys"]}
@@ -218,7 +224,8 @@ def main() -> None:
             r.pop("path", None)
         print(f"[quality] {tag} judged " + json.dumps(res, default=str), flush=True)
     judge.close()
-    passed = all(r.get("check_valid") and r.get("repeated_execution_passed") for r in results.values())
+    passed = all(r.get("check_valid") and r.get("repeated_execution_passed") and r.get("ranks_identical")
+                 and r.get("fidelity_pass") for r in results.values())
     print(json.dumps({"passed": bool(results) and passed, "configs": results}, default=str), flush=True)
 
 
