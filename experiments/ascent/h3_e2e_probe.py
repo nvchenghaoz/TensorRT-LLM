@@ -85,6 +85,23 @@ def main():
         }
         print("[probe]", json.dumps(rec), flush=True)
         results.append(rec)
+    log_out = os.environ.get("TORCH_LOGS_OUT")
+    if log_out:
+        import glob
+
+        for path in sorted(glob.glob(log_out + "*")):
+            with open(path, errors="replace") as f:
+                lines = f.read().splitlines()
+            print(f"[probe] torch log {path}: {len(lines)} lines", flush=True)
+            keys = ("all_reduce", "copy_", "clone", "Graph break", "graph break", "Recompiling",
+                    "recompil", "wait_tensor", "cache_size_limit", "memcpy")
+            hits = [i for i, ln in enumerate(lines) if any(k in ln for k in keys)]
+            shown = set()
+            for i in hits[:400]:
+                for j in range(max(0, i - 2), min(len(lines), i + 3)):
+                    if j not in shown:
+                        shown.add(j)
+                        print(f"[tlog {j}] {lines[j][:300]}", flush=True)
     same = len({(x["video_sha256"], x["audio_sha256"]) for x in results}) == 1
     print(json.dumps({"passed": same and all(x["error"] is None for x in results),
                       "repeats_identical": same, "results": results}), flush=True)
