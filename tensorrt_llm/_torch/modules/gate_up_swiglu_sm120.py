@@ -450,9 +450,11 @@ if _CUTE_OK:
 _COMPILED: Dict[tuple, object] = {}
 COMPILE_COUNT = 0
 # 256x160x32 (80 gate + 80 up columns per CTA, the pinned nvjet's tile shape), 3 stages,
-# 8 warps of 64x80, single-buffered ldmatrix fragments (fewer live registers).
+# 8 warps of 64x80, single-buffered ldmatrix fragments (fewer live registers). One CTA per tile
+# (grid = tiles, not persistent): the hardware hands tiles to whichever SMs are free, so the GEMM
+# does not stretch when NCCL all-reduce CTAs hold SMs inside H3's chunked TP overlap.
 DEFAULT_CFG = dict(tile_m=256, tile_n=160, tile_k=32, stages=3, atom_mn=(4, 2), group_m=16,
-                   persistent=True, frag_prefetch=False)
+                   persistent=False, frag_prefetch=False)
 # Below this many rows cuBLAS may pick a different (e.g. split-K) kernel for the unfused GEMM,
 # so the fused path is only taken where nvjet's single in-order K chain is the reference.
 MIN_ROWS = 4096
@@ -461,6 +463,10 @@ _SM_COUNT: Optional[int] = None
 
 
 def gate_up_sm120_available() -> bool:
+    """SM120 with CuTe DSL; TLLM_GATE_UP_SWIGLU_SM120=0 keeps the unfused GEMM -> swiglu chain."""
+    import os
+    if os.environ.get("TLLM_GATE_UP_SWIGLU_SM120", "1") == "0":
+        return False
     if not _CUTE_OK or not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability() == (12, 0)

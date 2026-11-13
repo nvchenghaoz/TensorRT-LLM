@@ -143,6 +143,7 @@ def kernel_names(fn):
 
 CFGS = {
     "SHIP": dict(G.DEFAULT_CFG),
+    "SHIP_persistent": dict(G.DEFAULT_CFG, persistent=True),
     "T128_32s4": dict(tile_m=256, tile_n=128, tile_k=32, stages=4, atom_mn=(4, 2), group_m=16),
     "T160_32s3": dict(tile_m=256, tile_n=160, tile_k=32, stages=3, atom_mn=(4, 2), group_m=16),
     "T160_32s3_nofp": dict(tile_m=256, tile_n=160, tile_k=32, stages=3, atom_mn=(4, 2),
