@@ -56,10 +56,9 @@ ROOT = Path(__file__).resolve().parents[3]
 PHASES = (("f9", 9), ("f20", 20))
 ARMS = [
     ("main_a", (False, 0, False)),
-    ("stage1", (True, 0, False)),
-    ("g188", (True, 188, False)),
+    ("stage1", (True, None, False)),  # the shipped default grid cap (setup_tp_overlap: SM count)
+    ("g0", (True, 0, False)),  # uncapped: one program per row
     ("g64", (True, 64, False)),
-    ("g24", (True, 24, False)),
     ("main_b", (False, 0, False)),
     ("noar", (False, 0, True)),
 ]
@@ -250,8 +249,15 @@ def worker(rank, ckpt, mode, port, iters, blocks_list, q):
     pristine = [t.clone() for t in inputs]
     compiled = [torch.compile(b, mode="default", dynamic=None) for b in blocks]
 
+    shipped_programs = getattr(blocks[0], "_tp_overlap_residual_programs", 0)
+    info["shipped_residual_programs"] = shipped_programs
+    if rank == 0:
+        log(f"shipped residual programs: {shipped_programs}")
+
     def set_arm(flags):
         chunk_res, programs, noar = flags
+        if programs is None:
+            programs = shipped_programs
         for b in blocks:
             b._tp_overlap_chunk_residual = chunk_res
             b._tp_overlap_residual_programs = programs
@@ -534,14 +540,14 @@ def main():
                                                  "link_width_current", "timing_pair")}
     common = {
         "passed": passed,
-        "compared": ("exact arms (stage1, g188/g64/g24 grid caps, main_b) vs main_a = main's compiled chunked "
+        "compared": ("exact arms (stage1 = shipped grid cap, g0 uncapped, g64, main_b) vs main_a = main's compiled chunked "
                      "path (chunk_residual off), forward 9 (BF16 attn) and 20 (FP8 attn), 1 and 2 chained "
                      f"blocks, bitwise per iteration over {WARMUP}+{CHECK_ITERS}, NaN-poisoned output pool, "
                      "rank0 == rank1, inputs read-only, prefetch counts == main_a, AR/wait/hook order == main, "
                      "no recompiles after warmup"),
         "has_stage1": r0["has_stage1"], "pair": pair_lbl,
         "setup": {k: r0.get(k) for k in ("K", "attention_backend", "quant_attention", "chunks", "dedicated_pg",
-                                         "pg_high_priority", "nblocks", "slot")},
+                                         "pg_high_priority", "nblocks", "slot", "shipped_residual_programs")},
         "dynamo": [r0["dynamo"]["recompiled_after_warmup"], r1["dynamo"]["recompiled_after_warmup"]],
         "event_order_ok": [all(v["ok"] for v in r["event_order"].values()) for r in res],
         "check_bad": {f"r{r['rank']}:{k}": v["bad"] for r in res for k, v in r["check"].items()
@@ -562,9 +568,10 @@ def main():
                 "stage1_minus_main_ms_per_block": [tt["stage1_minus_main_ms_per_block"],
                                                    t1["stage1_minus_main_ms_per_block"]],
                 "stage1_vs_main_rel": [tt["stage1_vs_main_rel"], t1["stage1_vs_main_rel"]],
-                "g188_minus_main": tt["g188_minus_main_ms_per_block"],
-                "g64_minus_main": tt["g64_minus_main_ms_per_block"],
-                "g24_minus_main": tt["g24_minus_main_ms_per_block"],
+                "g0_uncapped": tt["g0"],
+                "g0_minus_main_ms_per_block": [tt["g0_minus_main_ms_per_block"], t1["g0_minus_main_ms_per_block"]],
+                "g64_minus_main_ms_per_block": [tt["g64_minus_main_ms_per_block"],
+                                                t1["g64_minus_main_ms_per_block"]],
                 "main_a_minus_noar_ms_per_block": [tt["main_a_minus_noar_ms_per_block"],
                                                    t1["main_a_minus_noar_ms_per_block"]],
             }

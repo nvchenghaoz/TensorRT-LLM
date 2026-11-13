@@ -932,6 +932,17 @@ class MiniMaxH3TransformerBlock(nn.Module):
         self._tp_overlap_pg = None
         # TLLM_H3_TP_CHUNK_RESIDUAL=0 keeps the compiled cat + gated residual after the overlap.
         self._tp_overlap_chunk_residual = os.environ.get("TLLM_H3_TP_CHUNK_RESIDUAL", "1") != "0"
+        # Grid cap for the per-chunk residuals that run under a later down all-reduce: one program
+        # per SM by default (an uncapped one-program-per-row grid slows the concurrent NCCL kernel,
+        # AR d3 2.8 -> 3.3 ms on RTX PRO 6000 PIX); TLLM_H3_TP_RESIDUAL_PROGRAMS overrides (0 = uncapped).
+        programs = int(os.environ.get("TLLM_H3_TP_RESIDUAL_PROGRAMS", "-1"))
+        if programs < 0:
+            programs = (
+                torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+                if torch.cuda.is_available()
+                else 0
+            )
+        self._tp_overlap_residual_programs = programs
         to_out = self.attn.to_out[0]
         to_out_ar = to_out.all_reduce
         down_ar = self.ff.down_proj.all_reduce
@@ -973,7 +984,8 @@ class MiniMaxH3TransformerBlock(nn.Module):
                 logger.info(
                     f"[rank {dist.get_rank() if dist.is_initialized() else 0}] MiniMax-H3 TP "
                     f"overlap: chunks {self._tp_overlap_chunks} weights {self._tp_overlap_weights}, "
-                    f"chunk_residual {self._tp_overlap_chunk_residual}, "
+                    f"chunk_residual {self._tp_overlap_chunk_residual} (residual programs "
+                    f"{self._tp_overlap_residual_programs}), "
                     f"dedicated group {self._tp_overlap_pg is not None} (ctas "
                     f"{_TP_OVERLAP_PG_CTAS}, high priority {_TP_OVERLAP_PG_HIGH_PRIORITY})"
                 )
