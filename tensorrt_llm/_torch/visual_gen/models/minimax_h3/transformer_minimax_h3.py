@@ -809,8 +809,16 @@ class MiniMaxH3TransformerBlock(nn.Module):
         to_out_ar = to_out.all_reduce
         down_ar = self.ff.down_proj.all_reduce
         num_chunks = _tp_overlap_num_chunks()
+        # Read the quant mode from quant_config: Linear.has_any_quant asserts the weights
+        # exist, and the serving loader builds the model with skip_create_weights_in_init.
+        def _quantized(linear: Linear) -> bool:
+            quant_config = getattr(linear, "quant_config", None)
+            return quant_config is not None and quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True
+            )
+
         unquantized = not any(
-            getattr(linear, "has_any_quant", True)
+            _quantized(linear)
             for linear in [to_out] + [m for m in self.ff.modules() if isinstance(m, Linear)]
         )
         if (
