@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from ....attention.backends.interface import PredefinedAttentionMask
+from . import fa2_sm120
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -63,6 +64,12 @@ class VanillaAttention(AttentionBackend):
 
         # SDPA expects [B, H, S, D] format
         self._preferred_layout = AttentionTensorLayout.HND
+
+        # SM120: torch's own FA2 forward with a 256-row / 8-warp CTA, bitwise equal to
+        # SDPA's flash kernel (see fa2_sm120). Built once per process at construction.
+        self._fa2_sm120 = False
+        if head_dim == 128 and self.num_kv_heads == num_heads:
+            self._fa2_sm120 = fa2_sm120.is_available()
 
     def forward(
         self,
@@ -118,6 +125,10 @@ class VanillaAttention(AttentionBackend):
             return F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, scale=self.scale, enable_gqa=enable_gqa
             )
+
+        if self._fa2_sm120 and not is_causal and not enable_gqa:
+            if fa2_sm120.supports(q, k, v):
+                return fa2_sm120.attention(q, k, v, self.scale)
 
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=is_causal, scale=self.scale, enable_gqa=enable_gqa
