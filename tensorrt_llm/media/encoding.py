@@ -34,6 +34,8 @@ _VIDEO_ENCODER: Optional["_VideoEncoder"] = None
 # a second concurrent encode takes the pageable path instead of waiting.
 _PINNED_LOCK = threading.Lock()
 _PINNED_BUFFER: Optional[torch.Tensor] = None
+# Set once the first failed pinned allocation has been logged.
+_PINNED_ALLOC_WARNED = False
 
 # Requested stdin pipe capacity for the ffmpeg child (Linux F_SETPIPE_SZ);
 # fewer writer/reader wakeups per frame. Failure is ignored.
@@ -90,10 +92,10 @@ def _host_numpy(tensor: torch.Tensor) -> Iterator[Any]:
     A CUDA tensor whose elements tile one storage range is copied, storage
     as-is, into the cached pinned buffer (no device temporary); the yielded
     array is a strided view of that buffer and is valid only inside the
-    ``with`` block. Anything else (CPU tensors, gapped views, or a busy
-    buffer) goes through ``tensor.cpu().numpy()``.
+    ``with`` block. Anything else (CPU tensors, gapped views, a busy buffer,
+    or a pinned allocation that fails) goes through ``tensor.cpu().numpy()``.
     """
-    global _PINNED_BUFFER
+    global _PINNED_BUFFER, _PINNED_ALLOC_WARNED
     span = _dense_storage_span(tensor) if tensor.is_cuda else None
     if span is None or not _PINNED_LOCK.acquire(blocking=False):
         yield tensor.cpu().numpy()
@@ -103,7 +105,22 @@ def _host_numpy(tensor: torch.Tensor) -> Iterator[Any]:
         nbytes = numel * tensor.element_size()
         if _PINNED_BUFFER is None or _PINNED_BUFFER.numel() < nbytes:
             _PINNED_BUFFER = None
-            _PINNED_BUFFER = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+            try:
+                _PINNED_BUFFER = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+            except Exception as e:
+                # Host pinned-memory pressure (cudaHostAlloc failure): never fail
+                # the save; copy pageable instead (same bytes) and retry pinned
+                # on the next request.
+                _PINNED_BUFFER = None
+                if not _PINNED_ALLOC_WARNED:
+                    _PINNED_ALLOC_WARNED = True
+                    logger.warning(
+                        f"Pinned video staging buffer of {nbytes} B unavailable ({e}); "
+                        "using a pageable device-to-host copy"
+                    )
+        if _PINNED_BUFFER is None:
+            yield tensor.cpu().numpy()
+            return
         host_flat = _PINNED_BUFFER[:nbytes].view(tensor.dtype)
         with torch.cuda.device(tensor.device):
             stream = torch.cuda.current_stream()
