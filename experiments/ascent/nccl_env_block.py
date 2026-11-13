@@ -17,6 +17,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_WIN = {"NCCL_P2P_USE_CUDA_MEMCPY": "1"}
+NCH8_ONLY = False
 
 
 ART = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp")
@@ -82,30 +83,39 @@ def run(cmd, env_add, tag, timeout=900):
 
 def chan_phase(ckpt, py, bp, dbg, out):
     """CE hang probe, then channel-count winners in the chunked block regime."""
-    probe = os.path.join(HERE, "nccl_ce_hang_probe.py")
-    out["probe"] = {}
-    for v, env in (("plain", ENV_WIN), ("async4", ENV_WIN), ("sync", ENV_WIN), ("malloc", ENV_WIN),
-                   ("free", ENV_WIN), ("free_noCE", {})):
-        r = run([py, probe, v.replace("_noCE", "")], {**env, **dbg}, f"probe_{v}", timeout=100)
-        out["probe"][v] = {"ok": bool(r.get("ok")), "rc": r["_rc"], "wall_s": r["_wall_s"]}
     n16 = {"NCCL_MIN_NCHANNELS": "16", "NCCL_MAX_NCHANNELS": "16"}
     n8 = {"NCCL_MIN_NCHANNELS": "8", "NCCL_MAX_NCHANNELS": "8"}
-    arms = [("default", dbg), ("nch16", {**n16, **dbg}), ("nch8", {**n8, **dbg}), ("default_aa", dbg),
-            ("nch16_rep", {**n16, **dbg})]
+    out["probe"] = {}
+    if NCH8_ONLY:
+        # nch8 confirmation: alternating replicates in the chunked block regime, check under nch8
+        arms = [("default", dbg), ("nch8", {**n8, **dbg}), ("default_aa", dbg), ("nch8_rep", {**n8, **dbg}),
+                ("default_aa2", dbg), ("nch8_rep2", {**n8, **dbg})]
+        n16 = n8
+    else:
+        probe = os.path.join(HERE, "nccl_ce_hang_probe.py")
+        for v, env in (("plain", ENV_WIN), ("async4", ENV_WIN), ("sync", ENV_WIN), ("malloc", ENV_WIN),
+                       ("free", ENV_WIN), ("free_noCE", {})):
+            r = run([py, probe, v.replace("_noCE", "")], {**env, **dbg}, f"probe_{v}", timeout=100)
+            out["probe"][v] = {"ok": bool(r.get("ok")), "rc": r["_rc"], "wall_s": r["_wall_s"]}
+        arms = [("default", dbg), ("nch16", {**n16, **dbg}), ("nch8", {**n8, **dbg}), ("default_aa", dbg),
+                ("nch16_rep", {**n16, **dbg})]
     out["block"] = {}
     for tag, env in arms:
         r = run([py, bp, ckpt, "--mode", "time"], env, tag)
         out["block"][tag] = {"step_ms": r.get("batch", {}).get("1", {}).get("step_ms"),
                              "noise": r.get("batch", {}).get("1", {}).get("noise_floor"),
                              "detail": r.get("detail"), "rc": r["_rc"], "key_lines": r.get("_key_lines")}
-    chk = run([py, bp, ckpt, "--mode", "check", "--chunks", "4"], {**n16, **dbg}, "check_nch16")
+    chk = run([py, bp, ckpt, "--mode", "check", "--chunks", "4"], {**n16, **dbg},
+              "check_nch8" if NCH8_ONLY else "check_nch16")
     out["check_nch16"] = chk
     b = out["block"]
-    d = [b[k]["step_ms"] for k in ("default", "default_aa") if b[k]["step_ms"]]
+    d = [b[k]["step_ms"] for k in b if k.startswith("default") and b[k]["step_ms"]]
     s = {}
     if d:
         dm = sum(d) / len(d)
-        s = {"default_ms": d, "aa_delta": abs(d[0] - d[-1]) / dm,
+        c8 = [b[k]["step_ms"] for k in b if k.startswith("nch8") and b[k]["step_ms"]]
+        s = {"default_ms": d, "aa_delta": (max(d) - min(d)) / dm, "nch8_ms": c8,
+             "nch8_mean_rel": round(sum(c8) / len(c8) / dm - 1, 4) if c8 else None,
              "rel_vs_default": {k: (round(v["step_ms"] / dm - 1, 4) if v["step_ms"] else None) for k, v in b.items()},
              "noise": {k: v["noise"] for k, v in b.items()}}
     out["summary"] = s
@@ -121,8 +131,12 @@ def main():
     ckpt = sys.argv[1]
     py = sys.executable
     out = {}
+    global NCH8_ONLY
+    NCH8_ONLY = len(sys.argv) > 3 and sys.argv[3] == "nch8"
     cfgs = "default,nch16,nch8,default_rep" if (len(sys.argv) > 2 and sys.argv[2] == "chan") \
         else "default,p2p_cuda_memcpy,default_rep"
+    if NCH8_ONLY:
+        cfgs = "default,nch8,default_rep"
     ar = run([py, os.path.join(HERE, "ar_inplace_bench.py"), "--mode", "envsweep", "--checkpoint", ckpt,
               "--m", "37966", "--warmup", "5", "--iters", "30", "--quick", "--no-rsag",
               "--configs", cfgs], {}, "ar_quick", timeout=900)
