@@ -2,26 +2,141 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tensor → image/video encoding free functions."""
 
+import contextlib
 import math
 import os
 import shutil
 import struct
 import subprocess  # nosec B404
 import tempfile
+import threading
+import time
 import wave
 from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import torch
 from PIL import Image
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.media import response_timing
 
 # Video encoder availability flags (cached after first check).
 _FFMPEG_PATH: Optional[str] = None
 _VIDEO_ENCODER: Optional["_VideoEncoder"] = None
+
+# One grow-only page-locked staging buffer for device->host video copies,
+# reused across requests: a pinned D2H of a 384 MB video takes ~13 ms against
+# ~190 ms pageable, but a fresh pinned allocation costs 120-150 ms, so it is
+# allocated once and kept. The lock covers the whole encode that reads it;
+# a second concurrent encode takes the pageable path instead of waiting.
+_PINNED_LOCK = threading.Lock()
+_PINNED_BUFFER: Optional[torch.Tensor] = None
+
+# Requested stdin pipe capacity for the ffmpeg child (Linux F_SETPIPE_SZ);
+# fewer writer/reader wakeups per frame. Failure is ignored.
+_FFMPEG_PIPE_BYTES = 1 << 20
+
+
+def _dense_storage_span(tensor: torch.Tensor) -> Optional[Tuple[int, int]]:
+    """``(storage_offset, numel)`` when ``tensor`` covers that storage range exactly once.
+
+    True for any permutation of a contiguous tensor (e.g. the channel-planar
+    video behind a ``[T, H, W, C]`` view), so its storage can be copied as-is
+    and viewed on the host with the same strides.
+    """
+    if tensor.numel() == 0:
+        return None
+    expected = 1
+    for stride, size in sorted((s, n) for s, n in zip(tensor.stride(), tensor.shape) if n != 1):
+        if stride != expected:
+            return None
+        expected *= size
+    return tensor.storage_offset(), tensor.numel()
+
+
+@contextlib.contextmanager
+def _host_numpy(tensor: torch.Tensor) -> Iterator[Any]:
+    """Yield ``tensor`` as a host numpy array with the same shape, strides and values.
+
+    A CUDA tensor whose elements tile one storage range is copied, storage
+    as-is, into the cached pinned buffer (no device temporary); the yielded
+    array is a strided view of that buffer and is valid only inside the
+    ``with`` block. Anything else (CPU tensors, gapped views, or a busy
+    buffer) goes through ``tensor.cpu().numpy()``.
+    """
+    global _PINNED_BUFFER
+    span = _dense_storage_span(tensor) if tensor.is_cuda else None
+    if span is None or not _PINNED_LOCK.acquire(blocking=False):
+        yield tensor.cpu().numpy()
+        return
+    try:
+        offset, numel = span
+        nbytes = numel * tensor.element_size()
+        if _PINNED_BUFFER is None or _PINNED_BUFFER.numel() < nbytes:
+            _PINNED_BUFFER = None
+            _PINNED_BUFFER = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        host_flat = _PINNED_BUFFER[:nbytes].view(tensor.dtype)
+        with torch.cuda.device(tensor.device):
+            stream = torch.cuda.current_stream()
+            host_flat.copy_(tensor.as_strided((numel,), (1,), offset), non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(stream)
+            done.synchronize()
+        yield host_flat.as_strided(tensor.shape, tensor.stride(), 0).numpy()
+    finally:
+        _PINNED_LOCK.release()
+
+
+def _feed_ffmpeg(cmd: List[str], frames: Any, tmp_dir: str) -> float:
+    """Run ffmpeg with the bytes of numpy array ``frames`` (C order) on stdin.
+
+    Raises ``RuntimeError`` with ffmpeg's stderr on a nonzero exit. Only stdin
+    is a pipe: stdout goes to /dev/null and stderr to a file in ``tmp_dir``, so
+    the frames go out in one blocking ``write`` that releases the GIL, instead
+    of ``communicate()``'s selector loop of 4 KB slices. As before, ffmpeg is
+    spawned before ``frames.reshape(-1)`` (a copy for a strided array) so its
+    startup overlaps that copy. Returns the ``perf_counter`` time at which the
+    raw byte view was ready.
+    """
+    stderr_path = os.path.join(tmp_dir, "ffmpeg_stderr.log")
+    t_raw = time.perf_counter()
+    with open(stderr_path, "wb") as stderr_file:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )
+        try:
+            try:
+                import fcntl
+
+                fcntl.fcntl(process.stdin.fileno(), fcntl.F_SETPIPE_SZ, _FFMPEG_PIPE_BYTES)
+            except (ImportError, AttributeError, OSError):
+                pass
+            try:
+                try:
+                    raw = memoryview(frames.reshape(-1))
+                    t_raw = time.perf_counter()
+                    process.stdin.write(raw)
+                finally:
+                    process.stdin.close()
+            except BrokenPipeError:
+                # ffmpeg exited early; its return code and stderr say why.
+                pass
+            process.wait()
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+    if process.returncode != 0:
+        with open(stderr_path, "rb") as f:
+            stderr = f.read()
+        raise RuntimeError(f"ffmpeg encoding failed: {stderr.decode(errors='replace')}")
+    return t_raw
 
 
 def _check_ffmpeg_available() -> bool:
@@ -157,7 +272,27 @@ class _FfmpegCliEncoder(_VideoEncoder):
     ) -> str:
         self._validate_video_tensor(video)
 
-        video_np = video.cpu().numpy()
+        t_start = time.perf_counter()
+        with _host_numpy(video) as video_np:
+            t_host = time.perf_counter()
+            self._encode_host_video(
+                video_np, output_path, frame_rate, audio, audio_sample_rate, t_start, t_host
+            )
+
+        logger.info(f"Saved video{' with audio' if audio is not None else ''} to {output_path}")
+        return output_path
+
+    def _encode_host_video(
+        self,
+        video_np: Any,
+        output_path: str,
+        frame_rate: float,
+        audio: Optional[torch.Tensor],
+        audio_sample_rate: int,
+        t_start: float,
+        t_host: float,
+    ) -> None:
+        """Encode a host ``[T, H, W, 3]`` uint8 array (any strides) to ``output_path``."""
         num_frames, height, width, channels = video_np.shape
         if channels != 3:
             raise ValueError(f"Expected 3-channel RGB video, got {channels} channels")
@@ -205,22 +340,21 @@ class _FfmpegCliEncoder(_VideoEncoder):
                 output_path,
             ]
 
+            t_wav = time.perf_counter()
             try:
-                process = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                raw_frames = memoryview(video_np.reshape(-1))
-                _, stderr = process.communicate(input=raw_frames)
-                if process.returncode != 0:
-                    raise RuntimeError(f"ffmpeg encoding failed: {stderr.decode()}")
+                t_raw = _feed_ffmpeg(cmd, video_np, tmp_dir)
             except FileNotFoundError:
                 raise RuntimeError("ffmpeg not found. Install ffmpeg for video encoding.")
-
-        logger.info(f"Saved video{' with audio' if audio is not None else ''} to {output_path}")
-        return output_path
+            t_end = time.perf_counter()
+        response_timing.stamp(
+            "encode",
+            path=output_path,
+            d2h_numpy_ms=f"{(t_host - t_start) * 1e3:.1f}",
+            wav_ms=f"{(t_wav - t_host) * 1e3:.1f}",
+            spawn_reshape_ms=f"{(t_raw - t_wav) * 1e3:.1f}",
+            ffmpeg_ms=f"{(t_end - t_raw) * 1e3:.1f}",
+            total_ms=f"{(t_end - t_start) * 1e3:.1f}",
+        )
 
     def _write_wav(self, path: str, audio: Any, sample_rate: int) -> None:
         import numpy as np
