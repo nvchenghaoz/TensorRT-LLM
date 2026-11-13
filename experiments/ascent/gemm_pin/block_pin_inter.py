@@ -27,6 +27,7 @@ import tempfile
 import time
 
 import torch
+import torch._dynamo
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -154,7 +155,6 @@ def worker(rank, ckpt, q, uuids, port):
     dist.init_process_group("nccl", rank=rank, world_size=2, device_id=torch.device("cuda", rank),
                             timeout=datetime.timedelta(seconds=600))
     log(f"rank {rank}: process group up")
-    import torch._dynamo
     for k in ("cache_size_limit", "recompile_limit", "accumulated_cache_size_limit",
               "accumulated_recompile_limit"):
         if hasattr(torch._dynamo.config, k):
