@@ -64,7 +64,7 @@ def pair_link():
     link, topo_line = None, None
     for l in topo.splitlines():
         parts = l.split()
-        if parts and parts[0].endswith(f"GPU{i0}") and len(parts) > 1 + i1:
+        if parts and parts[0] == f"GPU{i0}" and len(parts) > 1 + i1:
             link = parts[1 + i1]
             topo_line = l
             break
