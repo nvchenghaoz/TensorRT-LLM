@@ -26,7 +26,13 @@ def main():
     p.add_argument("--no-warmup", action="store_true")
     p.add_argument("--profile-steps", default="",
                    help="TLLM_PROFILE_VISUAL_GEN_START_STOP value (cudaProfilerStart/Stop window)")
+    p.add_argument("--env", action="append", default=[], help="KEY=VALUE set before loading")
     args = p.parse_args()
+    import os
+
+    for kv in args.env:
+        k, v = kv.split("=", 1)
+        os.environ[k] = v
     if args.profile_steps:
         import os
 

@@ -64,6 +64,9 @@ def _pg_nccl_fallback_min_bytes() -> Optional[int]:
     custom all-reduce workspace (getMaxRequiredWorkspaceSize / ifFallbackToNCCL in thop/allreduceOp.cpp).
     None where the deterministic-all-reduce overrides change that choice."""
     truthy = ("1", "true", "on", "yes")
+    if os.environ.get("TLLM_ALLREDUCE_INPLACE_PRIVATE_INPUT",
+                      "1").strip().lower() not in truthy:
+        return None  # kill switch: always run the native op
     if any(
             os.environ.get(name, "").strip().lower() in truthy
             for name in ("FORCE_DETERMINISTIC",
