@@ -133,8 +133,8 @@ def main():
     fb_warnings = [w for w in warnings if "Pinned video staging buffer" in w]
     checks = {
         "no_exception": not errors,
-        "all_saved": len(res) == 4,
-        "all_sha_equal": len(shas) == 4 and len(set(shas.values())) == 1,
+        "all_saved": len(res) == 5,
+        "all_sha_equal": len(shas) == 5 and len(set(shas.values())) == 1,
         "pin_alloc_was_forced_to_fail": pin_calls["raised"] >= 2,
         "fallback_had_no_pinned_buffer": all(
             k in res and res[k]["pinned_buffer_bytes"] is None for k in ("B_fallback_1", "B_fallback_2")
