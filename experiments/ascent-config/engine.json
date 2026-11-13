@@ -7,8 +7,8 @@
       "max_warmup_steps": 8,
       "max_continuous_cached_steps": -1,
       "residual_diff_threshold": 0.08,
-      "scm_compute_bins": [8, 1, 1, 1, 1, 1, 2],
-      "scm_cache_bins": [9, 9, 9, 4, 2, 1],
+      "scm_compute_bins": [8, 1, 1, 1, 1, 1, 1, 1],
+      "scm_cache_bins": [4, 4, 5, 6, 6, 5, 4],
       "scm_steps_policy": "static"
     },
     "attention_config": {
