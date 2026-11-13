@@ -19,28 +19,63 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_WIN = {"NCCL_P2P_USE_CUDA_MEMCPY": "1"}
 
 
-def run(cmd, env_add, tag, timeout=1500):
+ART = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp")
+
+
+def clean(s):
+    return "".join(c if (32 <= ord(c) < 127 or c == "\t") else "?" for c in s)
+
+
+def run(cmd, env_add, tag, timeout=900):
+    import signal
+    import threading
+
     env = dict(os.environ)
     env.update(env_add)
     t0 = time.time()
     print(f"[{time.strftime('%H:%M:%S')}] === {tag}: env={env_add} cmd={' '.join(cmd[1:])}", flush=True)
-    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         errors="replace", start_new_session=True)
+
+    def killer():
+        while True:
+            try:
+                p.wait(timeout=60)
+                return
+            except subprocess.TimeoutExpired:
+                el = time.time() - t0
+                print(f"[{tag}] heartbeat {el:.0f} s", flush=True)
+                if el > timeout:
+                    break
+        print(f"[{tag}] TIMEOUT after {timeout} s: killing process group", flush=True)
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    threading.Thread(target=killer, daemon=True).start()
     last = None
     lines = []
+    logf = open(os.path.join(ART, f"log_{tag}.txt"), "w")
     for ln in p.stdout:
-        ln = ln.rstrip("\n")
+        ln = clean(ln.rstrip("\n"))
         lines.append(ln)
+        logf.write(ln + "\n")
+        logf.flush()
         if ln.startswith("{"):
             last = ln
-        if not ln.startswith("{") or len(ln) < 400:
+        if (not ln.startswith("{") or len(ln) < 400) and "frame #" not in ln:
             print(f"  [{tag}] {ln[-300:]}", flush=True)
-    p.wait(timeout=timeout)
+    logf.close()
+    p.wait()
     try:
         res = json.loads(last) if last else {"error": "no json", "tail": lines[-20:]}
     except Exception as ex:
         res = {"error": repr(ex), "tail": lines[-20:]}
     res["_wall_s"] = round(time.time() - t0, 1)
     res["_rc"] = p.returncode
+    keys = ("NCCL WARN", "rror", "Watchdog", "timeout", "Timeout", "block forward", "check chunks", "Traceback")
+    res["_key_lines"] = [ln[-400:] for ln in lines if any(k in ln for k in keys) and "frame #" not in ln][:25]
     print(f"[{time.strftime('%H:%M:%S')}] === {tag} done rc={p.returncode} in {res['_wall_s']} s", flush=True)
     return res
 
@@ -57,13 +92,31 @@ def main():
         return
     out["ar_quick"] = ar
     bp = os.path.join(HERE, "tp_overlap", "block_pair.py")
-    arms = [("default", {}), ("ce", ENV_WIN), ("default_aa", {}), ("ce_rep", ENV_WIN)]
+    dbg = {"NCCL_DEBUG": "WARN"}
+    arms = [("ce", {**ENV_WIN, **dbg}), ("default", dbg), ("ce_rep", {**ENV_WIN, **dbg}), ("default_aa", dbg)]
     out["block"] = {}
     for tag, env in arms:
         r = run([py, bp, ckpt, "--mode", "time"], env, tag)
         out["block"][tag] = {"step_ms": r.get("batch", {}).get("1", {}).get("step_ms"),
                              "noise": r.get("batch", {}).get("1", {}).get("noise_floor"),
-                             "detail": r.get("detail"), "rc": r["_rc"], "err": r.get("error")}
+                             "detail": r.get("detail"), "rc": r["_rc"], "err": r.get("error"),
+                             "key_lines": r.get("_key_lines")}
+        if tag == "ce" and out["block"][tag]["step_ms"] is None:
+            # diagnose: the serialized path (no chunked overlap) under CE
+            r2 = run([py, bp, ckpt, "--mode", "time"], {**ENV_WIN, **dbg, "TLLM_H3_TP_OVERLAP_CHUNKS": "0"},
+                     "ce_serial")
+            out["block"]["ce_serial"] = {"step_ms": r2.get("batch", {}).get("1", {}).get("step_ms"),
+                                         "rc": r2["_rc"], "key_lines": r2.get("_key_lines")}
+            r3 = run([py, bp, ckpt, "--mode", "time"], {**dbg, "TLLM_H3_TP_OVERLAP_CHUNKS": "0"}, "default_serial")
+            out["block"]["default_serial"] = {"step_ms": r3.get("batch", {}).get("1", {}).get("step_ms"),
+                                              "rc": r3["_rc"]}
+            with open(os.path.join(ART, "nccl_env_block.json"), "w") as f:
+                json.dump(out, f, indent=1)
+            print(json.dumps({"passed": False, "ce_chunked_failed": True,
+                              "label": ar.get("label"), "ar_table": ar.get("table"),
+                              "block": {k: {kk: v.get(kk) for kk in ("step_ms", "rc", "key_lines")}
+                                        for k, v in out["block"].items()}}), flush=True)
+            return
     chk = run([py, bp, ckpt, "--mode", "check", "--chunks", "4"], ENV_WIN, "check_ce")
     out["check_ce"] = chk
     b = out["block"]
