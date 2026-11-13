@@ -822,6 +822,14 @@ class MiniMaxH3TransformerBlock(nn.Module):
             ):
                 if isinstance(linear, Linear) and not _linear_quantized(linear):
                     linear.use_custom_cublas_mm = True
+            if layer_idx == 0:
+                from tensorrt_llm.logger import logger
+
+                logger.info(
+                    "[MiniMax-H3 SM120 cublas pin] block 0: use_custom_cublas_mm qkv/to_out/"
+                    "gate_up/down = "
+                    f"{[getattr(m, 'use_custom_cublas_mm', None) for m in (getattr(self.attn, 'qkv_proj', None), self.attn.to_out[0], getattr(self.ff, 'gate_up_proj', None), self.ff.down_proj)]}"
+                )
 
     def forward(
         self,
