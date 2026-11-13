@@ -969,6 +969,10 @@ class OpenAIServer(_VideoRoutesMixin):
         self.media_storage_path = _resolve_media_dir()
         logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
+        try:
+            self._reserve_video_pinned_buffer()
+        except Exception as e:
+            logger.warning(f"VisualGen: pinned video buffer reservation failed: {e}")
 
     def _supports_image_edit(self) -> bool:
         if not self._is_visual_gen:
