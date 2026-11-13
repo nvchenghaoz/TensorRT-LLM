@@ -128,20 +128,49 @@ def is_available() -> bool:
     return _load_ext() is not None
 
 
+_enabled: Optional[bool] = None
+_num_sms: Optional[int] = None
+
+
+def enabled() -> bool:
+    """is_available(), memoized for hot paths (the extension builds on the first call)."""
+    global _enabled
+    if _enabled is None:
+        _enabled = is_available()
+    return _enabled
+
+
+def _min_q_row_blocks() -> int:
+    # torch's mha_fwd may split KV (flash_fwd_splitkv_kernel, different numerics) when
+    # B*H*ceil(S_q/128) < 0.8 * 2 * num_SMs; at or above that it always runs one split,
+    # the kernel this op reproduces bitwise. Smaller calls stay on SDPA.
+    global _num_sms
+    if _num_sms is None:
+        _num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return int(0.8 * 2 * _num_sms) + 1
+
+
 def supports(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
-    """Shape/dtype/layout gate on SDPA-layout [B, H, S, D] inputs (metadata only)."""
+    """Shape/dtype/layout gate on SDPA-layout [B, H, S, D] inputs (metadata only).
+
+    k and v share one shape; q has the same B, H and D and may have its own S_q (q-sliced
+    calls). Non-causal only (the caller checks)."""
     return (
         q.dim() == 4
+        and k.dim() == 4
         and q.dtype == torch.bfloat16
         and k.dtype == torch.bfloat16
         and v.dtype == torch.bfloat16
         and q.is_cuda
-        and q.shape == k.shape
-        and q.shape == v.shape
+        and k.shape == v.shape
+        and q.shape[0] == k.shape[0]
+        and q.shape[1] == k.shape[1]
         and q.shape[-1] == 128
+        and k.shape[-1] == 128
         and q.stride(-1) == 1
         and k.stride(-1) == 1
         and v.stride(-1) == 1
+        and q.shape[0] * q.shape[1] * ((q.shape[2] + 127) // 128) >= _min_q_row_blocks()
         and not (torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad))
     )
 
@@ -153,11 +182,14 @@ _TAGS = tuple(
 
 @torch.library.custom_op("trtllm_vg::fa2_sm120_fwd", mutates_args=(), tags=_TAGS)
 def fa2_sm120_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
-    """q, k, v: [B, H, S, D] (SDPA layout). Returns the output as [B, S, H, D] contiguous."""
+    """q, k, v: [B, H, S, D] (SDPA layout). Returns the output as [B, S, H, D], strided like
+    q.transpose(1, 2) (contiguous for the usual NHD-contiguous q), as torch's FA2 does."""
     global _calls
     ext = _load_ext()
     b, h, s, d = q.shape
-    out = torch.empty((b, s, h, d), dtype=q.dtype, device=q.device)
+    # torch's mha_fwd allocates out = empty_like(q) on the [B, S, H, D] view, so the strides
+    # follow q's (e.g. a q-slice of a larger buffer keeps its batch stride).
+    out = torch.empty_like(q.transpose(1, 2))
     lse = torch.empty((b, h, s), dtype=torch.float32, device=q.device)
     launches = ext.fwd(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), out, lse, scale, _MAX_REM_FRAC
@@ -172,10 +204,37 @@ def fa2_sm120_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: floa
 
 @fa2_sm120_fwd.register_fake
 def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
-    b, h, s, d = q.shape
-    return q.new_empty((b, s, h, d))
+    return torch.empty_like(q.transpose(1, 2))
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
     """SDPA-layout in and out: returns [B, H, S, D] with SDPA FA2's strides (physical [B, S, H, D])."""
     return fa2_sm120_fwd(q, k, v, scale).transpose(1, 2)
+
+
+_taken = 0
+
+
+def take_calls() -> int:
+    """Op calls in this process since the previous take_calls() (host counter, for logs)."""
+    global _taken
+    n = _calls - _taken
+    _taken = _calls
+    return n
+
+
+def try_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    is_causal: bool = False,
+    enable_gqa: bool = False,
+) -> Optional[torch.Tensor]:
+    """The one dispatch gate for every backend: the op's output (SDPA layout and strides) when
+    it applies, else None and the caller runs torch SDPA. TLLM_FA2_SM120=0 disables it."""
+    if is_causal or enable_gqa or not enabled():
+        return None
+    if not supports(q, k, v):
+        return None
+    return attention(q, k, v, scale)

@@ -126,9 +126,10 @@ class VanillaAttention(AttentionBackend):
                 q, k, v, attn_mask=attn_mask, scale=self.scale, enable_gqa=enable_gqa
             )
 
-        if self._fa2_sm120 and not is_causal and not enable_gqa:
-            if fa2_sm120.supports(q, k, v):
-                return fa2_sm120.attention(q, k, v, self.scale)
+        if self._fa2_sm120:
+            output = fa2_sm120.try_attention(q, k, v, self.scale, is_causal, enable_gqa)
+            if output is not None:
+                return output
 
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=is_causal, scale=self.scale, enable_gqa=enable_gqa

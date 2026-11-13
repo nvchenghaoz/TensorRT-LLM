@@ -12,6 +12,7 @@ import torch
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.interface import PredefinedAttentionMask
+from . import fa2_sm120
 from .interface import AttentionBackend, AttentionTensorLayout
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -620,14 +621,14 @@ class FlashInferAttention(AttentionBackend):
         Main runs the VANILLA backend (torch SDPA, FA2). This is VanillaAttention's call on
         the same HND views of the NHD buffers; the output goes back to NHD as a view.
         """
-        output = torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            is_causal=is_causal,
-            scale=self.scale,
-            enable_gqa=self.num_heads != self.num_kv_heads,
-        )
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        enable_gqa = self.num_heads != self.num_kv_heads
+        # SM120: the bitwise FA2 op (fa2_sm120), same gate as VanillaAttention; else SDPA.
+        output = fa2_sm120.try_attention(q, k, v, self.scale, is_causal, enable_gqa)
+        if output is None:
+            output = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal, scale=self.scale, enable_gqa=enable_gqa
+            )
         return output.transpose(1, 2)
 
     def _log_fp8_tactic_once(self, tensor: torch.Tensor) -> None:

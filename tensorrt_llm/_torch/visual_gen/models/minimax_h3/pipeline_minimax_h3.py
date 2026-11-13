@@ -33,6 +33,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
+from tensorrt_llm._torch.visual_gen.attention.backends import fa2_sm120
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
@@ -1497,7 +1498,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                     f"{len(row_timestep_plan)} warmup={self._is_warmup} attention={attention} "
                     f"linear=bf16(no linear gate on main) "
                     f"cache={'computed' if calls >= num_blocks else 'cached'} "
-                    f"attention_calls={calls}/{num_blocks}",
+                    f"attention_calls={calls}/{num_blocks} "
+                    f"fa2_sm120_calls={fa2_sm120.take_calls()}",
                     flush=True,
                 )
             # A silent all-zero / non-finite velocity has been observed once in
