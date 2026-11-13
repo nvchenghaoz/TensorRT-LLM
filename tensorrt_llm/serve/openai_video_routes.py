@@ -28,7 +28,6 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.media import response_timing
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
@@ -138,39 +137,6 @@ class _VideoRoutesMixin:
     ``self._adjusted_steady_clock``, and ``self.create_error_response`` from
     their own initializer.
     """
-
-    def _reserve_video_pinned_buffer(self) -> None:
-        """Reserve the MP4 encoder's pinned staging buffer once, at startup.
-
-        Sized from the largest configured warmup shape (frames x H x W x 3
-        uint8) that the workers report in READY, so the first full-size
-        request does not pay the page-locked allocation. Skipped (and
-        logged) when the shape is unknown, the server process has no CUDA
-        context, or ffmpeg (the only user of the buffer) is missing.
-        """
-        from tensorrt_llm.media import encoding
-
-        executor = getattr(self.generator, "executor", None)
-        shapes = list(getattr(executor, "warmup_shapes", None) or [])
-        video_shapes = [(h, w, f) for h, w, f in shapes if f > 1]
-        if not video_shapes:
-            logger.info("VisualGen: no video warmup shape; pinned video buffer not reserved")
-            return
-        if not encoding._check_ffmpeg_available():
-            logger.info("VisualGen: ffmpeg not available; pinned video buffer not reserved")
-            return
-        h, w, f = max(video_shapes, key=lambda s: s[0] * s[1] * s[2])
-        nbytes = h * w * f * 3
-        ms = encoding.reserve_pinned_video_bytes(nbytes)
-        if ms is None:
-            logger.info(
-                f"VisualGen: pinned video buffer not reserved ({nbytes} B for {f}x{h}x{w}x3): "
-                "CUDA not initialised in the server process or buffer busy"
-            )
-            return
-        logger.info(
-            f"VisualGen: reserved pinned video buffer {nbytes} B for {f}x{h}x{w}x3 in {ms:.1f} ms"
-        )
 
     async def openai_video_generation_sync(self, raw_request: Request) -> Response:
         """Synchronous video generation endpoint.
@@ -531,14 +497,11 @@ class _VideoRoutesMixin:
         """
         try:
             background_start = time.perf_counter()
-            timing_rid = getattr(handle, "request_id", None)
-            response_timing.stamp("route_start", rid=timing_rid, video_id=video_id)
             job = await VIDEO_STORE.get(video_id)
             if job:
                 job.status = "generating"
                 await VIDEO_STORE.upsert(video_id, job)
             output = await handle
-            response_timing.stamp("route_awaited", rid=timing_rid)
 
             if output.video is None:
                 # Update job status to failed since we're in a background task
@@ -578,13 +541,11 @@ class _VideoRoutesMixin:
                 # Offload the blocking encode to a thread so the event loop
                 # stays responsive during ``postprocessing`` — pollers can
                 # observe the state and other requests progress meanwhile.
-                response_timing.stamp("route_save_start", rid=timing_rid)
                 save_future = asyncio.get_running_loop().run_in_executor(
                     None, lambda: output.save(paths_in, **_save_kwargs)
                 )
                 try:
                     saved_paths = await asyncio.shield(save_future)
-                    response_timing.stamp("route_save_end", rid=timing_rid)
                 except asyncio.CancelledError:
                     # A cancel cannot stop the encode once the thread picked it
                     # up, and ``delete_video`` cleans up by path before this
