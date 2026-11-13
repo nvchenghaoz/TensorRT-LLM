@@ -576,9 +576,11 @@ def enable_cache_dit_for_minimax_h3(
             full_mask_len is not None
             and n < full_mask_len
             and cache_dit_cfg.scm_steps_policy == "static"
+            and getattr(pipeline, "_is_warmup", False)
         ):
-            # Short request (server warmup): compute forward 0, cache forward 1, so the
-            # cached path is warmed before the first full request (pitfall 637).
+            # Server warmup only: compute forward 0, cache forward 1, so the cached path
+            # is warmed before the first full request (pitfall 637). Short client
+            # requests keep the configured bins.
             mask = ([1, 0] + [1] * n)[:n]
         logger.info(
             f"Cache-DiT: MiniMax-H3 step mask ({sum(mask)}/{len(mask)} computed, "
