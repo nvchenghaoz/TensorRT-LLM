@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "ascent-benchmark").is_dir())
 
 
 def sha(p):
