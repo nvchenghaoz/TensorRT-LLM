@@ -67,10 +67,75 @@ def _minimax_h3_adaln_kernel(
     shift_off,
     eps,
     SEQ,
+    ROWS,
+    HAS_RES: tl.constexpr,
+    CH: tl.constexpr,
+    RES_ONLY: tl.constexpr = False,
+):
+    if RES_ONLY:
+        # x1 = x + gate[idx] * a only, streamed chunk by chunk (in place on x1 == x is row-safe).
+        # Rows are strided over the grid, so a launch may use fewer programs than rows (to cap
+        # its HBM draw while all-reduces run beside it); each row's math is the HAS_RES path's.
+        for row in range(tl.program_id(0), ROWS, tl.num_programs(0)):
+            r64 = row.to(tl.int64)
+            mrow = tl.load(idx_ptr + row % SEQ).to(tl.int64)
+            gb = mod_ptr + mrow * mod_stride + gate_off
+            xr = x_ptr + r64 * x_stride
+            ar = a_ptr + r64 * a_stride
+            o1 = x1_ptr + r64 * x1_stride
+            for i in tl.static_range(6):
+                v = _ld(xr, i * CH, D, CH) + _ld(gb, i * CH, D, CH) * _ld(ar, i * CH, D, CH)
+                _st(o1, i * CH, D, v, CH)
+    else:
+        _adaln_row(
+            tl.program_id(0),
+            x_ptr,
+            a_ptr,
+            x1_ptr,
+            m_ptr,
+            w_ptr,
+            mod_ptr,
+            idx_ptr,
+            D,
+            x_stride,
+            a_stride,
+            x1_stride,
+            m_stride,
+            mod_stride,
+            gate_off,
+            scale_off,
+            shift_off,
+            eps,
+            SEQ,
+            HAS_RES,
+            CH,
+        )
+
+
+@triton.jit
+def _adaln_row(
+    row,
+    x_ptr,
+    a_ptr,
+    x1_ptr,
+    m_ptr,
+    w_ptr,
+    mod_ptr,
+    idx_ptr,
+    D,
+    x_stride,
+    a_stride,
+    x1_stride,
+    m_stride,
+    mod_stride,
+    gate_off,
+    scale_off,
+    shift_off,
+    eps,
+    SEQ,
     HAS_RES: tl.constexpr,
     CH: tl.constexpr,
 ):
-    row = tl.program_id(0)
     r64 = row.to(tl.int64)
     # idx has one entry per sequence position; rows are [batch * sequence].
     mrow = tl.load(idx_ptr + row % SEQ).to(tl.int64)
@@ -132,7 +197,36 @@ def h3_adaln_supported(hidden_size: int, dtype: torch.dtype) -> bool:
     return dtype == torch.bfloat16 and torch.cuda.is_available() and hidden_size <= 6 * _CH
 
 
-def _launch(x, a, w, mod, idx, eps, gate_col, scale_col, shift_col):
+def _out_rows(t, rows, D, dtype, name):
+    """``t`` as a [rows, D] row view for the kernel to write; raises instead of copying."""
+    if t.dtype != dtype:
+        raise ValueError(f"{name} must be {dtype}, got {t.dtype}")
+    if t.numel() != rows * D or t.shape[-1] != D:
+        raise ValueError(f"{name} must hold [{rows}, {D}] rows, got {tuple(t.shape)}")
+    try:
+        t2 = t.view(rows, D)
+    except RuntimeError as e:
+        raise ValueError(f"{name} {tuple(t.shape)} / {t.stride()} is not a row view") from e
+    if t2.stride(-1) != 1:
+        raise ValueError(f"{name} rows must be contiguous (stride(-1) == 1)")
+    return t2
+
+
+def _launch(
+    x,
+    a,
+    w,
+    mod,
+    idx,
+    eps,
+    gate_col,
+    scale_col,
+    shift_col,
+    x1_out=None,
+    m_out=None,
+    res_only=False,
+    max_programs=0,
+):
     D = x.shape[-1]
     seq_len = x.shape[-2] if x.ndim >= 2 else x.shape[0]
     if idx.numel() != seq_len:
@@ -143,15 +237,36 @@ def _launch(x, a, w, mod, idx, eps, gate_col, scale_col, shift_col):
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
     rows = x2.shape[0]
-    m = torch.empty((rows, D), dtype=x.dtype, device=x.device)
     has_res = a is not None
+    if res_only and not has_res:
+        raise ValueError("res_only needs the residual branch input a")
+    if res_only:
+        m = None
+    elif m_out is not None:
+        m = _out_rows(m_out, rows, D, x.dtype, "m_out")
+    else:
+        m = torch.empty((rows, D), dtype=x.dtype, device=x.device)
     a2 = a.reshape(-1, D) if has_res else x2
     if has_res and a2.stride(-1) != 1:
         a2 = a2.contiguous()
-    x1 = torch.empty((rows, D), dtype=x.dtype, device=x.device) if has_res else m
+    if not has_res:
+        x1 = m
+    elif x1_out is not None:
+        x1 = _out_rows(x1_out, rows, D, x.dtype, "x1_out")
+    else:
+        x1 = torch.empty((rows, D), dtype=x.dtype, device=x.device)
+    if m is None:
+        m = x1  # not written (RES_ONLY)
+    if w is None:
+        w = x2  # not read (RES_ONLY)
     if mod.stride(-1) != 1:
         mod = mod.contiguous()
-    _minimax_h3_adaln_kernel[(rows,)](
+    if rows == 0:
+        return x1, m
+    programs = rows
+    if res_only and max_programs > 0:
+        programs = min(rows, int(max_programs))
+    _minimax_h3_adaln_kernel[(programs,)](
         x2,
         a2,
         x1,
@@ -170,11 +285,52 @@ def _launch(x, a, w, mod, idx, eps, gate_col, scale_col, shift_col):
         shift_col * D,
         eps,
         seq_len,
+        rows,
         HAS_RES=has_res,
         CH=_CH,
+        RES_ONLY=bool(res_only),
         num_warps=4,
     )
     return x1, m
+
+
+def h3_gate_res_into(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    a: torch.Tensor,
+    mod: torch.Tensor,
+    idx: torch.Tensor,
+    gate_col: int,
+    max_programs: int = 0,
+) -> torch.Tensor:
+    """Eager ``out = x + mod[idx, gate] * a`` (fp32 math, one bf16 rounding) into row view ``out``.
+
+    ``out`` may be ``x`` itself (each element is read before the same program writes it). The gate
+    is read through the table pointer, row stride and column block, never materialized per token.
+    ``max_programs`` > 0 caps the grid (rows are strided over the programs), which caps the
+    launch's memory bandwidth draw when it runs beside an all-reduce; 0 = one program per row.
+    """
+    _launch(
+        x, a, None, mod, idx, 0.0, gate_col, 0, 0, x1_out=out, res_only=True,
+        max_programs=max_programs,
+    )
+    return out
+
+
+def h3_gate_res_norm_mod_into(
+    x1_out: torch.Tensor,
+    x: torch.Tensor,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    mod: torch.Tensor,
+    idx: torch.Tensor,
+    eps: float,
+    gate_col: int,
+    scale_col: int,
+    shift_col: int,
+) -> torch.Tensor:
+    """Eager h3_gate_res_norm_mod writing x1 into the row view ``x1_out``; returns m [rows, D]."""
+    return _launch(x, a, w, mod, idx, eps, gate_col, scale_col, shift_col, x1_out=x1_out)[1]
 
 
 @torch.library.custom_op(
