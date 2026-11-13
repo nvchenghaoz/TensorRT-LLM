@@ -24,7 +24,13 @@ def main():
     p.add_argument("--steps", type=int, default=4)
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--no-warmup", action="store_true")
+    p.add_argument("--profile-steps", default="",
+                   help="TLLM_PROFILE_VISUAL_GEN_START_STOP value (cudaProfilerStart/Stop window)")
     args = p.parse_args()
+    if args.profile_steps:
+        import os
+
+        os.environ["TLLM_PROFILE_VISUAL_GEN_START_STOP"] = args.profile_steps
 
     import torch
 
