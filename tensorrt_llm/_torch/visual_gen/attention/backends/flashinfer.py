@@ -677,11 +677,13 @@ class FlashInferAttention(AttentionBackend):
     ) -> torch.Tensor:
         """Per-tensor FP8 attention, or BF16 SDPA on the gate's leading forwards."""
         bf16 = self._runs_bf16_forward()
+        controller = self._step_controller()
+        if controller is not None and controller.step_index is not None:
+            controller.attention_calls += 1
         if self.layer_idx == 0:
             self._log_forward_path(bf16)
         if bf16:
             return self._run_bf16_dense(q, k, v, is_causal)
-        controller = self._step_controller()
         if controller is not None and controller.warmup and self._bf16_forwards():
             # Startup warmup: run the BF16 phase too, then FP8 (CuTe DSL JIT, quantize
             # autotune), so no timed request compiles or tunes either phase.

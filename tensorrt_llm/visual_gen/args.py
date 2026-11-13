@@ -134,6 +134,28 @@ class QuantAttentionConfig(StrictBaseModel):
     )
 
 
+class StepPrecisionConfig(StrictBaseModel):
+    """Per-denoising-step precision gates.
+
+    One controller on the transformer holds the index of the current denoising forward.
+    Each low-precision consumer runs its BF16 path on forwards with index below its own
+    count and its configured low-precision recipe on the rest. An absent (None) count
+    leaves that consumer on its configured path for every forward.
+    """
+
+    attention_bf16_forwards: Optional[int] = Field(
+        None,
+        ge=0,
+        status="prototype",
+        description=(
+            "Number of leading denoising forwards whose attention runs unquantized BF16 "
+            "(main's VANILLA torch SDPA path) before attention_config.quant_attention_config "
+            "takes over. Early forwards fix the subject and layout. Supported for the "
+            "FLASHINFER per-tensor fp8/fp8 recipe on SM120 with MiniMax-H3."
+        ),
+    )
+
+
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
     Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig, SolAttentionConfig],
@@ -228,6 +250,8 @@ class AttentionConfig(StrictBaseModel):
             ("nvfp4", "fp8", (0, 0, 1)),
         }
         FLASHINFER_RECIPES = {
+            # Per-tensor E4M3 Q/K/V (SM120 only, CuTe DSL sm120_fmha_fp8_ragged_prefill).
+            ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "nvfp4", (0, 0, 0)),
@@ -956,6 +980,11 @@ class VisualGenArgs(StrictBaseModel):
         status="prototype",
     )
     cache_config: Optional[CacheConfig] = Field(None, status="prototype")
+    step_precision: Optional[StepPrecisionConfig] = Field(
+        None,
+        status="prototype",
+        description="Per-denoising-step precision gates (BF16 leading forwards per consumer).",
+    )
     runtime_lora_config: Optional[RuntimeLoRAConfig] = Field(
         None,
         status="prototype",
@@ -991,6 +1020,25 @@ class VisualGenArgs(StrictBaseModel):
         if isinstance(data, dict) and data.get("quant_config", "_sentinel") is None:
             data = {**data, "quant_config": QuantConfig()}
         return data
+
+    @model_validator(mode="after")
+    def _validate_step_precision(self) -> "VisualGenArgs":
+        step_precision = self.step_precision
+        if step_precision is None or step_precision.attention_bf16_forwards is None:
+            return self
+        attention = self.attention_config
+        q_config = attention.quant_attention_config
+        if not (
+            attention.backend == "FLASHINFER"
+            and q_config is not None
+            and (q_config.qk_dtype, q_config.v_dtype) == ("fp8", "fp8")
+        ):
+            raise ValueError(
+                "step_precision.attention_bf16_forwards gates the FLASHINFER per-tensor fp8/fp8 "
+                "attention recipe; set attention_config.backend='FLASHINFER' with "
+                "quant_attention_config {qk_dtype: fp8, v_dtype: fp8}."
+            )
+        return self
 
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:
@@ -1041,6 +1089,7 @@ class VisualGenArgs(StrictBaseModel):
 
 __all__ = [
     "QuantAttentionConfig",
+    "StepPrecisionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
     "SolAttentionConfig",

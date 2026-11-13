@@ -29,6 +29,9 @@ class DenoiseStepController:
         self.step_index: Optional[int] = None
         self.num_steps: Optional[int] = None
         self.warmup = False
+        # Gated attention calls in the current forward (host counter, logging only):
+        # one per transformer block that ran, so a step cache shows as fewer calls.
+        self.attention_calls = 0
 
     def set_step(self, step_index: int, num_steps: int, warmup: bool = False) -> None:
         if num_steps <= 0:
@@ -38,11 +41,13 @@ class DenoiseStepController:
         self.step_index = step_index
         self.num_steps = num_steps
         self.warmup = bool(warmup)
+        self.attention_calls = 0
 
     def reset(self) -> None:
         self.step_index = None
         self.num_steps = None
         self.warmup = False
+        self.attention_calls = 0
 
     def runs_bf16(self, bf16_forwards: Optional[int]) -> bool:
         """Whether a consumer with ``bf16_forwards`` leading BF16 forwards runs BF16 now.
