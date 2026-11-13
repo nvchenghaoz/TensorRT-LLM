@@ -45,6 +45,11 @@ CONFIGS = {
     "w10_alt": dict(_BASE, max_warmup_steps=10, max_continuous_cached_steps=1,
                     scm_compute_bins=[10] + [1] * 16 + [6], scm_cache_bins=[1] * 17),
 }
+# Idea 109: per-tag extra visual_gen_args (each key merged one level into the engine.json value, e.g.
+# {"step_precision": {"attention_bf16_forwards": 6}}), and an optional hook PRE_TAG(tag, results, root)
+# run before each server that may fill CONFIGS/OVERRIDES for the tag or return a skip reason (str).
+OVERRIDES: dict = {}
+PRE_TAG = None
 
 
 def harness(ckpt: str, store: str) -> dict:
@@ -153,10 +158,22 @@ def main() -> None:
     results = {}
     try:
         for tag in tags:
+            skip = PRE_TAG(tag, results, root) if PRE_TAG is not None else None
+            if skip:
+                print(f"[quality] === {tag}: SKIPPED ({skip})", flush=True)
+                results[tag] = {"tag": tag, "skipped": skip, "check_valid": None, "per_prompt": [],
+                                "requests": [], "repeat": []}
+                continue
             if tag != "engine":  # "engine": run with the committed engine.json as is
                 # Replace cache_config only; keep main's other keys (attention, step_precision).
                 eng = json.loads(original) if original else {}
-                eng.setdefault("visual_gen_args", {})["cache_config"] = CONFIGS[tag]
+                vg = eng.setdefault("visual_gen_args", {})
+                vg["cache_config"] = CONFIGS[tag]
+                for key, val in (OVERRIDES.get(tag) or {}).items():
+                    if isinstance(val, dict) and isinstance(vg.get(key), dict):
+                        vg[key] = dict(vg[key], **val)
+                    else:
+                        vg[key] = val
                 ENGINE.write_text(json.dumps(eng))
             art = root / tag
             print(f"[quality] === {tag}: {ENGINE.read_text()}", flush=True)
@@ -182,6 +199,8 @@ def main() -> None:
     judge = Judge(ckpt)
     refs = {k: decode_video(store / manifest["reference"][k])[0] for k in manifest["check_keys"]}
     for tag, res in results.items():
+        if res.get("skipped"):
+            continue
         first = {}
         for r in res["requests"]:
             first.setdefault(r["key"], r["path"])
@@ -228,7 +247,7 @@ def main() -> None:
         print(f"[quality] {tag} judged " + json.dumps(res, default=str), flush=True)
     judge.close()
     passed = all(r.get("check_valid") and r.get("repeated_execution_passed") and r.get("ranks_identical")
-                 and r.get("fidelity_pass") for r in results.values())
+                 and r.get("fidelity_pass") for r in results.values() if not r.get("skipped"))
     print(json.dumps({"passed": bool(results) and passed, "configs": results}, default=str), flush=True)
 
 

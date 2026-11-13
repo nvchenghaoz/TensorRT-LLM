@@ -1468,7 +1468,7 @@ class BasePipeline(nn.Module):
         start_time = time.time()
 
         for i, t in self._profile_denoise_steps(timesteps):
-            step_start = time.time()
+            step_start = time.perf_counter()
 
             current_guidance_scale = self._resolve_step_guidance_scale(
                 t,
@@ -1538,11 +1538,11 @@ class BasePipeline(nn.Module):
 
             # Logging
             if self.rank == 0:
-                step_time = time.time() - step_start
+                step_time = time.perf_counter() - step_start
                 avg_time = (time.time() - start_time) / (i + 1)
                 eta = avg_time * (total_steps - i - 1)
                 logger.info(
-                    f"Step {i + 1}/{total_steps} | {step_time:.2f}s "
+                    f"Step {i + 1}/{total_steps} | {step_time:.4f}s start={step_start:.4f} "
                     f"(trans={t_trans:.2f}s cfg={t_cfg:.3f}s sched={t_sched:.3f}s) | "
                     f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
                 )
