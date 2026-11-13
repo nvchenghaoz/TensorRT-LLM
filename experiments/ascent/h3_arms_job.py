@@ -29,7 +29,7 @@ from h3_cache_arms_table import EXPECTED_CACHED, MASKS, check_masks  # noqa: E40
 
 L2 = "park=0.0390,perfume=0.0198,robot=0.0887"  # landing 10 check, job 371
 SNR_FLAG = {"park_portrait": 1.74, "perfume_bottle": 4.60, "golden_robot": 7.47}
-HEAD = {"E": 8, "D": 8, "C": 8, "fallback": 10, "W": 14, "w14_c2": 14}
+HEAD = {"E": 8, "D": 8, "C": 8, "fallback": 10, "W": 14, "w14_c2": 14, "F": 8, "Es": 8, "Ds": 8, "U31": 8}
 MCC = {"w14_c2": 2}
 
 
@@ -144,10 +144,29 @@ def main():
                                                                          "margin", "increment_over_L2", "passed")}
                                             for k, v in ((a.get("quality") or {}).get("prompts") or {}).items()}
                                 for a in tbl["arms"]}
-    passing = [a for a in ["E", "D", "C", "fallback", "W"] if a in arms
-               and out["arms"][a]["quality"].get("fidelity_pass")
-               and all(r.get("margin_to_floor_plus_0.03", -1) >= 0.005
-                       for r in out["arms"][a]["quality"].get("per_prompt") or [{}])]
+    def min_margin(a):
+        rows = out["arms"][a]["quality"].get("per_prompt") or []
+        vals = [r.get("margin_to_floor_plus_0.03") for r in rows]
+        return min(vals) if rows and None not in vals else -1.0
+
+    def passes(a):
+        return (a in out["arms"] and bool(out["arms"][a]["quality"].get("fidelity_pass"))
+                and len(out["arms"][a]["quality"].get("per_prompt") or []) == 3 and min_margin(a) >= 0.005)
+
+    # Plan 736 order: F; then whichever of E*/U31 passes with the larger min margin; then D*; then periodic.
+    mid = sorted([a for a in ("Es", "U31") if passes(a)], key=lambda a: -min_margin(a))
+    order = ["F"] + mid + ["Ds", "E", "D", "C", "fallback", "W"]
+    passing = [a for a in order if a in arms and passes(a)]
+    out["min_margin"] = {a: min_margin(a) for a in out["arms"]}
+    from h3_cache_arms_table import LPIPS_EST
+    keys = ("park_portrait", "perfume_bottle", "golden_robot")
+    out["measured_over_est"] = {}
+    for a in out["arms"]:
+        est = LPIPS_EST.get(a)
+        rows = {r["key"]: r.get("lpips") for r in out["arms"][a]["quality"].get("per_prompt") or []}
+        if est:
+            out["measured_over_est"][a] = {k: (round(rows[k] / e, 3) if rows.get(k) is not None else None)
+                                           for k, e in zip(keys, est)}
     out["pick_most_aggressive_passing"] = passing[0] if passing else None
     mech_ok = all(v["warmup_ok"] and v["decisions_ranks_identical"] and v["refresh_ranks_identical"]
                   and not v["cudnn_in_yaml"] and v["quality"].get("repeated_execution_passed")
@@ -166,6 +185,7 @@ def main():
                              "snr_flags": v["audio_snr_flags"],
                              "accuracy": (v["quality"].get("accuracy") or {}).get("correct")}
                          for a, v in out["arms"].items()},
+             "min_margin": out["min_margin"], "measured_over_est": out["measured_over_est"],
              "timing": out.get("timing")}
     print(json.dumps(small, default=str), flush=True)
 

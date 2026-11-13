@@ -64,12 +64,45 @@ MASKS: Dict[str, List[int]] = {
     "W": _mask([1] * 14 + [1, 0, 0, 0] * 8 + [1] * 3),
     "main": _mask([1] * N_FORWARDS),
 }
-EXPECTED_CACHED = {"w14_c2": 20, "C": 24, "D": 28, "E": 31, "fallback": 22, "W": 24, "main": 0}
+
+
+def _from_bins(comp: List[int], cache: List[int]) -> List[int]:
+    m: List[int] = []
+    for i, c in enumerate(comp):
+        m += [1] * c
+        if i < len(cache):
+            m += [0] * cache[i]
+    return m
+
+
+# Plan 736 (idea 83 DP masks, Fn8): string and bins must agree.
+_DP = {
+    "F": ("1111111100000000010000000001000000000100001001011", [8, 1, 1, 1, 1, 1, 2], [9, 9, 9, 4, 2, 1]),
+    "Es": ("1111111100000000010000000010000001000010010101111", [8, 1, 1, 1, 1, 1, 1, 4],
+           [9, 8, 6, 4, 2, 1, 1]),
+    "Ds": ("1111111100000001000000100000100001001001010111111", [8, 1, 1, 1, 1, 1, 1, 1, 6],
+           [7, 6, 5, 4, 2, 2, 1, 1]),
+    "U31": ("1111111100100010001000100001000010000100001000011", [8, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+            [2, 3, 3, 3, 4, 4, 4, 4, 4]),
+}
+for _n, (_s, _c, _k) in _DP.items():
+    _m = [int(ch) for ch in _s]
+    assert _m == _from_bins(_c, _k), _n
+    MASKS[_n] = _m
+EXPECTED_CACHED = {"w14_c2": 20, "C": 24, "D": 28, "E": 31, "fallback": 22, "W": 24, "main": 0,
+                   "F": 34, "Es": 31, "Ds": 28, "U31": 31}
 # max_warmup_steps per the brief (the explicit [1]*n prefix). The first compute RUN can be longer
 # (C, D, E start their periods with a 1, so their first run is 9; fallback 11; W 15).
-DENSE_HEAD = {"w14_c2": 14, "W": 14, "fallback": 10, "C": 8, "D": 8, "E": 8, "main": 49}
-FIRST_RUN = {"w14_c2": 14, "W": 15, "fallback": 11, "C": 9, "D": 9, "E": 9, "main": 49}
-PICK_ORDER = ["E", "D", "C", "fallback", "W"]
+DENSE_HEAD = {"w14_c2": 14, "W": 14, "fallback": 10, "C": 8, "D": 8, "E": 8, "main": 49,
+              "F": 8, "Es": 8, "Ds": 8, "U31": 8}
+FIRST_RUN = {"w14_c2": 14, "W": 15, "fallback": 11, "C": 9, "D": 9, "E": 9, "main": 49,
+             "F": 8, "Es": 8, "Ds": 8, "U31": 8}
+# idea 83 LPIPS_est (park, perfume, robot) = LPIPS_292 x S/S(w14_c2); U31 from its uniform-weight S ratio.
+LPIPS_EST = {"C": (0.048, 0.024, 0.107), "D": (0.076, 0.037, 0.162), "E": (0.127, 0.060, 0.257),
+             "fallback": (0.041, 0.021, 0.092), "W": (0.086, 0.041, 0.181),
+             "F": (0.126, 0.060, 0.254), "Es": (0.080, 0.039, 0.166), "Ds": (0.055, 0.027, 0.117),
+             "U31": (0.078, 0.039, 0.177)}
+PICK_ORDER = ["F", "Es", "U31", "Ds", "E", "D", "C", "fallback", "W"]
 
 PROMPTS = {"park": "park_portrait", "perfume": "perfume_bottle", "robot": "golden_robot"}
 BARS = {"park": 0.347, "perfume": 0.166, "robot": 0.508}
