@@ -63,14 +63,15 @@ def probe(ff, path):
     m = re.search(r"Duration: ([\d:.]+)", info)
     if m:
         out["container_duration"] = m.group(1)
-    v = subprocess.run([ff, "-hide_banner", "-i", path, "-map", "0:v:0", "-c", "copy", "-f", "null", "-"],
-                       capture_output=True, text=True).stderr
-    fr = re.findall(r"frame=\s*(\d+)", v)
-    out["frames"] = int(fr[-1]) if fr else None
-    a = subprocess.run([ff, "-hide_banner", "-i", path, "-map", "0:a:0", "-c", "copy", "-f", "null", "-"],
-                       capture_output=True, text=True).stderr
-    t = re.findall(r"time=\s*([\d:.]+)", a)
-    out["audio_duration"] = t[-1] if t else None
+    # Frames: decode every frame to rgb24 and count bytes (as ab_common.decode_video does).
+    v = subprocess.run([ff, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", path, "-map", "0:v:0",
+                        "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True)
+    if out.get("width") and out.get("height"):
+        out["frames"] = len(v.stdout) // (out["width"] * out["height"] * 3)
+    a = subprocess.run([ff, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", path, "-map", "0:a:0",
+                        "-f", "s16le", "-ac", "2", "-ar", "32000", "-"], capture_output=True)
+    out["audio_samples_32k"] = len(a.stdout) // 4
+    out["audio_duration_s"] = round(len(a.stdout) / 4 / 32000, 4)
     return out
 
 
