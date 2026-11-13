@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import ValidationError
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.media import response_timing
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
@@ -497,11 +498,14 @@ class _VideoRoutesMixin:
         """
         try:
             background_start = time.perf_counter()
+            timing_rid = getattr(handle, "request_id", None)
+            response_timing.stamp("route_start", rid=timing_rid, video_id=video_id)
             job = await VIDEO_STORE.get(video_id)
             if job:
                 job.status = "generating"
                 await VIDEO_STORE.upsert(video_id, job)
             output = await handle
+            response_timing.stamp("route_awaited", rid=timing_rid)
 
             if output.video is None:
                 # Update job status to failed since we're in a background task
@@ -541,11 +545,13 @@ class _VideoRoutesMixin:
                 # Offload the blocking encode to a thread so the event loop
                 # stays responsive during ``postprocessing`` — pollers can
                 # observe the state and other requests progress meanwhile.
+                response_timing.stamp("route_save_start", rid=timing_rid)
                 save_future = asyncio.get_running_loop().run_in_executor(
                     None, lambda: output.save(paths_in, **_save_kwargs)
                 )
                 try:
                     saved_paths = await asyncio.shield(save_future)
+                    response_timing.stamp("route_save_end", rid=timing_rid)
                 except asyncio.CancelledError:
                     # A cancel cannot stop the encode once the thread picked it
                     # up, and ``delete_video`` cleans up by path before this
