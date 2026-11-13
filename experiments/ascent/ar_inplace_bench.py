@@ -67,13 +67,23 @@ def worker(rank, args, port):
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
-        "nccl",
+        "cuda:nccl,cpu:gloo",
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=2,
         device_id=torch.device("cuda", rank),
     )
+    # As VisualGenMapping.build_mesh does: register the world/local PGs with the native side.
+    from tensorrt_llm._utils import torch_pybind11_abi
+    from tensorrt_llm.bindings.internal.process_group import init_pg
+
+    local = dist.new_group(ranks=[0, 1], backend="cuda:nccl,cpu:gloo")
+    init_pg(dist.group.WORLD, local, torch_pybind11_abi())
     ar = build_ar(rank)
+    from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
+
+    warmup_named_allreduce_topologies(torch.nn.ModuleList([ar]))
+    torch.cuda.synchronize()
     M, D = args.m, args.d
     log(rank, f"M={M} D={D} bytes={M * D * 2} torch={torch.__version__}")
     gen = torch.Generator(device="cuda").manual_seed(1234 + rank)
