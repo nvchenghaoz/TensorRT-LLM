@@ -28,6 +28,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 M = 37966
+block_vgm = []  # the VisualGenMapping build() made (one per process)
 WARMUP = 5
 ITERS = 20
 
@@ -44,6 +45,7 @@ def build(ckpt, rank):
     with open(os.path.join(ckpt, "transformer", "config.json")) as f:
         cfg = json.load(f)
     vgm = VisualGenMapping(2, rank, tp_size=2)
+    block_vgm[:] = [vgm]
     mc = DiffusionModelConfig(
         pretrained_config=None, mapping=vgm.to_llm_mapping(), visual_gen_mapping=vgm
     )
@@ -163,6 +165,40 @@ def worker(rank, ckpt, mode, chunks, q):
         from torch._dynamo.utils import counters
 
         ok = True
+        # The serving loader builds the model with skip_create_weights_in_init=True; the
+        # overlap setup must work (and enable) before the weights exist.
+        if has_overlap:
+            from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
+
+            with open(os.path.join(ckpt, "transformer", "config.json")) as f:
+                cfg = json.load(f)
+            from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+
+            vgm = block_vgm[0]
+            mc2 = DiffusionModelConfig(
+                pretrained_config=None,
+                mapping=vgm.to_llm_mapping(),
+                visual_gen_mapping=vgm,
+                skip_create_weights_in_init=True,
+            )
+            lazy = h3.MiniMaxH3TransformerBlock(
+                hidden_size=cfg["hidden_size"],
+                num_attention_heads=cfg["num_attention_heads"],
+                attention_head_dim=cfg["attention_head_dim"],
+                ffn_dim=cfg["ffn_dim"],
+                time_embed_dim=cfg["time_embed_dim"],
+                norm_eps=float(cfg.get("norm_eps", 1e-6)),
+                qk_norm_eps=float(cfg.get("qk_norm_eps", 1e-6)),
+                model_config=mc2,
+                layer_idx=1,
+                fuse_bf16_gate_up_swiglu=True,
+            )
+            lazy.setup_tp_overlap(mc2)
+            out["lazy_weights_setup_chunks"] = lazy._tp_overlap_chunks
+            ok = ok and lazy._tp_overlap_chunks == default_chunks > 1
+            if rank == 0:
+                log(f"skip_create_weights_in_init block: overlap chunks {lazy._tp_overlap_chunks}")
+            del lazy
         # Reference: the serialized block as main compiles it (overlap off; its all-reduces
         # go through allreduce_pg_by_name -> c10d NCCL all_reduce), first call.
         if has_overlap:
@@ -263,6 +299,8 @@ def main():
             "compared": "compiled block (serial and chunked overlap) vs eager serialized block, bitwise per iteration over 5 warmup + 20 iterations, both ranks; inputs read-only; no dynamo recompiles after warmup",
             "rank0": r0["check"], "rank1": res[1]["check"],
             "eager_serial_vs_compiled_serial": r0.get("eager_serial_vs_compiled_serial"),
+            "lazy_weights_setup_chunks": [r0.get("lazy_weights_setup_chunks"),
+                                          res[1].get("lazy_weights_setup_chunks")],
         }))
 
 
