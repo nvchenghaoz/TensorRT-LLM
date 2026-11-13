@@ -29,11 +29,20 @@ def main() -> None:
     harness["server"]["visual_gen_args"].pop("attention_config", None)
     print("harness.server:", json.dumps(harness.get("server")), flush=True)
     adapter = WT / "experiments" / "ascent-benchmark" / "run_check.py"
-    proc = subprocess.run([sys.executable, str(adapter), json.dumps(harness)], stdout=subprocess.PIPE,
-                          text=True)
-    out = proc.stdout
-    sys.stdout.write(out[-20000:])
-    last = out.strip().splitlines()[-1] if out.strip() else "{}"
+    # Stream the adapter's stdout (its heartbeat keeps the job from being stopped as silent).
+    proc = subprocess.Popen([sys.executable, str(adapter), json.dumps(harness)], stdout=subprocess.PIPE,
+                            text=True, bufsize=1)
+    lines = []
+    for line in proc.stdout:
+        lines.append(line)
+        if len(line) < 4000:
+            sys.stdout.write(line)
+        else:
+            sys.stdout.write(line[:2000] + " ...[truncated]\n")
+        sys.stdout.flush()
+    proc.wait()
+    nonempty = [ln for ln in lines if ln.strip()]
+    last = nonempty[-1] if nonempty else "{}"
     try:
         res = json.loads(last)
     except Exception:
