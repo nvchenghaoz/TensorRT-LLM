@@ -16,6 +16,8 @@ their own row stride, so a V that is a column slice of the packed qkv buffer is 
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 import triton
@@ -24,6 +26,9 @@ import triton.language as tl
 FP8_E4M3_MAX = 448.0
 # The C++ op's constexpr min_scaling_factor = 1.0f / (FP8_E4M3_MAX * 512.f), rounded to fp32.
 _MIN_SCALING_FACTOR = float(np.float32(1.0) / np.float32(448.0 * 512.0))
+
+# TLLM_FP8_ATTN_PREP_DISABLE=1 falls back to the per-tensor C++ op (main's prep), e.g. for A/B.
+_DISABLED = os.environ.get("TLLM_FP8_ATTN_PREP_DISABLE", "0") == "1"
 
 _BLOCK_R = 16
 _NUM_WARPS = 8
@@ -112,9 +117,12 @@ def _fp8_prep_quantize_kernel(
         partial_ptr + t * n_amax_programs + p_off, mask=p_off < n_amax_programs, other=0.0
     )
     amax = tl.max(partials, axis=0)
-    # (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor), T_S = bf16; IEEE division.
-    scale = tl.maximum(amax / 448.0, MIN_SCALE).to(tl.bfloat16).to(tl.float32)
-    factor = 1.0 / scale
+    # (T_S) std::max(max / FP8_E4M3_MAX, min_scaling_factor), T_S = bf16, then 1.0f / s. The C++
+    # op is built without fast math, so both divisions are IEEE: div_rn. Triton's plain '/' on
+    # fp32 is the approximate div.full.f32; with it a product just below 2^-10 (half the smallest
+    # E4M3 subnormal) can land on the other side and quantize to 0x01 instead of 0x00.
+    scale = tl.maximum(tl.math.div_rn(amax, 448.0), MIN_SCALE).to(tl.bfloat16).to(tl.float32)
+    factor = tl.math.div_rn(1.0, scale)
     if pid == 0:
         tl.store(descale_ptr + t, scale)
     base = _select(t, q_ptr, k_ptr, v_ptr)
@@ -167,6 +175,8 @@ def _sm_count(device: torch.device) -> int:
 
 
 def fp8_qkv_prep_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    if _DISABLED:
+        return False
     if not (q.shape == k.shape == v.shape and q.dim() >= 2 and q.numel() > 0):
         return False
     if not (q.dtype == k.dtype == v.dtype == torch.bfloat16):
@@ -177,7 +187,28 @@ def fp8_qkv_prep_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) ->
     return all(_as_rows(t, width) is not None for t in (q, k, v))
 
 
-def quantize_e4m3_qkv_per_tensor(
+def quantize_qkv_e4m3_per_tensor(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-tensor E4M3 Q, K, V and their descales, bitwise equal to main's FP8 attention prep.
+
+    Returns (q_fp8, k_fp8, v_fp8, descales): CONTIGUOUS float8_e4m3fn tensors with the input
+    shapes, and a float32 device tensor [3] of the q, k, v descales (x ~= x_fp8 * descale); the
+    caller reads it back. q, k, v are BF16 [B, S, H, D]; v may be a strided view of a packed qkv
+    buffer. Supported layouts (fp8_qkv_prep_supported) take the two-launch Triton path; anything
+    else runs the per-tensor C++ op on contiguous copies, exactly as main does.
+    """
+    if fp8_qkv_prep_supported(q, k, v):
+        return _quantize_qkv_triton(q, k, v)
+    outs, descales = [], []
+    for t in (q, k, v):
+        encoded, descale = torch.ops.trtllm.quantize_e4m3_per_tensor(t.contiguous())
+        outs.append(encoded)
+        descales.append(descale.float().reshape(1))
+    return outs[0], outs[1], outs[2], torch.cat(descales)
+
+
+def _quantize_qkv_triton(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -185,11 +216,7 @@ def quantize_e4m3_qkv_per_tensor(
     programs_per_sm: int = _PROGRAMS_PER_SM,
     reverse: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """E4M3 Q, K, V (contiguous, input shapes) and their float32 descales as one [3] tensor.
-
-    Bitwise equal to ``quantize_e4m3_per_tensor`` on each (made contiguous) tensor. Requires
-    ``fp8_qkv_prep_supported(q, k, v)``.
-    """
+    """The Triton path; requires ``fp8_qkv_prep_supported(q, k, v)``."""
     width = q.shape[-1] * q.shape[-2] if q.dim() >= 3 else q.shape[-1]
     q2, k2, v2 = (_as_rows(t, width) for t in (q, k, v))
     n_rows = q2.shape[0]

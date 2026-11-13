@@ -1,4 +1,4 @@
-"""Untimed bitwise check: fp8_attn_prep.quantize_e4m3_qkv_per_tensor vs main's FP8 attention prep.
+"""Untimed bitwise check: fp8_attn_prep.quantize_qkv_e4m3_per_tensor vs main's FP8 attention prep.
 
 Reference = main's prep, still in the tree: FlashInferAttention._quantize_e4m3_per_tensor
 (t.contiguous() + C++ torch.ops.trtllm.quantize_e4m3_per_tensor) on Q, K, V, descales via cat.
@@ -84,7 +84,7 @@ def main():
         packed[..., 2 * W:] = x[2].view(1, rows, W)
         v = packed[..., 2 * W:].unflatten(-1, (hh, dd))
         assert prep.fp8_qkv_prep_supported(q, k, v)
-        bad = compare(prep.quantize_e4m3_qkv_per_tensor(q, k, v), ref_prep(q, k, v))
+        bad = compare(prep.quantize_qkv_e4m3_per_tensor(q, k, v), ref_prep(q, k, v))
         if bad:
             a_fail += 1
             if a_fail <= 10:
@@ -112,7 +112,7 @@ def main():
         k = (torch.randn(1, r, hh, dd, device=dev, generator=gen) * 3).bfloat16()
         packed = (torch.randn(1, r, 3 * W, device=dev, generator=gen) * 7).bfloat16()
         v = packed[..., 2 * W:].unflatten(-1, (hh, dd))
-        bad = compare(prep.quantize_e4m3_qkv_per_tensor(q, k, v), ref_prep(q, k, v))
+        bad = compare(prep.quantize_qkv_e4m3_per_tensor(q, k, v), ref_prep(q, k, v))
         if bad:
             b_fail += 1
             if b_fail <= 10:
@@ -155,7 +155,7 @@ def main():
         c_fail = 0
         for it in range(WARMUP + ITERS):
             poison(sizes)
-            out = prep.quantize_e4m3_qkv_per_tensor(q, k, v)
+            out = prep.quantize_qkv_e4m3_per_tensor(q, k, v)
             bad = compare(out, ref)
             if bad:
                 c_fail += 1
@@ -207,6 +207,20 @@ def main():
                     log(f"  D {kind} with_lse={with_lse} rep {rep}: DIFFERS")
             log(f"D {kind} with_lse={with_lse}: done")
         del q, k, v, qkv
+
+    # ---------------- E: layouts that take the fallback (cross-attention lengths, GQA, B=2 strided)
+    e_cases = 0
+    for (qs, ks) in (((1, 300, 4, 128), (1, 77, 4, 128)), ((1, 256, 8, 128), (1, 256, 2, 128)),
+                     ((2, 256, 4, 128), (2, 256, 4, 128))):
+        q = torch.randn(qs, device=dev, generator=gen).bfloat16() * 3
+        k = torch.randn(ks, device=dev, generator=gen).bfloat16()
+        packed = torch.randn(ks[0], ks[1], 3 * ks[2] * ks[3], device=dev, generator=gen).bfloat16()
+        v = packed[..., 2 * ks[2] * ks[3]:].unflatten(-1, (ks[2], ks[3]))
+        bad = compare(prep.quantize_qkv_e4m3_per_tensor(q, k, v), ref_prep(q, k, v))
+        e_cases += 1
+        log(f"E {qs} {ks}: supported={prep.fp8_qkv_prep_supported(q, k, v)} {bad or 'bitwise'}")
+        if bad:
+            fails.append(f"E {qs}/{ks}: {bad}")
 
     passed = not fails
     log("FAILURES:" if fails else "all bitwise", fails)

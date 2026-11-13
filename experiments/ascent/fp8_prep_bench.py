@@ -93,8 +93,8 @@ def main():
                         prep._BLOCK_R, prep._NUM_WARPS = bR, nw
 
                         def fn():
-                            return prep.quantize_e4m3_qkv_per_tensor(q, k, v, programs_per_sm=pps,
-                                                                     reverse=rev)
+                            return prep._quantize_qkv_triton(q, k, v, programs_per_sm=pps,
+                                                             reverse=rev)
                         o = fn()
                         ok = all(torch.equal(a.view(torch.uint8), b.view(torch.uint8))
                                  for a, b in zip(o[:3], ref[:3])) and torch.equal(o[3], ref[3])
@@ -113,7 +113,7 @@ def main():
     log(f"A/A main prep: median {aa[0]:.4f} ms p10 {aa[1]:.4f} p90 {aa[2]:.4f} noise {aa[3]:.4f}")
     if prep is not None:
         arm = "branch: fp8_attn_prep (2 Triton launches)"
-        r = time_fn(lambda: prep.quantize_e4m3_qkv_per_tensor(q, k, v), flush)
+        r = time_fn(lambda: prep.quantize_qkv_e4m3_per_tensor(q, k, v), flush)
     else:
         arm = "main: V.contiguous + 3x C++ quantize_e4m3_per_tensor + cat"
         r = time_fn(lambda: main_prep(q, k, v), flush)
