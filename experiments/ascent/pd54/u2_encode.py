@@ -203,9 +203,12 @@ def build_gpu_video(frames):
     del planar
     video = video.clone()[0]
     want = (h * w, w, 1, t * h * w)
-    assert tuple(video.stride()) == want, (tuple(video.stride()), want)
-    assert not video.is_contiguous()
+    if tuple(video.stride()) != want or video.is_contiguous():
+        STRIDE_PROBLEMS.append(f"video strides {tuple(video.stride())} != planar {want}")
     return video
+
+
+STRIDE_PROBLEMS = []
 
 
 # --------------------------------------------------------------------------- rows
@@ -231,7 +234,8 @@ def time_rows(video, ffmpeg, work):
             t0 = time.perf_counter()
             with enc._host_numpy(video) as a:
                 pn.append((time.perf_counter() - t0) * 1e3)
-                assert a.strides == tuple(s for s in video.stride()), a.strides
+                if a.strides != tuple(video.stride()):
+                    STRIDE_PROBLEMS.append(f"pinned host view strides {a.strides} != {tuple(video.stride())}")
     out["d2h_pageable"] = stats(pg[2:])
     out["numpy"] = stats(npy[2:])
     out["reshape_copy"] = stats(rs[2:])
@@ -425,6 +429,7 @@ def main():
         result["prompts"][key] = pinfo
         log(f"{key}: {json.dumps(pinfo)}")
 
+    problems.extend(sorted(set(STRIDE_PROBLEMS)))
     passed = passed and not problems
     park = result["prompts"]["park_portrait"]["table"]
     result.update({
