@@ -290,8 +290,23 @@ def judge_all(ckpt: str, root: Path, results: dict) -> None:
     judge.close()
 
 
+def physical_gpus() -> list:
+    """Physical indices of the visible GPUs (UUIDs mapped through nvidia-smi)."""
+    vis = [v.strip() for v in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if v.strip()]
+    out = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+                         capture_output=True, text=True).stdout
+    by_uuid = {u.strip(): int(i) for i, u in (ln.split(",") for ln in out.splitlines() if "," in ln)}
+    return [by_uuid.get(v, v) for v in vis]
+
+
 def main():
     ckpt, arms = sys.argv[1], sys.argv[2:]
+    gpus = physical_gpus()
+    print(f"[stage3] physical GPUs {gpus}", flush=True)
+    if os.environ.get("STAGE3_NO_GPU5", "1") == "1" and 5 in gpus:
+        print(json.dumps({"passed": False, "error": "placed on GPU 5 (fidelity rule: any pair without GPU 5); "
+                          "resubmit", "gpus": gpus}), flush=True)
+        return
     root = Path(os.environ.get("AUTO_DEV_ARTIFACTS") or (Path.cwd() / "ab-artifacts"))
     original_text = ENGINE.read_text()
     original = json.loads(original_text)
