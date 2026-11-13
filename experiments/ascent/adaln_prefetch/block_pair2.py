@@ -227,6 +227,27 @@ def worker(rank, ckpt, mode, port, q):
 
         out["span"] = {a: {k: summ(v) for k, v in d.items() if v} for a, d in spans.items()}
         out["span_bad_iters"] = bad
+        # Critical path: the rank that reaches the drain last has the shortest span (the earlier
+        # rank's span also holds its wait for the peer); per iteration take the min over ranks.
+        gathered = [None, None]
+        dist.all_gather_object(gathered, {a: spans[a]["span"] for a in arms})
+        crit = {}
+        for a in arms:
+            r0s, r1s = gathered[0][a], gathered[1][a]
+            if len(r0s) == len(r1s) and r0s:
+                crit[a] = [min(u, v) for u, v in zip(r0s, r1s)]
+        out["crit_span"] = {a: summ(v) for a, v in crit.items()}
+        if slot is not None and len(crit) == len(arms):
+            n = min(len(v) for v in crit.values())
+            for x1, x2 in (("main", "on"), ("off", "on"), ("main", "off")):
+                d = sorted(crit[x1][i] - crit[x2][i] for i in range(n))
+                out.setdefault("crit_paired_delta_ms", {})[f"{x1}-{x2}"] = {
+                    "median": statistics.median(d), "p10": d[int(0.1 * (n - 1))], "p90": d[int(0.9 * (n - 1) + 0.5)]}
+        elif len(crit) == len(arms):
+            n = min(len(v) for v in crit.values())
+            d = sorted(crit["main"][i] - crit["main_x"][i] for i in range(n))
+            out["crit_aa_delta_ms"] = {"median": statistics.median(d), "p10": d[int(0.1 * (n - 1))],
+                                       "p90": d[int(0.9 * (n - 1) + 0.5)]}
         if slot is not None:
             n = min(len(spans[a]["span"]) for a in arms)
             for x1, x2 in (("main", "on"), ("off", "on"), ("main", "off")):
@@ -241,8 +262,11 @@ def worker(rank, ckpt, mode, port, q):
         if rank == 0:
             log(f"span: {json.dumps(out['span'])}")
             log(f"span deltas: {out.get('span_paired_delta_ms') or out.get('span_aa_delta_ms')}")
+        if rank == 0:
+            log(f"crit span: {json.dumps(out['crit_span'])}")
+            log(f"crit deltas: {out.get('crit_paired_delta_ms') or out.get('crit_aa_delta_ms')}")
         key = "on" if slot is not None else "main"
-        t = out["span"][key]["span"]
+        t = out["crit_span"][key] if key in out["crit_span"] else out["span"][key]["span"]
         out["batch"] = {"1": {"kernel_ms": t["median_ms"], "noise_floor": t["noise"]}}
         out["output"] = {"class": "exact"}
     elif mode == "time":
@@ -419,6 +443,8 @@ def main():
     ap.add_argument("--mode", default="time")
     a = ap.parse_args()
     topo = topo_check()
+    if a.mode in ("time", "span") and topo.get("link") is None:
+        raise SystemExit(f"topology parser failed (not a wrong pair): {topo}")
     if a.mode in ("time", "span") and topo.get("link") != "PIX":
         print(json.dumps({"wrong_pair": True, "topology": topo}), flush=True)
         return 0
