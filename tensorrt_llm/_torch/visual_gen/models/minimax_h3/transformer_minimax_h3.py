@@ -50,7 +50,14 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .adaln_prefetch import H3AdalnTableSlot, h3_adaln_table, make_prefetch_hook
-from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_mod_out, h3_norm_mod
+from .fused_adaln import (
+    h3_adaln_supported,
+    h3_gate_res_into,
+    h3_gate_res_norm_mod,
+    h3_gate_res_norm_mod_into,
+    h3_mod_out,
+    h3_norm_mod,
+)
 from .vsa import get_h3_vsa_context, h3_vsa_attention
 
 MINIMAX_H3_MODALITY_NUM = 3
@@ -740,6 +747,12 @@ class MiniMaxH3TransformerBlock(nn.Module):
     # the callables (temb, x_act) -> None run in _post_attn_overlap's all-reduce drain.
     _adaln_slot_id = None
     _drain_hooks = ()
+    # Per-chunk final gated residual under the last down all-reduces (see
+    # _post_attn_overlap_residual); False keeps the compiled cat + gated residual after the break.
+    _tp_overlap_chunk_residual = True
+    _tp_overlap_residual_logged = False
+    # Grid cap for the chunk residuals that run under a later all-reduce (0 = one program per row).
+    _tp_overlap_residual_programs = 0
 
     def __init__(
         self,
@@ -874,6 +887,10 @@ class MiniMaxH3TransformerBlock(nn.Module):
                 valid_seq_len,
                 project_out=False,
             )
+            if self._tp_overlap_chunk_residual and key_padding_mask is None:
+                return self._post_attn_overlap_residual(
+                    attn_hidden, hidden_states, mod, adaln_indices, temb, adaln_x_act
+                )
             residual_chunks, ff_chunks = self._post_attn_overlap(
                 attn_hidden, hidden_states, mod, adaln_indices, temb, adaln_x_act
             )
@@ -913,6 +930,8 @@ class MiniMaxH3TransformerBlock(nn.Module):
         self._tp_overlap_weights = None
         self._tp_overlap_group_name = None
         self._tp_overlap_pg = None
+        # TLLM_H3_TP_CHUNK_RESIDUAL=0 keeps the compiled cat + gated residual after the overlap.
+        self._tp_overlap_chunk_residual = os.environ.get("TLLM_H3_TP_CHUNK_RESIDUAL", "1") != "0"
         to_out = self.attn.to_out[0]
         to_out_ar = to_out.all_reduce
         down_ar = self.ff.down_proj.all_reduce
@@ -954,6 +973,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
                 logger.info(
                     f"[rank {dist.get_rank() if dist.is_initialized() else 0}] MiniMax-H3 TP "
                     f"overlap: chunks {self._tp_overlap_chunks} weights {self._tp_overlap_weights}, "
+                    f"chunk_residual {self._tp_overlap_chunk_residual}, "
                     f"dedicated group {self._tp_overlap_pg is not None} (ctas "
                     f"{_TP_OVERLAP_PG_CTAS}, high priority {_TP_OVERLAP_PG_HIGH_PRIORITY})"
                 )
@@ -1026,6 +1046,94 @@ class MiniMaxH3TransformerBlock(nn.Module):
         for work in ff_works:
             work.wait()
         return residual_chunks, ff_chunks
+
+    @torch.compiler.disable
+    def _post_attn_overlap_residual(
+        self,
+        attn_hidden: torch.Tensor,
+        hidden_states: torch.Tensor,
+        mod: torch.Tensor,
+        adaln_indices: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+        adaln_x_act: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """_post_attn_overlap with the block's final gated residual done per chunk, in eager.
+
+        Every chunk's post-attention residual is written straight into the block output
+        ``x_out`` (no cat). Once the last down GEMM and its all-reduce are queued (and the
+        drain hooks have run, at the same point as in _post_attn_overlap), chunk i waits only
+        for its own down all-reduce and runs ``x_out[i] += gate_mlp[idx] * ff[i]`` in place,
+        so chunks 0..n-2 run under the later all-reduces instead of after the last one. Same
+        math as the compiled ``cat + gate * cat``: fp32 x + g * a with one bf16 rounding per
+        element. Needs the dedicated high-priority TP group: on a normal-priority NCCL stream
+        the residual grid takes the SMs ahead of the next all-reduce (fact 743).
+        """
+        pg = self._tp_overlap_pg
+        if pg is None:
+            pg = dist.distributed_c10d._resolve_process_group(self._tp_overlap_group_name)
+            self._tp_overlap_pg = pg
+        if not MiniMaxH3TransformerBlock._tp_overlap_residual_logged:
+            MiniMaxH3TransformerBlock._tp_overlap_residual_logged = True
+            from tensorrt_llm.logger import logger
+
+            logger.info(
+                f"[rank {dist.get_rank() if dist.is_initialized() else 0}] MiniMax-H3 TP overlap: "
+                "per-chunk final gated residual under the down all-reduces (chunk_residual on)"
+            )
+        no_reduce = AllReduceParams(enable_allreduce=False)
+        hidden_size = hidden_states.shape[-1]
+        rows = hidden_states.shape[1]
+        bounds = _row_chunks(rows, self._tp_overlap_chunks, weights=self._tp_overlap_weights)
+        attn_rows = attn_hidden.reshape(rows, attn_hidden.shape[-1])
+        to_out = self.attn.to_out[0]
+
+        attn_outputs, attn_works = [], []
+        for start, end in bounds:
+            out = to_out(attn_rows[start:end], all_reduce_params=no_reduce)
+            attn_works.append(dist.all_reduce(out, group=pg, async_op=True))
+            attn_outputs.append(out)
+
+        x_out = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+        ff_chunks, ff_works = [], []
+        eps = self.norm2.variance_epsilon
+        for i, (start, end) in enumerate(bounds):
+            attn_works[i].wait()
+            norm_hidden = h3_gate_res_norm_mod_into(
+                x_out[:, start:end],
+                hidden_states[:, start:end],
+                attn_outputs[i].view(1, end - start, hidden_size),
+                self.norm2.weight,
+                mod,
+                adaln_indices[start:end],
+                eps,
+                2,
+                4,
+                3,
+            )
+            ff_out = self.ff(norm_hidden.view(end - start, hidden_size), final_all_reduce_params=no_reduce)
+            ff_works.append(dist.all_reduce(ff_out, group=pg, async_op=True))
+            ff_chunks.append(ff_out)
+        # Same point as _post_attn_overlap: after the last down all-reduce is queued, before
+        # any ff wait (block i+1's AdaLN table, adaln_prefetch.py).
+        if adaln_x_act is not None:
+            for hook in self._drain_hooks:
+                hook(temb, adaln_x_act)
+        last = len(bounds) - 1
+        for i, (start, end) in enumerate(bounds):
+            ff_works[i].wait()
+            rows_out = x_out[:, start:end]
+            h3_gate_res_into(
+                rows_out,
+                rows_out,
+                ff_chunks[i],
+                mod,
+                adaln_indices[start:end],
+                5,
+                # Chunks under a later all-reduce run on a capped grid (less HBM pressure on the
+                # NCCL kernel); the last one is exposed and takes the full grid.
+                max_programs=self._tp_overlap_residual_programs if i < last else 0,
+            )
+        return x_out
 
 
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
