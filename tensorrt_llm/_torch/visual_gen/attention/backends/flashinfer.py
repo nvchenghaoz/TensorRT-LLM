@@ -529,12 +529,14 @@ class FlashInferAttention(AttentionBackend):
         """
         from flashinfer.attention.cute_dsl.sm120_fmha import sm120_fmha_fp8_ragged_prefill
 
+        from .fp8_attn_prep import quantize_qkv_e4m3_per_tensor
+
         batch, q_len, num_heads, head_dim = q.shape
         kv_len = k.shape[1]
-        q_fp8, q_descale = self._quantize_e4m3_per_tensor(q)
-        k_fp8, k_descale = self._quantize_e4m3_per_tensor(k)
-        v_fp8, v_descale = self._quantize_e4m3_per_tensor(v)
-        descales = torch.cat([q_descale, k_descale, v_descale]).tolist()
+        # Two Triton launches for Q, K and V, reading V's strided view in place; bitwise equal
+        # to _quantize_e4m3_per_tensor on each (which it falls back to for other layouts).
+        q_fp8, k_fp8, v_fp8, descales = quantize_qkv_e4m3_per_tensor(q, k, v)
+        descales = descales.tolist()
         output = torch.empty(batch * q_len, num_heads, head_dim, dtype=q.dtype, device=q.device)
         lse = (
             torch.empty(batch * q_len, num_heads, dtype=torch.float32, device=q.device)
@@ -639,6 +641,16 @@ class FlashInferAttention(AttentionBackend):
         ):
             return
         FlashInferAttention._fp8_tactic_logged = True
+        from . import fp8_attn_prep
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        prep = (
+            "C++ quantize_e4m3_per_tensor x3 (TLLM_FP8_ATTN_PREP_DISABLE=1)"
+            if fp8_attn_prep._DISABLED
+            else "triton fp8_attn_prep (multi-tensor amax + E4M3 quantize, strided V read in "
+            "place; C++ quantize_e4m3_per_tensor only for unsupported layouts)"
+        )
+        print(f"[FlashInfer FP8 attention] rank={rank} prep={prep}", flush=True)
         try:
             from tensorrt_llm._torch.autotuner import AutoTuner
             from tensorrt_llm._torch.custom_ops.torch_custom_ops import QuantizeE4M3PerTensorRunner
