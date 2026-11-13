@@ -29,8 +29,15 @@ def main():
         dev = devs[0]
     seq = sorted(x for x in ev if x[2] == dev)
     t0 = seq[0][0]
-    for i, (s, e, d, t, n, st) in enumerate(seq[:n_print]):
-        print(f"{i:5d} t={(s - t0) / 1e6:10.3f}ms dur={(e - s) / 1e3:9.1f}us st={st} {t} {n}")
+    dtod_idx = [i for i, x in enumerate(seq) if x[3] == "M" and "kind=8" in x[4]]
+    shown = set()
+    for c in dtod_idx[:3]:
+        print(f"--- around DtoD at index {c}")
+        for i in range(max(0, c - n_print), min(len(seq), c + 12)):
+            s, e, d, t, n, st = seq[i]
+            print(f"{i:5d} t={(s - t0) / 1e6:10.3f}ms dur={(e - s) / 1e3:9.1f}us st={st} {t} {n}")
+    nccl_idx = [i for i, x in enumerate(seq) if "AllReduce" in x[4]]
+    print("first nccl idx:", nccl_idx[:6], "dtod idx:", dtod_idx[:6], "total events:", len(seq))
     ctx = Counter()
     for i, x in enumerate(seq):
         if x[3] == "M" and "kind=8" in x[4]:
