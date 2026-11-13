@@ -11,6 +11,5 @@
       "scm_cache_bins": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
       "scm_steps_policy": "static"
     }
-  },
-  "env": {}
+  }
 }
