@@ -23,6 +23,10 @@ WT = Path(__file__).resolve().parent.parent.parent
 
 def main() -> None:
     harness = find(["4285f767d2ff4900a5b55c2c9abf8847"])
+    # Job 158's harness already carried that run's candidate overlay (attention CUDNN). Restore the
+    # base server settings (no attention_config = VANILLA, as on e64bf1e4), so the adapter's own
+    # engine.json overlay is what selects CUDNN and output.class is computed against the base.
+    harness["server"]["visual_gen_args"].pop("attention_config", None)
     print("harness.server:", json.dumps(harness.get("server")), flush=True)
     adapter = WT / "experiments" / "ascent-benchmark" / "run_check.py"
     proc = subprocess.run([sys.executable, str(adapter), json.dumps(harness)], stdout=subprocess.PIPE,
