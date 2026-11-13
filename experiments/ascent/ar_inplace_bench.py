@@ -395,30 +395,44 @@ def sweep_worker(rank, name, env, opts, port, outdir):
         torch.cuda.empty_cache()
 
         if opts.get("overlap"):
+            import torch.nn.functional as Fn
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
             m2 = M // 2
-            xs, ref = make(m2, 101)
-            pristine = xs[rank]
-            del xs
-            inp = torch.empty_like(pristine)
+            m4 = (M + 3) // 4
             g = torch.Generator(device="cuda").manual_seed(777)
-            gemms = {
-                "gate_up": (torch.randn(m2, D, device="cuda", dtype=torch.bfloat16, generator=g),
-                            torch.randn(D, 2 * F, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02),
-                "down": (torch.randn(m2, F, device="cuda", dtype=torch.bfloat16, generator=g),
-                         torch.randn(F, D, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02),
-            }
+            gu = (torch.randn(m2, D, device="cuda", dtype=torch.bfloat16, generator=g),
+                  torch.randn(D, 2 * F, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02)
+            dn = (torch.randn(m2, F, device="cuda", dtype=torch.bfloat16, generator=g),
+                  torch.randn(F, D, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02)
+            Hl = opts.get("heads_local", 28)
+            q = torch.randn(1, Hl, m4, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+            kk = torch.randn(1, Hl, M, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+            vv = torch.randn(1, Hl, M, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+
+            def sdpa():
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    return Fn.scaled_dot_product_attention(q, kk, vv)
+
+            ops = [("gate_up", lambda: torch.matmul(gu[0], gu[1]), m2),
+                   ("down", lambda: torch.matmul(dn[0], dn[1]), m2),
+                   ("sdpa_fa2_q_M4", sdpa, m4)]
             side = torch.cuda.Stream()
             main_s = torch.cuda.current_stream()
             res["overlap"] = {}
-            for gname, (a, b) in gemms.items():
-                gref = torch.matmul(a, b)
+            for gname, fn, ar_rows in ops:
+                xs, ref = make(ar_rows, 101 if ar_rows == m2 else 102)
+                pristine = xs[rank]
+                del xs
+                inp = torch.empty_like(pristine)
+                gref = fn()
                 galone = []
                 for i in range(warm + iters):
                     sync()
                     s = torch.cuda.Event(enable_timing=True)
                     e = torch.cuda.Event(enable_timing=True)
                     s.record()
-                    o = torch.matmul(a, b)
+                    o = fn()
                     e.record()
                     torch.cuda.synchronize()
                     if i >= warm:
@@ -437,7 +451,7 @@ def sweep_worker(rank, name, env, opts, port, outdir):
                         dist.all_reduce(inp)
                         ev[2].record(side)
                     ev[3].record(main_s)
-                    o = torch.matmul(a, b)
+                    o = fn()
                     ev[4].record(main_s)
                     main_s.wait_stream(side)
                     ev[5].record(main_s)
@@ -469,8 +483,9 @@ def sweep_worker(rank, name, env, opts, port, outdir):
                           f"under AR {ent['gemm_under_ar']['median_ms']:.3f} ({ent['gemm_slowdown'] * 100:+.1f}%), "
                           f"AR e2e {ent['ar_e2e']['median_ms']:.3f}, wall {ent['pair_wall']['median_ms']:.3f}, "
                           f"exposed {ent['exposed_ar']['median_ms']:.3f}, mism={obad}", flush=True)
-                del gref
-            del inp, pristine, ref, gemms
+                del gref, inp, pristine, ref
+                torch.cuda.empty_cache()
+            del gu, dn, q, kk, vv
             torch.cuda.empty_cache()
 
         if opts.get("rsag"):
