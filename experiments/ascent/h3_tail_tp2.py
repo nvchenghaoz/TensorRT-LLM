@@ -306,16 +306,23 @@ def worker(rank, ckpt, port, q):
         H = cfg["num_attention_heads"] // 2
         hd = cfg["attention_head_dim"]
         g = torch.Generator(device="cuda").manual_seed(5)
-        qkv = torch.randn(1, M_TARGET, 3 * H * hd, generator=g, device="cuda").to(torch.bfloat16)
+        D = cfg["hidden_size"]
+        x_in = torch.randn(1, M_TARGET, D, generator=g, device="cuda").to(torch.bfloat16)
+        w_qkv = (torch.randn(3 * H * hd, D, generator=g, device="cuda") / D**0.5).to(torch.bfloat16)
         wq = (1 + 0.1 * torch.randn(hd, generator=g, device="cuda")).to(torch.bfloat16)
         wk = (1 + 0.1 * torch.randn(hd, generator=g, device="cuda")).to(torch.bfloat16)
         rot = static.rotary_emb
         cos, sin = rot[0], rot[1]
-        qk_in = (qkv.clone(), wq.clone(), wk.clone(), cos.clone(), sin.clone())
+        qk_in = (x_in.clone(), w_qkv.clone(), wq.clone(), wk.clone(), cos.clone(), sin.clone())
         eps = float(cfg.get("qk_norm_eps", 1e-6))
+        cur = {}
+
+        def qkv_proj():
+            # As in the model: the QKV GEMM writes qkv right before the kernel reads it.
+            cur["qkv"] = torch.nn.functional.linear(x_in, w_qkv)
 
         def qk():
-            return torch.ops.trtllm.minimax_h3_qk_norm_rope(qkv, wq, wk, cos, sin, eps, H, hd)
+            return torch.ops.trtllm.minimax_h3_qk_norm_rope(cur["qkv"], wq, wk, cos, sin, eps, H, hd)
 
         qref = None
         qk_bad = []
@@ -324,6 +331,7 @@ def worker(rank, ckpt, port, q):
             nonlocal qref
             ts = []
             for it in range(WARMUP + ITERS):
+                qkv_proj()
                 torch.cuda.synchronize()
                 s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 s.record()
@@ -336,7 +344,7 @@ def worker(rank, ckpt, port, q):
                     qref = tuple(x.clone() for x in r)
                 elif not all(torch.equal(x, y) for x, y in zip(r, qref)):
                     qk_bad.append(f"{tag}@{it}")
-                for x, y in zip((qkv, wq, wk, cos, sin), qk_in):
+                for x, y in zip((x_in, w_qkv, wq, wk, cos, sin), qk_in):
                     if not torch.equal(x, y):
                         qk_bad.append(f"{tag}@{it}:input_changed")
             return ts
@@ -351,6 +359,17 @@ def worker(rank, ckpt, port, q):
             r = qk()
             out["qk_vs_main_launch_bitwise"] = all(torch.equal(x, y) for x, y in zip(r, qref))
             fr._launch_by_device.clear()
+            # Tail-masked token count (1001 % 4 != 0): default SM120 launch vs main's launch.
+            for m_small in (1001, M_TARGET):
+                xs = torch.nn.functional.linear(x_in[:, :m_small], w_qkv)
+                cs, sn = cos[:m_small].contiguous(), sin[:m_small].contiguous()
+                new = torch.ops.trtllm.minimax_h3_qk_norm_rope(xs, wq, wk, cs, sn, eps, H, hd)
+                fr._launch_by_device[torch.cuda.current_device()] = (1, None, 1)
+                old = torch.ops.trtllm.minimax_h3_qk_norm_rope(xs, wq, wk, cs, sn, eps, H, hd)
+                fr._launch_by_device.clear()
+                out[f"qk_M{m_small}_vs_main_launch_bitwise"] = all(
+                    torch.equal(x, y) for x, y in zip(new, old)
+                )
             real = torch.cuda.get_device_capability
             try:
                 torch.cuda.get_device_capability = lambda *a, **k: (10, 0)
@@ -407,6 +426,9 @@ def main():
     )
     if r0["branch_tree"]:
         passed = passed and r0.get("qk_vs_main_launch_bitwise") and r1.get("qk_vs_main_launch_bitwise")
+        passed = passed and all(
+            r.get(f"qk_M{m}_vs_main_launch_bitwise") for r in (r0, r1) for m in (1001, M_TARGET)
+        )
         passed = passed and r0.get("sm100_launch") == [1, None, 1]
     t = r0["timing"]
     pa, pb = t["per_forward_A"], t["per_forward_B"]
@@ -422,6 +444,9 @@ def main():
         "hashes": r0["hashes"], "qk_hash": r0["qk_hash"],
         "branch_tree": r0["branch_tree"], "launch": r0["launch"], "sm100_launch": r0.get("sm100_launch"),
         "qk_vs_main_launch_bitwise": [r0.get("qk_vs_main_launch_bitwise"), r1.get("qk_vs_main_launch_bitwise")],
+        "qk_tail_masked_vs_main_launch": {f"M{m}": [r0.get(f"qk_M{m}_vs_main_launch_bitwise"),
+                                                     r1.get(f"qk_M{m}_vs_main_launch_bitwise")]
+                                           for m in (1001, M_TARGET)},
         "bad": [r0["bad"], r1["bad"]], "qk_bad": [r0["qk_bad"], r1["qk_bad"]],
         "recompiled_after_warmup": [r0["recompiled_after_warmup"], r1["recompiled_after_warmup"]],
         "overlap_chunks": r0["overlap_chunks"], "layout": r0["layout"],
