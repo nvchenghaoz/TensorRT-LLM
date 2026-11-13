@@ -230,6 +230,12 @@ def main():
     ap.add_argument("--chunks", default="2,4,8")
     args = ap.parse_args()
     chunks = [int(c) for c in args.chunks.split(",") if c]
+    # A fixed rendezvous port collides with sibling jobs (shared network namespace).
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        os.environ["MASTER_PORT"] = str(s.getsockname()[1])
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     t0 = time.time()

@@ -289,11 +289,15 @@ def main():
     prios = [int(p) for p in args.prio.split(",")]
     ctx = mp.get_context("spawn")
     all_res = []
-    port = 29600
+    import socket
+
     for env in envs:
         for prio in prios:
             q = ctx.Queue()
-            port += 1
+            # A fixed rendezvous port collides with sibling jobs (shared network namespace).
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
             t0 = time.time()
             procs = [ctx.Process(target=worker, args=(r, 2, port, env, ks, prio, q)) for r in range(2)]
             for p in procs:
