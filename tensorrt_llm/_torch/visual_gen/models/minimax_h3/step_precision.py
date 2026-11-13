@@ -20,6 +20,7 @@ from typing import Optional
 # the controller and attention's own BF16 forward count.
 STEP_PRECISION_STATE_KEY = "step_precision_controller"
 ATTENTION_BF16_FORWARDS_STATE_KEY = "attention_bf16_forwards"
+ATTENTION_SAGE_ONSET_STATE_KEY = "attention_sage_onset"
 
 
 class DenoiseStepController:
@@ -72,3 +73,16 @@ class DenoiseStepController:
         if self.step_index is None:
             return True
         return self.step_index < bf16_forwards
+
+    def runs_sage(self, sage_onset: Optional[int], bf16_forwards: Optional[int]) -> bool:
+        """Whether a gated BF16 call runs the Sage2 middle tier instead, on this same index.
+
+        True only on denoising forwards in ``[sage_onset, bf16_forwards)``; never on the
+        startup warmup (which runs the low-precision recipe) or outside a denoising loop
+        (the text refiner stays BF16). ``sage_onset`` None leaves the BF16 phase unchanged.
+        """
+        if sage_onset is None or not self.runs_bf16(bf16_forwards):
+            return False
+        if self.step_index is None:
+            return False
+        return self.step_index >= sage_onset
