@@ -40,6 +40,32 @@ _PINNED_BUFFER: Optional[torch.Tensor] = None
 _FFMPEG_PIPE_BYTES = 1 << 20
 
 
+def reserve_pinned_video_bytes(nbytes: int) -> Optional[float]:
+    """Grow the pinned video staging buffer to at least ``nbytes`` now.
+
+    Moves the one-time page-locked allocation (~0.2 s for a 384 MB video) out
+    of the first request's encode. Grow-only and under the same lock as
+    ``_host_numpy``; call it once at startup with the largest expected video.
+    Returns the milliseconds spent, ``0.0`` if the buffer was already large
+    enough, or ``None`` if skipped (CUDA not initialised in this process, or
+    the buffer is busy).
+    """
+    global _PINNED_BUFFER
+    if nbytes <= 0 or not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        return None
+    if not _PINNED_LOCK.acquire(blocking=False):
+        return None
+    try:
+        if _PINNED_BUFFER is not None and _PINNED_BUFFER.numel() >= nbytes:
+            return 0.0
+        t0 = time.perf_counter()
+        _PINNED_BUFFER = None
+        _PINNED_BUFFER = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        return (time.perf_counter() - t0) * 1e3
+    finally:
+        _PINNED_LOCK.release()
+
+
 def _dense_storage_span(tensor: torch.Tensor) -> Optional[Tuple[int, int]]:
     """``(storage_offset, numel)`` when ``tensor`` covers that storage range exactly once.
 

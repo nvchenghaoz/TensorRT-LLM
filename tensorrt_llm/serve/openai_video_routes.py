@@ -139,6 +139,39 @@ class _VideoRoutesMixin:
     their own initializer.
     """
 
+    def _reserve_video_pinned_buffer(self) -> None:
+        """Reserve the MP4 encoder's pinned staging buffer once, at startup.
+
+        Sized from the largest configured warmup shape (frames x H x W x 3
+        uint8) that the workers report in READY, so the first full-size
+        request does not pay the page-locked allocation. Skipped (and
+        logged) when the shape is unknown, the server process has no CUDA
+        context, or ffmpeg (the only user of the buffer) is missing.
+        """
+        from tensorrt_llm.media import encoding
+
+        executor = getattr(self.generator, "executor", None)
+        shapes = list(getattr(executor, "warmup_shapes", None) or [])
+        video_shapes = [(h, w, f) for h, w, f in shapes if f > 1]
+        if not video_shapes:
+            logger.info("VisualGen: no video warmup shape; pinned video buffer not reserved")
+            return
+        if not encoding._check_ffmpeg_available():
+            logger.info("VisualGen: ffmpeg not available; pinned video buffer not reserved")
+            return
+        h, w, f = max(video_shapes, key=lambda s: s[0] * s[1] * s[2])
+        nbytes = h * w * f * 3
+        ms = encoding.reserve_pinned_video_bytes(nbytes)
+        if ms is None:
+            logger.info(
+                f"VisualGen: pinned video buffer not reserved ({nbytes} B for {f}x{h}x{w}x3): "
+                "CUDA not initialised in the server process or buffer busy"
+            )
+            return
+        logger.info(
+            f"VisualGen: reserved pinned video buffer {nbytes} B for {f}x{h}x{w}x3 in {ms:.1f} ms"
+        )
+
     async def openai_video_generation_sync(self, raw_request: Request) -> Response:
         """Synchronous video generation endpoint.
 

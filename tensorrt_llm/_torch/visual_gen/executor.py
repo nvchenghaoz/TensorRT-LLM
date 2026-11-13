@@ -541,6 +541,16 @@ class DiffusionExecutor:
         # Send READY signal with pipeline metadata for the client.
         if self.rank == 0:
             logger.info(f"Worker {self.device_id}: Sending READY")
+            # The configured warmup shapes (h, w, frames): the server sizes
+            # its one-time pinned video staging buffer from them.
+            try:
+                warmup_shapes = [
+                    tuple(int(v) for v in shape)
+                    for shape in self.pipeline.resolve_warmup_plan()[0]
+                ]
+            except Exception as e:
+                logger.warning(f"Worker {self.device_id}: no warmup shapes for READY: {e}")
+                warmup_shapes = []
             self.response_queue.put(
                 DiffusionResponse(
                     request_id=-1,
@@ -550,6 +560,7 @@ class DiffusionExecutor:
                         "extra_param_specs": self.pipeline.extra_param_specs,
                         "supports_image_edit": self.pipeline.supports_image_edit,
                         "ref_slot_specs": self.pipeline.ref_slot_specs,
+                        "warmup_shapes": warmup_shapes,
                     },
                 )
             )
@@ -991,6 +1002,7 @@ class DiffusionRemoteClient:
         self.extra_param_specs: Dict = {}
         self.supports_image_edit: bool = False
         self.ref_slot_specs: Dict = {}
+        self.warmup_shapes: List[Tuple[int, int, int]] = []
 
         # --- Launch workers ---
         # multiprocessing installs its own timeout-less child joins at import
@@ -1588,6 +1600,9 @@ class DiffusionRemoteClient:
                         self.extra_param_specs = payload.get("extra_param_specs", {})
                         self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                         self.ref_slot_specs = payload.get("ref_slot_specs", {})
+                        self.warmup_shapes = [
+                            tuple(shape) for shape in payload.get("warmup_shapes", [])
+                        ]
                     if self._worker_failure is not None:
                         raise RuntimeError(self._worker_failure)
                     elapsed = time.time() - start_time
