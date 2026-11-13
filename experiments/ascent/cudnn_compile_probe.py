@@ -76,6 +76,37 @@ def main():
     print("graph_breaks:", json.dumps(gb, default=str)[:3000])
     print("stats:", json.dumps(stats, default=str))
     passed = all(r["repeat_bitwise"] and r["maxdiff_vs_eager"] < 5e-2 for r in res.values())
+
+    # Misaligned-base guard: Q/K/V views with unit/aligned strides but storage_offset 1
+    # (data_ptr % 16 == 2) must give the same output as aligned copies of the same values,
+    # and match the FP32 SDPA math reference.
+    with torch.inference_mode():
+        S = 2048
+        attn = CuDNNAttention(num_heads=H, head_dim=D, dtype=torch.bfloat16)
+        views = []
+        for _ in range(3):
+            flat = torch.randn(S * H * D + 1, device="cuda", dtype=torch.bfloat16)
+            views.append(flat[1:].view(1, S, H, D))
+        assert all(t.data_ptr() % 16 != 0 for t in views)
+        aligned = [t.clone() for t in views]
+        kw = dict(discard_padded_queries=True, valid_seq_len=None, timestep=None)
+        o_mis = attn.forward(*views, **kw)
+        o_mis2 = attn.forward(*views, **kw)
+        o_al = attn.forward(*aligned, **kw)
+        qf, kf, vf = (t.float().transpose(1, 2) for t in aligned)
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf).transpose(1, 2)
+        torch.cuda.synchronize()
+        mis = dict(
+            misaligned_vs_aligned_bitwise=bool(torch.equal(o_mis, o_al)),
+            misaligned_repeat_bitwise=bool(torch.equal(o_mis, o_mis2)),
+            maxabs_vs_fp32=float((o_mis.float() - ref).abs().max()),
+            inputs_unchanged=all(torch.equal(a, b) for a, b in zip(views, aligned)),
+        )
+        print("misaligned guard:", json.dumps(mis), flush=True)
+        res["misaligned"] = mis
+        passed = passed and mis["misaligned_vs_aligned_bitwise"] and mis[
+            "misaligned_repeat_bitwise"] and mis["inputs_unchanged"] and mis["maxabs_vs_fp32"] < 2e-2
     print(json.dumps({"passed": passed, "results": res, "graph_breaks": len(gb),
                       "unique_graphs": stats.get("unique_graphs"),
                       "calls_captured": stats.get("calls_captured")}))

@@ -510,6 +510,20 @@ class CuDNNAttention(AttentionBackend):
         tensor_map: Dict[Any, torch.Tensor],
         device: torch.device,
     ) -> None:
+        # BF16/FP16 Q/K/V may be strided views (no .contiguous() in the caller); cuDNN needs
+        # 16-byte aligned base pointers. Checked here, outside torch.compile, so data_ptr()
+        # costs no graph break. A misaligned view is copied into a fresh allocation with the
+        # same strides, so the cached graph (keyed on strides) still matches.
+        input_ids = {id(g) for g in bundle.inputs.values()}
+        for key, t in list(tensor_map.items()):
+            if (
+                id(key) in input_ids
+                and t.dtype in (torch.bfloat16, torch.float16)
+                and t.data_ptr() % 16 != 0
+            ):
+                fresh = torch.empty_strided(t.size(), t.stride(), dtype=t.dtype, device=t.device)
+                fresh.copy_(t)
+                tensor_map[key] = fresh
         with torch.cuda.device(device):
             handle = cls._get_handle(device)
             cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(device).cuda_stream)
