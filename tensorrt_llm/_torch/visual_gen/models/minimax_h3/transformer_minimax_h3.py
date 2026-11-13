@@ -665,10 +665,13 @@ def _row_chunks(
 
 
 # Dedicated NCCL communicator for the chunked TP all-reduces (read once at model build).
-# 8 CTAs (channels) instead of NCCL's default 4 on the 2-GPU PCIe pair; normal stream priority.
-# 0 CTAs or a non-NCCL setup keeps the shared TP group.
-_TP_OVERLAP_PG_CTAS = 8
-_TP_OVERLAP_PG_HIGH_PRIORITY = False
+# Its NCCL stream runs at high priority, so each chunk's all-reduce kernel gets SMs as soon as its
+# GEMM finishes instead of queueing behind the next chunks' GEMMs (2-GPU PCIe pair: ~0.8 ms median
+# launch-to-start delay per all-reduce and ~7 ms exposed per block on the shared normal-priority
+# group, ~2.7% of the block). _TP_OVERLAP_PG_CTAS > 0 pins NCCL's CTA (channel) count through the
+# communicator config (0 = NCCL's default; 8 measured no better). Both off keep the shared TP group.
+_TP_OVERLAP_PG_CTAS = 0
+_TP_OVERLAP_PG_HIGH_PRIORITY = True
 # Per-chunk row weights for the chunked overlap (None = uniform _tp_overlap_num_chunks() chunks).
 _TP_OVERLAP_CHUNK_WEIGHTS: Optional[tuple[float, ...]] = None
 _H3_TP_GROUPS: dict = {}

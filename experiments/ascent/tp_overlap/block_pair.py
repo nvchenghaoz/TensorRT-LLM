@@ -672,7 +672,9 @@ def main():
         if pair.get("wrong_pair") or pair.get("relation") != "PIX":
             node_x16 = (pair.get("relation") == "NODE" and not pair.get("wrong_pair")
                         and set(pair.get("physical_ids") or []) == {4, 6})
-            if args.mode == "arms" and node_x16:
+            if args.mode == "check" and node_x16:
+                log("NODE 4+6 x16: valid for the untimed bitwise check")
+            elif args.mode == "arms" and node_x16:
                 # NODE x16 (4+6) is valid for bitwise checks, not timing: run the untimed check only.
                 os.environ["BLOCK_PAIR_CHECK_ONLY"] = "1"
                 log("NODE 4+6: timing skipped, running the untimed bitwise check of every arm")
