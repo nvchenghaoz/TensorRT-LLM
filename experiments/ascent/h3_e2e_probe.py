@@ -26,6 +26,12 @@ def main():
     p.add_argument("--no-warmup", action="store_true")
     args = p.parse_args()
 
+    import torch
+
+    # Create this process's CUDA context before the workers fill the GPU: the client receives the
+    # outputs and needs a context to materialize them (cuDevicePrimaryCtxRetain OOM otherwise).
+    torch.zeros(1, device="cuda")
+
     from tensorrt_llm import VisualGen, VisualGenArgs
 
     vg_args = VisualGenArgs(
