@@ -164,6 +164,19 @@ class StepPrecisionConfig(StrictBaseModel):
             "FLASHINFER per-tensor fp8/fp8 recipe on SM120 with MiniMax-H3."
         ),
     )
+    attention_sage_onset: Optional[int] = Field(
+        None,
+        ge=0,
+        status="prototype",
+        description=(
+            "First denoising forward of a middle attention tier between the BF16 phase and "
+            "the quantized recipe: forwards below it run BF16, forwards from it up to "
+            "attention_bf16_forwards - 1 run Sage2 (INT8 Q/K with smooth-K, FP8 P.V; FlashInfer "
+            "SM120 'cake' kernel, all KV blocks), and forwards from attention_bf16_forwards on "
+            "run attention_config.quant_attention_config. Must be below "
+            "attention_bf16_forwards. Unset: no middle tier."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -1040,6 +1053,17 @@ class VisualGenArgs(StrictBaseModel):
             raise ValueError(
                 "step_precision.linear_bf16_forwards has no step-gated linear consumer in this "
                 "build; leave it unset (a silently ignored gate would run every forward BF16)."
+            )
+        sage_onset = step_precision.attention_sage_onset
+        if sage_onset is not None and not (
+            step_precision.attention_bf16_forwards is not None
+            and sage_onset < step_precision.attention_bf16_forwards
+        ):
+            raise ValueError(
+                "step_precision.attention_sage_onset must be below "
+                "step_precision.attention_bf16_forwards (the Sage2 tier runs forwards "
+                f"[attention_sage_onset, attention_bf16_forwards)); got attention_sage_onset="
+                f"{sage_onset}, attention_bf16_forwards={step_precision.attention_bf16_forwards}."
             )
         if step_precision.attention_bf16_forwards is None:
             return self

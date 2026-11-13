@@ -83,6 +83,7 @@ from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .step_precision import (
     ATTENTION_BF16_FORWARDS_STATE_KEY,
+    ATTENTION_SAGE_ONSET_STATE_KEY,
     STEP_PRECISION_STATE_KEY,
     DenoiseStepController,
 )
@@ -590,10 +591,19 @@ class MiniMaxH3Pipeline(BasePipeline):
             step_precision.attention_bf16_forwards if step_precision is not None else None
         )
         self._attention_bf16_forwards = attention_bf16_forwards
+        # Sage2 middle tier on forwards [onset, attention_bf16_forwards); None = no tier.
+        attention_sage_onset = (
+            getattr(step_precision, "attention_sage_onset", None)
+            if step_precision is not None
+            else None
+        )
+        self._attention_sage_onset = attention_sage_onset
         metadata_state = getattr(model_config, "attention_metadata_state", None)
         if metadata_state is not None:
             metadata_state[STEP_PRECISION_STATE_KEY] = controller
             metadata_state[ATTENTION_BF16_FORWARDS_STATE_KEY] = attention_bf16_forwards
+            if attention_sage_onset is not None:
+                metadata_state[ATTENTION_SAGE_ONSET_STATE_KEY] = attention_sage_onset
         elif attention_bf16_forwards is not None:
             raise ValueError(
                 "step_precision.attention_bf16_forwards needs an attention backend with "
@@ -619,6 +629,14 @@ class MiniMaxH3Pipeline(BasePipeline):
             f"tp_overlap_chunks={tp_overlap_chunks}",
             flush=True,
         )
+        if attention_sage_onset is not None:
+            print(
+                f"[step_precision] rank={rank} attention_sage_onset={attention_sage_onset}: "
+                f"forwards < {attention_sage_onset} bf16-fa2, "
+                f"{attention_sage_onset}..{attention_bf16_forwards - 1} sage2 (int8 qk, fp8 pv, "
+                f"cake), >= {attention_bf16_forwards} quantized recipe",
+                flush=True,
+            )
 
     def _log_peak_memory(self, phase: str) -> None:
         """Host-only allocator counters for this rank (no device sync)."""
@@ -1533,6 +1551,10 @@ class MiniMaxH3Pipeline(BasePipeline):
                     if step_controller.runs_bf16(self._attention_bf16_forwards)
                     else "fp8"
                 )
+                if step_controller.runs_sage(
+                    self._attention_sage_onset, self._attention_bf16_forwards
+                ):
+                    attention = "sage2-int8qk-fp8pv"
                 print(
                     f"[step_precision] rank={self.rank} forward_summary {index}/"
                     f"{len(row_timestep_plan)} warmup={self._is_warmup} attention={attention} "
