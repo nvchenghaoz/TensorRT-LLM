@@ -10,7 +10,7 @@ park_portrait, perfume_bottle, golden_robot, park_portrait (seed 42, 1344x768, 1
 Compares MP4 sha256 branch vs main per request and the park repeat vs first pass, quotes the
 "[MiniMax-H3 SM120 cublas pin]" line on both ranks, counts recompile / graph-break lines after warmup
 (TORCH_LOGS=recompiles,graph_breaks) and 'failed with OOM' lines per rank.
-usage: python experiments/ascent/gemm_pin/e2e_check.py <checkpoint>
+usage: python experiments/ascent/gemm_pin/e2e_check.py <checkpoint> {worktree}/experiments/ascent-benchmark
 Last stdout line: {"passed": bool, ...}
 """
 
@@ -22,7 +22,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve()
 WT = HERE.parents[3]
-sys.path.insert(0, str(WT / "experiments" / "ascent-benchmark"))
+# The frozen benchmark rides the job under {worktree}; pass it as argv[2].
+BENCH = Path(sys.argv[2]) if len(sys.argv) > 2 else WT / "experiments" / "ascent-benchmark"
+sys.path.insert(0, str(BENCH))
 
 from ab_common import (Heartbeat, Server, effective_server, ensure_ffmpeg, load_json, log,  # noqa: E402
                        run_bench, sha256_file, warmup, workload_params)
