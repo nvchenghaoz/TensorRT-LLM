@@ -286,10 +286,10 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. "
                 "Other architectures need model-specific numerical validation; use VANILLA."
             )
-        if pipeline_config.cache is not None:
-            raise NotImplementedError(
-                "TeaCache and Cache-DiT are not quality-validated for MiniMax-H3."
-            )
+        if pipeline_config.cache is not None and pipeline_config.cache_backend != "cache_dit":
+            # TeaCache's generic hook keeps only the first output (it would drop
+            # H3's audio velocity) and has no calibrated H3 coefficients.
+            raise NotImplementedError("TeaCache is not supported for MiniMax-H3; use Cache-DiT.")
         if pipeline_config.cuda_graph.enable:
             raise NotImplementedError(
                 "CUDA graphs are not yet supported for MiniMax-H3's packed layout inputs."
@@ -1440,6 +1440,19 @@ class MiniMaxH3Pipeline(BasePipeline):
                 extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
                 extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
             )
+        if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
+            # Every rank logs its own decisions so TP ranks can be compared.
+            from tensorrt_llm._torch.visual_gen.cache.cache_dit_enablers import (
+                cache_dit_context_stats,
+            )
+
+            for stats in cache_dit_context_stats(self.transformer):
+                logger.info(
+                    f"Cache-DiT decisions rank={self.rank}: context={stats['name']} "
+                    f"steps={stats['executed_steps']} cached={len(stats['cached_steps'])} "
+                    f"cached_steps={stats['cached_steps']} "
+                    f"residual_diffs={stats['residual_diffs']}"
+                )
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()

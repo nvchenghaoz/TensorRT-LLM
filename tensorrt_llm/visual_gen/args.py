@@ -672,6 +672,34 @@ class CacheDiTConfig(BaseCacheConfig):
         "dynamic",
         status="prototype",
     )
+    scm_compute_bins: Optional[List[int]] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Explicit step computation mask as alternating bins: compute "
+            "scm_compute_bins[0] steps, cache scm_cache_bins[0] steps, compute "
+            "scm_compute_bins[1] steps, ... Takes precedence over "
+            "scm_steps_mask_policy. Steps past the bins are computed; the last "
+            "step is always computed. Supported by the MiniMax-H3 enabler."
+        ),
+    )
+    scm_cache_bins: Optional[List[int]] = Field(
+        None,
+        status="prototype",
+        description="Cache intervals paired with scm_compute_bins.",
+    )
+
+    @model_validator(mode="after")
+    def validate_scm_bins(self) -> "CacheDiTConfig":
+        """Require scm_compute_bins and scm_cache_bins together, with positive entries."""
+        if (self.scm_compute_bins is None) != (self.scm_cache_bins is None):
+            raise ValueError("scm_compute_bins and scm_cache_bins must be set together")
+        if self.scm_compute_bins is not None:
+            if not self.scm_compute_bins:
+                raise ValueError("scm_compute_bins cannot be empty")
+            if any(b <= 0 for b in self.scm_compute_bins + self.scm_cache_bins):
+                raise ValueError("scm_compute_bins and scm_cache_bins entries must be > 0")
+        return self
 
     force_refresh_step_hint: Optional[int] = Field(
         None,

@@ -1,0 +1,15 @@
+{
+  "visual_gen_args": {
+    "cache_config": {
+      "cache_backend": "cache_dit",
+      "Fn_compute_blocks": 8,
+      "Bn_compute_blocks": 0,
+      "max_warmup_steps": 14,
+      "max_continuous_cached_steps": 2,
+      "residual_diff_threshold": 0.08,
+      "scm_compute_bins": [14, 1, 1, 1, 1, 1, 1, 1, 1, 1, 6],
+      "scm_cache_bins": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+      "scm_steps_policy": "static"
+    }
+  }
+}

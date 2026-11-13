@@ -430,6 +430,145 @@ def enable_cache_dit_for_qwen_image(
     )
 
 
+def h3_steps_computation_mask(
+    cache_dit_cfg: CacheDiTConfig, num_inference_steps: int
+) -> Optional[List[int]]:
+    """Step computation mask for one request (1 = compute, 0 = may use cache).
+
+    None means no mask is configured (pure dynamic DBCache). Explicit bins take
+    precedence over the predefined policies. When a predefined policy cannot
+    describe ``num_inference_steps`` (e.g. a 2-step warmup), every step is
+    computed, so no stale mask from an earlier request survives the refresh.
+    """
+    n = num_inference_steps
+    if cache_dit_cfg.scm_compute_bins is not None:
+        mask: List[int] = []
+        compute_bins = list(cache_dit_cfg.scm_compute_bins)
+        cache_bins = list(cache_dit_cfg.scm_cache_bins or [])
+        for i, compute in enumerate(compute_bins):
+            mask.extend([1] * compute)
+            if i < len(cache_bins):
+                mask.extend([0] * cache_bins[i])
+        mask = (mask + [1] * n)[:n]
+    elif cache_dit_cfg.scm_steps_mask_policy is not None:
+        if n < 8 and n not in (4, 6):
+            mask = [1] * n
+        else:
+            mask = list(
+                cache_dit.steps_mask(
+                    mask_policy=cache_dit_cfg.scm_steps_mask_policy,
+                    total_steps=n,
+                )
+            )[:n]
+    else:
+        return None
+    if mask:
+        mask[-1] = 1
+    return mask
+
+
+def cache_dit_context_stats(transformer: nn.Module) -> List[dict]:
+    """Per-context cached-step record of the request that just ran (this rank)."""
+    manager = getattr(transformer, "_context_manager", None)
+    names = getattr(transformer, "_context_names", None) or []
+    out = []
+    if manager is None:
+        return out
+    for name in names:
+        try:
+            ctx = manager.get_context(name)
+        except Exception:
+            continue
+        out.append(
+            dict(
+                name=name,
+                executed_steps=ctx.executed_steps,
+                cached_steps=ctx.get_cached_steps(),
+                residual_diffs={k: round(float(v), 6) for k, v in ctx.residual_diffs.items()},
+            )
+        )
+    return out
+
+
+def enable_cache_dit_for_minimax_h3(
+    pipeline: Any, cache_dit_cfg: CacheDiTConfig
+) -> CacheDiTEnableResult:
+    """MiniMax-H3: one packed text+audio+video stream, Pattern_3 BlockAdapter.
+
+    MiniMaxH3TransformerBlock.forward(hidden_states, temb, adaln_indices,
+    rotary_emb, key_padding_mask, timestep, valid_seq_len=) -> hidden_states.
+    H3 is guidance-distilled (one transformer call per step), so separate CFG
+    is off. Under TP the cached residual is the full (replicated) hidden state,
+    identical on every rank; with a static step mask the compute/cache
+    decision is a pure function of the step index. Dynamic decisions use
+    cache_dit's world all-reduce of the diff (``_is_parallelized``), so every
+    rank takes the same branch.
+    """
+    calibrator = _maybe_calibrator(cache_dit_cfg)
+    separate = _resolved_enable_separate_cfg(cache_dit_cfg, False)
+    db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=separate)
+
+    if calibrator is not None:
+        logger.info(f"TaylorSeer enabled with order={cache_dit_cfg.taylorseer_order}")
+        modifier = ParamsModifier(cache_config=db_cfg, calibrator_config=calibrator)
+    else:
+        modifier = ParamsModifier(cache_config=db_cfg)
+
+    transformer = pipeline.transformer
+    blocks = transformer.transformer_blocks
+    compiled_blocks = _has_compiled_blocks(blocks)
+    adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[blocks],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        params_modifiers=[modifier],
+        check_forward_pattern=not compiled_blocks,
+        check_num_outputs=False,
+    )
+
+    logger.info(
+        f"Cache-DiT: MiniMax-H3 — {len(blocks)} blocks, Fn={db_cfg.Fn_compute_blocks}, "
+        f"Bn={db_cfg.Bn_compute_blocks}, W={db_cfg.max_warmup_steps}, "
+        f"MC={db_cfg.max_continuous_cached_steps}, R={cache_dit_cfg.residual_diff_threshold}, "
+        f"scm={cache_dit_cfg.scm_steps_mask_policy}/{cache_dit_cfg.scm_compute_bins}/"
+        f"{cache_dit_cfg.scm_cache_bins} ({cache_dit_cfg.scm_steps_policy}), "
+        f"compiled_blocks={compiled_blocks}"
+    )
+
+    _cached = cache_dit.enable_cache(
+        adapter,
+        cache_config=db_cfg,
+        calibrator_config=calibrator,
+    )
+
+    def refresh_h3(num_inference_steps: int, **_kwargs) -> None:
+        mask = h3_steps_computation_mask(cache_dit_cfg, num_inference_steps)
+        if mask is None:
+            cache_dit.refresh_context(
+                transformer, num_inference_steps=num_inference_steps, verbose=False
+            )
+            return
+        logger.info(
+            f"Cache-DiT: MiniMax-H3 step mask ({sum(mask)}/{len(mask)} computed, "
+            f"{cache_dit_cfg.scm_steps_policy}): {''.join(map(str, mask))}"
+        )
+        cache_dit.refresh_context(
+            transformer,
+            cache_config=DBCacheConfig().reset(
+                num_inference_steps=num_inference_steps,
+                steps_computation_mask=mask,
+                steps_computation_policy=cache_dit_cfg.scm_steps_policy,
+            ),
+            verbose=False,
+        )
+
+    return CacheDiTEnableResult(
+        refresh=refresh_h3,
+        disable=lambda: cache_dit.disable_cache(_cached),
+        summary_modules=[transformer],
+    )
+
+
 CUSTOM_CACHE_DIT_ENABLERS = {
     "WanPipeline": enable_cache_dit_for_wan,
     "WanImageToVideoPipeline": enable_cache_dit_for_wan,
@@ -438,6 +577,7 @@ CUSTOM_CACHE_DIT_ENABLERS = {
     "LTX2Pipeline": enable_cache_dit_for_ltx2,
     "QwenImagePipeline": enable_cache_dit_for_qwen_image,
     "QwenImageLayeredPipeline": enable_cache_dit_for_qwen_image,
+    "MiniMaxH3Pipeline": enable_cache_dit_for_minimax_h3,
 }
 
 
