@@ -179,6 +179,19 @@ def worker(rank, ckpt, mode, chunks, q):
         from torch._dynamo.utils import counters
 
         ok = True
+        spg = getattr(block, "_tp_overlap_pg", None)
+        info = {"dedicated": spg is not None}
+        if spg is not None:
+            try:
+                be = spg._get_backend(torch.device("cuda"))
+                info["is_high_priority_stream"] = bool(be.options.is_high_priority_stream)
+                info["min_ctas"] = int(be.options.config.min_ctas)
+                info["max_ctas"] = int(be.options.config.max_ctas)
+            except Exception as ex:
+                info["error"] = repr(ex)
+        out["shipped_pg"] = info
+        if rank == 0:
+            log(f"shipped TP overlap group: {info}")
         # The serving loader builds the model with skip_create_weights_in_init=True; the
         # overlap setup must work (and enable) before the weights exist.
         if has_overlap:
@@ -758,6 +771,8 @@ def main():
             "eager_serial_vs_compiled_serial": r0.get("eager_serial_vs_compiled_serial"),
             "lazy_weights_setup_chunks": [r0.get("lazy_weights_setup_chunks"),
                                           res[1].get("lazy_weights_setup_chunks")],
+            "shipped_pg": [r0.get("shipped_pg"), res[1].get("shipped_pg")],
+            "pair": {k: (pair or {}).get(k) for k in ("physical_ids", "relation", "link_width_current")},
         }))
 
 
