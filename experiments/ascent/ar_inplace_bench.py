@@ -101,11 +101,11 @@ def worker(rank, args, port):
     torch.cuda.synchronize()
 
     result = {}
-    if args.mode == "bench":
+    if args.mode in ("bench", "check"):
         inp = torch.empty_like(pristine)
         times = []
         n = args.warmup + args.iters
-        for i in range(n):
+        for i in range(n if args.mode == "bench" else 0):
             inp.copy_(pristine)  # reset (outside the timed region)
             sync()
             s = torch.cuda.Event(enable_timing=True)
@@ -122,11 +122,11 @@ def worker(rank, args, port):
         # Rank 0's times; also gather rank 1's median for the record. The PCIe NCCL transfer dominates
         # and varies per call, so the noise floor is the spread of block medians (repeated timings of
         # blocks of --block consecutive iterations), next to the per-iteration spread.
-        med, spread_iter, lo, hi = stats(times)
+        med, spread_iter, lo, hi = stats(times) if times else (0.0, 0.0, 0.0, 0.0)
         blocks = [stats(times[j:j + args.block])[0] for j in range(0, len(times), args.block)
                   if len(times[j:j + args.block]) == args.block]
-        _, _, blo, bhi = stats(blocks)
-        spread = (bhi - blo) / med
+        _, _, blo, bhi = stats(blocks) if blocks else (0.0, 0.0, 0.0, 0.0)
+        spread = (bhi - blo) / med if med else 0.0
         meds = torch.tensor([med], device="cuda", dtype=torch.float64)
         all_meds = [torch.zeros_like(meds) for _ in range(2)]
         dist.all_gather(all_meds, meds)
@@ -169,6 +169,17 @@ def worker(rank, args, port):
                 "mismatches_rank0": mismatches[:5],
             },
         }
+        if args.mode == "check":
+            result = {
+                "passed": int(ok.item()) == 0,
+                "compared": ("AllReduce module output vs torch.distributed.all_reduce reference, bitwise, "
+                             f"{n} iterations ({args.warmup} warmup + {args.iters}) with the input restored "
+                             "from a pristine copy before each; pristine (read-only) copy verified unchanged "
+                             "before every reset; both ranks"),
+                "M": M, "D": D, "iterations": n, "inplace_iters": inplace_iters,
+                "inplace_path_used": inplace_iters == n,
+                "mismatches_rank0": mismatches[:5],
+            }
     else:
         import torch._dynamo
         import torch.nn as nn
@@ -238,7 +249,7 @@ def worker(rank, args, port):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", default="bench", choices=["bench", "compile"])
+    p.add_argument("--mode", default="bench", choices=["bench", "check", "compile"])
     p.add_argument("--m", type=int, default=38016)
     p.add_argument("--d", type=int, default=0)
     p.add_argument("--warmup", type=int, default=5)
