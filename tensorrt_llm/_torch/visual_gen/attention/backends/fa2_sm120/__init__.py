@@ -48,6 +48,9 @@ _DEFINES = [
 # fraction of a 256-row wave; otherwise one 256-row launch covers all rows.
 _MAX_REM_FRAC = 0.5
 
+_LOG_EVERY = 500
+_calls = 0
+
 _lock = threading.Lock()
 _ext = None
 _ext_state: Optional[bool] = None  # None: not tried, True: loaded, False: failed
@@ -151,11 +154,19 @@ _TAGS = tuple(
 @torch.library.custom_op("trtllm_vg::fa2_sm120_fwd", mutates_args=(), tags=_TAGS)
 def fa2_sm120_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
     """q, k, v: [B, H, S, D] (SDPA layout). Returns the output as [B, S, H, D] contiguous."""
+    global _calls
     ext = _load_ext()
     b, h, s, d = q.shape
     out = torch.empty((b, s, h, d), dtype=q.dtype, device=q.device)
     lse = torch.empty((b, h, s), dtype=torch.float32, device=q.device)
-    ext.fwd(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), out, lse, scale, _MAX_REM_FRAC)
+    launches = ext.fwd(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), out, lse, scale, _MAX_REM_FRAC
+    )
+    _calls += 1
+    if _calls == 1 or _calls % _LOG_EVERY == 0:
+        logger.info(
+            f"[fa2_sm120] calls={_calls} device={q.device} B={b} H={h} S={s} launches={launches}"
+        )
     return out
 
 
