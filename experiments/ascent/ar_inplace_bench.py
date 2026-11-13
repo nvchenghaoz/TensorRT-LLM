@@ -119,12 +119,19 @@ def worker(rank, args, port):
             del out
             if rank == 0 and i % 10 == 0:
                 log(rank, f"iter {i}/{n}")
-        # Rank 0's times; also gather rank 1's median for the record.
-        med, spread, lo, hi = stats(times)
+        # Rank 0's times; also gather rank 1's median for the record. The PCIe NCCL transfer dominates
+        # and varies per call, so the noise floor is the spread of block medians (repeated timings of
+        # blocks of --block consecutive iterations), next to the per-iteration spread.
+        med, spread_iter, lo, hi = stats(times)
+        blocks = [stats(times[j:j + args.block])[0] for j in range(0, len(times), args.block)
+                  if len(times[j:j + args.block]) == args.block]
+        _, _, blo, bhi = stats(blocks)
+        spread = (bhi - blo) / med
         meds = torch.tensor([med], device="cuda", dtype=torch.float64)
         all_meds = [torch.zeros_like(meds) for _ in range(2)]
         dist.all_gather(all_meds, meds)
-        log(rank, f"median={med:.4f} ms spread(p90-p10)/med={spread:.4f} min={lo:.4f} max={hi:.4f}")
+        log(rank, f"median={med:.4f} ms block-spread={spread:.4f} iter-spread={spread_iter:.4f} "
+            f"min={lo:.4f} max={hi:.4f} blocks={[round(b, 3) for b in blocks]}")
         # Repeated-execution check: same warmup/iters and reset points, untimed.
         mismatches = []
         inplace_iters = 0
@@ -152,6 +159,10 @@ def worker(rank, args, port):
                 "warmup": args.warmup,
                 "min_ms": lo,
                 "max_ms": hi,
+                "per_iter_spread_p90_p10": spread_iter,
+                "block": args.block,
+                "block_medians_ms": blocks,
+                "noise_floor_def": "(max-min)/median of block medians",
                 "rank_medians_ms": [float(x.item()) for x in all_meds],
                 "inplace_iters": inplace_iters,
                 "check_passed_all_ranks": int(ok.item()) == 0,
@@ -231,7 +242,8 @@ def main():
     p.add_argument("--m", type=int, default=38016)
     p.add_argument("--d", type=int, default=0)
     p.add_argument("--warmup", type=int, default=5)
-    p.add_argument("--iters", type=int, default=40)
+    p.add_argument("--iters", type=int, default=200)
+    p.add_argument("--block", type=int, default=25)
     p.add_argument("--checkpoint", default="")
     args = p.parse_args()
     if args.d <= 0:
