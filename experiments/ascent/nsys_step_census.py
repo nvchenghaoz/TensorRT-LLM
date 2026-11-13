@@ -54,6 +54,7 @@ def main():
         hi = bisect.bisect_right(starts, e)
         dtod = 0
         dtod_bytes = 0
+        dtod_sizes = Counter()
         other_copies = Counter()
         kernels = Counter()
         for j in range(lo, hi):
@@ -64,6 +65,7 @@ def main():
                 if kind == 8:
                     dtod += 1
                     dtod_bytes += nbytes
+                    dtod_sizes[nbytes] += 1
                 else:
                     other_copies[kind] += 1
             for kid in kname.get((pid, corr), []):
@@ -72,15 +74,17 @@ def main():
                    if any(w in k.lower() for w in ("copy", "clone", "cat"))}
         rec = {
             "range": text, "pid": pid, "dur_ms": (e - s) / 1e6, "memcpy_dtod": dtod,
-            "memcpy_dtod_MB": dtod_bytes / 1e6, "other_memcpy_kinds": dict(other_copies),
+            "memcpy_dtod_MB": dtod_bytes / 1e6,
+            "dtod_sizes_bytes": {str(k): v for k, v in sorted(dtod_sizes.items())},
+            "other_memcpy_kinds": dict(other_copies),
             "kernels_total": sum(kernels.values()), "copy_like_kernels": copyish,
             "top_kernels": dict(kernels.most_common(25)),
         }
         print(json.dumps(rec), flush=True)
         out.append(rec)
     print(json.dumps({"passed": True, "ranges": [
-        {k: r[k] for k in ("range", "pid", "dur_ms", "memcpy_dtod", "memcpy_dtod_MB", "kernels_total",
-                           "copy_like_kernels")} for r in out]}))
+        {k: r[k] for k in ("range", "pid", "dur_ms", "memcpy_dtod", "memcpy_dtod_MB", "dtod_sizes_bytes",
+                           "kernels_total", "copy_like_kernels")} for r in out]}))
 
 
 if __name__ == "__main__":
