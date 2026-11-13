@@ -29,7 +29,8 @@ def main() -> None:
     engine = os.path.join(here, "..", "ascent-config", "engine.json")
     cache = "none"
     if os.path.isfile(engine):
-        cfg = json.load(open(engine)).get("cache_config")
+        doc = json.load(open(engine))
+        cfg = doc.get("visual_gen_args", {}).get("cache_config") or doc.get("cache_config")
         if cfg:
             cache = json.dumps(cfg)
     tag = "cache" if cache != "none" else "base"
