@@ -660,12 +660,12 @@ def gate_up_sm120(x: torch.Tensor, weight: torch.Tensor, fused: bool = True,
 def _log_fused_call(m: int) -> None:
     global FUSED_CALLS
     FUSED_CALLS += 1
-    if FUSED_CALLS == 1 or FUSED_CALLS % 1000 == 0:
-        from tensorrt_llm.logger import logger
+    if FUSED_CALLS == 1 or FUSED_CALLS % 500 == 0:
+        import sys
         rank = torch.distributed.get_rank() if (torch.distributed.is_available()
                                                 and torch.distributed.is_initialized()) else 0
-        logger.info(f"[rank {rank}] gate_up_swiglu_sm120: fused calls {FUSED_CALLS} "
-                    f"(last M={m}, compiles {COMPILE_COUNT})")
+        print(f"[gate_up_swiglu_sm120] rank {rank} fused calls {FUSED_CALLS} "
+              f"(last M={m}, compiles {COMPILE_COUNT})", file=sys.stderr, flush=True)
 
 
 @torch.library.custom_op("trtllm::gate_up_swiglu_bf16_sm120", mutates_args=())
