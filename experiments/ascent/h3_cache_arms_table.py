@@ -84,19 +84,23 @@ _DP = {
            [7, 6, 5, 4, 2, 2, 1, 1]),
     "U31": ("1111111100100010001000100001000010000100001000011", [8, 1, 1, 1, 1, 1, 1, 1, 1, 2],
             [2, 3, 3, 3, 4, 4, 4, 4, 4]),
+    # Idea 113 (Fn=1 arms): F verbatim, and U34 (dense 0-7, 12, 17, 23, 30, 37, 43, 48).
+    "F_F1": ("1111111100000000010000000001000000000100001001011", [8, 1, 1, 1, 1, 1, 2], [9, 9, 9, 4, 2, 1]),
+    "U34_F1": ("1111111100001000010000010000001000000100000100001", [8, 1, 1, 1, 1, 1, 1, 1],
+               [4, 4, 5, 6, 6, 5, 4]),
 }
 for _n, (_s, _c, _k) in _DP.items():
     _m = [int(ch) for ch in _s]
     assert _m == _from_bins(_c, _k), _n
     MASKS[_n] = _m
 EXPECTED_CACHED = {"w14_c2": 20, "C": 24, "D": 28, "E": 31, "fallback": 22, "W": 24, "main": 0,
-                   "F": 34, "Es": 31, "Ds": 28, "U31": 31}
+                   "F": 34, "Es": 31, "Ds": 28, "U31": 31, "F_F1": 34, "U34_F1": 34}
 # max_warmup_steps per the brief (the explicit [1]*n prefix). The first compute RUN can be longer
 # (C, D, E start their periods with a 1, so their first run is 9; fallback 11; W 15).
 DENSE_HEAD = {"w14_c2": 14, "W": 14, "fallback": 10, "C": 8, "D": 8, "E": 8, "main": 49,
-              "F": 8, "Es": 8, "Ds": 8, "U31": 8}
+              "F": 8, "Es": 8, "Ds": 8, "U31": 8, "F_F1": 8, "U34_F1": 8}
 FIRST_RUN = {"w14_c2": 14, "W": 15, "fallback": 11, "C": 9, "D": 9, "E": 9, "main": 49,
-             "F": 8, "Es": 8, "Ds": 8, "U31": 8}
+             "F": 8, "Es": 8, "Ds": 8, "U31": 8, "F_F1": 8, "U34_F1": 8}
 # idea 83 LPIPS_est (park, perfume, robot) = LPIPS_292 x S/S(w14_c2); U31 from its uniform-weight S ratio.
 LPIPS_EST = {"C": (0.048, 0.024, 0.107), "D": (0.076, 0.037, 0.162), "E": (0.127, 0.060, 0.257),
              "fallback": (0.041, 0.021, 0.092), "W": (0.086, 0.041, 0.181),

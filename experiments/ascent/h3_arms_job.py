@@ -81,8 +81,13 @@ def fwd_summary(path: Path):
         return []
     return [(int(m.group(1)), m.group(3), m.group(4), m.group(5))
             for ln in path.read_text(errors="replace").splitlines() for m in [FWD_RE.search(ln)] if m]
-HEAD = {"E": 8, "D": 8, "C": 8, "fallback": 10, "W": 14, "w14_c2": 14, "F": 8, "Es": 8, "Ds": 8, "U31": 8}
+HEAD = {"E": 8, "D": 8, "C": 8, "fallback": 10, "W": 14, "w14_c2": 14, "F": 8, "Es": 8, "Ds": 8, "U31": 8,
+        "F_F1": 8, "U34_F1": 8}
 MCC = {"w14_c2": 2}
+FN = {"F_F1": 1, "U34_F1": 1}  # idea 113: Fn_compute_blocks 1 (default 8)
+# Idea 113: the FIRST arm's server also runs park seed 43 then park seed 42 after the frozen check's
+# repeat (per-request reset), through run_check_reset.py (imports the frozen run_check unchanged).
+RESET_FIRST_ARM = os.environ.get("H3_ARMS_RESET_FIRST", "1") == "1"
 
 
 def bins_of(mask):
@@ -107,7 +112,7 @@ def arm_config(arm):
         if i < len(cache):
             rebuilt += [0] * cache[i]
     assert rebuilt == mask, arm
-    return {"cache_backend": "cache_dit", "Fn_compute_blocks": 8, "Bn_compute_blocks": 0,
+    return {"cache_backend": "cache_dit", "Fn_compute_blocks": FN.get(arm, 8), "Bn_compute_blocks": 0,
             "max_warmup_steps": HEAD[arm], "max_continuous_cached_steps": MCC.get(arm, -1),
             "residual_diff_threshold": 0.08, "scm_compute_bins": comp, "scm_cache_bins": cache,
             "scm_steps_policy": "static"}
@@ -121,6 +126,47 @@ def grep(path: Path, rx):
     if not path.is_file():
         return []
     return [m.group(1) for ln in path.read_text(errors="replace").splitlines() for m in [rx.search(ln)] if m]
+
+
+def _run_check_script(h: dict, art: Path, script: Path) -> dict:
+    """h3_quality_job.run_check with another adapter script (same harness JSON, same streaming)."""
+    env = dict(os.environ, AUTO_DEV_ARTIFACTS=str(art))
+    print(f"[arms] check via {script.name} -> {art}", flush=True)
+    proc = subprocess.Popen([sys.executable, str(script), json.dumps(h)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    last = None
+    for line in proc.stdout:
+        if line.startswith("{") and '"adapter"' in line:
+            last = line
+            sys.stdout.write(line[:2000] + "\n")
+        else:
+            sys.stdout.write(line)
+        sys.stdout.flush()
+    proc.wait()
+    return json.loads(last) if last else {"valid": False, "errors": ["no check result"]}
+
+
+RECOMP_RE = re.compile(r"(Recompiling[^\n]*)")
+ENABLE_RE = re.compile(r"(Cache-DiT: MiniMax-H3 \S+ \d+ blocks, Fn=.*)$")
+STATS_LINE_RE = re.compile(r"accumulated_cached_steps=(\d+)")
+
+
+def recompile_scan(path: Path):
+    """Recompiling lines with (request ordinal by 'Step 1/' lines, last Step k/n seen before them)."""
+    out, req, last = [], 0, None
+    if not path.is_file():
+        return out
+    for ln in path.read_text(errors="replace").splitlines():
+        m = STEP_RE.search(ln)
+        if m:
+            if m.group(1) == "1":
+                req += 1
+            last = f"{m.group(1)}/{m.group(2)}"
+            continue
+        r = RECOMP_RE.search(ln)
+        if r:
+            out.append({"request": req, "after_step": last, "line": r.group(1)[:260]})
+    return out
 
 
 def main():
@@ -143,6 +189,16 @@ def main():
             _print(*a, **k)
 
     q.print = tee
+    if RESET_FIRST_ARM and arms:
+        _orig_rc = q.run_check
+        first = arms[0]
+
+        def _rc(h, art):
+            if art.name in (first, f"{first}_retry"):
+                return _run_check_script(h, art, HERE / "run_check_reset.py")
+            return _orig_rc(h, art)
+
+        q.run_check = _rc
     sys.argv = [sys.argv[0], ckpt] + arms
     q.main()
     (root / "quality.json").write_text(json.dumps(captured.get("quality", {}), default=str))
@@ -188,6 +244,34 @@ def post(root: Path, arms, quality):
             if p.is_file():
                 oom += [f"{p.name}: {m.group(0)[:200]}" for m in OOM_RE.finditer(p.read_text(errors="replace"))]
         steps = step_requests(logs / "server-check.log")
+        ares = {}
+        if (art / "adapter_result.json").is_file():
+            try:
+                ares = json.loads((art / "adapter_result.json").read_text())
+            except ValueError:
+                ares = {}
+        want_fn = FN.get(arm, 8)
+        mask_str = "".join(map(str, mask))
+        full0 = [ln for ln in r0 if ln.startswith("n=49 ")]
+        full1 = [ln for ln in r1 if ln.startswith("n=49 ")]
+        texts = {p.name: p.read_text(errors="replace") for p in (logs / "server-check.log",
+                                                                logs / "server-check-rank1.log") if p.is_file()}
+        enable = {n: [m.group(1) for m in map(ENABLE_RE.search, t.splitlines()) if m] for n, t in texts.items()}
+        stats_counts = [int(x) for x in STATS_LINE_RE.findall(texts.get("server-check.log", ""))]
+        out.setdefault("_extra", {})[arm] = {
+            "fn_ok": bool(r0) and bool(r1) and all(f"Fn={want_fn} Bn=0" in ln for ln in r0 + r1),
+            "mask_ok": bool(full0) and bool(full1) and all(f"mask={mask_str}" in ln for ln in full0 + full1),
+            "refresh_count": [len(r0), len(r1)],
+            "enable_lines": enable,
+            "taylorseer": {n: ("TaylorSeer enabled" in t) for n, t in texts.items()},
+            "stats_accumulated_cached_rank0": stats_counts,
+            "recompiles_rank0": recompile_scan(logs / "server-check.log"),
+            "recompiles_rank1": recompile_scan(logs / "server-check-rank1.log"),
+            "reset_sequence": ares.get("reset_sequence"),
+            "post_denoise_s": [r.get("server_post_denoise_s") for r in (ares.get("requests") or [])],
+            "denoise_s": [r.get("server_denoise_s") for r in (ares.get("requests") or [])],
+            "e2e_s": [r.get("client_e2e_s") for r in (ares.get("requests") or [])],
+        }
         out["arms"][arm] = {
             "yaml_keys": {"attention_backend": attn.get("backend"),
                           "quant_attention_config": attn.get("quant_attention_config"),
@@ -242,7 +326,7 @@ def post(root: Path, arms, quality):
 
     # Plan 736 order: F; then whichever of E*/U31 passes with the larger min margin; then D*; then periodic.
     mid = sorted([a for a in ("Es", "U31") if passes(a)], key=lambda a: -min_margin(a))
-    order = ["F"] + mid + ["Ds", "E", "D", "C", "fallback", "W"]
+    order = ["F_F1", "U34_F1", "F"] + mid + ["Ds", "E", "D", "C", "fallback", "W"]
     passing = [a for a in order if a in arms and passes(a)]
     out["min_margin"] = {a: min_margin(a) for a in out["arms"]}
     from h3_cache_arms_table import LPIPS_EST
@@ -285,7 +369,11 @@ def post(root: Path, arms, quality):
                              "accuracy": (v["quality"].get("accuracy") or {}).get("correct")}
                          for a, v in out["arms"].items()},
              "min_margin": out["min_margin"], "measured_over_est": out["measured_over_est"],
-             "timing": out.get("timing")}
+             "timing": out.get("timing"),
+             "extra": {a: {k: v for k, v in e.items() if k not in ("recompiles_rank0", "recompiles_rank1")}
+                       | {"recompiles_rank0_n": len(e["recompiles_rank0"]),
+                          "recompiles_rank1_n": len(e["recompiles_rank1"])}
+                       for a, e in out.get("_extra", {}).items()}}
     print(json.dumps(small, default=str), flush=True)
 
 
