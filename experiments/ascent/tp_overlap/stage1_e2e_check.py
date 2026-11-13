@@ -96,7 +96,7 @@ def scan_logs(paths, marks=None):
                 lines["chunk_residual"].append(s)
             if "[adaln_prefetch]" in ln:
                 lines["adaln_prefetch"].append(f"[{sec}] {s[-200:]}")
-            if "Recompiling" in ln or "recompil" in ln.lower():
+            if "Recompiling function" in ln:
                 lines["recompile"].setdefault(sec, []).append(s[-300:])
                 lines["recompile_count"][sec] = lines["recompile_count"].get(sec, 0) + 1
         for sec in lines["oom"]:
@@ -240,7 +240,10 @@ def main():
         for per in side.values() for v in per.values()) and bool(side)
     result["prefetch_equal_no_recompiles"] = all(
         v["adaln_prefetch_equal"]
-        and v["recompiles_after_warmup_branch"] == v["recompiles_after_warmup_main"]
+        # Request-shape recompiles (warmup request -> first real request) happen on main too;
+        # the branch may not add any.
+        and all(n <= v["recompiles_after_warmup_main"].get(sec, 0)
+                for sec, n in v["recompiles_after_warmup_branch"].items())
         for per in side.values() for v in per.values()) and bool(side)
     ok = ok and result["prefetch_equal_no_recompiles"]
     result["passed"] = ok

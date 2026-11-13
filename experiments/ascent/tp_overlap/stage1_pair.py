@@ -489,6 +489,8 @@ def main():
     ap.add_argument("--pair-check", action="store_true")
     ap.add_argument("--timing-pair-only", action="store_true")
     ap.add_argument("--report-arm", default="stage1")
+    ap.add_argument("--report-key", default=None,
+                    help="timing key for the batch entry, e.g. blocks8/f20 (default: first --blocks, f9)")
     args = ap.parse_args()
     blocks_list = [int(b) for b in args.blocks.split(",") if b]
     pair = None
@@ -557,7 +559,7 @@ def main():
         "max_mem_alloc_gib": [r0["max_mem_alloc_gib"], r1["max_mem_alloc_gib"]],
     }
     if args.mode == "time":
-        tkey = f"blocks{blocks_list[0]}/{PHASES[0][0]}"
+        tkey = args.report_key or f"blocks{blocks_list[0]}/{PHASES[0][0]}"
         t = r0["timing"][tkey][args.report_arm]
         summary = {}
         for key, tt in r0["timing"].items():
