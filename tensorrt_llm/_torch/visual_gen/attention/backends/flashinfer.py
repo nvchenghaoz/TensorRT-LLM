@@ -24,8 +24,13 @@ class FlashInferAttention(AttentionBackend):
     The backend accepts the VisualGen NHD layout ``[B, S, H, D]``. The FP16/BF16
     path uses FlashInfer's single-request or batched ragged prefill kernel. Block-scaled
     MXFP8 or NVFP4 Q/K dispatches to FlashInfer's SM100/SM103 FMHA with FP8 V. The
-    SM120/SM121 path supports dense NVFP4 Q/K/V, according to the validated YAML recipe.
+    SM120/SM121 path supports dense NVFP4 Q/K/V, according to the validated YAML recipe,
+    and per-tensor FP8 Q/K/V on SM120, optionally BF16 for the first ``dense_steps``
+    denoising steps.
     """
+
+    # Set after the first serving call of the SM120 FP8 recipe logs its quantize tactic.
+    _fp8_tactic_logged = False
 
     def __init__(
         self,
@@ -54,13 +59,26 @@ class FlashInferAttention(AttentionBackend):
         self._single_prefill = flashinfer.single_prefill_with_kv_cache
         self._batch_prefill_cls = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
         if quant_attention_config is not None and quant_attention_config.qk_dtype not in (
+            "fp8",
             "mxfp8",
             "nvfp4",
         ):
             raise ValueError(
-                "FlashInfer quantized attention supports qk_dtype='mxfp8' or 'nvfp4', "
+                "FlashInfer quantized attention supports qk_dtype='fp8', 'mxfp8' or 'nvfp4', "
                 f"got {quant_attention_config.qk_dtype!r}."
             )
+        if quant_attention_config is not None and quant_attention_config.qk_dtype == "fp8":
+            if quant_attention_config.v_dtype != "fp8":
+                raise ValueError(
+                    "FlashInfer per-tensor FP8 attention requires v_dtype='fp8', "
+                    f"got {quant_attention_config.v_dtype!r}."
+                )
+            if torch.cuda.is_available() and torch.cuda.get_device_capability() != (12, 0):
+                raise RuntimeError(
+                    "FlashInfer per-tensor FP8 attention (qk_dtype='fp8', v_dtype='fp8') "
+                    "runs the SM120 CuTe DSL FP8 FMHA and requires an SM120 GPU."
+                )
+
 
     def _validate_inputs(
         self,
@@ -486,6 +504,195 @@ class FlashInferAttention(AttentionBackend):
         output = output[:, :, :sequence_length].transpose(1, 2).contiguous()
         return output, lse[:, :, :sequence_length]
 
+    @staticmethod
+    def _quantize_e4m3_per_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused amax + E4M3 cast with one device-side descale (x ~= x_q * descale)."""
+        encoded, descale = torch.ops.trtllm.quantize_e4m3_per_tensor(tensor.contiguous())
+        return encoded, descale.float().reshape(1)
+
+    @torch.compiler.disable
+    def _run_fp8_sm120(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        is_causal: bool,
+        with_lse: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Per-tensor E4M3 Q/K/V attention on SM120 with BF16/FP16 output.
+
+        Q, K and V are each quantized with one tensor-wide scale; the Q and K descales are
+        folded into the softmax scale and the V descale scales the output. The CuTe DSL
+        kernel takes host scalars, so the three descales are read back once per call.
+        """
+        from flashinfer.attention.cute_dsl.sm120_fmha import sm120_fmha_fp8_ragged_prefill
+
+        batch, q_len, num_heads, head_dim = q.shape
+        kv_len = k.shape[1]
+        q_fp8, q_descale = self._quantize_e4m3_per_tensor(q)
+        k_fp8, k_descale = self._quantize_e4m3_per_tensor(k)
+        v_fp8, v_descale = self._quantize_e4m3_per_tensor(v)
+        descales = torch.cat([q_descale, k_descale, v_descale]).tolist()
+        output = torch.empty(batch * q_len, num_heads, head_dim, dtype=q.dtype, device=q.device)
+        lse = (
+            torch.empty(batch * q_len, num_heads, dtype=torch.float32, device=q.device)
+            if with_lse
+            else None
+        )
+        cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * q_len
+        cu_seqlens_k = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * kv_len
+        sm120_fmha_fp8_ragged_prefill(
+            q_fp8.view(batch * q_len, num_heads, head_dim),
+            k_fp8.view(batch * kv_len, self.num_kv_heads, head_dim),
+            v_fp8.view(batch * kv_len, self.num_kv_heads, head_dim),
+            output,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=q_len,
+            is_causal=is_causal,
+            sm_scale=descales[0] * descales[1] * self.scale,
+            lse=lse,
+            v_scale=descales[2],
+        )
+        output = output.view(batch, q_len, num_heads, head_dim)
+        if lse is None:
+            return output, None
+        # The kernel reports log2 LSE; VisualGen exposes natural-log LSE in [B, H, S].
+        lse = lse.view(batch, q_len, num_heads).transpose(1, 2).contiguous() * math.log(2.0)
+        return output, lse
+
+    def _is_fp8_sm120(self) -> bool:
+        quant_config = self.quant_attention_config
+        return (
+            quant_config is not None
+            and quant_config.qk_dtype == "fp8"
+            and quant_config.v_dtype == "fp8"
+        )
+
+    def _step_controller(self) -> Any:
+        # Published by the model (MiniMax-H3: models/minimax_h3/step_precision.py).
+        return self._metadata_state.get("step_precision_controller")
+
+    def _bf16_forwards(self) -> int | None:
+        # visual_gen_args.step_precision.attention_bf16_forwards, published by the model.
+        return self._metadata_state.get("attention_bf16_forwards")
+
+    def _runs_bf16_forward(self) -> bool:
+        """Whether this call runs BF16 attention under the step gate.
+
+        The transformer's step-precision controller (set by the pipeline before every
+        denoising forward) holds the forward index; forwards below
+        ``attention_bf16_forwards`` run main's BF16 path (VANILLA torch SDPA).
+        """
+        bf16_forwards = self._bf16_forwards()
+        if not bf16_forwards:
+            return False
+        controller = self._step_controller()
+        if controller is None:
+            raise RuntimeError(
+                "step_precision.attention_bf16_forwards needs a model that publishes a "
+                "step_precision_controller (MiniMax-H3); none was found."
+            )
+        return controller.runs_bf16(bf16_forwards)
+
+    def _log_forward_path(self, bf16: bool) -> None:
+        """One host log line per denoising forward (layer 0): which attention path ran."""
+        controller = self._step_controller()
+        if controller is None or controller.step_index is None:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        path = (
+            "bf16 via torch SDPA (VANILLA path)"
+            if bf16
+            else "fp8 via FlashInfer sm120_fmha_fp8_ragged_prefill"
+        )
+        print(
+            f"[step_precision] rank={rank} forward {controller.step_index}/"
+            f"{controller.num_steps} warmup={controller.warmup} attention={path} "
+            f"(attention_bf16_forwards={self._bf16_forwards()})",
+            flush=True,
+        )
+
+    def _run_bf16_dense(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool):
+        """The BF16 phase of the step gate: main's BF16 attention, bitwise.
+
+        Main runs the VANILLA backend (torch SDPA, FA2). This is VanillaAttention's call on
+        the same HND views of the NHD buffers; the output goes back to NHD as a view.
+        """
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            is_causal=is_causal,
+            scale=self.scale,
+            enable_gqa=self.num_heads != self.num_kv_heads,
+        )
+        return output.transpose(1, 2)
+
+    def _log_fp8_tactic_once(self, tensor: torch.Tensor) -> None:
+        """Log the quantize tactic serving dispatches to (layer 0, first non-warmup call)."""
+        controller = self._step_controller()
+        if FlashInferAttention._fp8_tactic_logged or (
+            controller is not None and (controller.warmup or controller.step_index is None)
+        ):
+            return
+        FlashInferAttention._fp8_tactic_logged = True
+        try:
+            from tensorrt_llm._torch.autotuner import AutoTuner
+            from tensorrt_llm._torch.custom_ops.torch_custom_ops import QuantizeE4M3PerTensorRunner
+            from tensorrt_llm.logger import logger
+
+            tuner = AutoTuner.get()
+            runner = QuantizeE4M3PerTensorRunner()
+            hit, runner_id, tactic, min_time = tuner.profiling_cache.search_cache(
+                "trtllm::quantize_e4m3_per_tensor",
+                [runner],
+                tuple(tuner._get_input_sizes([tensor])),
+                QuantizeE4M3PerTensorRunner.tuning_config,
+                apply_map_to_tuning_buckets=True,
+            )
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            logger.warning(
+                f"[FlashInfer FP8 attention] rank={rank} quantize_e4m3_per_tensor dispatch: "
+                f"tactic={tactic!r} cache_hit={hit} runner_id={runner_id} "
+                f"profiled_time={min_time} shape={tuple(tensor.shape)}"
+            )
+            print(
+                f"[FlashInfer FP8 attention] rank={rank} quantize_e4m3_per_tensor tactic="
+                f"{tactic!r} cache_hit={hit}",
+                flush=True,
+            )
+        except Exception as exc:  # logging only; never fail the forward
+            print(f"[FlashInfer FP8 attention] tactic lookup failed: {exc!r}", flush=True)
+
+    @torch.compiler.disable
+    def _run_fp8_gated(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        """Per-tensor FP8 attention, or BF16 SDPA on the gate's leading forwards."""
+        bf16 = self._runs_bf16_forward()
+        controller = self._step_controller()
+        if controller is not None and controller.step_index is not None:
+            controller.attention_calls += 1
+        if self.layer_idx == 0:
+            self._log_forward_path(bf16)
+        if bf16:
+            return self._run_bf16_dense(q, k, v, is_causal)
+        if controller is not None and controller.warmup and self._bf16_forwards():
+            # Startup warmup: run the BF16 phase too, then FP8 (CuTe DSL JIT, quantize
+            # autotune), so no timed request compiles or tunes either phase.
+            self._run_bf16_dense(q, k, v, is_causal)
+        if self.layer_idx == 0:
+            self._log_fp8_tactic_once(q)
+        output, _ = self._run_fp8_sm120(q, k, v, is_causal=is_causal, with_lse=False)
+        return output
+
     def forward(
         self,
         q: torch.Tensor,
@@ -496,6 +703,17 @@ class FlashInferAttention(AttentionBackend):
         key_padding_mask: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
+        if self._is_fp8_sm120():
+            # No LSE consumer: skip the kernel's LSE write.
+            self._validate_inputs(q, k, v, key_padding_mask)
+            if key_padding_mask is not None:
+                raise ValueError(
+                    "FlashInfer quantized attention does not support key padding masks."
+                )
+            is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
+            if is_causal and q.shape[1] != k.shape[1]:
+                raise ValueError("FlashInfer causal attention requires equal Q and K/V lengths.")
+            return self._run_fp8_gated(q, k, v, is_causal=is_causal)
         output, _ = self.forward_with_lse(
             q,
             k,
@@ -559,6 +777,8 @@ class FlashInferAttention(AttentionBackend):
             )
         if capability[0] == 12 and qk_dtype == "nvfp4" and quant_config.v_dtype == "nvfp4":
             return self._run_nvfp4_sm12x(q, k, v, is_causal=is_causal)
+        if capability == (12, 0) and qk_dtype == "fp8" and quant_config.v_dtype == "fp8":
+            return self._run_fp8_sm120(q, k, v, is_causal=is_causal, with_lse=True)
         raise RuntimeError(
             "Unsupported FlashInfer quantized attention recipe for "
             f"SM{capability[0]}{capability[1]}: qk_dtype={qk_dtype!r}, "

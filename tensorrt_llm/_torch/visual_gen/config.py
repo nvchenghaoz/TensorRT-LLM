@@ -39,6 +39,7 @@ from tensorrt_llm.visual_gen.args import (
     CudaGraphConfig,
     ParallelConfig,
     RuntimeLoRAConfig,
+    StepPrecisionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
@@ -140,6 +141,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
+    step_precision: Optional[StepPrecisionConfig] = None
 
     # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
     enable_layerwise_nvtx_marker: bool = False
@@ -214,6 +216,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
+    step_precision: Optional[StepPrecisionConfig] = None
     runtime_lora: Optional[RuntimeLoRAConfig] = None
 
     # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
@@ -290,6 +293,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             attention_metadata_state=_model_config_value(self.attention_metadata_state),
             parallel=_model_config_value(self.parallel),
             cache=_model_config_value(self.cache),
+            step_precision=_model_config_value(self.step_precision),
             enable_layerwise_nvtx_marker=_model_config_value(self.enable_layerwise_nvtx_marker),
         )
 
@@ -619,6 +623,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         attention_cfg = args.attention_config if args else AttentionConfig()
         parallel_cfg = args.parallel_config if args else ParallelConfig()
         cache_cfg = args.cache_config if args else None
+        step_precision_cfg = args.step_precision if args else None
         runtime_lora_cfg = args.runtime_lora_config if args else None
         enable_layerwise_nvtx_marker = bool(args.enable_layerwise_nvtx_marker) if args else False
 
@@ -839,6 +844,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
+            step_precision=step_precision_cfg,
             device=device,
             runtime_lora=runtime_lora_cfg,
             enable_layerwise_nvtx_marker=enable_layerwise_nvtx_marker,

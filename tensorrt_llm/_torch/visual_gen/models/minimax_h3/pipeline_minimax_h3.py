@@ -80,6 +80,11 @@ from .packing import (
 )
 from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
+from .step_precision import (
+    ATTENTION_BF16_FORWARDS_STATE_KEY,
+    STEP_PRECISION_STATE_KEY,
+    DenoiseStepController,
+)
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 from .vsa import build_h3_vsa_metadata, set_h3_vsa_context
@@ -529,8 +534,63 @@ class MiniMaxH3Pipeline(BasePipeline):
                 model_config.attention_metadata_state = create_attention_metadata_state()
 
     def _init_transformer(self) -> None:
-        self.transformer = MiniMaxH3Transformer3DModel(
-            self.pipeline_config.model_configs[PipelineComponent.TRANSFORMER]
+        model_config = self.pipeline_config.model_configs[PipelineComponent.TRANSFORMER]
+        self.transformer = MiniMaxH3Transformer3DModel(model_config)
+        self._init_step_precision(model_config)
+
+    def _init_step_precision(self, model_config) -> None:
+        """Attach the denoising-step controller and publish it to the attention backends.
+
+        The pipeline sets the controller's step before each denoising forward; attention
+        backends find it (and attention's BF16 forward count) in the shared
+        attention_metadata_state, which they hold by reference since construction.
+        """
+        controller = DenoiseStepController()
+        self.transformer.step_precision_controller = controller
+        step_precision = getattr(model_config, "step_precision", None)
+        attention_bf16_forwards = (
+            step_precision.attention_bf16_forwards if step_precision is not None else None
+        )
+        self._attention_bf16_forwards = attention_bf16_forwards
+        metadata_state = getattr(model_config, "attention_metadata_state", None)
+        if metadata_state is not None:
+            metadata_state[STEP_PRECISION_STATE_KEY] = controller
+            metadata_state[ATTENTION_BF16_FORWARDS_STATE_KEY] = attention_bf16_forwards
+        elif attention_bf16_forwards is not None:
+            raise ValueError(
+                "step_precision.attention_bf16_forwards needs an attention backend with "
+                "attention_metadata_state (FLASHINFER)."
+            )
+        rank = model_config.mapping.rank if model_config.mapping is not None else 0
+        tp_overlap_chunks = sorted(
+            {
+                getattr(block, "_tp_overlap_chunks", None)
+                for block in getattr(self.transformer, "transformer_blocks", [])
+            },
+            key=str,
+        )
+        logger.info(
+            f"[step_precision] rank={rank} MiniMax-H3 step gate: "
+            f"attention_bf16_forwards={attention_bf16_forwards} "
+            f"tp_overlap_chunks={tp_overlap_chunks} "
+            f"(attention backend {getattr(model_config.attention, 'backend', None)}, "
+            f"recipe {getattr(model_config.attention, 'quant_attention_config', None)})"
+        )
+        print(
+            f"[step_precision] rank={rank} attention_bf16_forwards={attention_bf16_forwards} "
+            f"tp_overlap_chunks={tp_overlap_chunks}",
+            flush=True,
+        )
+
+    def _log_peak_memory(self, phase: str) -> None:
+        """Host-only allocator counters for this rank (no device sync)."""
+        gib = 1024**3
+        print(
+            f"[step_precision] rank={self.rank} peak_memory {phase}: "
+            f"max_allocated={torch.cuda.max_memory_allocated() / gib:.2f} GiB "
+            f"max_reserved={torch.cuda.max_memory_reserved() / gib:.2f} GiB "
+            f"total={torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / gib:.2f} GiB",
+            flush=True,
         )
 
     def load_weights(self, weights: dict) -> None:
@@ -1387,6 +1447,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                 self.device,
             )
 
+        step_controller = self.transformer.step_precision_controller
+
         def forward_fn(
             video_latents: torch.Tensor,
             extra_stream_latents: dict[str, torch.Tensor],
@@ -1396,6 +1458,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             extra_tensors: dict[str, torch.Tensor],
         ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
             del timestep, encoder_hidden_states, extra_tensors
+            step_controller.set_step(index, len(row_timestep_plan), warmup=self._is_warmup)
             unique_timesteps, timestep_indices = row_timestep_plan[index]
             transformer_kwargs = dict(
                 hidden_states=torch.cat((condition_prefix, video_latents), dim=1),
@@ -1419,6 +1482,24 @@ class MiniMaxH3Pipeline(BasePipeline):
                     video_velocity, audio_velocity = self.transformer(**transformer_kwargs)
             else:
                 video_velocity, audio_velocity = self.transformer(**transformer_kwargs)
+            if self._attention_bf16_forwards is not None:
+                # Host-only record of this forward: gate recipe and cache state (the
+                # number of transformer blocks whose attention ran).
+                num_blocks = len(self.transformer.transformer_blocks)
+                calls = step_controller.attention_calls
+                attention = (
+                    "bf16-fa2"
+                    if step_controller.runs_bf16(self._attention_bf16_forwards)
+                    else "fp8"
+                )
+                print(
+                    f"[step_precision] rank={self.rank} forward_summary {index}/"
+                    f"{len(row_timestep_plan)} warmup={self._is_warmup} attention={attention} "
+                    f"linear=bf16(no linear gate on main) "
+                    f"cache={'computed' if calls >= num_blocks else 'cached'} "
+                    f"attention_calls={calls}/{num_blocks}",
+                    flush=True,
+                )
             # A silent all-zero / non-finite velocity has been observed once in
             # practice: the run completed, reported success, and wrote a black
             # video with silent audio.  The cause was never reproduced, so fail
@@ -1430,16 +1511,20 @@ class MiniMaxH3Pipeline(BasePipeline):
             return video_velocity[:, condition_rows:].float(), {"audio": audio_velocity.float()}
 
         timer.mark_denoise_start()
-        with self.offloader.context_if_requested("transformer"):
-            generated_latents, extra_latents = self.denoise(
-                latents=latents[condition_rows:][None],
-                scheduler=self.scheduler,
-                prompt_embeds=prompt_embeds,
-                guidance_scale=1.0,
-                forward_fn=forward_fn,
-                extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
-                extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
-            )
+        step_controller.reset()
+        try:
+            with self.offloader.context_if_requested("transformer"):
+                generated_latents, extra_latents = self.denoise(
+                    latents=latents[condition_rows:][None],
+                    scheduler=self.scheduler,
+                    prompt_embeds=prompt_embeds,
+                    guidance_scale=1.0,
+                    forward_fn=forward_fn,
+                    extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
+                    extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
+                )
+        finally:
+            step_controller.reset()
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
             # Every rank logs its own decisions so TP ranks can be compared.
             from tensorrt_llm._torch.visual_gen.cache.cache_dit_enablers import (
@@ -1453,6 +1538,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                     f"cached_steps={stats['cached_steps']} "
                     f"residual_diffs={stats['residual_diffs']}"
                 )
+        if self._attention_bf16_forwards is not None:
+            self._log_peak_memory("after denoise")
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()
@@ -1469,6 +1556,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "audio": (audio_latents, lambda rows: self._decode_audio(rows, num_audio_latents))
             },
         )
+        if self._attention_bf16_forwards is not None:
+            self._log_peak_memory("after VAE decode")
         timer.mark_end()
         logger.info(f"MiniMax-H3 inference completed in {time.time() - pipeline_start:.2f}s")
         return timer.fill(
