@@ -773,9 +773,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         # activations would be rejected at the kernel boundary.  Hand those
         # projections the model dtype instead; FP8 has no such restriction and
         # keeps its validated FP32 activations.
-        self._projection_act_dtype = (
-            model_config.torch_dtype if quant_algo == QuantAlgo.NVFP4 else torch.float32
-        )
+        # Per projection, resolved below once the alignment exclusions are known:
+        # an NVFP4-excluded projection stays FP32 and keeps FP32 activations.
         # The dynamic loader does not initialize NVFP4's static activation scale.
         if quant_algo == QuantAlgo.NVFP4 and not model_config.force_dynamic_quantization:
             raise NotImplementedError(
@@ -821,7 +820,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         video_patch_dim = in_channels * patch_size[0] * patch_size[1] * patch_size[2]
         # Block-scaled GEMMs require aligned dimensions. Keep the checkpoint's
         # small FP32 media projections unquantized, including their output heads.
-        if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+        # NVFP4 too: at K = 96 (proj_in) and K = 32 (audio_proj_in) the SM120
+        # nvfp4_gemm returns non-finite outputs from finite inputs, so H3's
+        # first denoise step fails its finiteness check.
+        if quant_algo in (QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4):
             excluded = list(model_config.quant_config.exclude_modules or [])
             for name, input_dim, output_dim in (
                 ("proj_in", video_patch_dim, hidden_size),
@@ -833,6 +835,15 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     if name not in excluded:
                         excluded.append(name)
             model_config.quant_config.exclude_modules = excluded
+        self._projection_act_dtypes = {
+            name: (
+                model_config.torch_dtype
+                if quant_algo == QuantAlgo.NVFP4
+                and not model_config.quant_config.is_module_excluded_from_quantization(name)
+                else torch.float32
+            )
+            for name in ("proj_in", "audio_proj_in", "proj_out", "audio_proj_out")
+        }
         self.config = SimpleNamespace(
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
@@ -1052,8 +1063,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         if static_context.text_embeds.shape[1] != text_indices.numel():
             raise ValueError("text_indices must contain one entry for every cached text embedding.")
 
-        video_embeds = self.proj_in(hidden_states.to(self._projection_act_dtype))
-        audio_embeds = self.audio_proj_in(audio_hidden_states.to(self._projection_act_dtype))
+        video_embeds = self.proj_in(hidden_states.to(self._projection_act_dtypes["proj_in"]))
+        audio_embeds = self.audio_proj_in(
+            audio_hidden_states.to(self._projection_act_dtypes["audio_proj_in"])
+        )
         text_embeds = static_context.text_embeds
         packed_hidden_states = text_embeds.new_zeros(
             (text_embeds.shape[0], sequence_length, text_embeds.shape[-1])
@@ -1144,10 +1157,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             unpad_to=sequence_length,
         )
         video_output = self.proj_out(
-            packed_hidden_states.to(self._projection_act_dtype)
+            packed_hidden_states.to(self._projection_act_dtypes["proj_out"])
         ).index_select(1, video_indices)
         audio_output = self.audio_proj_out(
-            packed_hidden_states.to(self._projection_act_dtype)
+            packed_hidden_states.to(self._projection_act_dtypes["audio_proj_out"])
         ).index_select(1, audio_indices)
 
         if not return_dict:
