@@ -226,3 +226,98 @@ def h3_gate_res_norm_mod(
 @h3_gate_res_norm_mod.register_fake
 def _(x, a, w, mod, idx, eps, gate_col, scale_col, shift_col):
     return torch.empty_like(x), torch.empty_like(x)
+
+
+@triton.jit
+def _rne_bf16(x):
+    """Round fp32 to the nearest-even bf16 value, kept in fp32.
+
+    Integer form on purpose: Triton folded ``(a * b).to(bf16).to(fp32) + c`` into one rounding of
+    ``a * b + c`` (measured on SM120, Triton 3.8), which loses eager's intermediate rounding.
+    """
+    b = x.to(tl.uint32, bitcast=True)
+    b = b + 0x7FFF + ((b >> 16) & 1)
+    b = (b >> 16) << 16
+    return b.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _minimax_h3_mod_out_kernel(
+    n_ptr,
+    t_ptr,
+    idx_ptr,
+    o_ptr,
+    D,
+    n_stride,
+    t_stride,
+    o_stride,
+    scale_off,
+    shift_off,
+    SEQ,
+    CH: tl.constexpr,
+    NCH: tl.constexpr,
+):
+    """o = bf16(bf16(n * bf16(1 + scale[idx])) + shift[idx]), stored in o's dtype (eager rounding)."""
+    row = tl.program_id(0)
+    r64 = row.to(tl.int64)
+    trow = tl.load(idx_ptr + row % SEQ).to(tl.int64)
+    tb = t_ptr + trow * t_stride
+    nr = n_ptr + r64 * n_stride
+    orow = o_ptr + r64 * o_stride
+    for i in tl.static_range(NCH):
+        c = i * CH + tl.arange(0, CH)
+        msk = c < D
+        n = tl.load(nr + c, mask=msk, other=0.0).to(tl.float32)
+        s = tl.load(tb + scale_off + c, mask=msk, other=0.0).to(tl.float32)
+        h = tl.load(tb + shift_off + c, mask=msk, other=0.0).to(tl.float32)
+        s1 = _rne_bf16(1.0 + s)
+        p = _rne_bf16(n * s1)
+        o = _rne_bf16(p + h)
+        # o is bf16-representable, so the store conversion is exact for bf16 and fp32 outputs.
+        tl.store(orow + c, o.to(o_ptr.dtype.element_ty), mask=msk)
+
+
+def h3_mod_out(
+    n: torch.Tensor,
+    table: torch.Tensor,
+    idx: torch.Tensor,
+    scale_col: int,
+    shift_col: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Eager ``n * (1 + scale[idx]) + shift[idx]`` on bf16 (three bf16 roundings), written as out_dtype.
+
+    ``table`` is ``[n_t, k * D]`` with scale and shift in column blocks ``scale_col`` / ``shift_col``.
+    Used by the final AdaLN norm_out so the FP32 output projections read its result without casts.
+    """
+    D = n.shape[-1]
+    seq_len = n.shape[-2] if n.ndim >= 2 else n.shape[0]
+    if idx.numel() != seq_len:
+        raise ValueError(
+            f"indices must have one entry per sequence position: {idx.numel()} vs {seq_len}"
+        )
+    n2 = n.reshape(-1, D)
+    if n2.stride(-1) != 1:
+        n2 = n2.contiguous()
+    if table.stride(-1) != 1:
+        table = table.contiguous()
+    rows = n2.shape[0]
+    out = torch.empty((rows, D), dtype=out_dtype, device=n.device)
+    if rows:
+        _minimax_h3_mod_out_kernel[(rows,)](
+            n2,
+            table,
+            idx,
+            out,
+            D,
+            n2.stride(0),
+            table.stride(0),
+            out.stride(0),
+            scale_col * D,
+            shift_col * D,
+            seq_len,
+            CH=_CH,
+            NCH=triton.cdiv(D, _CH),
+            num_warps=4,
+        )
+    return out.view(n.shape)
