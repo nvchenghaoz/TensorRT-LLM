@@ -27,8 +27,60 @@ sys.path.insert(0, str(HERE))
 import h3_quality_job as q  # noqa: E402
 from h3_cache_arms_table import EXPECTED_CACHED, MASKS, check_masks  # noqa: E402
 
-L2 = "park=0.0390,perfume=0.0198,robot=0.0887"  # landing 10 check, job 371
+L2 = os.environ.get("H3_ARMS_L2", "park=0.0390,perfume=0.0198,robot=0.0887")  # default: job 371 (BF16)
 SNR_FLAG = {"park_portrait": 1.74, "perfume_bottle": 4.60, "golden_robot": 7.47}
+SNR_REF = json.loads(os.environ.get("H3_ARMS_SNR_REF", "{}"))  # e.g. job 455's per-prompt audio SNR
+K_BF16 = int(os.environ.get("H3_ARMS_K_BF16", "0"))  # attention_bf16_forwards on the base, 0 = none
+STEP_RE = re.compile(r"Step (\d+)/(\d+) \| ([0-9.]+)s")
+FWD_RE = re.compile(r"\[step_precision\] rank=\d+ forward_summary (\d+)/(\d+) warmup=(\w+) attention=(\S+) "
+                    r".*?cache=(\w+) attention_calls=(\d+)/(\d+)")
+OOM_RE = re.compile(r"(failed with OOM|out of memory|CUDA error)[^\n]*", re.IGNORECASE)
+
+
+def step_requests(path: Path):
+    """Rank-0 Step lines split into requests: list of [(k, n, seconds)]."""
+    reqs, cur = [], []
+    if not path.is_file():
+        return reqs
+    for ln in path.read_text(errors="replace").splitlines():
+        m = STEP_RE.search(ln)
+        if not m:
+            continue
+        k, n, t = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        if k == 1 and cur:
+            reqs.append(cur)
+            cur = []
+        cur.append((k, n, t))
+    if cur:
+        reqs.append(cur)
+    return reqs
+
+
+def phase_timing(reqs, mask, k_bf16):
+    """Dense/cached mean per precision phase over 49-forward requests (forward i = Step i+1)."""
+    out = []
+    for r in reqs:
+        if not r or r[0][1] != len(mask):
+            continue
+        rec = {}
+        for (k, n, t) in r:
+            i = k - 1
+            ph = "bf16" if (k_bf16 and i < k_bf16) else ("fp8" if k_bf16 else "all")
+            key = f"{ph}_{'dense' if mask[i] else 'cached'}"
+            rec.setdefault(key, []).append(t)
+        rec = {k: (round(sum(v) / len(v), 3), len(v)) for k, v in rec.items()}
+        rec["step1_3"] = [t for (k, n, t) in r[:3]]
+        rec["total"] = round(sum(t for (_, _, t) in r), 2)
+        out.append(rec)
+    return out
+
+
+def fwd_summary(path: Path):
+    """Per-forward (index, warmup, attention phase, cache state) lines of one rank."""
+    if not path.is_file():
+        return []
+    return [(int(m.group(1)), m.group(3), m.group(4), m.group(5))
+            for ln in path.read_text(errors="replace").splitlines() for m in [FWD_RE.search(ln)] if m]
 HEAD = {"E": 8, "D": 8, "C": 8, "fallback": 10, "W": 14, "w14_c2": 14, "F": 8, "Es": 8, "Ds": 8, "U31": 8}
 MCC = {"w14_c2": 2}
 
@@ -93,8 +145,11 @@ def main():
     q.print = tee
     sys.argv = [sys.argv[0], ckpt] + arms
     q.main()
+    (root / "quality.json").write_text(json.dumps(captured.get("quality", {}), default=str))
+    post(root, arms, captured.get("quality", {}).get("configs", {}))
 
-    quality = captured.get("quality", {}).get("configs", {})
+
+def post(root: Path, arms, quality):
     out = {"arms": {}}
     specs = []
     for arm in arms:
@@ -115,7 +170,39 @@ def main():
         snr_flags = [p["key"] for p in qa.get("per_prompt", [])
                      if p.get("audio_snr_db") is not None and (p["audio_snr_db"] < SNR_FLAG.get(p["key"], 0)
                                                                  or p["audio_snr_db"] < 0)]
+        mask = MASKS[arm]
+        f0 = fwd_summary(logs / "server-check.log")
+        f1 = fwd_summary(logs / "server-check-rank1.log")
+        fwd_ok = None
+        if K_BF16:
+            # Timed forwards: phase must follow the gate (i < K -> bf16-fa2) and cache state the mask.
+            timed = [x for x in f0 if x[1] == "False"]
+            fwd_ok = bool(timed) and all(
+                (a == ("bf16-fa2" if i < K_BF16 else "fp8")) and (c == ("computed" if mask[i] else "cached"))
+                for (i, w, a, c) in timed if len(mask) == 49)
+        import yaml as _yaml
+        yv = _yaml.safe_load(ytxt) if ytxt else {}
+        attn = (yv or {}).get("attention_config") or {}
+        oom = []
+        for p in (logs / "server-check.log", logs / "server-check-rank1.log"):
+            if p.is_file():
+                oom += [f"{p.name}: {m.group(0)[:200]}" for m in OOM_RE.finditer(p.read_text(errors="replace"))]
+        steps = step_requests(logs / "server-check.log")
         out["arms"][arm] = {
+            "yaml_keys": {"attention_backend": attn.get("backend"),
+                          "quant_attention_config": attn.get("quant_attention_config"),
+                          "step_precision": (yv or {}).get("step_precision"),
+                          "parallel_config": (yv or {}).get("parallel_config")},
+            "warmup_forward_summary_rank0": [x for x in f0 if x[1] == "True"],
+            "warmup_forward_summary_rank1": [x for x in f1 if x[1] == "True"],
+            "forward_summary_ranks_identical": bool(f0) and f0 == f1 if K_BF16 else None,
+            "forward_phase_cache_ok": fwd_ok,
+            "phase_timing": phase_timing(steps, mask, K_BF16),
+            "warmup_step_lines": [r for r in steps if r and r[0][1] != 49],
+            "oom_hits": oom[:20],
+            "audio_snr_delta_vs_ref": {p["key"]: round(p["audio_snr_db"] - SNR_REF[p["key"]], 2)
+                                       for p in qa.get("per_prompt", [])
+                                       if p.get("audio_snr_db") is not None and p["key"] in SNR_REF},
             "cudnn_in_yaml": "CUDNN" in ytxt.upper(),
             "refresh_rank0": r0, "refresh_rank1": r1, "refresh_ranks_identical": bool(r0) and r0 == r1,
             "decisions_rank0": d0, "decisions_rank1": d1, "decisions_ranks_identical": bool(d0) and d0 == d1,
@@ -170,6 +257,10 @@ def main():
     out["pick_most_aggressive_passing"] = passing[0] if passing else None
     mech_ok = all(v["warmup_ok"] and v["decisions_ranks_identical"] and v["refresh_ranks_identical"]
                   and not v["cudnn_in_yaml"] and v["quality"].get("repeated_execution_passed")
+                  and (not K_BF16 or (v["forward_phase_cache_ok"] and v["forward_summary_ranks_identical"]
+                                      and v["yaml_keys"]["attention_backend"] == "FLASHINFER"
+                                      and (v["yaml_keys"]["step_precision"] or {}).get("attention_bf16_forwards")
+                                      == K_BF16))
                   for v in out["arms"].values())
     out["mechanics_ok"] = mech_ok
     (root / "arms_summary.json").write_text(json.dumps(out, indent=1, default=str))
@@ -183,6 +274,14 @@ def main():
                              "margin": {p["key"]: p.get("margin_to_floor_plus_0.03")
                                         for p in v["quality"].get("per_prompt") or []},
                              "snr_flags": v["audio_snr_flags"],
+                             "snr_delta_vs_ref": v["audio_snr_delta_vs_ref"],
+                             "fwd_phase_cache_ok": v["forward_phase_cache_ok"],
+                             "yaml_keys": {k: v["yaml_keys"][k] for k in ("attention_backend",
+                                                                           "quant_attention_config",
+                                                                           "step_precision")},
+                             "oom_hits": len(v["oom_hits"]),
+                             "phase_timing": v["phase_timing"],
+                             "warmup_fwd_rank0": v["warmup_forward_summary_rank0"],
                              "accuracy": (v["quality"].get("accuracy") or {}).get("correct")}
                          for a, v in out["arms"].items()},
              "min_margin": out["min_margin"], "measured_over_est": out["measured_over_est"],
@@ -191,4 +290,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 2 and sys.argv[1] == "--post-only":  # --post-only ROOT ARM...
+        _root = Path(sys.argv[2])
+        _q = json.loads((_root / "quality.json").read_text()) if (_root / "quality.json").is_file() else {}
+        post(_root, sys.argv[3:], _q.get("configs", {}))
+    else:
+        main()
