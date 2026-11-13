@@ -65,7 +65,16 @@ def source_grep():
         "step_precision_controller_assign": re.compile(r"\.step_precision_controller\s*="),
     }
     hits = {k: [] for k in pats}
-    for p in sorted((WT / "tensorrt_llm").rglob("*.py")):
+    # MiniMax-H3's gate, its attention consumer and the args. Cosmos3 has its own,
+    # pre-existing controller on main (models/cosmos3/step_precision.py), outside H3.
+    roots = [WT / "tensorrt_llm/_torch/visual_gen/models/minimax_h3",
+             WT / "tensorrt_llm/_torch/visual_gen/attention",
+             WT / "tensorrt_llm/_torch/visual_gen/config.py",
+             WT / "tensorrt_llm/visual_gen"]
+    files = []
+    for r in roots:
+        files += [r] if r.is_file() else sorted(r.rglob("*.py"))
+    for p in files:
         try:
             lines = p.read_text(errors="replace").splitlines()
         except OSError:
@@ -98,8 +107,11 @@ def config_parses():
             False),
     }
     if "linear_bf16_forwards" in StepPrecisionConfig.model_fields:
-        cases["linear_only_vanilla"] = ({"attention_config": {"backend": "VANILLA"},
-                                         "step_precision": {"linear_bf16_forwards": 10}}, True)
+        # No linear consumer on this tree (landing 11 not on main): the key is refused, never
+        # silently ignored (attention plan 737 d). Branch 19's fold-in flips this to parse.
+        cases["linear_only_vanilla_refused_without_linear_consumer"] = (
+            {"attention_config": {"backend": "VANILLA"}, "cache_config": eng["cache_config"],
+             "step_precision": {"linear_bf16_forwards": 10}}, False)
     for name, (cfg, should_parse) in cases.items():
         try:
             args = VisualGenArgs(**cfg)
@@ -230,6 +242,8 @@ def main():
         gate = [l for l in sp if "attention_bf16_forwards=" in l and "forward " not in l]
         fwd = [l for l in sp if " forward " in l]
         quotes[p.name] = {"gate_lines": gate[:4], "n_forward_lines": len(fwd),
+                          "peak_memory_lines": [l for l in sp if "peak_memory" in l][-10:],
+                          "forward_summary_head": [l for l in sp if "forward_summary" in l][:20],
                           "forward_lines_head": fwd[:3], "forward_lines_sample": fwd[-52:],
                           "tactic_lines": [l for l in sp if "FlashInfer FP8 attention" in l][:4]}
         rc_lines = [l for l in lines if re.search(r"[Rr]ecompil|graph break|Graph break", l)]

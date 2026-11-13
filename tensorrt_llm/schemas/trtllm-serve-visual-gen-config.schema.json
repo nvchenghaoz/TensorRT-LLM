@@ -913,6 +913,21 @@
           "description": "Number of leading denoising forwards whose attention runs unquantized BF16 (main's VANILLA torch SDPA path) before attention_config.quant_attention_config takes over. Early forwards fix the subject and layout. Supported for the FLASHINFER per-tensor fp8/fp8 recipe on SM120 with MiniMax-H3.",
           "status": "prototype",
           "title": "Attention Bf16 Forwards"
+        },
+        "linear_bf16_forwards": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of leading denoising forwards whose step-gated linears run BF16 before their quantized recipe takes over. Reserved: no linear consumer reads it yet, so setting it is refused.",
+          "status": "prototype",
+          "title": "Linear Bf16 Forwards"
         }
       },
       "title": "StepPrecisionConfig",

@@ -143,6 +143,16 @@ class StepPrecisionConfig(StrictBaseModel):
     leaves that consumer on its configured path for every forward.
     """
 
+    linear_bf16_forwards: Optional[int] = Field(
+        None,
+        ge=0,
+        status="prototype",
+        description=(
+            "Number of leading denoising forwards whose step-gated linears run BF16 before "
+            "their quantized recipe takes over. Reserved: no linear consumer reads it yet, so "
+            "setting it is refused."
+        ),
+    )
     attention_bf16_forwards: Optional[int] = Field(
         None,
         ge=0,
@@ -1024,7 +1034,14 @@ class VisualGenArgs(StrictBaseModel):
     @model_validator(mode="after")
     def _validate_step_precision(self) -> "VisualGenArgs":
         step_precision = self.step_precision
-        if step_precision is None or step_precision.attention_bf16_forwards is None:
+        if step_precision is None:
+            return self
+        if step_precision.linear_bf16_forwards is not None:
+            raise ValueError(
+                "step_precision.linear_bf16_forwards has no step-gated linear consumer in this "
+                "build; leave it unset (a silently ignored gate would run every forward BF16)."
+            )
+        if step_precision.attention_bf16_forwards is None:
             return self
         attention = self.attention_config
         q_config = attention.quant_attention_config

@@ -582,6 +582,17 @@ class MiniMaxH3Pipeline(BasePipeline):
             flush=True,
         )
 
+    def _log_peak_memory(self, phase: str) -> None:
+        """Host-only allocator counters for this rank (no device sync)."""
+        gib = 1024**3
+        print(
+            f"[step_precision] rank={self.rank} peak_memory {phase}: "
+            f"max_allocated={torch.cuda.max_memory_allocated() / gib:.2f} GiB "
+            f"max_reserved={torch.cuda.max_memory_reserved() / gib:.2f} GiB "
+            f"total={torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / gib:.2f} GiB",
+            flush=True,
+        )
+
     def load_weights(self, weights: dict) -> None:
         transformer_weights = weights.get(PipelineComponent.TRANSFORMER, weights)
         self.transformer.load_weights(transformer_weights)
@@ -1527,6 +1538,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                     f"cached_steps={stats['cached_steps']} "
                     f"residual_diffs={stats['residual_diffs']}"
                 )
+        if self._attention_bf16_forwards is not None:
+            self._log_peak_memory("after denoise")
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()
@@ -1543,6 +1556,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "audio": (audio_latents, lambda rows: self._decode_audio(rows, num_audio_latents))
             },
         )
+        if self._attention_bf16_forwards is not None:
+            self._log_peak_memory("after VAE decode")
         timer.mark_end()
         logger.info(f"MiniMax-H3 inference completed in {time.time() - pipeline_start:.2f}s")
         return timer.fill(
