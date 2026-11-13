@@ -49,6 +49,7 @@ from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .adaln_prefetch import H3AdalnTableSlot, h3_adaln_table, make_prefetch_hook
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_mod_out, h3_norm_mod
 from .vsa import get_h3_vsa_context, h3_vsa_attention
 
@@ -675,6 +676,8 @@ _TP_OVERLAP_PG_HIGH_PRIORITY = True
 # Per-chunk row weights for the chunked overlap (None = uniform _tp_overlap_num_chunks() chunks).
 _TP_OVERLAP_CHUNK_WEIGHTS: Optional[tuple[float, ...]] = None
 _H3_TP_GROUPS: dict = {}
+# Block i+1's AdaLN table computed in block i's all-reduce drain (setup_adaln_prefetch).
+_ADALN_PREFETCH = True
 
 
 def h3_dedicated_tp_group(
@@ -733,6 +736,10 @@ class MiniMaxH3TransformerBlock(nn.Module):
     _tp_overlap_weights = None
     _tp_overlap_group_name = None
     _tp_overlap_pg = None
+    # AdaLN table prefetch (adaln_prefetch.py; set by the owning model): the model's slot id, and
+    # the callables (temb, x_act) -> None run in _post_attn_overlap's all-reduce drain.
+    _adaln_slot_id = None
+    _drain_hooks = ()
 
     def __init__(
         self,
@@ -843,11 +850,22 @@ class MiniMaxH3TransformerBlock(nn.Module):
         valid_seq_len: Optional[int],
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
-        mod = self.adaln_proj.table(temb)
+        overlap = self._tp_overlap_chunks > 1 and hidden_states.shape[0] == 1
+        adaln_x_act = None
+        if overlap and self._adaln_slot_id is not None:
+            # Same math as adaln_proj.table(temb); the GEMM is an opaque op that takes the table
+            # the previous block prefetched in its all-reduce drain (adaln_prefetch.py).
+            adaln_linear = self.adaln_proj.linear
+            adaln_x_act = F.silu(temb).to(adaln_linear.dtype)
+            mod = h3_adaln_table(
+                temb, adaln_x_act, adaln_linear.weight, adaln_linear.bias, self._adaln_slot_id
+            ).view(-1, 6 * hidden_size)
+        else:
+            mod = self.adaln_proj.table(temb)
         norm_hidden_states = h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
         )
-        if self._tp_overlap_chunks > 1 and hidden_states.shape[0] == 1:
+        if overlap:
             attn_hidden = self.attn(
                 norm_hidden_states,
                 rotary_emb,
@@ -857,7 +875,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
                 project_out=False,
             )
             residual_chunks, ff_chunks = self._post_attn_overlap(
-                attn_hidden, hidden_states, mod, adaln_indices
+                attn_hidden, hidden_states, mod, adaln_indices, temb, adaln_x_act
             )
             gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
             return torch.cat(residual_chunks, dim=1) + gate_mlp.index_select(
@@ -947,6 +965,8 @@ class MiniMaxH3TransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         mod: torch.Tensor,
         adaln_indices: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+        adaln_x_act: Optional[torch.Tensor] = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Token-chunked post-attention half with the TP all-reduces off the critical path.
 
@@ -998,6 +1018,11 @@ class MiniMaxH3TransformerBlock(nn.Module):
             ff_works.append(dist.all_reduce(ff_out, group=pg, async_op=True))
             residual_chunks.append(residual)
             ff_chunks.append(ff_out.view(1, end - start, hidden_size))
+        # Next-block work for the compute stream while the last all-reduces drain (same order on
+        # every rank): block i+1's AdaLN table (adaln_prefetch.py), later hooks append here.
+        if adaln_x_act is not None:
+            for hook in self._drain_hooks:
+                hook(temb, adaln_x_act)
         for work in ff_works:
             work.wait()
         return residual_chunks, ff_chunks
@@ -1196,6 +1221,48 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         self.apply_quant_config_exclude_modules()
         for block in self.transformer_blocks:
             block.setup_tp_overlap(model_config)
+        self.setup_adaln_prefetch()
+
+    def setup_adaln_prefetch(self) -> None:
+        """Compute block i+1's AdaLN table in block i's TP all-reduce drain (adaln_prefetch.py).
+
+        Only with the chunked TP overlap on every block (its drain is where the prefetch runs) and
+        plain BF16 AdaLN Linears (whose forward is exactly ``F.linear``); otherwise every block
+        keeps ``adaln_proj.table``.
+        """
+        blocks = list(self.transformer_blocks)
+        self._adaln_table_slot = None
+
+        def _plain(linear) -> bool:
+            quant_config = getattr(linear, "quant_config", None)
+            return (
+                not (
+                    quant_config is not None
+                    and quant_config.layer_quant_mode.has_any_quant(exclude_kv_cache=True)
+                )
+                and linear.dtype == torch.bfloat16
+                and getattr(linear, "lora", None) is None
+                and not getattr(linear, "use_custom_cublas_mm", False)
+                and not getattr(linear, "use_cute_dsl_bf16_gemm", False)
+                and getattr(linear, "tp_mode", None) is None
+            )
+
+        if not (
+            _ADALN_PREFETCH
+            and blocks
+            and all(b._tp_overlap_chunks > 1 for b in blocks)
+            and all(_plain(b.adaln_proj.linear) for b in blocks)
+        ):
+            return
+        slot = H3AdalnTableSlot(self)
+        self._adaln_table_slot = slot
+        for i, block in enumerate(blocks):
+            block._adaln_slot_id = slot.slot_id
+            block._drain_hooks = (
+                [make_prefetch_hook(slot, i + 1, blocks[i + 1].adaln_proj.linear)]
+                if i + 1 < len(blocks)
+                else []
+            )
 
     def apply_quant_config_exclude_modules(self) -> None:
         """Drop quantization from Linears the quant config excludes.
