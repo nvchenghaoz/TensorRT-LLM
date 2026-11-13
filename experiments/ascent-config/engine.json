@@ -1,7 +1,0 @@
-{
-  "visual_gen_args": {
-    "attention_config": {
-      "backend": "CUDNN"
-    }
-  }
-}
