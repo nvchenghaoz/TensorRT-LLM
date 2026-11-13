@@ -623,6 +623,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             f"max_reserved={torch.cuda.max_memory_reserved() / gib:.2f} GiB "
             f"num_alloc_retries={stats.get('num_alloc_retries', 0)} "
             f"num_ooms={stats.get('num_ooms', 0)} "
+            f"free_device={torch.cuda.mem_get_info()[0] / gib:.3f} GiB "
             f"total={torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / gib:.2f} GiB",
             flush=True,
         )
