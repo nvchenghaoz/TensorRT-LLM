@@ -14,6 +14,22 @@ _CHUNK = 16
 # falls back to 4, 2 or 1 for head counts that eight does not divide.
 _TOKENS_PER_PROGRAM = 1
 _NUM_WARPS = 1
+# SM120 (RTX PRO 6000): four tokens x one head with two warps measured fastest and bitwise equal to
+# the default launch at the H3 TP2 rank shape (28 local heads, ~38k tokens): 0.787 vs 0.926 ms.
+_SM120_LAUNCH = (4, 1, 2)  # (tokens_per_program, heads_per_program, num_warps)
+_launch_by_device: dict = {}
+
+
+def _default_launch(device: torch.device) -> tuple[int, int | None, int]:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    shape = _launch_by_device.get(idx)
+    if shape is None:
+        if torch.cuda.get_device_capability(idx) == (12, 0):
+            shape = _SM120_LAUNCH
+        else:
+            shape = (_TOKENS_PER_PROGRAM, None, _NUM_WARPS)
+        _launch_by_device[idx] = shape
+    return shape
 
 
 @triton.jit
@@ -114,15 +130,23 @@ def launch_minimax_h3_qk_norm_rope(
     num_heads: int,
     head_dim: int,
     *,
-    tokens_per_program: int = _TOKENS_PER_PROGRAM,
+    tokens_per_program: int | None = None,
     heads_per_program: int | None = None,
-    num_warps: int = _NUM_WARPS,
+    num_warps: int | None = None,
 ) -> None:
     """Launch the Triton kernel on validated inputs, writing ``q`` and ``k`` in place.
 
     The launch shape is a keyword so tests can exercise tail-token masking with shapes that do not
-    divide the token count; the model uses the defaults through the custom op.
+    divide the token count; the model uses the defaults through the custom op. With no shape given
+    the device default applies: (1 token, largest of 8/4/2/1 heads dividing num_heads, 1 warp), or
+    (4, 1, 2) on SM120; a partly given shape fills the rest from the former (1, auto, 1).
     """
+    if tokens_per_program is None and heads_per_program is None and num_warps is None:
+        tokens_per_program, heads_per_program, num_warps = _default_launch(qkv.device)
+    if tokens_per_program is None:
+        tokens_per_program = _TOKENS_PER_PROGRAM
+    if num_warps is None:
+        num_warps = _NUM_WARPS
     if heads_per_program is None:
         # Largest power of two up to _MAX_HEADS_PER_PROGRAM that divides the head count.
         heads_per_program = next(h for h in (8, 4, 2, 1) if num_heads % h == 0)
