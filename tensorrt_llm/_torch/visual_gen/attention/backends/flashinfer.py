@@ -528,12 +528,20 @@ class FlashInferAttention(AttentionBackend):
         """
         from flashinfer.attention.cute_dsl.sm120_fmha import sm120_fmha_fp8_ragged_prefill
 
+        from .fp8_attn_prep import fp8_qkv_prep_supported, quantize_e4m3_qkv_per_tensor
+
         batch, q_len, num_heads, head_dim = q.shape
         kv_len = k.shape[1]
-        q_fp8, q_descale = self._quantize_e4m3_per_tensor(q)
-        k_fp8, k_descale = self._quantize_e4m3_per_tensor(k)
-        v_fp8, v_descale = self._quantize_e4m3_per_tensor(v)
-        descales = torch.cat([q_descale, k_descale, v_descale]).tolist()
+        if fp8_qkv_prep_supported(q, k, v):
+            # Two Triton launches for Q, K and V, reading V's strided view in place; bitwise
+            # equal to the per-tensor C++ op below on contiguous copies.
+            q_fp8, k_fp8, v_fp8, descale_t = quantize_e4m3_qkv_per_tensor(q, k, v)
+            descales = descale_t.tolist()
+        else:
+            q_fp8, q_descale = self._quantize_e4m3_per_tensor(q)
+            k_fp8, k_descale = self._quantize_e4m3_per_tensor(k)
+            v_fp8, v_descale = self._quantize_e4m3_per_tensor(v)
+            descales = torch.cat([q_descale, k_descale, v_descale]).tolist()
         output = torch.empty(batch * q_len, num_heads, head_dim, dtype=q.dtype, device=q.device)
         lse = (
             torch.empty(batch * q_len, num_heads, dtype=torch.float32, device=q.device)
@@ -638,6 +646,13 @@ class FlashInferAttention(AttentionBackend):
         ):
             return
         FlashInferAttention._fp8_tactic_logged = True
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(
+            f"[FlashInfer FP8 attention] rank={rank} prep=triton fp8_attn_prep "
+            "(multi-tensor amax + E4M3 quantize, strided V read in place; "
+            "C++ quantize_e4m3_per_tensor only for unsupported layouts)",
+            flush=True,
+        )
         try:
             from tensorrt_llm._torch.autotuner import AutoTuner
             from tensorrt_llm._torch.custom_ops.torch_custom_ops import QuantizeE4M3PerTensorRunner
