@@ -21,16 +21,19 @@ The architecture follows the Diffusers implementations while using TRT-LLM's
 linear, attention, normalization, and dynamic-weight-loading modules
 """
 
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
+from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
@@ -235,7 +238,10 @@ class MiniMaxH3Attention(Attention):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
+        project_out: bool = True,
     ) -> torch.Tensor:
+        """``project_out=False`` returns the attention output before ``to_out`` so the
+        caller can run the row-parallel output projection (and its all-reduce) itself."""
         if self.use_async_ulysses:
             return self.forward_async(
                 hidden_states,
@@ -243,6 +249,7 @@ class MiniMaxH3Attention(Attention):
                 key_padding_mask=key_padding_mask,
                 timestep=timestep,
                 valid_seq_len=valid_seq_len,
+                project_out=project_out,
             )
         batch_size, sequence_length = hidden_states.shape[:2]
         if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
@@ -292,7 +299,8 @@ class MiniMaxH3Attention(Attention):
                 self._attn_impl,
                 backend=self._vsa_backend,
             )
-            return self.to_out[0](output.flatten(2))
+            output = output.flatten(2)
+            return self.to_out[0](output) if project_out else output
 
         hidden_states = self._attn_impl(
             query,
@@ -303,7 +311,7 @@ class MiniMaxH3Attention(Attention):
             valid_seq_len=valid_seq_len,
             timestep=timestep,
         )
-        return self.to_out[0](hidden_states)
+        return self.to_out[0](hidden_states) if project_out else hidden_states
 
     def forward_async(
         self,
@@ -312,6 +320,7 @@ class MiniMaxH3Attention(Attention):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         valid_seq_len: Optional[int] = None,
+        project_out: bool = True,
     ) -> torch.Tensor:
         """``forward`` with each projection pushed to the peers as soon as it is
         computed: V, then Q and K with their per-head norm and RoPE, run on the
@@ -347,7 +356,8 @@ class MiniMaxH3Attention(Attention):
             timestep=timestep,
         )
         batch_size, local_seq_len = out_4d.shape[:2]
-        return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))
+        output = out_4d.reshape(batch_size, local_seq_len, -1)
+        return self.to_out[0](output) if project_out else output
 
 
 def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -598,6 +608,25 @@ class MiniMaxH3TokenRefiner(nn.Module):
         return self.sharder.gather(hidden_states, dim=1, unpad_to=seq_len)
 
 
+def _tp_overlap_num_chunks() -> int:
+    """Row chunks for the TP all-reduce/compute overlap in the transformer blocks.
+
+    ``TLLM_H3_TP_OVERLAP_CHUNKS`` overrides the default of 4; 0 or 1 restores the
+    serialized path (to_out -> all-reduce -> ... -> down -> all-reduce).
+    """
+    try:
+        return max(0, int(os.environ.get("TLLM_H3_TP_OVERLAP_CHUNKS", "4")))
+    except ValueError:
+        return 4
+
+
+def _row_chunks(rows: int, num_chunks: int, align: int = 128) -> list[tuple[int, int]]:
+    """Split ``rows`` into at most ``num_chunks`` ranges whose starts are ``align``-aligned."""
+    step = -(-rows // num_chunks)
+    step = -(-step // align) * align
+    return [(start, min(rows, start + step)) for start in range(0, rows, step)]
+
+
 def _pad_rotary_emb(
     rotary_emb: tuple[torch.Tensor, torch.Tensor],
     pad: int,
@@ -610,6 +639,12 @@ def _pad_rotary_emb(
 
 
 class MiniMaxH3TransformerBlock(nn.Module):
+    # TP all-reduce/compute overlap (see setup_tp_overlap and _post_attn_overlap); off until
+    # the owning model enables it.
+    _tp_overlap_chunks = 0
+    _tp_overlap_group_name = None
+    _tp_overlap_pg = None
+
     def __init__(
         self,
         *,
@@ -723,6 +758,22 @@ class MiniMaxH3TransformerBlock(nn.Module):
         norm_hidden_states = h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
         )
+        if self._tp_overlap_chunks > 1 and hidden_states.shape[0] == 1:
+            attn_hidden = self.attn(
+                norm_hidden_states,
+                rotary_emb,
+                key_padding_mask,
+                timestep,
+                valid_seq_len,
+                project_out=False,
+            )
+            residual_chunks, ff_chunks = self._post_attn_overlap(
+                attn_hidden, hidden_states, mod, adaln_indices
+            )
+            gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
+            return torch.cat(residual_chunks, dim=1) + gate_mlp.index_select(
+                0, adaln_indices
+            ) * torch.cat(ff_chunks, dim=1)
         attn_output = self.attn(
             norm_hidden_states, rotary_emb, key_padding_mask, timestep, valid_seq_len
         )
@@ -742,6 +793,100 @@ class MiniMaxH3TransformerBlock(nn.Module):
         ).reshape_as(norm_hidden_states)
         gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
         return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
+
+    def setup_tp_overlap(self, model_config: DiffusionModelConfig) -> None:
+        """Enable the token-chunked TP all-reduce/compute overlap when it keeps the numerics.
+
+        Needs tensor parallelism with both row-parallel projections (attention ``to_out`` and
+        ``ff.down_proj``) reducing through the same c10d process group (TLLM_DISABLE_MPI), and
+        the fused AdaLN path. Quantized Linears are excluded: a dynamic per-tensor activation
+        scale (FP8/NVFP4 amax over all rows) would become a per-chunk scale.
+        """
+        self._tp_overlap_chunks = 0
+        self._tp_overlap_group_name = None
+        self._tp_overlap_pg = None
+        to_out = self.attn.to_out[0]
+        to_out_ar = to_out.all_reduce
+        down_ar = self.ff.down_proj.all_reduce
+        num_chunks = _tp_overlap_num_chunks()
+        unquantized = not any(
+            getattr(linear, "has_any_quant", True)
+            for linear in [to_out] + [m for m in self.ff.modules() if isinstance(m, Linear)]
+        )
+        if (
+            num_chunks > 1
+            and unquantized
+            and self._fused_adaln
+            and model_config.mapping.tp_size > 1
+            and to_out_ar is not None
+            and down_ar is not None
+            and getattr(to_out_ar, "_group_name", None) is not None
+            and to_out_ar._group_name == getattr(down_ar, "_group_name", None)
+        ):
+            self._tp_overlap_chunks = num_chunks
+            self._tp_overlap_group_name = to_out_ar._group_name
+
+    @torch.compiler.disable
+    def _post_attn_overlap(
+        self,
+        attn_hidden: torch.Tensor,
+        hidden_states: torch.Tensor,
+        mod: torch.Tensor,
+        adaln_indices: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Token-chunked post-attention half with the TP all-reduces off the critical path.
+
+        Everything after attention is row-local, so the rows are split into chunks:
+        every chunk's ``to_out`` partial is all-reduced asynchronously (in place, on the
+        process group's NCCL stream) while later chunks' GEMMs run; each chunk's gated
+        residual + norm2 + feed-forward waits only for its own reduction, and its
+        ``down_proj`` partial is all-reduced asynchronously under the next chunks' work.
+        Each row's math is unchanged (same kernels; a two-rank sum is order-free), and
+        the all-reduces need no ``clone`` because their inputs are private GEMM outputs.
+
+        Runs eagerly (one graph break per block); the caller's compiled code fuses the
+        final gated residual. Returns the per-chunk ``[1, rows, D]`` residual stream after
+        attention and the reduced feed-forward outputs.
+        """
+        pg = self._tp_overlap_pg
+        if pg is None:
+            pg = dist.distributed_c10d._resolve_process_group(self._tp_overlap_group_name)
+            self._tp_overlap_pg = pg
+        no_reduce = AllReduceParams(enable_allreduce=False)
+        hidden_size = hidden_states.shape[-1]
+        rows = hidden_states.shape[1]
+        bounds = _row_chunks(rows, self._tp_overlap_chunks)
+        attn_rows = attn_hidden.reshape(rows, attn_hidden.shape[-1])
+        to_out = self.attn.to_out[0]
+
+        attn_outputs, attn_works = [], []
+        for start, end in bounds:
+            out = to_out(attn_rows[start:end], all_reduce_params=no_reduce)
+            attn_works.append(dist.all_reduce(out, group=pg, async_op=True))
+            attn_outputs.append(out)
+
+        residual_chunks, ff_chunks, ff_works = [], [], []
+        eps = self.norm2.variance_epsilon
+        for i, (start, end) in enumerate(bounds):
+            attn_works[i].wait()
+            residual, norm_hidden = h3_gate_res_norm_mod(
+                hidden_states[:, start:end],
+                attn_outputs[i].view(1, end - start, hidden_size),
+                self.norm2.weight,
+                mod,
+                adaln_indices[start:end],
+                eps,
+                2,
+                4,
+                3,
+            )
+            ff_out = self.ff(norm_hidden.view(end - start, hidden_size), final_all_reduce_params=no_reduce)
+            ff_works.append(dist.all_reduce(ff_out, group=pg, async_op=True))
+            residual_chunks.append(residual)
+            ff_chunks.append(ff_out.view(1, end - start, hidden_size))
+        for work in ff_works:
+            work.wait()
+        return residual_chunks, ff_chunks
 
 
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
@@ -935,6 +1080,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         )
 
         self.apply_quant_config_exclude_modules()
+        for block in self.transformer_blocks:
+            block.setup_tp_overlap(model_config)
 
     def apply_quant_config_exclude_modules(self) -> None:
         """Drop quantization from Linears the quant config excludes.
