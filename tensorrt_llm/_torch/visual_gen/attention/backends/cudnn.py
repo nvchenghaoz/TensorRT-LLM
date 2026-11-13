@@ -796,10 +796,16 @@ class CuDNNAttention(AttentionBackend):
             # cuDNN reads any [B, S, H, D] view whose head dim is unit-stride, e.g. V as a
             # slice of the fused qkv projection, so only other layouts are copied.
             def _unit_stride_d(t: torch.Tensor) -> torch.Tensor:
+                # cuDNN needs 16-byte aligned rows: every non-unit stride a multiple of 8
+                # BF16/FP16 elements. Callers pass views that start at a multiple of
+                # heads * head_dim inside a [B, S, H*D] buffer. Strides only, no
+                # storage_offset(): that call is a graph break under torch.compile.
+                stride = t.stride()
                 aligned = (
-                    t.stride(3) == 1
-                    and all(t.stride(i) % 8 == 0 for i in range(3))
-                    and t.data_ptr() % 16 == 0
+                    stride[3] == 1
+                    and stride[0] % 8 == 0
+                    and stride[1] % 8 == 0
+                    and stride[2] % 8 == 0
                 )
                 return t if aligned else t.contiguous()
 
