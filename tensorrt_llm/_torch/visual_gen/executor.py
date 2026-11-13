@@ -29,6 +29,7 @@ from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
 from tensorrt_llm.logger import logger
+from tensorrt_llm.media import response_timing
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 if TYPE_CHECKING:
@@ -540,6 +541,16 @@ class DiffusionExecutor:
         # Send READY signal with pipeline metadata for the client.
         if self.rank == 0:
             logger.info(f"Worker {self.device_id}: Sending READY")
+            # The configured warmup shapes (h, w, frames): the server sizes
+            # its one-time pinned video staging buffer from them.
+            try:
+                warmup_shapes = [
+                    tuple(int(v) for v in shape)
+                    for shape in self.pipeline.resolve_warmup_plan()[0]
+                ]
+            except Exception as e:
+                logger.warning(f"Worker {self.device_id}: no warmup shapes for READY: {e}")
+                warmup_shapes = []
             self.response_queue.put(
                 DiffusionResponse(
                     request_id=-1,
@@ -549,6 +560,7 @@ class DiffusionExecutor:
                         "extra_param_specs": self.pipeline.extra_param_specs,
                         "supports_image_edit": self.pipeline.supports_image_edit,
                         "ref_slot_specs": self.pipeline.ref_slot_specs,
+                        "warmup_shapes": warmup_shapes,
                     },
                 )
             )
@@ -608,6 +620,7 @@ class DiffusionExecutor:
             if self.rank == 0:
                 req = self.requests_ipc.get()
                 if req is not None:
+                    response_timing.stamp("worker_received", rid=req.request_id)
                     req.refs_from_shm()
                 logger.info(f"Worker {self.device_id}: Request available")
 
@@ -692,6 +705,15 @@ class DiffusionExecutor:
             generation = time.perf_counter() - generation_start  # seconds
 
             if self.rank == 0:
+                if response_timing.ENABLED:
+                    t_gen_end = time.time()
+                    response_timing.stamp(
+                        "worker_generation",
+                        t=t_gen_end,
+                        rid=req.request_id,
+                        start=f"{t_gen_end - generation:.6f}",
+                    )
+                    video = getattr(output, "video", None)
                 # CUDA IPC handles are invalid within the producing process, so
                 # a same-process client takes the media via in-process handoff.
                 output.to_handle(local=self.in_client_process)
@@ -702,6 +724,17 @@ class DiffusionExecutor:
                         generation=generation,
                     )
                 )
+                if response_timing.ENABLED:
+                    response_timing.stamp("worker_handed_off", rid=req.request_id)
+                    if isinstance(video, torch.Tensor) and video.is_cuda:
+                        response_timing.stamp(
+                            "worker_video_segment",
+                            rid=req.request_id,
+                            segment_bytes=response_timing.cuda_allocation_bytes(video),
+                            video_bytes=video.numel() * video.element_size(),
+                            stride=tuple(video.stride()),
+                        )
+                    video = None
         except Exception as e:
             if log_cuda_memory:
                 self._log_cuda_peak_memory(req.request_id)
@@ -969,6 +1002,7 @@ class DiffusionRemoteClient:
         self.extra_param_specs: Dict = {}
         self.supports_image_edit: bool = False
         self.ref_slot_specs: Dict = {}
+        self.warmup_shapes: List[Tuple[int, int, int]] = []
 
         # --- Launch workers ---
         # multiprocessing installs its own timeout-less child joins at import
@@ -1212,6 +1246,7 @@ class DiffusionRemoteClient:
             req = self._request_to_send
             logger.info(f"DiffusionClient: Sending request {req.request_id}")
             self.requests_ipc.put_nowait(req)
+            response_timing.stamp("client_sent", rid=req.request_id)
             self._request_to_send = None
             # Once the request has been handed to the workers it becomes the
             # in-flight ("active") request from the client's perspective.
@@ -1238,9 +1273,11 @@ class DiffusionRemoteClient:
                 if isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
                         logger.info("DiffusionClient: Received READY signal")
+                    response_timing.stamp("client_received", rid=response.request_id)
 
                     if isinstance(response.output, PipelineOutput):
                         response.output.to_tensor()
+                        response_timing.stamp("client_rebuilt", rid=response.request_id)
 
                     # Schedule the lock acquisition and event setting in the event loop
                     asyncio.run_coroutine_threadsafe(
@@ -1274,6 +1311,7 @@ class DiffusionRemoteClient:
             self._iter_stats.record_request_completed(
                 response.request_id, self.pending_requests.qsize()
             )
+        response_timing.stamp("client_stored", rid=response.request_id)
         self.response_event.set()
 
     def get_iteration_stats(self) -> List[Dict]:
@@ -1562,6 +1600,9 @@ class DiffusionRemoteClient:
                         self.extra_param_specs = payload.get("extra_param_specs", {})
                         self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                         self.ref_slot_specs = payload.get("ref_slot_specs", {})
+                        self.warmup_shapes = [
+                            tuple(shape) for shape in payload.get("warmup_shapes", [])
+                        ]
                     if self._worker_failure is not None:
                         raise RuntimeError(self._worker_failure)
                     elapsed = time.time() - start_time
