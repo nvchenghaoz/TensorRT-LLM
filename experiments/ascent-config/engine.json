@@ -2,7 +2,7 @@
   "visual_gen_args": {
     "cache_config": {
       "cache_backend": "cache_dit",
-      "Fn_compute_blocks": 8,
+      "Fn_compute_blocks": 1,
       "Bn_compute_blocks": 0,
       "max_warmup_steps": 8,
       "max_continuous_cached_steps": -1,
