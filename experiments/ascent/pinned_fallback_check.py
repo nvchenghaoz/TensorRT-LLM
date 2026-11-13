@@ -35,6 +35,15 @@ def sha(path):
 
 
 def main():
+    # The container has no ffmpeg: take the same binary the frozen adapters use (store-cached,
+    # sha-reported) via ab_common.ensure_ffmpeg. argv[1] = experiments/ascent-benchmark/ab_common.py.
+    if len(sys.argv) > 1:
+        bench_dir = os.path.dirname(os.path.abspath(sys.argv[1]))
+        sys.path.insert(0, bench_dir)
+        from ab_common import ensure_ffmpeg, load_json
+
+        info = ensure_ffmpeg(load_json("reference_manifest.json")["store"])
+        log("ffmpeg", info)
     from tensorrt_llm.media import encoding
 
     assert encoding._check_ffmpeg_available(), "ffmpeg missing"
