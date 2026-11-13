@@ -144,12 +144,16 @@ def analyze(path, n_calls):
     return res
 
 
-def worker(rank, ckpt, q, uuids):
+def worker(rank, ckpt, q, uuids, port):
+    import datetime
     os.environ["TLLM_DISABLE_MPI"] = "1"
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ.setdefault("MASTER_PORT", "29717")
+    os.environ["MASTER_PORT"] = str(port)
+    log(f"rank {rank}: worker start, port {port}")
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=2, device_id=torch.device("cuda", rank))
+    dist.init_process_group("nccl", rank=rank, world_size=2, device_id=torch.device("cuda", rank),
+                            timeout=datetime.timedelta(seconds=600))
+    log(f"rank {rank}: process group up")
     import torch._dynamo
     for k in ("cache_size_limit", "recompile_limit", "accumulated_cache_size_limit",
               "accumulated_recompile_limit"):
@@ -158,9 +162,11 @@ def worker(rank, ckpt, q, uuids):
     import block_pair as bp
     torch.manual_seed(0)
     block_m, (x, temb, idx, rot), cfg = bp.build(ckpt, rank)
+    log(f"rank {rank}: block M built")
     torch.manual_seed(0)
     block_p, _inputs2, _ = bp.build(ckpt, rank)
     del _inputs2
+    log(f"rank {rank}: block P built")
 
     def lins(b):
         return [getattr(b.attn, "qkv_proj", None), b.attn.to_out[0],
@@ -193,10 +199,11 @@ def worker(rank, ckpt, q, uuids):
     res = {"rank": rank, "model_flags": model_flags, "chunks": chunks, "identical_weights": same_w}
 
     # ---- timed, interleaved ABBA per iteration ----
-    for _ in range(WARMUP):
+    for w in range(WARMUP):
         for arm in ORDER:
             call(arm)
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        log(f"rank {rank}: warmup {w + 1}/{WARMUP} done")
     stats_warm = dict(counters["stats"])
     gb_warm = len(counters["graph_break"])
     res["clocks_before"] = clocks(uuids) if rank == 0 else None
@@ -317,12 +324,41 @@ def main():
     if pl["link"] != "PIX" or x8:
         print(json.dumps({"wrong_pair": True, "pair": pl}))
         return
+    import socket
+    import threading
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    done = threading.Event()
+
+    def heartbeat():
+        t0 = time.time()
+        while not done.wait(60):
+            log(f"[heartbeat] {time.time() - t0:.0f} s")
+
+    threading.Thread(target=heartbeat, daemon=True).start()
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    ps = [ctx.Process(target=worker, args=(r, ckpt, q, pl["uuids"])) for r in range(2)]
+    ps = [ctx.Process(target=worker, args=(r, ckpt, q, pl["uuids"], port)) for r in range(2)]
     for p in ps:
         p.start()
-    outs = [q.get() for _ in ps]
+    outs = []
+    while len(outs) < 2:
+        try:
+            outs.append(q.get(timeout=30))
+        except Exception:
+            dead = [p.exitcode for p in ps if not p.is_alive()]
+            if any(c not in (None, 0) for c in dead):
+                done.set()
+                log(f"FAIL LOUD: worker exit codes {[p.exitcode for p in ps]}")
+                for p in ps:
+                    if p.is_alive():
+                        p.terminate()
+                print(json.dumps({"passed": False, "error": "worker died",
+                                  "exitcodes": [p.exitcode for p in ps]}))
+                return
+    done.set()
     for p in ps:
         p.join()
     outs.sort(key=lambda o: o["rank"])
