@@ -49,7 +49,7 @@ from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_mod_out, h3_norm_mod
 from .vsa import get_h3_vsa_context, h3_vsa_attention
 
 MINIMAX_H3_MODALITY_NUM = 3
@@ -467,6 +467,22 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         return hidden_states * (1.0 + scale.index_select(0, timestep_indices)) + shift.index_select(
             0, timestep_indices
         )
+
+    def forward_to(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        timestep_indices: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """``forward(...).to(out_dtype)`` for BF16 input, bitwise equal, in one modulation kernel.
+
+        The kernel applies eager's three bf16 roundings and writes ``out_dtype`` directly, so the
+        FP32 output projections then skip their casts.
+        """
+        table = self.linear(F.silu(temb).to(self.linear.dtype))
+        hidden_states = _norm_2d(self.norm, hidden_states)
+        return h3_mod_out(hidden_states, table, timestep_indices, 1, 0, out_dtype)
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
@@ -1290,11 +1306,27 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 valid_seq_len=valid_seq_len,
             )
 
-        packed_hidden_states = self.norm_out(
-            packed_hidden_states,
-            temb,
-            timestep_indices_for_norm,
-        )
+        if (
+            packed_hidden_states.dtype == torch.bfloat16
+            and packed_hidden_states.is_cuda
+            and not self.sharder.is_active
+            and not getattr(self.sharder, "token_sharded_tp", False)
+        ):
+            # No row gather follows (token-sharded TP reports an inactive sharder but still
+            # all-gathers rows): write the projections' activation dtype straight from the
+            # modulation kernel; the .to() calls below are then no-ops.
+            packed_hidden_states = self.norm_out.forward_to(
+                packed_hidden_states,
+                temb,
+                timestep_indices_for_norm,
+                self._projection_act_dtype,
+            )
+        else:
+            packed_hidden_states = self.norm_out(
+                packed_hidden_states,
+                temb,
+                timestep_indices_for_norm,
+            )
         packed_hidden_states = self.sharder.gather(
             packed_hidden_states,
             dim=1,
