@@ -575,8 +575,8 @@ def pair_check():
     bus = []
     for d in (0, 1):
         err, s = cudart.cudaDeviceGetPCIBusId(32, d)
-        s = s.decode() if isinstance(s, (bytes, bytearray)) else str(s)
-        bus.append(s.strip("\x00").strip())
+        s = s.decode(errors="replace") if isinstance(s, (bytes, bytearray)) else str(s)
+        bus.append(s.split("\x00")[0].strip())
     info["cuda_bus_ids"] = bus
     lst = _smi(["--query-gpu=index,pci.bus_id", "--format=csv,noheader"])
     idx_by_bus = {}
@@ -796,6 +796,18 @@ def envsweep_main(args):
     summary["aa"] = {"default_medians_M": dmeds, "aa_delta": aa_delta, "aa_iter_spread_max": aa_spread}
     print("A/A", json.dumps(summary["aa"]), flush=True)
 
+    if args.quick:
+        ce = summary["ce_start"]
+        table = {n: {k: [c["ar"][k]["median_ms"], c["ar"][k]["p10_ms"], c["ar"][k]["p90_ms"],
+                         c["ar"][k]["GBps_per_dir"], round(c["ar"][k]["median_ms"] / ce[k]["median_ms"], 3)]
+                     for k in ("M", "M2", "M4")} | {"mism": c["mismatches_total_both"]}
+                 for n, c in summary["configs"].items() if c.get("ok")}
+        summary["table"] = table
+        save()
+        ok = all(c.get("ok") and c["mismatches_total_both"] == 0 for c in summary["configs"].values())
+        print(json.dumps({"passed": ok, "label": label, "aa": summary["aa"],
+                          "ce_ms": {k: ce[k]["median_ms"] for k in ce}, "table": table}), flush=True)
+        return 0
     # rerun noisy configs
     if aa_spread:
         for name, env in SWEEP_CONFIGS:
@@ -872,6 +884,7 @@ def main():
     p.add_argument("--f", type=int, default=0, help="per-rank FFN width (ffn_dim / 2)")
     p.add_argument("--configs", default="", help="envsweep: comma list of config names (default all)")
     p.add_argument("--no-rsag", action="store_true")
+    p.add_argument("--quick", action="store_true", help="envsweep: phase A only (no reruns/combos/overlap)")
     p.add_argument("--m", type=int, default=38016)
     p.add_argument("--d", type=int, default=0)
     p.add_argument("--warmup", type=int, default=5)
