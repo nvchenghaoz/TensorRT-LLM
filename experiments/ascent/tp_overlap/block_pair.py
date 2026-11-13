@@ -457,7 +457,12 @@ def arms_phase(rank, block, compiled, call, inputs, pristine):
     arm_set = os.environ.get("BLOCK_PAIR_ARMS", "0b")
     ARMS_SEL = ARMS_1 if arm_set == "1" else ARMS
     PROF_SEL = PROFILE_ARMS_1 if arm_set == "1" else PROFILE_ARMS
-    res["arm_set"] = arm_set
+    check_only = os.environ.get("BLOCK_PAIR_CHECK_ONLY") == "1"
+    if check_only:  # every arm of both sets
+        seen = {a[0] for a in ARMS}
+        ARMS_SEL = list(ARMS) + [a for a in ARMS_1 if a[0] not in seen]
+        PROF_SEL = []
+    res["arm_set"] = arm_set + ("+check_only" if check_only else "")
     needed = {a[1] for a in ARMS_SEL}
     for name, spec in PGS.items():
         if spec is None or name not in needed:
@@ -508,7 +513,7 @@ def arms_phase(rank, block, compiled, call, inputs, pristine):
             f"ranks equal {res['reference_rank0_eq_rank1']}")
 
     # ---- timing: interleaved rounds, every arm in every round, rotated order -------------------
-    ROUNDS, WU, TI = 5, 2, 8
+    ROUNDS, WU, TI = (0 if check_only else 5), 2, 8
     times = {a[0]: [] for a in ARMS_SEL}
     for arm in ARMS_SEL:  # compile/warm every arm once (no recompiles expected: pg/weights not guarded)
         set_arm(arm)
@@ -544,7 +549,7 @@ def arms_phase(rank, block, compiled, call, inputs, pristine):
         return {"median_ms": round(med, 3), "p10": round(p10, 3), "p90": round(p90, 3),
                 "noise": round((p90 - p10) / med, 4), "n": n}
 
-    res["timing"] = {k: st(v) for k, v in times.items()}
+    res["timing"] = {k: st(v) for k, v in times.items() if v}
 
     # ---- untimed repeat check: same warmup/iteration counts, bitwise vs reference ---------------
     check = {}
@@ -585,7 +590,7 @@ def arms_phase(rank, block, compiled, call, inputs, pristine):
 
     prof_res = {}
     arms_by_name = {a[0]: a for a in ARMS_SEL}
-    plist = [(n, arms_by_name[n]) for n in PROF_SEL] + [("serial", None)]
+    plist = ([(n, arms_by_name[n]) for n in PROF_SEL] + [("serial", None)]) if PROF_SEL else []
     for name, arm in plist:
         if arm is None:
             block._tp_overlap_chunks = 0
@@ -665,8 +670,15 @@ def main():
 
         pair = pair_check()
         if pair.get("wrong_pair") or pair.get("relation") != "PIX":
-            print(json.dumps({"wrong_pair": True, "pair": pair}), flush=True)
-            return
+            node_x16 = (pair.get("relation") == "NODE" and not pair.get("wrong_pair")
+                        and set(pair.get("physical_ids") or []) == {4, 6})
+            if args.mode == "arms" and node_x16:
+                # NODE x16 (4+6) is valid for bitwise checks, not timing: run the untimed check only.
+                os.environ["BLOCK_PAIR_CHECK_ONLY"] = "1"
+                log("NODE 4+6: timing skipped, running the untimed bitwise check of every arm")
+            else:
+                print(json.dumps({"wrong_pair": True, "pair": pair}), flush=True)
+                return
     if args.mode == "arms":
         art = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp")
         os.environ.setdefault("NCCL_DEBUG", "INFO")
@@ -711,13 +723,15 @@ def main():
                                              "minCTAs", "maxCTAs", "Config")):
                         nccl_lines.append(ln.strip()[-220:])
         t0m = r0["timing"]
-        base = t0m["main"]["median_ms"]
-        rel = {k: round(v["median_ms"] / base - 1, 4) for k, v in t0m.items()}
+        base = t0m["main"]["median_ms"] if "main" in t0m else None
+        rel = {k: round(v["median_ms"] / base - 1, 4) for k, v in t0m.items()} if base else {}
         full = {"pair": pair, "rank0": r0, "rank1": res[1], "nccl_debug_lines": nccl_lines[:80]}
         with open(os.path.join(art, "arms_result.json"), "w") as f:
             json.dump(full, f, indent=1)
         print(json.dumps({
-            "passed": bool(r0["check_passed"] and res[1]["check_passed"]),
+            "passed": bool(r0["check_passed"] and res[1]["check_passed"]
+                           and all(rr.get("reference_rank0_eq_rank1") for rr in res)),
+            "timing_valid": bool(t0m) and (pair or {}).get("relation") == "PIX",
             "pair": {k: (pair or {}).get(k) for k in ("physical_ids", "relation", "link_width_current")},
             "rel_vs_main": rel, "aa": rel.get("main_aa"),
             "timing_rank0": t0m,
