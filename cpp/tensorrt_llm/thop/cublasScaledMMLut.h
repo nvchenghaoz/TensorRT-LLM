@@ -108,6 +108,23 @@ inline const AlgoListType bf16_algo_list = {
     {{1024, 7168, 256}, {66, 13, 35, 1, 0, 0, 1, 3}},
 };
 
+// bf16*bf16->fp32->bf16 on SM 12.0 (RTX PRO 6000 Blackwell), looked up before bf16_algo_list.
+// MiniMax-H3 DiT linears at TP2 per-rank shapes (768x1344x124f: QKV at the full packed M ~38k,
+// to_out/gate_up/down at the TP-overlap row-chunk M ~9.2-9.6k). The cuBLASLt heuristic picks
+// nvjet 256x128x64 for all four; these split-K-free nvjet tiles keep the K summation order and are
+// bitwise identical to it, with better wave fill (1-GPU, interleaved medians vs F.linear):
+// QKV -1.4%, to_out -6.2%, gate_up -4.4%, down -4.5%.
+inline const AlgoListType sm120_bf16_algo_list = {
+    // QKV 10752x5376: nvjet_sm120_tst_mma_192x208x32_3
+    {{65536, 5376, 10752}, {67, 470, 34, 1, 0, 0, 30, 0}},
+    // to_out 5376x3584: nvjet_sm120_tst_mma_192x160x64_2
+    {{16384, 3584, 5376}, {67, 465, 35, 1, 0, 0, 69, 0}},
+    // gate_up 14336x5376: nvjet_sm120_tst_mma_256x160x32_3 (cluster 2x1x1)
+    {{16384, 5376, 14336}, {67, 502, 34, 1, 0, 0, 69, 3}},
+    // down 5376x7168: nvjet_sm120_tst_mma_192x208x32_3 (cluster 1x1x1)
+    {{16384, 7168, 5376}, {67, 470, 34, 1, 0, 0, 30, 2}},
+};
+
 // fp8*fp8->fp32->fp16
 inline const AlgoListType fp8_algo_list = {
     // Llama-3.1-70B

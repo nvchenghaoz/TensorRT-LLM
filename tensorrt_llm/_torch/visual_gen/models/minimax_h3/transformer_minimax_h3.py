@@ -718,6 +718,28 @@ def h3_dedicated_tp_group(
     return pg
 
 
+def _linear_quantized(linear: Linear) -> bool:
+    """Quant mode from quant_config (the weights may not exist yet at build time)."""
+    quant_config = getattr(linear, "quant_config", None)
+    return quant_config is not None and quant_config.layer_quant_mode.has_any_quant(
+        exclude_kv_cache=True
+    )
+
+
+def _h3_sm120_cublas_pin(model_config: DiffusionModelConfig) -> bool:
+    """Whether the DiT block Linears use trtllm::cublas_mm's SM120 BF16 tile pins.
+
+    ``TLLM_H3_SM120_CUBLAS_PIN=0`` keeps F.linear.
+    """
+    if os.environ.get("TLLM_H3_SM120_CUBLAS_PIN", "1") == "0":
+        return False
+    if model_config.torch_dtype != torch.bfloat16 or not torch.cuda.is_available():
+        return False
+    from tensorrt_llm._utils import get_sm_version
+
+    return get_sm_version() == 120
+
+
 def _pad_rotary_emb(
     rotary_emb: tuple[torch.Tensor, torch.Tensor],
     pad: int,
@@ -793,6 +815,28 @@ class MiniMaxH3TransformerBlock(nn.Module):
         for linear in (self.attn.to_out[0], self.ff.down_proj):
             if getattr(linear, "all_reduce", None) is not None:
                 linear.all_reduce.inplace_private_input = True
+        # SM120: run the four BF16 DiT Linears through trtllm::cublas_mm, whose SM120 LUT
+        # (cublasScaledMMLut.h sm120_bf16_algo_list) pins split-K-free nvjet tiles that are
+        # bitwise identical to the F.linear heuristic kernel but faster at H3's per-rank shapes.
+        # Shapes without a LUT entry fall back to the cuBLASLt heuristic. Output buffers stay
+        # ordinary private allocations (no NCCL window: H3 runs with MPI disabled).
+        if _h3_sm120_cublas_pin(model_config):
+            for linear in (
+                getattr(self.attn, "qkv_proj", None),
+                self.attn.to_out[0],
+                getattr(self.ff, "gate_up_proj", None),
+                self.ff.down_proj,
+            ):
+                if isinstance(linear, Linear) and not _linear_quantized(linear):
+                    linear.use_custom_cublas_mm = True
+            if layer_idx == 0:
+                from tensorrt_llm.logger import logger
+
+                logger.info(
+                    "[MiniMax-H3 SM120 cublas pin] block 0: use_custom_cublas_mm qkv/to_out/"
+                    "gate_up/down = "
+                    f"{[getattr(m, 'use_custom_cublas_mm', None) for m in (getattr(self.attn, 'qkv_proj', None), self.attn.to_out[0], getattr(self.ff, 'gate_up_proj', None), self.ff.down_proj)]}"
+                )
 
     def forward(
         self,
