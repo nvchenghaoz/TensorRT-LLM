@@ -914,21 +914,6 @@
           "status": "prototype",
           "title": "Attention Bf16 Forwards"
         },
-        "attention_sage_onset": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "First denoising forward of a middle attention tier between the BF16 phase and the quantized recipe: forwards below it run BF16, forwards from it up to attention_bf16_forwards - 1 run Sage2 (INT8 Q/K with smooth-K, FP8 P.V; FlashInfer SM120 'cake' kernel, all KV blocks), and forwards from attention_bf16_forwards on run attention_config.quant_attention_config. Must be below attention_bf16_forwards. Unset: no middle tier.",
-          "status": "prototype",
-          "title": "Attention Sage Onset"
-        },
         "linear_bf16_forwards": {
           "anyOf": [
             {

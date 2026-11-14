@@ -19,8 +19,7 @@
       }
     },
     "step_precision": {
-      "attention_bf16_forwards": 14,
-      "attention_sage_onset": 6
+      "attention_bf16_forwards": 14
     }
   }
 }

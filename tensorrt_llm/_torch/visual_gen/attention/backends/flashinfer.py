@@ -18,34 +18,6 @@ from .interface import AttentionBackend, AttentionTensorLayout
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 _BlockScaledQKMode = Literal["mxfp8", "nvfp4"]
 
-# Dense block list for the Sage2 tier, shared by every layer; the packed sequence
-# length changes per prompt (pitfall 622), so it is rebuilt when the shape changes.
-_SAGE_BLOCK = 64
-_sage_dense_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, int]] = {}
-
-
-def _sage_dense_blocks(
-    batch: int, heads: int, q_len: int, kv_len: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Every KV block for every 64-query block, plus the valid-token count per KV block."""
-    key = (batch, heads, q_len, kv_len, device)
-    cached = _sage_dense_cache.get(key)
-    if cached is not None:
-        return cached
-    num_q_blocks = (q_len + _SAGE_BLOCK - 1) // _SAGE_BLOCK
-    num_kv_blocks = (kv_len + _SAGE_BLOCK - 1) // _SAGE_BLOCK
-    block_index = (
-        torch.arange(num_kv_blocks, dtype=torch.int32, device=device)
-        .view(1, 1, 1, num_kv_blocks)
-        .expand(batch, heads, num_q_blocks, num_kv_blocks)
-        .contiguous()
-    )
-    block_sizes = torch.full((num_kv_blocks,), _SAGE_BLOCK, dtype=torch.int32, device=device)
-    block_sizes[-1] = kv_len - _SAGE_BLOCK * (num_kv_blocks - 1)
-    _sage_dense_cache.clear()
-    _sage_dense_cache[key] = (block_index, block_sizes, num_kv_blocks)
-    return _sage_dense_cache[key]
-
 
 class FlashInferAttention(AttentionBackend):
     """Dense FlashInfer attention without an LLM KV cache.
@@ -627,92 +599,21 @@ class FlashInferAttention(AttentionBackend):
             )
         return controller.runs_bf16(bf16_forwards)
 
-    def _sage_onset(self) -> int | None:
-        # visual_gen_args.step_precision.attention_sage_onset, published by the model;
-        # absent unless the Sage2 middle tier is configured.
-        return self._metadata_state.get("attention_sage_onset")
-
-    def _runs_sage_forward(self) -> bool:
-        """Whether a call the step gate sends to BF16 runs the Sage2 middle tier instead.
-
-        Asked only after ``_runs_bf16_forward()`` returned True; the same controller and
-        set_step index decide it (forwards in [attention_sage_onset, attention_bf16_forwards)).
-        """
-        sage_onset = self._sage_onset()
-        if sage_onset is None:
-            return False
-        controller = self._step_controller()
-        if controller is None:
-            return False
-        return controller.runs_sage(sage_onset, self._bf16_forwards())
-
-    @torch.compiler.disable
-    def _run_sage_sm12x(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Dense Sage2 attention on SM120: INT8 Q/K (per-32-query / per-64-key scales,
-        smooth-K), FP8 E4M3 P.V with per-channel V scales, FlashInfer's 'cake' block-sparse
-        kernel with every KV block selected. Non-causal MHA, head_dim 128, BF16 in and out.
-
-        The Sage quantizers read the HND views of the NHD buffers in place (strided V
-        included); the kernel writes a contiguous [B, H, S, D] output returned as an NHD view.
-        """
-        from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import bsa_attn_sm120_blk64_sage_fwd
-        from flashinfer.cute_dsl.sparse.bsa_utils.sage_quant_sm120 import (
-            quantize_sage_qkv_sm120,
-        )
-
-        if (
-            self.num_heads != self.num_kv_heads
-            or self.head_dim != 128
-            or q.dtype != torch.bfloat16
-            or k.shape[1] != v.shape[1]
-        ):
-            raise ValueError(
-                "step_precision.attention_sage_onset: the Sage2 tier supports non-causal BF16 "
-                f"MHA with head_dim 128 only; got heads={self.num_heads}/{self.num_kv_heads}, "
-                f"head_dim={self.head_dim}, dtype={q.dtype}."
-            )
-        batch, q_len, num_heads, head_dim = q.shape
-        kv_len = k.shape[1]
-        quantized = quantize_sage_qkv_sm120(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-        block_index, block_sizes, num_kv_blocks = _sage_dense_blocks(
-            batch, num_heads, q_len, kv_len, q.device
-        )
-        output = torch.empty(batch, num_heads, q_len, head_dim, dtype=q.dtype, device=q.device)
-        bsa_attn_sm120_blk64_sage_fwd(
-            *quantized,
-            block_index,
-            num_kv_blocks,
-            block_sizes=block_sizes,
-            softmax_scale=self.scale,
-            out=output,
-            uniform_block_count=True,
-            contiguous_block_indices=True,
-            backend="cake",
-        )
-        return output.transpose(1, 2)
-
-    def _log_forward_path(self, bf16: bool, sage: bool = False) -> None:
+    def _log_forward_path(self, bf16: bool) -> None:
         """One host log line per denoising forward (layer 0): which attention path ran."""
         controller = self._step_controller()
         if controller is None or controller.step_index is None:
             return
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         path = (
-            "sage2 int8-qk/fp8-pv via FlashInfer bsa_attn_sm120_blk64_sage_fwd cake (dense)"
-            if sage
-            else "bf16 via torch SDPA (VANILLA path)"
+            "bf16 via torch SDPA (VANILLA path)"
             if bf16
             else "fp8 via FlashInfer sm120_fmha_fp8_ragged_prefill"
         )
         print(
             f"[step_precision] rank={rank} forward {controller.step_index}/"
             f"{controller.num_steps} warmup={controller.warmup} attention={path} "
-            f"(attention_bf16_forwards={self._bf16_forwards()}"
-            + (
-                f", attention_sage_onset={self._sage_onset()})"
-                if self._sage_onset() is not None
-                else ")"
-            ),
+            f"(attention_bf16_forwards={self._bf16_forwards()})",
             flush=True,
         )
 
@@ -789,24 +690,17 @@ class FlashInferAttention(AttentionBackend):
     ) -> torch.Tensor:
         """Per-tensor FP8 attention, or BF16 SDPA on the gate's leading forwards."""
         bf16 = self._runs_bf16_forward()
-        # Sage2 middle tier: a sub-range of the gate's BF16 forwards (absent = never).
-        sage = bf16 and not is_causal and self._runs_sage_forward()
         controller = self._step_controller()
         if controller is not None and controller.step_index is not None:
             controller.attention_calls += 1
         if self.layer_idx == 0:
-            self._log_forward_path(bf16, sage)
-        if sage:
-            return self._run_sage_sm12x(q, k, v)
+            self._log_forward_path(bf16)
         if bf16:
             return self._run_bf16_dense(q, k, v, is_causal)
         if controller is not None and controller.warmup and self._bf16_forwards():
             # Startup warmup: run the BF16 phase too, then FP8 (CuTe DSL JIT, quantize
             # autotune), so no timed request compiles or tunes either phase.
             self._run_bf16_dense(q, k, v, is_causal)
-            if self._sage_onset() is not None and not is_causal:
-                # And the Sage2 tier (Triton quantizers, cake JIT module).
-                self._run_sage_sm12x(q, k, v)
         if self.layer_idx == 0:
             self._log_fp8_tactic_once(q)
         output, _ = self._run_fp8_sm120(q, k, v, is_causal=is_causal, with_lse=False)
