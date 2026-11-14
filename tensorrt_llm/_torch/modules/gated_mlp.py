@@ -17,6 +17,7 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
+from . import gate_up_swiglu_sm120 as _sm120_gate_up
 from .gate_up_swiglu_quack import (gate_up_swiglu_quack_available,
                                    gate_up_swiglu_quack_bf16,
                                    gate_up_swiglu_quack_shape_ok)
@@ -64,6 +65,11 @@ class GatedMLP(nn.Module):
         # run under torch.compile, only reads a plain attribute.
         self.fuse_bf16_gate_up_swiglu = (fuse_bf16_gate_up_swiglu
                                          and gate_up_swiglu_quack_available())
+        # The same opt-in on SM120: a CuTe DSL mma.sync gate/up GEMM whose SwiGLU epilogue is
+        # bitwise to F.linear -> swiglu (gate_up_swiglu_sm120.py).
+        self.fuse_bf16_gate_up_swiglu_sm120 = (
+            fuse_bf16_gate_up_swiglu and not split_gate_up
+            and _sm120_gate_up.gate_up_sm120_available())
         # Keeps each projection's own calibrated scale, which fusing would
         # discard. Off by default.
         self.split_gate_up = split_gate_up
@@ -425,6 +431,42 @@ class GatedMLP(nn.Module):
                                            self.gate_up_proj.weight)
         return output.reshape(*input_shape[:-1], output.shape[-1])
 
+    def _can_fuse_gate_up_swiglu_sm120(self, x) -> bool:
+        """Whether this call takes the SM120 BF16 gate/up GEMM + SwiGLU epilogue.
+
+        Exactly the calls whose unfused chain is a split-K-free cuBLAS nvjet GEMM -> swiglu with
+        plain SwiGLU: unquantized BF16 gate_up_proj and down_proj, no bias, no CuTe DSL GEMM
+        provider, no limit, at >= MIN_ROWS rows. The trtllm::cublas_mm SM120 pin
+        (use_custom_cublas_mm) stays eligible: its pinned nvjet tiles are bitwise to F.linear,
+        and so is this kernel (one in-order K chain of mma.sync m16n8k16 per element).
+        """
+        if not self.fuse_bf16_gate_up_swiglu_sm120:
+            return False
+        if not (self.activation == F.silu and self._is_plain_swiglu()
+                and self.swiglu_limit is None):
+            return False
+        if not (isinstance(x, torch.Tensor) and x.is_cuda
+                and x.dtype == torch.bfloat16 and x.dim() >= 2
+                and not torch.is_grad_enabled()):
+            return False
+        proj = self.gate_up_proj
+        if (proj.has_any_quant or self.down_proj.has_any_quant
+                or proj.bias is not None or proj.weight.dtype != torch.bfloat16
+                or proj.use_cute_dsl_bf16_gemm):
+            return False
+        k = x.shape[-1]
+        if x.numel() // k < _sm120_gate_up.MIN_ROWS:
+            return False
+        if x.stride(-1) != 1 or (x.dim() == 2 and x.stride(0) != k):
+            return False
+        return _sm120_gate_up.gate_up_swiglu_sm120_shape_ok(k, proj.weight.shape[0])
+
+    def _fused_gate_up_swiglu_sm120(self, x: torch.Tensor) -> torch.Tensor:
+        input_shape = x.shape
+        output = torch.ops.trtllm.gate_up_swiglu_bf16_sm120(
+            x.reshape(-1, input_shape[-1]), self.gate_up_proj.weight)
+        return output.reshape(*input_shape[:-1], output.shape[-1])
+
     def _can_fuse_swiglu_fp8_quant(self) -> bool:
         """Check whether down projection can consume fused SwiGLU FP8 output."""
         # silu_and_mul_fp8_quantize_1x128_packed_ue8m0 takes the limit but has
@@ -559,6 +601,8 @@ class GatedMLP(nn.Module):
             h2 = self._fused_gate_up_swiglu(x)
         elif self._can_fuse_gate_up_swiglu_bf16(x):
             h2 = self._fused_gate_up_swiglu_bf16(x)
+        elif self._can_fuse_gate_up_swiglu_sm120(x):
+            h2 = self._fused_gate_up_swiglu_sm120(x)
         else:
             h1 = self.gate_up_proj(x)
             if self._can_fuse_swiglu_fp8_quant():
