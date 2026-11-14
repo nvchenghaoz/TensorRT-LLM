@@ -760,18 +760,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
             group = (module.mapping.tp_group
                      if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
                      and module.mapping is not None else None)
-            # cublas_mm takes a 2D [M, K] activation; fold leading dims.
-            input_2d = (input if input.dim() == 2 else input.reshape(
-                -1, input.shape[-1]))
             output = torch.ops.trtllm.cublas_mm(
-                input_2d,
+                input,
                 weight.t(),
                 bias,
                 out_dtype=None,
                 output_buffer_kind=output_buffer_kind,
                 group=group)
-            if input.dim() != 2:
-                output = output.view(*input.shape[:-1], output.shape[-1])
         else:
             output = F.linear(input, weight, bias)
         return output
