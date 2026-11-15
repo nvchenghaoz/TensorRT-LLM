@@ -308,6 +308,30 @@ def worker(a):
         save.mkdir(parents=True, exist_ok=True)
     batch, hashes, recs = {}, {}, []
     ok = True
+    # Warmup phase (untimed, not recorded): build/load every JIT module the cases use, then keep
+    # the GPU busy ~3 s so clocks are up before the first timed case (the first case after a
+    # long CPU-bound JIT build otherwise times low-clock).
+    t0 = time.time()
+    for layer in a.layers.split(","):
+        c = Case(layer, "warm", [300], None, dims, {})
+        wo = torch.empty(c.total_q, c.Hq, c.D, dtype=torch.bfloat16, device="cuda")
+        ww = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "HND", backend="fa2")
+        ww.plan(c.qo_indptr, c.kv_indptr, c.kv_indices, c.last_page_len, c.Hq, c.Hkv, c.D,
+                PAGE, causal=True, sm_scale=c.sm_scale, window_left=c.window_left,
+                q_data_type=torch.bfloat16, kv_data_type=torch.float8_e4m3fn)
+        ww.run(c.q, c.kv_fp8, out=wo)
+        torch.cuda.synchronize()
+        del c, wo, ww
+    log("WARM jit/load done", round(time.time() - t0, 1), "s")
+    xa = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    t1 = time.time()
+    while time.time() - t1 < 3.0:
+        for _ in range(20):
+            xa = (xa @ xa).clamp_(-1, 1)
+        torch.cuda.synchronize()
+    del xa
+    torch.cuda.empty_cache()
+    log("WARM gpu spin done")
     for layer, label, ql, kl, kw in case_list(a.layers, a.cases):
         key = f"{label}_{'d256' if layer == 'sliding' else 'd512'}"
         t0 = time.time()
