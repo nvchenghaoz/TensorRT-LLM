@@ -22,6 +22,8 @@ import sys
 import time
 
 os.environ.setdefault("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+# Host prefill plan flag: main's default (1) unless the job sets it; read once at flashinfer import.
+os.environ.setdefault("TRTLLM_FI_HOST_PREFILL_PLAN", "1")
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -676,6 +678,213 @@ def mode_routea():
                       "report": rep}), flush=True)
 
 
+def _first_cmp(m, c):
+    """(differ, flip, max top-20 |dlp| over common tokens, top-20 token sets equal) for one prompt."""
+    tm, dm = _first(m)
+    tc, dc = _first(c)
+    common = set(dm) & set(dc)
+    d = max((abs(dm[t] - dc[t]) for t in common), default=0.0)
+    return m != c, tm != tc, d, set(dm) == set(dc)
+
+
+def mode_item5():
+    """Item 5 (plan 547 / ruling 914-1): in-process A,B,A',B' over own prompts, 1 token, top-20 bitwise.
+
+    TRTLLM_FI_HOST_PREFILL_PLAN is set (default 1, main's default) before tensorrt_llm is imported and is
+    never changed. Arms: main (fused prep off = main's unfused chain), b7 (fused prep on, all 60 layers),
+    main_b, b7_b, plus the landing-3 OLD kernel (positive control) on the trigger set (a).
+    Set (a): job 246's random-id prompts, Prompts(774): 10 x isl300@1 then 10 x isl1k@1 (sha256 printed).
+    Set (b): natural text + random-id prompts across ISL x c, c=4 / c=16 groups sent together.
+    Mode (ii) LLM (overlap off, one request per call, sync per request): main vs b7 on set (a) and on
+    every prompt that diverged in mode (i).
+    """
+    import gc
+    import hashlib
+
+    print_dims()
+    import tensorrt_llm._torch.attention.backends.flashinfer as fi
+    import tensorrt_llm._torch.models.modeling_gemma4 as mg
+    hp_env = os.environ.get("TRTLLM_FI_HOST_PREFILL_PLAN")
+    log(f"TRTLLM_FI_HOST_PREFILL_PLAN={hp_env!r} (set before import) -> flashinfer._HOST_PREFILL_PLAN="
+        f"{fi._HOST_PREFILL_PLAN}; TLLM_WORKER_USE_SINGLE_PROCESS={os.environ.get('TLLM_WORKER_USE_SINGLE_PROCESS')}")
+    real = mg.gemma4_fused_qkv_norm_rope_quant
+    real_enabled = mg.Gemma4Attention._fused_qkv_prep_enabled
+    variant = {"cute": True}
+
+    def wrapped(*a, **kw):
+        kw["cute_norm_order"] = bool(variant["cute"] and kw.get("cute_norm_order", False))
+        return real(*a, **kw)
+
+    def enabled(self):
+        ok = real_enabled(self)
+        return ok and (variant["cute"] or not self._qk_only_proj)  # OLD kernel: sliding layers only
+
+    mg.gemma4_fused_qkv_norm_rope_quant = wrapped
+    mg.Gemma4Attention._fused_qkv_prep_enabled = enabled
+    params = sp(logprobs=20)
+
+    # ---- set (a): trigger set, regenerated from job 246's seed in job 246's order
+    rnd = Prompts(774)
+    set_a = [("a_rnd_isl300@1", [rnd.make(300)]) for _ in range(10)] + \
+            [("a_rnd_isl1k@1", [rnd.make(1000)]) for _ in range(10)]
+    ids_a = [g[1][0] for g in set_a]
+    sha_a = hashlib.sha256(json.dumps(ids_a).encode()).hexdigest()
+    sha_a300 = hashlib.sha256(json.dumps(ids_a[:10]).encode()).hexdigest()
+    log(f"set (a): {len(ids_a)} prompts sha256(all)={sha_a} sha256(isl300 x10)={sha_a300} "
+        f"first ids #0={ids_a[0][:6]} #2={ids_a[2][:6]}")
+
+    # ---- set (b): 200+ own prompts
+    nat = NaturalPrompts(9147)
+    rb = Prompts(5470)
+    sb = []
+    for isl, lab, n in ((300, "isl300@1", 20), (1000, "isl1k@1", 20), (2000, "isl2k@1", 20),
+                        (4000, "isl4k@1", 8), (8000, "isl8k@1", 16)):
+        sb += [(lab, [nat.make(isl)]) for _ in range(n)]
+    for isl, lab, n in ((300, "rnd_isl300@1", 10), (1000, "rnd_isl1k@1", 10), (2000, "rnd_isl2k@1", 10),
+                        (4000, "rnd_isl4k@1", 5), (8000, "rnd_isl8k@1", 5)):
+        sb += [(lab, [rb.make(isl)]) for _ in range(n)]
+    for isl, lab, n in ((8000, "isl8k@4", 5), (1000, "isl1k@4", 5), (300, "isl300@4", 3), (2000, "isl2k@4", 3),
+                        (4000, "isl4k@4", 2)):
+        sb += [(lab, [nat.make(isl) for _ in range(4)]) for _ in range(n)]
+    sb.append(("rnd_isl1k@4", [rb.make(1000) for _ in range(4)]))
+    sb.append(("rnd_isl8k@4", [rb.make(8000) for _ in range(4)]))
+    sb.append(("isl1k@16", [nat.make(1000) for _ in range(16)]))
+    n_b = sum(len(g) for _, g in sb)
+    n_rnd_b = sum(len(g) for lab, g in sb if lab.startswith("rnd"))
+    sha_b = hashlib.sha256(json.dumps([g for _, g in sb]).encode()).hexdigest()
+    log(f"set (b): {len(sb)} submissions, {n_b} prompts ({n_rnd_b} random-id, {n_b - n_rnd_b} natural), "
+        f"sha256={sha_b}")
+
+    def run(llm, tag, fused, cute, gs, sequential=False):
+        mg._FUSED_QKV_PREP = fused
+        variant["cute"] = cute
+        res = []
+        t0 = time.time()
+        for label, ps in gs:
+            if sequential:
+                outs = []
+                for p in ps:
+                    outs.extend(llm.generate([p], sampling_params=params, use_tqdm=False))
+                    torch.cuda.synchronize()
+            else:
+                outs = llm.generate(ps, sampling_params=params, use_tqdm=False)
+            for o in outs:
+                res.append((label, len(res), summarize(o)))
+        log(f"arm {tag}: fused={fused} cute={cute} host_plan={fi._HOST_PREFILL_PLAN} seq={sequential} "
+            f"n={len(res)} {time.time() - t0:.1f}s")
+        return res
+
+    def per_prompt(ref, cand, tag):
+        rows = []
+        for (lab, i, m), (_, _, c) in zip(ref, cand):
+            differ, flip, d, same_set = _first_cmp(m, c)
+            rows.append({"idx": i, "label": lab, "ref_tok": _first(m)[0], "tok": _first(c)[0],
+                         "bitwise": not differ, "flip": flip, "max_top20_dlp": d, "top20_set_equal": same_set})
+        return rows
+
+    rep = {}
+    t_start = time.time()
+    batch_wait = float(os.environ.get("BATCH_WAIT_MS", "300"))
+    llm = build_llm(batch_wait_timeout_ms=batch_wait)
+    log(f"LLM 1 (mode i, overlap on, batch_wait_timeout_ms={batch_wait}) loaded in {time.time() - t_start:.0f}s")
+    warm = Prompts(5)
+    for isl in (300, 1000, 8000):
+        llm.generate([warm.make(isl) for _ in range(2)], sampling_params=params, use_tqdm=False)
+    llm.generate([warm.make(1000) for _ in range(4)], sampling_params=params, use_tqdm=False)
+    out = {}
+    # (a) first
+    for tag, f, c in (("main", False, True), ("b7", True, True), ("main_b", False, True), ("b7_b", True, True),
+                      ("old", True, False)):
+        out["a_" + tag] = run(llm, "a_" + tag, f, c, set_a)
+    a_rows = {t: per_prompt(out["a_main"], out["a_" + t], t) for t in ("b7", "main_b", "b7_b", "old")}
+    rep["a_b7_vs_main"] = _cmp_arms(out["a_main"], out["a_b7"])
+    rep["a_b7_b_vs_main"] = _cmp_arms(out["a_main"], out["a_b7_b"])
+    rep["a_main_b_vs_main"] = _cmp_arms(out["a_main"], out["a_main_b"])
+    rep["a_b7_b_vs_b7"] = _cmp_arms(out["a_b7"], out["a_b7_b"])
+    rep["a_old_vs_main"] = _cmp_arms(out["a_main"], out["a_old"])
+    for k in [k for k in rep if k.startswith("a_")]:
+        log(f"{k}: {json.dumps(rep[k]['total'])}")
+    named = {}
+    for j in (2, 4, 7, 8):
+        b, o = a_rows["b7"][j], a_rows["old"][j]
+        named[f"#{j}"] = {"label": b["label"], "main_tok": b["ref_tok"], "b7_tok": b["tok"], "b7_bitwise": b["bitwise"],
+                          "b7_max_dlp": b["max_top20_dlp"], "b7_b_bitwise": a_rows["b7_b"][j]["bitwise"],
+                          "old_tok": o["tok"], "old_flip": o["flip"], "old_max_dlp": round(o["max_top20_dlp"], 4)}
+    log("set (a) named isl300@1 prompts (0-based): " + json.dumps(named))
+    for r_b7, r_old in zip(a_rows["b7"], a_rows["old"]):
+        log(f"  a#{r_b7['idx']:2d} {r_b7['label']}: main={r_b7['ref_tok']} b7={r_b7['tok']} "
+            f"b7_bitwise={r_b7['bitwise']} b7_dlp={r_b7['max_top20_dlp']} | old={r_old['tok']} "
+            f"old_flip={r_old['flip']} old_dlp={r_old['max_top20_dlp']:.4f}")
+    # (b)
+    for tag, f in (("main", False), ("b7", True), ("main_b", False), ("b7_b", True)):
+        out["b_" + tag] = run(llm, "b_" + tag, f, True, sb)
+    rep["b_b7_vs_main"] = _cmp_arms(out["b_main"], out["b_b7"])
+    rep["b_b7_b_vs_main"] = _cmp_arms(out["b_main"], out["b_b7_b"])
+    rep["b_main_b_vs_main"] = _cmp_arms(out["b_main"], out["b_main_b"])
+    rep["b_b7_b_vs_b7"] = _cmp_arms(out["b_b7"], out["b_b7_b"])
+    for k in [k for k in rep if k.startswith("b_")]:
+        log(f"{k}: {json.dumps(rep[k]['total'])}")
+    flip_table = {lab: {"n": v["n"], "flips": v["flips"], "differ": v["differ"], "max_top20_dlp": v["max_top20_dlp"]}
+                  for lab, v in rep["b_b7_vs_main"]["per_label"].items()}
+    log("set (b) flip table b7 vs main per ISL x c: " + json.dumps(flip_table))
+    # prompts that diverged anywhere in mode (i) between b7 arms and main
+    div = []
+    for key in ("b_b7", "b_b7_b"):
+        for (lab, i, m), (_, _, c) in zip(out["b_main"], out[key]):
+            if m != c and i not in div:
+                div.append(i)
+    flat_b = [(lab, p) for lab, ps in sb for p in ps]
+    llm.shutdown()
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
+    log(f"LLM 1 freed; mode (i) diverging set (b) prompts: {div}")
+    # ---- mode (ii)
+    try:
+        llm = build_llm(batch_wait_timeout_ms=0.0, disable_overlap_scheduler=True)
+        for isl in (300, 1000):
+            llm.generate([warm.make(isl)], sampling_params=params, use_tqdm=False)
+        o2 = {}
+        o2["a_main"] = run(llm, "ii_a_main", False, True, set_a, sequential=True)
+        o2["a_b7"] = run(llm, "ii_a_b7", True, True, set_a, sequential=True)
+        rep["ii_a_b7_vs_main"] = _cmp_arms(o2["a_main"], o2["a_b7"])
+        log(f"ii_a_b7_vs_main: {json.dumps(rep['ii_a_b7_vs_main']['total'])}")
+        if div:
+            gd = [(flat_b[i][0], [flat_b[i][1]]) for i in div]
+            o2["d_main"] = run(llm, "ii_div_main", False, True, gd, sequential=True)
+            o2["d_b7"] = run(llm, "ii_div_b7", True, True, gd, sequential=True)
+            rep["ii_div_b7_vs_main"] = _cmp_arms(o2["d_main"], o2["d_b7"])
+            log(f"ii_div_b7_vs_main: {json.dumps(rep['ii_div_b7_vs_main']['total'])}")
+        llm.shutdown()
+    except Exception as e:  # noqa: BLE001
+        log(f"mode (ii) failed: {e!r}")
+        rep["mode_ii_error"] = repr(e)
+    mg._FUSED_QKV_PREP, variant["cute"] = True, True
+    a_ok = rep["a_b7_vs_main"]["total"]["differ"] == 0 and rep["a_b7_b_vs_main"]["total"]["differ"] == 0
+    b_ok = rep["b_b7_vs_main"]["total"]["differ"] == 0 and rep["b_b7_b_vs_main"]["total"]["differ"] == 0
+    rep_ok = all(rep[k]["total"]["differ"] == 0 for k in ("a_main_b_vs_main", "a_b7_b_vs_b7", "b_main_b_vs_main",
+                                                          "b_b7_b_vs_b7"))
+    ii_ok = rep.get("ii_a_b7_vs_main", {"total": {"differ": 1}})["total"]["differ"] == 0
+    pos_ctrl = rep["a_old_vs_main"]["total"]
+    print(json.dumps({
+        "passed": bool(a_ok and b_ok and rep_ok and ii_ok),
+        "compared": "first token id + top-20 logprobs, bitwise, in one process: A=main (fused prep off, main's "
+                    "unfused chain), B=b7 fused prep (60 layers, cute_norm_order), A'=main repeat, B'=b7 repeat; "
+                    "1 token per prompt; c=4/c=16 groups submitted together (batch_wait_timeout_ms); "
+                    "own prompts per ruling 914-1",
+        "host_prefill_plan": {"env_TRTLLM_FI_HOST_PREFILL_PLAN": hp_env, "module_flag": bool(fi._HOST_PREFILL_PLAN),
+                              "same_in_every_arm": True},
+        "set_a": {"sha256_ids": sha_a, "sha256_isl300x10": sha_a300, "n": len(ids_a),
+                  "b7_vs_main": rep["a_b7_vs_main"]["total"], "b7_b_vs_main": rep["a_b7_b_vs_main"]["total"],
+                  "named_isl300": named, "positive_control_old_kernel_vs_main": pos_ctrl,
+                  "per_prompt_b7": a_rows["b7"], "per_prompt_old": a_rows["old"]},
+        "set_b": {"sha256_ids": sha_b, "n": n_b, "n_random_id": n_rnd_b, "flip_table_b7_vs_main": flip_table,
+                  "b7_vs_main": rep["b_b7_vs_main"]["total"], "b7_b_vs_main": rep["b_b7_b_vs_main"]["total"]},
+        "repeat_arms_bitwise": rep_ok, "mode_ii_set_a_bitwise": ii_ok, "mode_i_diverging_prompts": div,
+        "summary": {k: v["total"] for k, v in rep.items() if isinstance(v, dict) and "total" in v},
+        "elapsed_s": round(time.time() - t_start, 1)}), flush=True)
+
+
 def mode_both(modes=("dump", "ab")):
     """dump then ab, each in its own process (one model instance at a time); combined JSON last."""
     import subprocess
@@ -707,5 +916,7 @@ if __name__ == "__main__":
         mode_both(("dump", "routea"))
     elif sys.argv[1] == "outcome0":
         mode_outcome0()
+    elif sys.argv[1] == "item5":
+        mode_item5()
     else:
         mode_ab()
