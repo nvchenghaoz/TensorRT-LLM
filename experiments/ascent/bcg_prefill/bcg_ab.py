@@ -300,11 +300,106 @@ def mode_check():
           flush=True)
 
 
+def mode_inproc():
+    """Same-process replay-vs-eager bitwise A/B: ONE LLM with the BCG overlay; replay is
+    switched off/on between passes by gating BreakableCUDAGraphRunner.has_graph from this
+    script (both the input-prep graph check and the runner dispatch use it), so both modes
+    share one AutoTuner cache, one KV pool and one process. Order: A(eager) B(replay)
+    A'(eager) B'(replay), then a repeated-replay sequence (5 warmup + 20 calls, no reset)."""
+    print_dims()
+    llm = build_llm(batch_wait_timeout_ms=1500.0)
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
+        BreakableCUDAGraphRunner,
+    )
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import graphs as _g
+    import tensorrt_llm._torch.attention.backends.flashinfer as _fi
+
+    replay_on = [True]
+    orig_has_graph = BreakableCUDAGraphRunner.has_graph
+    BreakableCUDAGraphRunner.has_graph = lambda self, n: replay_on[0] and orig_has_graph(self, n)
+    counts = getattr(_g, "_BCG_STEP_COUNTS", None)
+    host_plan = getattr(_fi, "_HOST_PREFILL_PLAN", None)
+    log(f"FlashInfer _HOST_PREFILL_PLAN={host_plan} (main default, same in all passes)")
+    params = sp(logprobs=20)
+    ps = Prompts(9090)
+    # groups submitted together; batch_wait_timeout_ms fixes each group's step composition
+    groups = []
+    for isl in (300, 1000, 2000, 8000):          # c=1 (8000 > largest bucket: eager in both)
+        groups += [("1x%d" % isl, [ps.make(isl)]) for _ in range(5)]
+    for n, isl in ((2, 300), (3, 300), (4, 300), (5, 300), (6, 300), (2, 1000), (4, 1000)):
+        groups += [("%dx%d" % (n, isl), [ps.make(isl) for _ in range(n)]) for _ in range(2)]
+    warm = Prompts(5)
+    for isl in (300, 1000, 2000, 8000):
+        run_batch(llm, [warm.make(isl)], params)
+    passes = {}
+    steps = {}
+    for tag, on in (("A", False), ("B", True), ("A2", False), ("B2", True)):
+        replay_on[0] = on
+        before = dict(counts) if counts is not None else None
+        res = []
+        for _, grp in groups:
+            _, outs = run_batch(llm, grp, params)
+            res.append([summarize(o) for o in outs])
+        passes[tag] = res
+        if counts is not None:
+            steps[tag] = {k: counts[k] - before[k] for k in counts}
+        log(f"pass {tag} replay={on} steps={steps.get(tag)}")
+    # repeated replay, no reset: same prompt / same batch, 5 warmup + 20 calls
+    replay_on[0] = True
+    rep_single = ps.make(300)
+    rep_batch = [ps.make(300) for _ in range(4)]
+    rep_s, rep_b = [], []
+    for i in range(25):
+        _, o = run_batch(llm, [rep_single], params)
+        rep_s.append(summarize(o[0]))
+        _, o = run_batch(llm, rep_batch, params)
+        rep_b.append([summarize(x) for x in o])
+    replay_on[0] = False
+    _, o = run_batch(llm, [rep_single], params)
+    eager_s = summarize(o[0])
+    _, o = run_batch(llm, rep_batch, params)
+    eager_b = [summarize(x) for x in o]
+    replay_on[0] = True
+    BreakableCUDAGraphRunner.has_graph = orig_has_graph
+
+    def diff(a, b):
+        out = {}
+        for (label, _), x, y in zip(groups, a, b):
+            d = out.setdefault(label, [0, 0])
+            d[1] += len(x)
+            d[0] += sum(1 for u, v in zip(x, y) if u != v)
+        return {k: f"{v[0]}/{v[1]} differ" for k, v in out.items()}, sum(v[0] for v in out.values())
+
+    cmp = {}
+    total = 0
+    for a, b in (("B", "A"), ("B2", "A"), ("A2", "A"), ("B2", "B")):
+        per, n = diff(passes[a], passes[b])
+        cmp[f"{a}_vs_{b}"] = {"n_diff": n, "per_group": per}
+        total += n
+    rep_ok = all(x == rep_s[0] for x in rep_s) and all(x == rep_b[0] for x in rep_b)
+    rep_eq_eager = rep_s[0] == eager_s and rep_b[0] == eager_b
+    n_out = sum(len(x) for x in passes["A"])
+    passed = total == 0 and rep_ok and rep_eq_eager and bool(passes["A"][0][0]["lp"])
+    replayed_in_B = (steps.get("B") or {}).get("replayed", 0)
+    print(json.dumps({
+        "passed": bool(passed and replayed_in_B > 0),
+        "compared": "token ids + top-20 logprobs, bitwise, ONE process: BCG replay (B, B2) vs "
+                    "eager (A, A2) on the same engine; %d outputs per pass over groups 1x300, "
+                    "1x1000, 1x2000, 1x8000 (eager>bucket), 2/3/4/5/6x300, 2x1000, 4x1000; "
+                    "repeated replay 25 calls (5 warmup + 20) of 1x300 and 4x300, every call "
+                    "== first == eager" % n_out,
+        "comparisons": cmp, "repeat_replay_all_equal_first": rep_ok,
+        "repeat_replay_equal_eager": rep_eq_eager, "context_steps_per_pass": steps,
+        "flashinfer_host_prefill_plan": host_plan, "overlay": overlay()}), flush=True)
+
+
 if __name__ == "__main__":
     m = sys.argv[1] if len(sys.argv) > 1 else "time"
     if m == "time":
         mode_time()
     elif m == "arm":
         mode_arm(sys.argv[2], sys.argv[3])
+    elif m == "inproc":
+        mode_inproc()
     else:
         mode_check()
