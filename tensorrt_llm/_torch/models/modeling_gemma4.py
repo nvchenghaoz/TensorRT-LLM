@@ -50,6 +50,7 @@ from ..attention.backends.interface import (
 )
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..kernels.fused_ops.embed_scale_rmsnorm import embed_scale_rmsnorm, rmsnorm_replay_supported
 from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
 from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
 from ..kernels.fused_ops.rmsnorm_residual_add import (
@@ -1312,6 +1313,10 @@ class Gemma4TextModel(DecoderModel):
             eps=pretrained.rms_norm_eps,
             dtype=pretrained.torch_dtype,
         )
+        # Fused embedding lookup (+ layer-0 input norm); resolved on first use.
+        self._fused_embed: Optional[bool] = None
+        self._fused_embed_norm: bool = False
+        self._embed_scale_value: float = 1.0
 
         # Per-Layer Embedding (PLE) model-level components
         self.hidden_size_per_layer_input = getattr(pretrained, "hidden_size_per_layer_input", 0)
@@ -1406,6 +1411,49 @@ class Gemma4TextModel(DecoderModel):
                 if mod is not None and hasattr(mod, "weight") and mod.weight.dtype != target:
                     mod.to(target)
 
+    def _resolve_fused_embed(self) -> bool:
+        """Whether embed_tokens' masked lookup + embed_scale (and layer 0's
+        input norm) can run as one embed_scale_rmsnorm launch."""
+        if self._fused_embed is None:
+            emb = self.embed_tokens
+            w = getattr(emb, "weight", None)
+            scale = getattr(emb, "embed_scale", None)
+            self._fused_embed = (
+                isinstance(emb, Gemma4TextScaledWordEmbedding)
+                # The full table is local: the masked path's range is [0, V).
+                and emb.tp_size == 1
+                and isinstance(w, torch.Tensor)
+                and w.dim() == 2
+                and w.dtype == torch.bfloat16
+                # aten bf16 * bf16 0-d tensor: fp32 opmath, one bf16 round.
+                and isinstance(scale, torch.Tensor)
+                and scale.dtype == torch.bfloat16
+                and scale.numel() == 1
+            )
+            if self._fused_embed:
+                self._embed_scale_value = float(scale.float().item())
+                layer0 = self.layers[0] if len(self.layers) > 0 else None
+                norm = getattr(layer0, "input_layernorm", None)
+                self._fused_embed_norm = (
+                    isinstance(norm, RMSNorm)
+                    and layer0._norm_is_plain_bf16(norm)
+                    # RMSNorm.forward then dispatches to flashinfer's rmsnorm,
+                    # which the kernel replays bitwise.
+                    and IS_FLASHINFER_AVAILABLE
+                    and not norm.use_cuda_tile
+                    and not norm.fp8_per_token_out
+                    and not norm.return_hp_output
+                    and not (norm.is_nvfp4 and norm.nvfp4_scale is not None)
+                    and rmsnorm_replay_supported(w.shape[1], w.dtype, w.device)
+                )
+            logger.info_once(
+                f"Gemma4 fused embedding(+scale) path: "
+                f"{'enabled' if self._fused_embed else 'disabled'}, "
+                f"layer-0 input norm fused: {self._fused_embed_norm}",
+                key="gemma4_fused_embed",
+            )
+        return self._fused_embed
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1417,15 +1465,38 @@ class Gemma4TextModel(DecoderModel):
         local_variable_window_token_starts: Optional[torch.Tensor] = None,
         local_variable_window_token_ends: Optional[torch.Tensor] = None,
         ple_input_ids: Optional[torch.IntTensor] = None,
+        apply_final_norm: bool = True,
         **kwargs,
     ) -> torch.Tensor:
+        """With ``apply_final_norm=False`` the caller applies ``self.norm``
+        (row-wise) itself, e.g. only to the rows it keeps."""
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        pre_normed = None
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            if (
+                not is_torch_compiling()
+                and input_ids.is_cuda
+                and self._resolve_fused_embed()
+                and self.embed_tokens.weight.is_contiguous()
+            ):
+                # One launch: masked lookup + embed_scale, and layer 0's input
+                # norm as a second output (bitwise the unfused chain).
+                norm0 = self.layers[0].input_layernorm if self._fused_embed_norm else None
+                inputs_embeds, pre_normed = embed_scale_rmsnorm(
+                    input_ids,
+                    self.embed_tokens.weight,
+                    self._embed_scale_value,
+                    norm_weight=norm0.weight if norm0 is not None else None,
+                    eps=norm0.variance_epsilon if norm0 is not None else 1e-6,
+                )
+            else:
+                inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds.to(self.dtype)
+        if pre_normed is not None and hidden_states is not inputs_embeds:
+            pre_normed = None
 
         # Compute PLE inputs.  When both input_ids and inputs_embeds are
         # provided (multimodal path, where inputs_embeds has audio/image
@@ -1438,7 +1509,6 @@ class Gemma4TextModel(DecoderModel):
         ple_ids = ple_input_ids if ple_input_ids is not None else input_ids
         per_layer_inputs = self._compute_per_layer_inputs(ple_ids, hidden_states)
 
-        pre_normed = None
         for i, decoder_layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, i, :] if per_layer_inputs is not None else None
 
@@ -1468,7 +1538,8 @@ class Gemma4TextModel(DecoderModel):
 
         if hidden_states.dtype != self.dtype:
             hidden_states = hidden_states.to(self.dtype)
-        hidden_states = self.norm(hidden_states)
+        if apply_final_norm:
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
@@ -1769,6 +1840,18 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                     effective_sliding_window=self.config.sliding_window,
                 )
 
+        # Only the last token of each request reaches the LM head: apply the
+        # (row-wise) final norm to just those rows instead of all M. The
+        # logits processor's gather is replayed here, so the LM head sees the
+        # same rows, bitwise.
+        norm_gathered_rows = (
+            self.spec_worker is None
+            and spec_metadata is None
+            and not return_context_logits
+            and attn_metadata is not None
+            and getattr(attn_metadata, "seq_lens_cuda", None) is not None
+            and not is_torch_compiling()
+        )
         output = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1778,6 +1861,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             local_variable_window_token_starts=local_variable_window_token_starts,
             local_variable_window_token_ends=local_variable_window_token_ends,
             ple_input_ids=kwargs.pop("ple_input_ids", None),
+            apply_final_norm=not norm_gathered_rows,
             **kwargs,
         )
 
@@ -1785,6 +1869,23 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, output)
         if attn_metadata.padded_num_tokens is not None:
             output = output[: attn_metadata.num_tokens]
+
+        if norm_gathered_rows:
+            last_tokens = (
+                torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            )
+            hidden = self.model.norm(output[last_tokens])
+            # The rows are already gathered: project them as they are.
+            logits = self.logits_processor.forward(
+                hidden,
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
+            if self.config.final_logit_softcapping is not None:
+                cap = self.config.final_logit_softcapping
+                logits = torch.tanh(logits / cap) * cap
+            return logits
 
         if self.spec_worker is not None:
             return self._forward_speculative(
