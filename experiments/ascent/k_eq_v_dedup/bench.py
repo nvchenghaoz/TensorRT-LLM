@@ -149,6 +149,42 @@ def main():
     batch = {}
     passed = True
     details = {}
+    layers_info = {}
+    if MODE == "check":
+        from tensorrt_llm._utils import is_sm_100f
+
+        layers_info["is_sm_100f"] = bool(is_sm_100f())
+        layers_info["num_kv_shared_layers"] = rtext.get("num_kv_shared_layers")
+        layers_info["global"] = {
+            "qkv_proj": type(attn.qkv_proj).__name__,
+            "weight_mode": str(attn.qkv_proj.weights_loading_config.weight_mode),
+            "weight_shape": list(attn.qkv_proj.weight.shape),
+            "qk_only_proj": getattr(attn, "_qk_only_proj", None),
+            "fused_qkv_prep_enabled": bool(attn._fused_qkv_prep_enabled()),
+        }
+        sl_idx = tcfg.layer_types.index("sliding_attention")
+        for name, kw in (
+            ("sliding", dict(layer_idx=sl_idx, is_sliding=True)),
+            ("kv_shared_global", dict(layer_idx=layer_idx, is_sliding=False, is_kv_shared=True)),
+            ("kv_shared_sliding", dict(layer_idx=sl_idx, is_sliding=True, is_kv_shared=True)),
+        ):
+            with torch.device("cuda"):
+                other = Gemma4Attention(mc, **kw)
+            layers_info[name] = {
+                "qkv_proj": type(other.qkv_proj).__name__,
+                "weight_mode": str(other.qkv_proj.weights_loading_config.weight_mode),
+                "weight_shape": list(other.qkv_proj.weight.shape),
+                "expected_N": other.q_size + (0 if kw.get("is_kv_shared") else 2 * other.kv_size),
+                "qk_only_proj": getattr(other, "_qk_only_proj", None),
+            }
+            ok_layer = (
+                layers_info[name]["weight_shape"][0] == layers_info[name]["expected_N"]
+                and not layers_info[name]["qk_only_proj"]
+            )
+            passed &= ok_layer
+            del other
+        torch.cuda.empty_cache()
+        log("layers:", json.dumps(layers_info))
     for M in MS:
         torch.manual_seed(M)
         x = torch.randn(M, H, device="cuda", dtype=torch.bfloat16)
@@ -181,8 +217,16 @@ def main():
             }
             log(f"M={M}: median {med:.4f} ms p10 {p10:.4f} p90 {p90:.4f} sha {first}")
         else:
+            x_before = x.clone()
             ref_a = main_front(x, pos)
             ref_b = fp32_ref(x, pos)
+            # Direct check: candidate v == v_norm(raw K GEMM output, before k_norm).
+            attn.qkv_proj.weight.data = copies[0]
+            raw = attn.qkv_proj(x)
+            raw_k = raw[:, qs : qs + kvs]
+            v_direct = attn.v_norm(raw_k.reshape(-1, hd)).reshape(-1, kvs)
+            raw_main_k = F.linear(x, w_full)[:, qs : qs + kvs]
+            ok_rawk = torch.equal(raw_k, raw_main_k)
             ea = errs(ref_a, ref_b)
             first = None
             ok_rep = True
@@ -205,7 +249,10 @@ def main():
                 ok_ref &= ec[name][1] <= 1.10 * ea[name][1] + 2.0**-8
             finite = all(torch.isfinite(t).all().item() for t in first)
             shapes = [tuple(t.shape) for t in first] == [tuple(t.shape) for t in ref_a]
-            ok = ok_rep and ok_main and ok_ref and finite and shapes
+            ok_vdirect = torch.equal(first[2], v_direct)
+            ok_inputs = torch.equal(x, x_before)
+            ok = ok_rep and ok_main and ok_ref and finite and shapes and ok_vdirect and ok_inputs
+            ok = ok and ok_rawk
             passed &= ok
             details[str(M)] = {
                 "repeat_bitwise": ok_rep,
@@ -215,6 +262,9 @@ def main():
                 "main_vs_fp32": {k: v[:2] for k, v in ea.items()},
                 "finite": finite,
                 "shapes_ok": shapes,
+                "v_equals_vnorm_of_raw_k": ok_vdirect,
+                "raw_k_gemm_bitwise_vs_main_k_block": ok_rawk,
+                "inputs_unchanged": ok_inputs,
                 "sha": sha(first),
             }
             log(f"M={M}: {json.dumps(details[str(M)])}")
@@ -230,6 +280,7 @@ def main():
                     "replica (bitwise), vs first call over 30 calls (bitwise), and vs FP32 reference",
                     "qkv_weight_shape": list(attn.qkv_proj.weight.shape),
                     "config": info,
+                    "layers": layers_info,
                     "details": details,
                 }
             )
