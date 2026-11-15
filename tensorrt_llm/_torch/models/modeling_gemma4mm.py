@@ -53,6 +53,7 @@ from ...sampling_params import SamplingParams
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear
 from ..peft.lora.ownership import DecoderLoraOwner
+from .gemma4_text_tokenize import Gemma4TextEncoder
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
@@ -300,6 +301,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         )
         self._config = config
         self._tokenizer = tokenizer
+        self._text_encoder = Gemma4TextEncoder(tokenizer)
         self._model_path = model_path
         self._dtype = getattr(config, "torch_dtype", torch.bfloat16)
 
@@ -900,6 +902,10 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         inputs: TextPrompt,
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        text_prompt = inputs.get("prompt")
+        if not inputs.get("multi_modal_data") and isinstance(text_prompt, str):
+            # Text only: the same ids as the tokenizer call in _preprocess, as a list.
+            return self._text_encoder.encode(text_prompt), None
         (
             input_ids,
             pixel_values,
