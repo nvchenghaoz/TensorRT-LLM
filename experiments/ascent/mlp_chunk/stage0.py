@@ -129,7 +129,10 @@ def act_into(x, gs, out, sf, cfgname, rev):
     """Act on x [m, 2I] writing into out [m, I/2] and sf (pad128(m) rows)."""
     bm, bk, nw = ACT_CFGS[cfgname]
     m = x.shape[0]
-    if cfgname == "main" and not rev:
+    if not rev and "m_pad" in gm._gelu_tanh_mul_fp4_kernel.arg_names:
+        # post-landing-7 tree: the production wrapper (its own SM120 config)
+        gm.gelu_tanh_mul_fp4_quant(x, gs, out=out, sf_out=sf)
+    elif cfgname == "main" and not rev:
         gm._gelu_tanh_mul_fp4_kernel[(triton.cdiv(m, bm), triton.cdiv(I, bk))](
             x, out, sf, gs, m, x.stride(0), NKT_ACT, IDIM=I, BM=bm, BK=bk, num_warps=nw)
     else:
