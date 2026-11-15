@@ -25,11 +25,13 @@ def _patch(mod):
 
     def wrapped(self, inputs, sampling_params):
         before = sum(1 for t in threading.enumerate() if t.name.startswith("gemma4_tok"))
+        c0 = time.process_time()
         a = time.perf_counter()
         out = orig(self, inputs, sampling_params)
         dt = time.perf_counter() - a
+        cpu = time.process_time() - c0
         after = sum(1 for t in threading.enumerate() if t.name.startswith("gemma4_tok"))
-        rec = {"t_end": time.time(), "ms": 1e3 * dt, "n_ids": len(out[0]),
+        rec = {"t_end": time.time(), "ms": 1e3 * dt, "process_cpu_ms": 1e3 * cpu, "n_ids": len(out[0]),
                "chars": len(inputs.get("prompt") or ""), "pid": os.getpid(), "ppid": os.getppid(),
                "pool_threads_before": before, "pool_threads_after": after,
                "thread": threading.current_thread().name,
