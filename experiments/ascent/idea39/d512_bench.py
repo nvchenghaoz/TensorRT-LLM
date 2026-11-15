@@ -27,6 +27,7 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 PAGE = 32
+TILE64_FLAG = "FLASHINFER_FA2_D512_TILE64"
 CASES = "1x300,16x300,27x300,1x1000,8x1000,1x2000,4x2000,16x512,1x4000,2x4000,1x8000"
 # ragged / prefix / split-KV numerics cases: name -> (q_lens, kv_lens, plan kwargs)
 EXTRA = {
@@ -219,6 +220,24 @@ def run_arm(a):
         rec = dict(case=label, q_lens=ql if len(ql) <= 8 else f"{len(ql)}x{ql[0]}",
                    cta_tile_q=pi[3], split_kv=bool(pi[14]), padded_batch=pi[0],
                    first_plan_s=round(first_plan_s, 2), gflop=c.flops / 1e9)
+        ref32 = None
+        if a.self_compare:
+            # Same build, 32-row path (FLASHINFER_FA2_D512_TILE64=0 is read on every plan):
+            # main's kernel. Then re-plan with the default (64-row where eligible).
+            os.environ[TILE64_FLAG] = "0"
+            plan()
+            pi32 = [int(x) for x in w._plan_info]
+            run()
+            torch.cuda.synchronize()
+            ref32 = dict(o=out.clone(), lse=None if lse is None else lse.clone(),
+                         cta_tile_q=pi32[3], split_kv=bool(pi32[14]))
+            if not a.no_time:
+                t32 = time_fn(run, a.warmup, a.iters)
+                ref32["timing"] = t32
+            os.environ.pop(TILE64_FLAG, None)
+            plan()
+            pi = [int(x) for x in w._plan_info]
+            rec.update(cta_tile_q=pi[3], split_kv=bool(pi[14]), padded_batch=pi[0])
         # untimed repeated-execution sequence: same call count as the timing run
         run()
         torch.cuda.synchronize()
@@ -240,6 +259,22 @@ def run_arm(a):
             rec["err_vs_fp32"] = err_stats(first, ref)
             all_ok &= rec["err_vs_fp32"]["finite"]
             del ref
+        if ref32 is not None:
+            nbad = int((first.view(torch.int16) != ref32["o"].view(torch.int16)).sum())
+            sc = dict(path32_tile=ref32["cta_tile_q"], path32_split=ref32["split_kv"],
+                      byte_mismatch_elems=nbad, elems=first.numel())
+            if lse is not None:
+                # the repeated sequence left the last call's lse in place: deterministic
+                sc["lse_byte_mismatch"] = int(
+                    (lse.view(torch.int32) != ref32["lse"].view(torch.int32)).sum())
+            sc["bitwise"] = nbad == 0 and sc.get("lse_byte_mismatch", 0) == 0
+            if "timing" in ref32:
+                sc["path32_ms"] = ref32["timing"]["median_ms"]
+                sc["path32_p10"] = ref32["timing"]["p10_ms"]
+                sc["path32_p90"] = ref32["timing"]["p90_ms"]
+            rec["vs_path32"] = sc
+            all_ok &= sc["bitwise"]
+            del ref32
         if save_dir is not None:
             lse_first = lse.clone() if lse is not None else None
             if a.arm == "tree":
@@ -271,8 +306,10 @@ def run_arm(a):
         torch.cuda.empty_cache()
     batch = {r["case"]: {"kernel_ms": r.get("median_ms"), "noise_floor": r.get("noise")}
              for r in results}
-    final = {"batch": batch, "output": {"class": "reordered"}, "passed": bool(all_ok),
-             "arm": a.arm, "results": results}
+    exact = all(r.get("vs_path32", {}).get("bitwise", False) for r in results) if \
+        a.self_compare else False
+    final = {"batch": batch, "output": {"class": "exact" if exact else "reordered"},
+             "passed": bool(all_ok), "arm": a.arm, "results": results}
     print(json.dumps(final), flush=True)
 
 
@@ -383,6 +420,8 @@ def main():
     ap.add_argument("--no-ref", action="store_true")
     ap.add_argument("--no-time", action="store_true")
     ap.add_argument("--lse", action="store_true", help="also return and byte-compare LSE")
+    ap.add_argument("--self-compare", action="store_true",
+                    help="byte-compare each case against the 32-row path of the same build")
     ap.add_argument("--save-dir", default="")
     ap.add_argument("--overlay-dir", default="")
     a = ap.parse_args()

@@ -50,11 +50,10 @@ constexpr bool FA2D512Tile64Eligible() {
 }
 
 // Runtime switch: the kernel was tuned on SM12x (99 KB opt-in shared memory per block,
-// one CTA per SM). FLASHINFER_FA2_D512_TILE64=0 turns the path off.
+// one CTA per SM). FLASHINFER_FA2_D512_TILE64=0 turns the path off; it is read on every
+// plan, so one process can switch between the 32-row and 64-row paths.
 inline bool FA2D512Tile64Enabled() {
-  static const bool enabled = [] {
-    const char* env = std::getenv("FLASHINFER_FA2_D512_TILE64");
-    if (env != nullptr && env[0] == '0') return false;
+  static const bool device_ok = [] {
     int dev = 0, major = 0, smem_optin = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return false;
     if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess)
@@ -62,9 +61,11 @@ inline bool FA2D512Tile64Enabled() {
     if (cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) !=
         cudaSuccess)
       return false;
-    return major == 12 && smem_optin >= 100864;
+    return major == 12 && smem_optin >= 100352;
   }();
-  return enabled;
+  if (!device_ok) return false;
+  const char* env = std::getenv("FLASHINFER_FA2_D512_TILE64");
+  return !(env != nullptr && env[0] == '0');
 }
 
 // Planner hook, called after the 32-row plan's split-KV decision. The 64-row kernel computes
