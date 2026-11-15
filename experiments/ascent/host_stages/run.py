@@ -419,6 +419,13 @@ def main():
     summary = {"mode": mode, "artifacts": str(out)}
     rng = random.Random(f"hs-{mode}-{time.time()}")
     try:
+        if mode == "reanalyze":
+            src = Path(sys.argv[4])
+            log(f"reanalyze {src} exists={src.exists()}")
+            res = json.loads((src / "N_nsys_client.json").read_text())
+            summary["N"] = analyze.analyze_lifetime(res, src / "N_nsys_trace")
+            summary["N_gpu"] = analyze.analyze_nsys(str(src / "N_nsys_nsys.sqlite"), res, src / "N_nsys_trace")
+            raise SystemExit(0)
         pf = Prompts(ckpt)
         if mode == "timing":
             summary["tokenization"] = tokenization_test(ckpt, pf, rng)
@@ -459,9 +466,10 @@ def main():
             else:
                 summary["N_gpu"] = {"error": f"no report at {repf}", "ls": os.listdir(out)}
     except BaseException as e:  # noqa: BLE001
-        import traceback
-        summary["error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-3000:]}"
-        log(summary["error"])
+        if not (isinstance(e, SystemExit) and e.code == 0):
+            import traceback
+            summary["error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-3000:]}"
+            log(summary["error"])
     finally:
         _cleanup()
     (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str))

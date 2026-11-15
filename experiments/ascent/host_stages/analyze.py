@@ -464,6 +464,12 @@ def analyze_nsys(sq, results, tdir):
         if c in tr.pub:
             inflight.append((ns(f["t"]), ns(tr.pub[c]["t"])))
     inflight.sort()
+    inflight_u = []
+    for fa, fb in inflight:
+        if inflight_u and fa <= inflight_u[-1][1]:
+            inflight_u[-1] = (inflight_u[-1][0], max(inflight_u[-1][1], fb))
+        else:
+            inflight_u.append((fa, fb))
 
     def in_flight(x):
         for a, b in inflight:
@@ -550,64 +556,98 @@ def analyze_nsys(sq, results, tdir):
         big = []
         small_total = 0.0
         inter = defaultdict(float)
+        # Requests of this case with their host timeline (ns), for inter-request splits.
+        req_tl = []
+        for rq in case["requests"]:
+            fe = tr.fe_head.get(rq.get("head")) if rq else None
+            if fe is None or "t_send" not in rq:
+                continue
+            cid = fe["cid"]
+            if cid not in tr.fetch:
+                continue
+            req_tl.append((ns(tr.fetch[cid]["t"]), [
+                ("client_turnaround", None), ("http_receive", ns(rq["t_send"])),
+                ("tokenization", ns(fe["entry"])), ("ipc_to_executor", ns(fe["gen0"])),
+                ("queue_wait", ns(tr.w1[cid]["t"]) if cid in tr.w1 else None)]))
+        req_tl.sort(key=lambda x: x[0])
+        fstarts = [x[0] for x in req_tl]
+        op_starts = [o[0] for o in ops]
+
+        def pieces(a, b):
+            """Split [a,b] into (lo, hi, in_flight) pieces by the in-flight union."""
+            out_p, cur = [], a
+            for fa, fb in inflight_u:
+                if fb <= cur:
+                    continue
+                if fa >= b:
+                    break
+                if fa > cur:
+                    out_p.append((cur, min(fa, b), False))
+                lo = max(fa, cur)
+                hi = min(fb, b)
+                if hi > lo:
+                    out_p.append((lo, hi, True))
+                cur = max(cur, hi)
+                if cur >= b:
+                    break
+            if cur < b:
+                out_p.append((cur, b, False))
+            return out_p
+
         for a, b, corr in gaps:
             d = b - a
             if d < 20e3:
                 small_total += d
                 continue
-            api = api_spanning(a + 1e3)
-            kind = "launch_starved"
-            if api is not None and any(w in api[2] for w in SYNC_WORDS) and api[0] < a and api[1] >= a:
-                kind = "blocking"
-                where = innermost(api[0], ranges, rstarts)
-                detail = innermost(api[0], allr, astarts)
-            else:
-                mid = (a + b) / 2
-                where = innermost(mid, ranges, rstarts)
-                detail = innermost(mid, allr, astarts)
-            bk = bucket(kind, where, api)
-            if bk is None:
-                if in_flight((a + b) / 2):
-                    bk = "loop_between_stages (other)"
-                else:
-                    bk = "inter_request (HTTP/tokenize/IPC/admission)"
-                    # Split by where the next request was during the gap.
-                    nxt = None
-                    for rq in case["requests"]:
-                        if rq and "t_send" in rq and ns(rq["t_send"]) <= b and (
-                                nxt is None or rq["t_send"] > nxt["t_send"]):
-                            nxt = rq
-                    fe = tr.fe_head.get(nxt.get("head")) if nxt else None
-                    if fe is not None:
-                        cid = fe["cid"]
-                        it = tr.step_of.get(cid)
-                        p = tr.pass_by_it.get(it, {})
-                        pts = [("client_turnaround", a), ("http_receive", ns(nxt["t_send"])),
-                               ("tokenization", ns(fe["entry"])), ("ipc", ns(fe["gen0"])),
-                               ("queue", ns(tr.w1[cid]["t"]) if cid in tr.w1 else None),
-                               ("schedule_prep", ns(tr.fetch[cid]["t"]) if cid in tr.fetch else None),
-                               ("prepare_inputs", ns(p["fwd0"]) if "fwd0" in p else None), ("end", b)]
+            for lo, hi, infl in pieces(a, b):
+                pd = hi - lo
+                api, where, detail = None, None, None
+                if not infl:
+                    kind, bk = "inter_request", "inter_request (HTTP/tokenize/IPC/admission)"
+                    j = bisect.bisect_left(fstarts, lo)
+                    if j < len(req_tl):
+                        pts = [(k, v) for k, v in req_tl[j][1]]
+                        pts[0] = ("client_turnaround", lo)
+                        pts.append(("end", req_tl[j][0]))
                         pts = [(k, v) for k, v in pts if v is not None]
-                        for j in range(len(pts) - 1):
-                            lo, hi = max(pts[j][1], a), min(pts[j + 1][1], b)
-                            if hi > lo:
-                                inter[pts[j][0]] += hi - lo
-            full = f"{kind}:{bk}"
-            cat[full] += d
-            cat_n[full] += 1
-            if d > 0.3e6:
-                big.append({"ms": r3(d / 1e6), "kind": kind, "bucket": bk, "at_range": where,
-                            "nvtx": detail, "api": api[2] if api else None,
-                            "next_op": ops[bisect.bisect_left([o[0] for o in ops], b)][4][:50]
-                            if b <= ops[-1][0] else None})
+                        for q in range(len(pts) - 1):
+                            x0, x1 = max(pts[q][1], lo), min(pts[q + 1][1], hi)
+                            if x1 > x0:
+                                inter[pts[q][0]] += x1 - x0
+                        if hi > req_tl[j][0]:
+                            inter["after_fetch"] += hi - max(lo, req_tl[j][0])
+                    else:
+                        inter["no_next_request"] += pd
+                else:
+                    api = api_spanning(lo + 1e3)
+                    kind = "launch_starved"
+                    if api is not None and any(w in api[2] for w in SYNC_WORDS) and api[0] < lo and api[1] >= lo:
+                        kind = "blocking"
+                        where = innermost(api[0], ranges, rstarts)
+                        detail = innermost(api[0], allr, astarts)
+                    else:
+                        mid = (lo + hi) / 2
+                        where = innermost(mid, ranges, rstarts)
+                        detail = innermost(mid, allr, astarts)
+                    bk = bucket(kind, where, api) or "loop_between_stages (other)"
+                full = f"{kind}:{bk}"
+                cat[full] += pd
+                cat_n[full] += 1
+                if pd > 0.3e6:
+                    k2 = bisect.bisect_left(op_starts, b)
+                    big.append({"ms": r3(pd / 1e6), "kind": kind, "bucket": bk, "at_range": where,
+                                "nvtx": detail, "api": api[2] if api else None,
+                                "next_op": ops[k2][4][:50] if k2 < len(ops) else None})
         idle = span - busy
         ls = sum(v for k, v in cat.items() if k.startswith("launch_starved"))
         bl = sum(v for k, v in cat.items() if k.startswith("blocking"))
+        ir = sum(v for k, v in cat.items() if k.startswith("inter_request"))
         cases[name] = {
             "requests": nreq, "span_ms": r3(span / 1e6), "busy_ms": r3(busy / 1e6), "idle_ms": r3(idle / 1e6),
             "idle_share": r3(idle / span) if span else None,
             "busy_ms_per_request": r3(busy / 1e6 / nreq), "idle_ms_per_request": r3(idle / 1e6 / nreq),
             "launch_starved_ms_per_request": r3(ls / 1e6 / nreq), "blocking_ms_per_request": r3(bl / 1e6 / nreq),
+            "inter_request_ms_per_request": r3(ir / 1e6 / nreq),
             "small_gaps_lt20us_ms_per_request": r3(small_total / 1e6 / nreq),
             "by_mechanism_ms_per_request": {k: r3(v / 1e6 / nreq) for k, v in sorted(cat.items(), key=lambda x: -x[1])},
             "by_mechanism_count": dict(cat_n),
