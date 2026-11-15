@@ -37,9 +37,19 @@ N_PER_ISL = int(os.environ.get("N_PER_ISL", "40"))
 
 
 def load_common():
-    for cand in [Path("experiments/ascent-benchmark/common.py"),
-                 Path(__file__).resolve().parents[2] / "ascent-benchmark" / "common.py"]:
-        if cand.exists():
+    import glob
+    import hashlib
+    cands = [Path("experiments/ascent-benchmark/common.py"),
+             Path(__file__).resolve().parents[2] / "ascent-benchmark" / "common.py"]
+    # The base tree of a pair does not carry the frozen benchmark; any copy on the node is the
+    # same frozen file (sha256 logged so both arms can be compared).
+    root = "/home/scratch.chengzhang/trtllm-dev-gemma4-31b-pf-20261114-163048/runner/slots"
+    cands += [Path(p) for p in sorted(glob.glob(f"{root}/*/workspace/trtllm/experiments/ascent-benchmark/common.py"))]
+    cands += [Path(p) for p in sorted(glob.glob(f"{root}/*/jobs/*/trtllm/experiments/ascent-benchmark/common.py"))]
+    for cand in cands:
+        if cand.exists() and (cand.parent / "corpus.txt").exists():
+            log("benchmark common sha256", hashlib.sha256(cand.read_bytes()).hexdigest()[:16],
+                "corpus sha256", hashlib.sha256((cand.parent / "corpus.txt").read_bytes()).hexdigest()[:16])
             spec = importlib.util.spec_from_file_location("bench_common", cand)
             mod = importlib.util.module_from_spec(spec)
             sys.modules["bench_common"] = mod
