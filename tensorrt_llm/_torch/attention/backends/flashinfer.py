@@ -64,6 +64,13 @@ from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
 _FORCE_RAGGED_FA2 = False
 """Used for testing."""
 
+_HOST_PREFILL_PLAN = os.environ.get("TRTLLM_FI_HOST_PREFILL_PLAN",
+                                    "1").strip() != "0"
+"""Plan context-only prefill from host indptrs without a stream drain.
+
+TRTLLM_FI_HOST_PREFILL_PLAN=0 restores the synchronizing device-indptr plan
+(an A/B and debugging switch; the outputs are the same either way)."""
+
 _MAX_CUDA_THREADS_PER_BLOCK = 1024
 
 
@@ -297,6 +304,12 @@ class FlashInferWrappers:
     # and columns before narrowing future updates.
     decode_block_table_active_rows: int = field(default=0, repr=False)
     decode_block_table_active_width: int = field(default=0, repr=False)
+    # Recorded right after a host-planned (sync-free) prefill plan. FlashInfer
+    # stages each plan in the wrapper's own pinned int workspace and issues a
+    # non-blocking H2D from it; the next plan on this wrapper waits on this
+    # event instead of draining the whole stream before rewriting that buffer.
+    prefill_plan_event: Optional[torch.cuda.Event] = field(default=None,
+                                                           repr=False)
 
 
 # Environment variable arming the host-side page-table check, and how many
@@ -1181,6 +1194,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._host_pool_indices: Dict[int, torch.Tensor] = {}
         self._host_paged_kv_indices: Optional[torch.Tensor] = None
         self._host_paged_kv_indptr_decode: Optional[torch.Tensor] = None
+        # Pinned host copies of (qo_indptr, paged_kv_indptr_prefill,
+        # paged_kv_last_page_len) for the context rows, built by prepare()
+        # with the num_contexts they describe. Context-only prefill plans hand
+        # them to flashinfer so that its .to("cpu") calls do no D2H work.
+        self._host_prefill_plan_inputs: Optional[tuple[
+            int, torch.Tensor, torch.Tensor, torch.Tensor]] = None
         self._uses_full_generation_page_table = False
         self._max_num_blocks_per_seq = 0
 
@@ -1643,6 +1662,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 torch.from_numpy(arr.astype(np.int32, copy=False)))
 
         super().prepare()
+        self._host_prefill_plan_inputs = None
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
@@ -1820,6 +1840,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             np.concatenate([[0], np.cumsum(num_blocks[:self.num_contexts])]))
         self.paged_kv_indptr_prefill[:paged_kv_indptr_prefill.size(0)].copy_(
             paged_kv_indptr_prefill, non_blocking=True)
+
+        # Host copies of the context rows' plan inputs, equal to what the
+        # device buffers hold once the copies above (and the qo_indptr cumsum
+        # of the same host seq_lens) have run. Never mutated after this point.
+        if self.num_contexts > 0 and not self.is_cuda_graph:
+            host_seq_lens = self.seq_lens[:self.num_contexts].numpy()
+            host_qo_indptr = _to_int32_tensor(
+                np.concatenate([[0], np.cumsum(host_seq_lens,
+                                               dtype=np.int64)]))
+            self._host_prefill_plan_inputs = (
+                self.num_contexts,
+                host_qo_indptr,
+                paged_kv_indptr_prefill,
+                paged_kv_last_page_len[:self.num_contexts],
+            )
 
         # This paged_kv_indptr attribute has both prefill and decode information in it.
         # It's for the append_paged_kv_cache kernel.
@@ -2234,6 +2269,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         o_dtype = (torch.bfloat16 if plan_params.q_dtype
                    in (torch.float8_e4m3fn, torch.float8_e5m2) else None)
 
+        # Context-only eager steps plan from prepare()'s pinned host copies of
+        # the indptrs, so neither a stream drain nor flashinfer's .to("cpu")
+        # readbacks are needed. Custom masks keep the device path: their
+        # packbits indptr is computed from these tensors on the mask's device.
+        host_prefill_inputs = self._host_prefill_plan_inputs
+        use_host_prefill_plan = (
+            _HOST_PREFILL_PLAN and self.num_contexts > 0
+            and self.num_generations == 0
+            and not self.is_cuda_graph
+            and plan_params.attention_mask_data is None
+            and host_prefill_inputs is not None
+            and host_prefill_inputs[0] == self.num_contexts)
+
         def prefill_plan():
             # Setting `window_left` to -1 for custom attention mask is important.
             # Else, FlashInfer proceeds to use SWA regardless of attention_mask_data.
@@ -2241,11 +2289,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 window_left = -1
             else:
                 window_left = plan_params.window_left
+            if use_host_prefill_plan:
+                _, qo_indptr, paged_kv_indptr, paged_kv_last_page_len = \
+                    host_prefill_inputs
+            else:
+                qo_indptr = self.qo_indptr[:self.num_contexts + 1]
+                paged_kv_indptr = self.paged_kv_indptr_prefill[:self.
+                                                               num_contexts +
+                                                               1]
+                paged_kv_last_page_len = self._paged_kv_last_page_len[:self.
+                                                                      num_contexts]
             prefill_wrapper.plan(
-                self.qo_indptr[:self.num_contexts + 1],
-                self.paged_kv_indptr_prefill[:self.num_contexts + 1],
+                qo_indptr,
+                paged_kv_indptr,
                 self._paged_kv_indices[:self.num_context_blocks],
-                self._paged_kv_last_page_len[:self.num_contexts],
+                paged_kv_last_page_len,
                 plan_params.num_heads,
                 plan_params.num_kv_heads,
                 plan_params.head_dim,
@@ -2331,6 +2389,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 wrappers.fa2_plan_num_blocks = tuple(
                     self.num_blocks[self.num_contexts:])
             self._publish_decode_wrapper_kv_lens(decode_wrapper)
+
+        if use_host_prefill_plan:
+            # The plan only reads host data, and every device write it makes
+            # (int workspace, indptr copies) is ordered on the current stream.
+            # The one cross-step hazard is the wrapper's pinned staging
+            # buffer, which this wrapper's previous plan may still be copying
+            # from: wait for that copy alone.
+            if wrappers.prefill_plan_event is not None:
+                wrappers.prefill_plan_event.synchronize()
+            prefill_plan()
+            if wrappers.prefill_plan_event is None:
+                wrappers.prefill_plan_event = torch.cuda.Event()
+            wrappers.prefill_plan_event.record()
+            wrappers.is_planned = True
+            return plan_params
 
         # Must sync after append_paged_kv_cache and before plan.
         torch.cuda.current_stream().synchronize()
