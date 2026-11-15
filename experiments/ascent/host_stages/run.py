@@ -135,7 +135,7 @@ class Server:
                "--host", "127.0.0.1", "--port", str(self.port), "--config", str(cfgp)]
         if nsys_session:
             cmd = ["nsys", "launch", f"--session-new={nsys_session}", "--trace=cuda,nvtx",
-                   "--sample=none", "--cpuctxsw=none", "--trace-fork-before-exec=true"] + cmd
+                   "--trace-fork-before-exec=true"] + cmd
         env = dict(os.environ)
         env.update(env_extra)
         env["TLLM_ASCENT_OWNER"] = OWNER
@@ -379,7 +379,12 @@ def lifetime(ckpt, out, tag, pf, rng, cases, env_extra, nsys_session=None):
         if nsys_session:
             rep = str(Path(out) / f"{tag}_nsys")
             r = subprocess.run(["nsys", "start", f"--session={nsys_session}", f"--output={rep}",
-                                "--force-overwrite=true"], capture_output=True, text=True, timeout=120)
+                                "--force-overwrite=true", "--sample=none", "--cpuctxsw=none"],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                log(f"nsys start failed ({r.stderr[-300:]}); retrying without sampling flags")
+                r = subprocess.run(["nsys", "start", f"--session={nsys_session}", f"--output={rep}",
+                                    "--force-overwrite=true"], capture_output=True, text=True, timeout=120)
             log(f"nsys start rc={r.returncode} {r.stdout[-300:]} {r.stderr[-300:]}")
             time.sleep(2)
         res = run_cases(srv.port, pf, rng, cases, tag)

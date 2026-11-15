@@ -7917,6 +7917,19 @@ class PyExecutor:
                 _AT.rpop()
                 if _atr is not None:
                     _atr["sched"] = _AT.now()
+                    if scheduled_batch is not None:
+                        try:
+                            _atr["ctx"] = [
+                                r.py_client_id
+                                for r in scheduled_batch.context_requests
+                            ]
+                            _atr["ntok"] = int(
+                                sum(r.context_chunk_size
+                                    for r in scheduled_batch.context_requests))
+                            _atr["ngen"] = len(
+                                scheduled_batch.generation_requests)
+                        except Exception as _e:  # noqa: BLE001
+                            _atr["ctx_err"] = str(_e)[:120]
                 self._stage_mark('schedule')
 
                 if scheduled_batch is None:
@@ -8293,21 +8306,13 @@ class PyExecutor:
 
                 self._stage_mark('tail')
                 if _atr is not None:
-                    try:
-                        _ctx = (scheduled_batch.context_requests
-                                if can_queue else [])
-                        _AT.ev("ex_pass",
-                               it=self.iter_counter,
-                               cq=bool(can_queue),
-                               ctx=[r.py_client_id for r in _ctx],
-                               ntok=int(
-                                   sum(r.context_chunk_size for r in _ctx)),
-                               ngen=(len(scheduled_batch.generation_requests)
-                                     if can_queue else 0),
-                               tail=_AT.now(),
-                               **_atr)
-                    except Exception as _e:  # noqa: BLE001
-                        _AT.ev("ex_pass_err", err=str(_e)[:200])
+                    if not can_queue:
+                        _atr["ctx"] = []
+                    _AT.ev("ex_pass",
+                           it=self.iter_counter,
+                           cq=bool(can_queue),
+                           tail=_AT.now(),
+                           **_atr)
                 self._stage_end(can_queue)
                 self.iter_counter += 1
 
