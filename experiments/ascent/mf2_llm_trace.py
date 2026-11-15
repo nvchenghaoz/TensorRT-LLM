@@ -4,10 +4,24 @@ Used under profile_timeline to count per-forward kernel launches, and as a
 quick end-to-end smoke test (greedy token per prompt printed).
 """
 import json
+import os
 import sys
+import threading
 import time
 
-from tensorrt_llm import LLM, SamplingParams
+os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
+
+
+def _heartbeat():
+    t0 = time.time()
+    while True:
+        time.sleep(60)
+        print(f"[heartbeat] {time.time() - t0:.0f}s", flush=True)
+
+
+threading.Thread(target=_heartbeat, daemon=True).start()
+
+from tensorrt_llm import LLM, SamplingParams  # noqa: E402
 from tensorrt_llm.llmapi import KvCacheConfig
 
 ck = sys.argv[1]
