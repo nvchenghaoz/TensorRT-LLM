@@ -55,6 +55,7 @@ from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4
 from ..kernels.fused_ops.rmsnorm_residual_add import (
     rmsnorm_residual_add,
     rmsnorm_residual_add_fp4_quant,
+    rmsnorm_residual_add_fp4_quant_supported,
     rmsnorm_residual_add_scale,
 )
 from ..model_config import KVCacheLayerSpec, ModelConfig
@@ -83,6 +84,10 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
     from .modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+# One kernel for the post-attention junction (norm + residual add + pre-ffn
+# norm + gate_up NVFP4 quant); bitwise equal to the two-kernel chain.
+_FUSE_POST_ATTN_FP4 = True
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
 if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
@@ -1053,7 +1058,8 @@ class Gemma4DecoderLayer(DecoderLayer):
         if (
             fuse_post_attn
             and not lora_params
-            and hidden_states.shape[-1] % 32 == 0
+            and rmsnorm_residual_add_fp4_quant_supported(hidden_states.shape[-1])
+            and _FUSE_POST_ATTN_FP4
             and self._fused_norm_quant_enabled()
         ):
             # One kernel for the whole post-attention junction: the

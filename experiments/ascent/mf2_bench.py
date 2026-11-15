@@ -42,13 +42,45 @@ WARMUP, ITERS = 5, 30
 dev = "cuda"
 
 
-def make_inputs(m, seed=1234):
+REAL = {}
+
+
+def _real_weights():
+    """Layer norm weights and gate_up input scale from the checkpoint."""
+    if REAL or not CK:
+        return REAL
+    try:
+        from safetensors import safe_open
+        idx = json.load(open(os.path.join(CK, "model.safetensors.index.json")))["weight_map"]
+
+        def load(sub):
+            k = [k for k in idx if k.endswith(sub)][0]
+            with safe_open(os.path.join(CK, idx[k]), framework="pt", device="cpu") as f:
+                return f.get_tensor(k)
+        nl = int(tc["num_hidden_layers"])
+        for li in sorted({0, 5, nl // 2, nl - 1}):
+            wpa = load(f"layers.{li}.post_attention_layernorm.weight").to(torch.bfloat16).to(dev)
+            wpf = load(f"layers.{li}.pre_feedforward_layernorm.weight").to(torch.bfloat16).to(dev)
+            iv = load(f"layers.{li}.mlp.gate_proj.input_scale").float().item()
+            REAL[li] = (wpa, wpf, torch.tensor([1.0 / iv], device=dev, dtype=torch.float32))
+        print("real norm weights from layers", list(REAL), flush=True)
+    except Exception as e:  # noqa: BLE001
+        print("real weights unavailable:", repr(e), flush=True)
+    return REAL
+
+
+def make_inputs(m, seed=1234, layer=None):
     g = torch.Generator(device=dev).manual_seed(seed + m)
-    x = (torch.randn(m, H, device=dev, generator=g) * 3.0).to(torch.bfloat16)
-    r = (torch.randn(m, H, device=dev, generator=g) * 8.0).to(torch.bfloat16)
+    real = _real_weights()
+    # heavy-tailed channels like a real residual stream
+    chs = torch.exp(torch.randn(H, device=dev, generator=g))
+    x = (torch.randn(m, H, device=dev, generator=g) * 4.0 * chs).to(torch.bfloat16)
+    r = (torch.randn(m, H, device=dev, generator=g) * 20.0 * chs.flip(0)).to(torch.bfloat16)
+    if real:
+        w, w2, gs = real[layer if layer in real else sorted(real)[len(real) // 2]]
+        return x, r, w, w2, gs
     w = (torch.rand(H, device=dev, generator=g) * 2.0 + 0.05).to(torch.bfloat16)
     w2 = (torch.rand(H, device=dev, generator=g) * 2.0 + 0.05).to(torch.bfloat16)
-    # a realistic static input_scale: 448*6/amax over a typical activation
     gs = torch.tensor([448.0 * 6.0 / 40.0], device=dev, dtype=torch.float32)
     return x, r, w, w2, gs
 
@@ -96,7 +128,7 @@ if MODE == "time":
         print(f"M={label:>7} median={med*1000:8.1f}us p10={p10*1000:8.1f} p90={p90*1000:8.1f}", flush=True)
         out[label] = {"kernel_ms": med, "noise_floor": (p90 - p10) / med, "p10_ms": p10, "p90_ms": p90}
         del args
-    print(json.dumps({"batch": out, "output": {"class": "reordered"}}))
+    print(json.dumps({"batch": out, "output": {"class": "exact"}}))
     sys.exit(0)
 
 # ---------------- correctness ----------------
@@ -145,7 +177,27 @@ if MODE == "divexp":
 assert FUSED is not None
 allok = True
 report = {}
-for label, m in CASES:
+CHECK_CASES = [("1", 1), ("27", 27)] + CASES
+LAYERS = sorted(_real_weights()) or [None]
+for label, m in CHECK_CASES:
+    # Byte identity on every real-weight layer, A (fused), B (chain), A again.
+    aba = {}
+    for li in LAYERS:
+        a = make_inputs(m, seed=77 + (li or 0), layer=li)
+        o1 = [t.clone() for t in fused(*a)]
+        ob = chain(*a)
+        o2 = fused(*a)
+        torch.cuda.synchronize()
+        aba[str(li)] = {
+            "h_diff_elems": (o1[0].view(torch.int16) != ob[0].view(torch.int16)).sum().item(),
+            "fp4_diff_bytes": (o1[1] != ob[1]).sum().item(),
+            "sf_full_diff_bytes": (o1[2] != ob[2]).sum().item() if o1[2].shape == ob[2].shape else -1,
+            "sf_bytes": o1[2].numel(),
+            "A_A2_bitwise": all(torch.equal(x, y) for x, y in zip(o1, o2)),
+        }
+        del a, o1, ob, o2
+    aba_ok = all(v["h_diff_elems"] == 0 and v["fp4_diff_bytes"] == 0 and v["sf_full_diff_bytes"] == 0
+                 and v["A_A2_bitwise"] for v in aba.values())
     args = make_inputs(m)
     snap = [a.clone() for a in args]
     hb, qb, sb = chain(*args)
@@ -182,9 +234,11 @@ for label, m in CASES:
     cand_vs_main_max = (dq_c - dq_b).abs().max().item()
     ulp = (ref.abs().max().item()) * 2 ** -8
     ref_ok = finite and ma_c <= 1.10 * ma_b + ulp and rf_c <= 1.10 * rf_b + 2 ** -8
-    ok = h_bit and rep_ok and inputs_ok and ref_ok and (qc.shape == qb.shape) and (sc.shape == sb.shape)
+    ok = (h_bit and rep_ok and inputs_ok and ref_ok and (qc.shape == qb.shape) and (sc.shape == sb.shape)
+          and qbytes_diff == 0 and sf_full_eq and aba_ok)
     allok &= ok
-    report[label] = dict(h_bitwise=h_bit, sf_valid_bitwise=sf_valid_eq, sf_full_bitwise=sf_full_eq,
+    report[label] = dict(ok=ok, aba_real_layers=aba, h_bitwise=h_bit, sf_valid_bitwise=sf_valid_eq,
+                         sf_full_bitwise=sf_full_eq,
                          payload_bitwise=qbytes_diff == 0, payload_nibble_diff=nib_diff,
                          payload_nibble_diff_rate=nib_rate, rows_with_diff=rows_diff, sf_diff=sf_diff,
                          repeated_ok=rep_ok, inputs_unchanged=inputs_ok,
@@ -194,4 +248,9 @@ for label, m in CASES:
     del args, snap, hb, qb, sb, hc, qc, sc, first, ref, dq_c, dq_b
     torch.cuda.empty_cache()
 
-print(json.dumps({"passed": bool(allok), "compared": "fused vs main chain (rmsnorm_residual_add + flashinfer rmsnorm_fp4quant) and FP32 torch ref", "cases": report}))
+print(json.dumps({"passed": bool(allok), "class": "exact",
+                  "compared": "fused vs main chain (rmsnorm_residual_add + flashinfer CuTe rmsnorm_fp4quant): "
+                              "h, FP4 payload and full swizzled SF (padding included) byte-identical on "
+                              "real checkpoint norm weights/input scales, A,B,A bitwise, 35-call repeat "
+                              "sequence bitwise, inputs unchanged, FP32 torch ref sanity",
+                  "cases": report}))

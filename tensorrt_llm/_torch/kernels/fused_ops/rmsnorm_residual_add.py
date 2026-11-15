@@ -143,6 +143,33 @@ def _rcp_approx(x):
     )
 
 
+# Rounded fp32 ops ptxas cannot contract or reassociate.
+@triton.jit
+def _mul_rn(a, b):
+    return tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _add_rn(a, b):
+    return tl.inline_asm_elementwise(
+        "add.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _fma_rn(a, b, c):
+    return tl.inline_asm_elementwise(
+        "fma.rn.f32 $0, $1, $2, $3;",
+        "=f,f,f,f",
+        [a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
 @triton.jit
 def _rmsnorm_residual_add_fp4_kernel(
     x_ptr,  # [M, H] bf16 kernel input (the branch output being normed)
@@ -163,6 +190,8 @@ def _rmsnorm_residual_add_fp4_kernel(
     H: tl.constexpr,
     BH: tl.constexpr,  # next_power_of_2(H)
     DIV_RN: tl.constexpr,
+    SSQ_MODE: tl.constexpr,  # 0: tl.sum; 1/2: CuTe rmsnorm_fp4quant order
+    NVB: tl.constexpr,  # CuTe num_vec_blocks = ceil(H / (8 * 64))
 ):
     # Primary stage: identical to _rmsnorm_residual_add_kernel(BM=1,
     # HAS_SCALE=False) so h stays bitwise equal to rmsnorm_residual_add.
@@ -196,7 +225,68 @@ def _rmsnorm_residual_add_fp4_kernel(
     # Rows in [M, pad128(M)) load zeros and store zero scales (the padding
     # the fused flashinfer kernel zero-fills).
     outf = out.to(tl.float32)
-    ssq2 = tl.sum(outf * outf, axis=1)
+    if SSQ_MODE == 0:
+        ssq2 = tl.sum(outf * outf, axis=1)
+    else:
+        # Replay RMSNormFP4QuantKernel's sum of squares bit for bit
+        # (H in (3072, 6144]: 64 threads per row, 8-element vectors, NVB
+        # vector blocks). Lane l of the row owns columns 8l + v + 512b; it
+        # sums x^2 sequentially over (b, v), v fastest (MODE 1: separate
+        # mul.rn/add.rn, MODE 2: fma.rn chain). The 64 lane partials then
+        # combine as an adjacent-pair binary tree (warp butterfly 1..16,
+        # then warp0 + warp1). h is elementwise, so it is recomputed here in
+        # that layout from x, r, w with the stage-1 formula (bitwise equal).
+        row = tl.program_id(0).to(tl.int64)
+        rcp_s = tl.max(rcp, axis=0)  # the single row's rcp, as a scalar
+        lane = tl.arange(0, 64)
+        vv = tl.arange(0, 8)
+        acc = tl.zeros([64], dtype=tl.float32)
+        for b in tl.static_range(NVB):
+            c2 = b * 512 + lane[:, None] * 8 + vv[None, :]
+            m2 = (c2 < H) & (row < M)
+            xb = tl.load(x_ptr + row * SX + c2, mask=m2, other=0.0).to(tl.float32)
+            wb = tl.load(w_ptr + c2, mask=c2 < H, other=0.0).to(tl.float32)
+            rb = tl.load(r_ptr + row * SR + c2, mask=m2, other=0.0).to(tl.float32)
+            nb = ((xb * rcp_s) * wb).to(tl.bfloat16)
+            hb = (rb + nb.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+            t = tl.reshape(hb, (64, 2, 2, 2))  # v = 4i + 2j + k
+            te, to = tl.split(t)
+            te0, te1 = tl.split(te)
+            to0, to1 = tl.split(to)
+            h0, h4 = tl.split(te0)
+            h2, h6 = tl.split(te1)
+            h1, h5 = tl.split(to0)
+            h3, h7 = tl.split(to1)
+            if SSQ_MODE == 1:
+                acc = _add_rn(acc, _mul_rn(h0, h0))
+                acc = _add_rn(acc, _mul_rn(h1, h1))
+                acc = _add_rn(acc, _mul_rn(h2, h2))
+                acc = _add_rn(acc, _mul_rn(h3, h3))
+                acc = _add_rn(acc, _mul_rn(h4, h4))
+                acc = _add_rn(acc, _mul_rn(h5, h5))
+                acc = _add_rn(acc, _mul_rn(h6, h6))
+                acc = _add_rn(acc, _mul_rn(h7, h7))
+            else:
+                acc = _fma_rn(h0, h0, acc)
+                acc = _fma_rn(h1, h1, acc)
+                acc = _fma_rn(h2, h2, acc)
+                acc = _fma_rn(h3, h3, acc)
+                acc = _fma_rn(h4, h4, acc)
+                acc = _fma_rn(h5, h5, acc)
+                acc = _fma_rn(h6, h6, acc)
+                acc = _fma_rn(h7, h7, acc)
+        p0, p1 = tl.split(tl.reshape(acc, (32, 2)))
+        s32 = _add_rn(p0, p1)
+        p0, p1 = tl.split(tl.reshape(s32, (16, 2)))
+        s16 = _add_rn(p0, p1)
+        p0, p1 = tl.split(tl.reshape(s16, (8, 2)))
+        s8 = _add_rn(p0, p1)
+        p0, p1 = tl.split(tl.reshape(s8, (4, 2)))
+        s4 = _add_rn(p0, p1)
+        p0, p1 = tl.split(tl.reshape(s4, (2, 2)))
+        s2 = _add_rn(p0, p1)  # [warp0, warp1]
+        p0, p1 = tl.split(tl.reshape(s2, (1, 2)))
+        ssq2 = _add_rn(p0, p1)  # [1]
     if DIV_RN:
         ms2 = tl.div_rn(ssq2, tl.full(ssq2.shape, H, tl.float32))
     else:
@@ -266,8 +356,9 @@ def rmsnorm_residual_add_fp4_quant(
     residual once, writes h, and emits the packed E2M1 payload plus the
     128x4-swizzled E4M3 scales of ``rmsnorm(h, next_norm_weight)`` without
     re-reading h. h is bitwise identical to ``rmsnorm_residual_add``; the
-    quantized output replicates rmsnorm_fp4quant's math op-for-op (only the
-    fp32 sum-of-squares reduction order differs).
+    payload and the full swizzled SF (padding included) are bitwise identical
+    to rmsnorm_fp4quant's: the sum of squares replays its per-thread fma
+    chain and lane tree (``_FP4_SSQ_MODE`` 2).
 
     Returns:
         (h, fp4, sf): h [M, H] bf16; fp4 [M, H//2] uint8 (element 2j in the
@@ -290,6 +381,10 @@ def rmsnorm_residual_add_fp4_quant(
         return o, fp4, sf
     bh = triton.next_power_of_2(h)
     assert bh // 16 >= nkt * 4
+    if _FP4_SSQ_MODE != 0:
+        # The CuTe-order replay covers RMSNormFP4QuantKernel's
+        # threads_per_row == 64, cluster_n == 1 configuration.
+        assert rmsnorm_residual_add_fp4_quant_supported(h)
     _rmsnorm_residual_add_fp4_kernel[(m_pad,)](
         x,
         residual,
@@ -309,14 +404,25 @@ def rmsnorm_residual_add_fp4_quant(
         H=h,
         BH=bh,
         DIV_RN=_FP4_DIV_RN,
+        SSQ_MODE=_FP4_SSQ_MODE,
+        NVB=triton.cdiv(h, 512),
         num_warps=4,
     )
     return o, fp4, sf
 
 
+def rmsnorm_residual_add_fp4_quant_supported(h: int) -> bool:
+    """Whether the fused kernel reproduces rmsnorm_fp4quant bitwise at H=h:
+    bf16, 64 threads per row (3072 < H <= 6144), single-CTA rows."""
+    return 3072 < h <= 6144 and h % 16 == 0
+
+
 # mean(h^2) as an IEEE (div.rn) divide: matches the CuTe-DSL kernel more
 # often than Triton's default approximate fp32 divide (measured).
 _FP4_DIV_RN = True
+# Sum-of-squares order of the secondary norm: 0 = Triton tl.sum (reordered),
+# 1 = CuTe per-thread mul/add chain + lane tree, 2 = same with an fma chain.
+_FP4_SSQ_MODE = 2
 
 
 def _launch_norm_add(
