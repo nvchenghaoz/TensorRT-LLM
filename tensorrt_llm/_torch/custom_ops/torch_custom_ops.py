@@ -1092,7 +1092,7 @@ class CublasLtFP4GemmRunner(TunableRunner):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
-        result = self.cublaslt_runner.run_gemm(
+        result = self.cublaslt_runner.run_gemm_bucketed(
             mat1,
             mat2,
             mat1_scale,
@@ -1100,10 +1100,31 @@ class CublasLtFP4GemmRunner(TunableRunner):
             alpha,
             self.output_buffer_kind,
             tactic,
+            self.heuristic_m(mat1.shape[0], tactic),
             self.group,
             bias,
         )
         return result
+
+    @classmethod
+    def heuristic_m(cls, m: int, tactic: int) -> int:
+        """The M whose cuBLASLt heuristic list a tuned tactic indexes.
+
+        A tactic is an index into the heuristic list cuBLASLt returns for one
+        M, and the list changes with M. The AutoTuner profiles at the bucket
+        ``map_to_tuning_buckets(M)`` (clamped to ``tune_max_num_tokens``) and
+        returns that bucket's tactic for every M mapped to it, so the
+        algorithm must come from the bucket's list, not from the list of the
+        actual M. A fallback tactic (-1) uses the actual M.
+        """
+        if tactic is None or tactic < 0 or m <= 0:
+            return m
+        spec = cls.tuning_config.dynamic_tensor_specs[0]
+        bucket = spec.map_to_tuning_buckets(m)
+        tune_max = cls.tuning_config.tune_max_num_tokens
+        if tune_max is not None:
+            bucket = min(bucket, tune_max)
+        return int(bucket)
 
 
 class CudaCoreNVFP4Runner(TunableRunner):

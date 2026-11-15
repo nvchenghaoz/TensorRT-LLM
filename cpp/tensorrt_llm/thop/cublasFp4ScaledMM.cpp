@@ -192,10 +192,25 @@ public:
     }
 
     // Run GEMM with specified tactic (-1 for default/best). Optional `bias`
-    // is fused via CUBLASLT_EPILOGUE_BIAS.
+    // is fused via CUBLASLT_EPILOGUE_BIAS. The tactic indexes the heuristic
+    // list queried at the actual m.
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
         at::Tensor const& mat2_scale, at::Tensor const& alpha, int64_t output_buffer_kind, int64_t tactic,
         c10::optional<torch::List<int64_t>> group = c10::nullopt,
+        c10::optional<torch::Tensor> bias = c10::nullopt) const
+    {
+        return runGemmBucketed(
+            mat1, mat2, mat1_scale, mat2_scale, alpha, output_buffer_kind, tactic, /*heuristic_m=*/-1, group, bias);
+    }
+
+    // Run GEMM where `tactic` indexes the heuristic list queried at `heuristic_m`
+    // (the autotuner bucket the tactic was profiled at). The selected algorithm is
+    // validated on the actual (m, n, k) with cublasLtMatmulAlgoCheck; if it is not
+    // supported there, the top-1 heuristic of the actual m runs instead.
+    // heuristic_m <= 0 means "the actual m" (same as runGemm).
+    at::Tensor runGemmBucketed(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
+        at::Tensor const& mat2_scale, at::Tensor const& alpha, int64_t output_buffer_kind, int64_t tactic,
+        int64_t heuristic_m, c10::optional<torch::List<int64_t>> group = c10::nullopt,
         c10::optional<torch::Tensor> bias = c10::nullopt) const
     {
         int m = mat1.size(0);
@@ -208,53 +223,194 @@ public:
         auto [out, _] = torch_ext::allocate_output(
             output_size, mOutputDtype, mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
-        // Get algorithm cache
-        auto& cache = getOrCreateAlgoCache(m, k, n, mat1.device(), mat1_scale, mat2_scale);
-
-        // Select algorithm
-        bool has_algo = false;
-        cublasLtMatmulAlgo_t const* algo_ptr = nullptr;
-
-        if (tactic >= 0 && tactic < static_cast<int64_t>(cache.heuristics.size()))
-        {
-            // Use specified tactic
-            algo_ptr = &cache.heuristics[tactic].algo;
-            has_algo = true;
-            TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: Using specified tactic %ld (out of %zu) for shape (m=%d, n=%d, k=%d)", tactic,
-                cache.heuristics.size(), m, n, k);
-        }
-        else if (tactic == -1 && !cache.heuristics.empty())
-        {
-            // Use best tactic (default is first one)
-            int64_t best_idx
-                = cache.best_tactic < static_cast<int64_t>(cache.heuristics.size()) ? cache.best_tactic : 0;
-            algo_ptr = &cache.heuristics[best_idx].algo;
-            has_algo = true;
-            TLLM_LOG_DEBUG("CublasLtFP4GemmRunner: Using best tactic %ld (out of %zu) for shape (m=%d, n=%d, k=%d)",
-                best_idx, cache.heuristics.size(), m, n, k);
-        }
+        ResolvedAlgo const& resolved
+            = resolveAlgo(m, static_cast<int>(heuristic_m), k, n, mat1.device(), mat1_scale, mat2_scale, tactic);
 
         // Execute GEMM (beta is always 0 and is managed internally)
-        if (has_algo)
+        if (resolved.has_algo)
         {
             cublas_fp4_gemm_caller_with_algo(
-                out, mat1, mat2, mat1_scale, mat2_scale, alpha, *algo_ptr, mOutputDtype, bias);
+                out, mat1, mat2, mat1_scale, mat2_scale, alpha, resolved.algo, mOutputDtype, bias);
         }
         else
         {
             // Fall back to default (no algorithm specified)
             TLLM_LOG_DEBUG(
-                "CublasLtFP4GemmRunner: No valid algorithm found (tactic=%ld, available=%zu), falling back to default "
+                "CublasLtFP4GemmRunner: No valid algorithm found (tactic=%ld), falling back to default "
                 "for shape (m=%d, n=%d, k=%d)",
-                tactic, cache.heuristics.size(), m, n, k);
+                tactic, m, n, k);
             cublas_fp4_gemm_caller(out, mat1, mat2, mat1_scale, mat2_scale, alpha, bias);
         }
 
         return out;
     }
 
+    // Debug/introspection: the cuBLASLt algorithm config runGemmBucketed would run for
+    // (mat1.size(0), heuristic_m, tactic). Returns
+    // [has_algo, fallback, algo_id, tile_id, stages_id, splitk_num, reduction_scheme, cta_swizzling,
+    //  custom_option, inner_shape_id, cluster_shape_id]. No GEMM is executed.
+    std::vector<int64_t> getAlgoConfig(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
+        at::Tensor const& mat2_scale, int64_t tactic, int64_t heuristic_m) const
+    {
+        int m = mat1.size(0);
+        int k = mat1.size(1) * 2;
+        int n = mat2.size(0);
+        ResolvedAlgo const& resolved
+            = resolveAlgo(m, static_cast<int>(heuristic_m), k, n, mat1.device(), mat1_scale, mat2_scale, tactic);
+        std::vector<int64_t> result{resolved.has_algo ? 1 : 0, resolved.fallback ? 1 : 0};
+        if (!resolved.has_algo)
+        {
+            result.resize(11, -1);
+            return result;
+        }
+        auto const* a = &resolved.algo;
+        int32_t algoId = 0, tile = 0, stages = 0, splitK = 0, reduction = 0, swizzle = 0, custom = 0;
+        uint16_t inner = 0, cluster = 0;
+        cublasLtMatmulAlgoConfigGetAttribute(a, CUBLASLT_ALGO_CONFIG_ID, &algoId, sizeof(algoId), nullptr);
+        cublasLtMatmulAlgoConfigGetAttribute(a, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile), nullptr);
+        cublasLtMatmulAlgoConfigGetAttribute(a, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages, sizeof(stages), nullptr);
+        cublasLtMatmulAlgoConfigGetAttribute(a, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitK, sizeof(splitK), nullptr);
+        cublasLtMatmulAlgoConfigGetAttribute(
+            a, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction, sizeof(reduction), nullptr);
+        cublasLtMatmulAlgoConfigGetAttribute(a, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &swizzle, sizeof(swizzle), nullptr);
+        cublasLtMatmulAlgoConfigGetAttribute(a, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &custom, sizeof(custom), nullptr);
+        cublasLtMatmulAlgoConfigGetAttribute(a, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, &inner, sizeof(inner), nullptr);
+        cublasLtMatmulAlgoConfigGetAttribute(
+            a, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &cluster, sizeof(cluster), nullptr);
+        result.insert(result.end(), {algoId, tile, stages, splitK, reduction, swizzle, custom, inner, cluster});
+        return result;
+    }
+
 private:
+    struct ResolvedAlgo
+    {
+        cublasLtMatmulAlgo_t algo{};
+        bool has_algo = false;
+        bool fallback = false; // the requested tactic could not run at this m; actual-m top-1 is used
+    };
+
+    // (m, heuristic_m, k, n, device_id, output_dtype, tactic)
+    using ResolvedKey = std::tuple<int, int, int, int, int, int, int64_t>;
+
+    struct ResolvedKeyHash
+    {
+        size_t operator()(ResolvedKey const& key) const
+        {
+            size_t seed = 0;
+            auto combine = [&seed](auto const& v)
+            {
+                using T = std::decay_t<decltype(v)>;
+                seed ^= std::hash<T>{}(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            };
+            combine(std::get<0>(key));
+            combine(std::get<1>(key));
+            combine(std::get<2>(key));
+            combine(std::get<3>(key));
+            combine(std::get<4>(key));
+            combine(std::get<5>(key));
+            combine(std::get<6>(key));
+            return seed;
+        }
+    };
+
+    mutable std::unordered_map<ResolvedKey, ResolvedAlgo, ResolvedKeyHash> mResolvedCache;
+
+    // Validate `algo` on the actual problem (n, m, k after the row-major swap).
+    bool algoSupportedAt(int m, int k, int n, c10::Device device, at::Tensor const& mat1_scale,
+        at::Tensor const& mat2_scale, cublasLtMatmulAlgo_t const& algo) const
+    {
+        at::cuda::CUDAGuard deviceGuard(device);
+        auto cublasWrapper
+            = std::make_shared<CublasMMWrapper>(getCublasHandle(), getCublasLtHandle(), nullptr, nullptr);
+        cublasWrapper->setFP4GemmConfig(getCudaDataType(mOutputDtype));
+        cublasWrapper->createDescriptors(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, k, k, n, 0);
+        void* a_sf_ptr = const_cast<void*>(reinterpret_cast<void const*>(mat1_scale.data_ptr()));
+        void* b_sf_ptr = const_cast<void*>(reinterpret_cast<void const*>(mat2_scale.data_ptr()));
+        cublasWrapper->setScaleDescriptors(a_sf_ptr, b_sf_ptr);
+        bool ok = cublasWrapper->checkTactic(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, k, k, n, algo);
+        cublasWrapper->destroyDescriptors();
+        return ok;
+    }
+
+    ResolvedAlgo const& resolveAlgo(int m, int heuristic_m, int k, int n, c10::Device device,
+        at::Tensor const& mat1_scale, at::Tensor const& mat2_scale, int64_t tactic) const
+    {
+        if (heuristic_m <= 0)
+        {
+            heuristic_m = m;
+        }
+        ResolvedKey key
+            = std::make_tuple(m, heuristic_m, k, n, device.index(), static_cast<int>(mOutputDtype), tactic);
+        auto it = mResolvedCache.find(key);
+        if (it != mResolvedCache.end())
+        {
+            return it->second;
+        }
+
+        ResolvedAlgo r;
+        if (heuristic_m == m)
+        {
+            // Original semantics: index the heuristic list of the actual m.
+            auto& cache = getOrCreateAlgoCache(m, k, n, device, mat1_scale, mat2_scale);
+            if (tactic >= 0 && tactic < static_cast<int64_t>(cache.heuristics.size()))
+            {
+                r.algo = cache.heuristics[tactic].algo;
+                r.has_algo = true;
+            }
+            else if (tactic == -1 && !cache.heuristics.empty())
+            {
+                int64_t best_idx
+                    = cache.best_tactic < static_cast<int64_t>(cache.heuristics.size()) ? cache.best_tactic : 0;
+                r.algo = cache.heuristics[best_idx].algo;
+                r.has_algo = true;
+            }
+        }
+        else
+        {
+            bool resolved = false;
+            if (tactic >= 0)
+            {
+                // The tactic was profiled at heuristic_m: take the algorithm from that list.
+                auto& hcache = getOrCreateAlgoCache(heuristic_m, k, n, device, mat1_scale, mat2_scale);
+                if (tactic < static_cast<int64_t>(hcache.heuristics.size()))
+                {
+                    cublasLtMatmulAlgo_t const& candidate = hcache.heuristics[tactic].algo;
+                    if (algoSupportedAt(m, k, n, device, mat1_scale, mat2_scale, candidate))
+                    {
+                        r.algo = candidate;
+                        r.has_algo = true;
+                        resolved = true;
+                    }
+                }
+                if (!resolved)
+                {
+                    TLLM_LOG_WARNING(
+                        "CublasLtFP4GemmRunner: tactic %ld profiled at m=%d is not usable at m=%d (n=%d, k=%d); "
+                        "using the top heuristic of m=%d",
+                        tactic, heuristic_m, m, n, k, m);
+                    r.fallback = true;
+                }
+            }
+            if (!resolved)
+            {
+                auto& cache = getOrCreateAlgoCache(m, k, n, device, mat1_scale, mat2_scale);
+                if (!cache.heuristics.empty())
+                {
+                    int64_t best_idx
+                        = cache.best_tactic < static_cast<int64_t>(cache.heuristics.size()) ? cache.best_tactic : 0;
+                    r.algo = cache.heuristics[best_idx].algo;
+                    r.has_algo = true;
+                }
+            }
+        }
+        TLLM_LOG_DEBUG(
+            "CublasLtFP4GemmRunner: resolved tactic %ld (heuristic_m=%d) for shape (m=%d, n=%d, k=%d): has_algo=%d "
+            "fallback=%d",
+            tactic, heuristic_m, m, n, k, static_cast<int>(r.has_algo), static_cast<int>(r.fallback));
+        auto [ins, _] = mResolvedCache.emplace(key, r);
+        return ins->second;
+    }
+
     struct AlgoCache
     {
         std::vector<cublasLtMatmulHeuristicResult_t> heuristics;
@@ -464,5 +620,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::CublasLtFP4GemmRunner>("CublasLtFP4GemmRunner")
         .def(torch::init<at::ScalarType>())
         .def("run_gemm", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::runGemm)
+        .def("run_gemm_bucketed", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::runGemmBucketed)
+        .def("get_algo_config", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::getAlgoConfig)
         .def("get_num_heuristic_algos", &tensorrt_llm::torch_ext::CublasLtFP4GemmRunner::getNumHeuristicAlgos);
 }
