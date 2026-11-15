@@ -103,6 +103,19 @@ def main():
                          "p90_ms": st["p90"] / 1000.0, "noise_floor": st["noise"]}
         log(f"M={m}: {st['med']:.1f} us (p10 {st['p10']:.1f} p90 {st['p90']:.1f}) noise {st['noise']:.4f}")
     rec.append(receipts(" end"))
+    if dws is not None:
+        # dispatch receipt: one counted call per M (split path taken or not)
+        cnt = {"n": 0}
+        orig = dws.down_wave_split_gemm
+
+        def counted(*a, **kw):
+            cnt["n"] += 1
+            return orig(*a, **kw)
+        dws.down_wave_split_gemm = counted
+        for m in ms:
+            call(lins[0], a_fp4[:m], a_sf[: ((m + 127) // 128) * 128 * sfk])
+        dws.down_wave_split_gemm = orig
+        log(f"split dispatches: {cnt['n']} of {len(ms)} M values")
     art = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp")
     json.dump({"batch": batch, "receipts": rec}, open(os.path.join(art, "bench.json"), "w"), indent=1)
     print(json.dumps({"batch": batch, "output": {"class": "exact"}}))

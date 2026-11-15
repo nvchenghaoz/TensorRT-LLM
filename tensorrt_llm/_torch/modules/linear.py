@@ -2063,7 +2063,9 @@ class NVFP4LinearMethod(LinearMethodBase):
                 and bias is None and not use_marlin
                 and output_buffer_kind == int(BufferKind.DEFAULT)
                 and module.weight.shape[0] == module.out_features
-                and getattr(module, "lora", None) is None
+                # (LoRA, when active, adds its delta outside apply via
+                # LoraLayer.forward_with_base; the base GEMM bytes are the
+                # same either way, so no LoRA guard is needed here.)
                 and not is_torch_compiling() and _gemma4_dws.prepare()
                 and not AutoTuner.get().is_tuning_mode
                 and _gemma4_dws.applies(act_fp4, module.weight, act_sf,
