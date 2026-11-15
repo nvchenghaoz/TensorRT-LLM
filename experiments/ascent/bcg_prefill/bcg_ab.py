@@ -136,9 +136,18 @@ def proof_output_class():
     """output.class is not asserted by the timing run: it is derived from the pinned-tactic
     proof (pin_proof.py) whose summary lives in BCG_PROOF_DIR with a sha256 manifest. Without a
     verified, passing proof no class is claimed."""
+    if not USE_OVERLAY:
+        return {"class": "exact",
+                "class_source": "baseline arm: main's eager path, i.e. the reference itself"}
     d = os.environ.get("BCG_PROOF_DIR")
     if not d:
         return {"class_source": "none: BCG_PROOF_DIR unset, no output class claimed"}
+    # The proof may still be running in another job: wait for its manifest (after timing,
+    # so this never touches the timed region).
+    deadline = time.time() + float(os.environ.get("BCG_PROOF_WAIT_S", "0"))
+    while not os.path.exists(os.path.join(d, "manifest.json")) and time.time() < deadline:
+        log(f"waiting for proof manifest in {d}")
+        time.sleep(60)
     try:
         import hashlib
         man = json.load(open(os.path.join(d, "manifest.json")))
