@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 PAGE = 32
+SHARED_STATE = {"on": False, "state": None}
 WARMUP = 5
 ITERS = 25
 # (label, batch, seq_len): workload case labels for the packed batches the
@@ -164,9 +165,17 @@ class Case:
         meta = self.metadata()
         pp = self.plan_params()
 
-        def fn(out):
+        def fn(out, miss=False):
+            if SHARED_STATE.get("on") and SHARED_STATE.get("state") is not None:
+                # one metadata object across steps of different shapes, as in the engine
+                meta._read_rows_state = SHARED_STATE["state"]
+            st = getattr(meta, "_read_rows_state", None)
+            if miss and st is not None:
+                st["key"] = None  # force the sub-plan (a step with new shapes)
             ok = cls._prefill_forward_read_rows(me, meta, pp, self.q, self.kv, out)
             assert ok, "read-rows path fell back"
+            if SHARED_STATE.get("on"):
+                SHARED_STATE["state"] = meta._read_rows_state
             return meta
         return fn
 
@@ -225,31 +234,42 @@ def mode_time(ckpt):
         out = torch.empty(c.M, heads * head_dim, dtype=torch.bfloat16, device="cuda")
         if candidate:
             rr = c.read_rows_fn()
-            fn = lambda: rr(out)
+            fn = lambda: rr(out, miss=True)   # every call re-plans (conservative)
+            fn_hit = lambda: rr(out)           # same host plan inputs as the last call
         else:
-            fn = lambda: c.run_main(out)
+            fn = fn_hit = lambda: c.run_main(out)
+
+        def host_ms(f):
+            hs = []
+            for _ in range(ITERS):
+                torch.cuda.synchronize()  # GPU idle: no wait on in-flight work
+                t0 = time.perf_counter()
+                f()
+                hs.append((time.perf_counter() - t0) * 1e3)
+            torch.cuda.synchronize()
+            return stats(hs)[0]
+
         for _ in range(WARMUP):
             fn()
+            fn_hit()
         torch.cuda.synchronize()
         gpu = events_time(fn, ITERS, preroll=True)
+        gpu_hit = events_time(fn_hit, ITERS, preroll=True)
         span = events_time(fn, ITERS, preroll=False)
-        torch.cuda.synchronize()
-        hs = []
-        for _ in range(ITERS):
-            torch.cuda._sleep(2_000_000)
-            t0 = time.perf_counter()
-            fn()
-            hs.append((time.perf_counter() - t0) * 1e3)
-        torch.cuda.synchronize()
+        span_hit = events_time(fn_hit, ITERS, preroll=False)
+        h_miss, h_hit = host_ms(fn), host_ms(fn_hit)
         med, p10, p90 = stats(gpu)
+        hmed_, hp10, hp90 = stats(gpu_hit)
         smed, sp10, sp90 = stats(span)
-        hmed, _, _ = stats(hs)
+        shmed = stats(span_hit)[0]
         batch[label] = {"kernel_ms": med, "noise_floor": (p90 - p10) / med, "p10": p10, "p90": p90,
                         "tokens": c.M}
-        extra[label] = {"span_ms_no_preroll": smed, "span_p10": sp10, "span_p90": sp90,
-                        "host_enqueue_ms": hmed}
+        extra[label] = {"gpu_ms_plan_cached": hmed_, "gpu_cached_p10": hp10, "gpu_cached_p90": hp90,
+                        "span_ms_no_preroll": smed, "span_p10": sp10, "span_p90": sp90,
+                        "span_ms_no_preroll_plan_cached": shmed,
+                        "host_ms_replan": h_miss, "host_ms_plan_cached": h_hit}
         log(f"{label:10s} B={b:2d} L={L:5d} M={c.M:5d} gpu {med:8.4f} ms [p10 {p10:.4f} p90 {p90:.4f}] "
-            f"span {smed:8.4f} host {hmed:.4f} ms")
+            f"cached {hmed_:8.4f} span {smed:8.4f}/{shmed:8.4f} host replan {h_miss:.4f} cached {h_hit:.4f} ms")
         del c, out
         torch.cuda.empty_cache()
     print(json.dumps({"batch": batch, "output": {"class": "exact"},
@@ -261,6 +281,7 @@ def mode_check(ckpt):
     heads, kv_heads, head_dim = read_shapes(ckpt)
     ws = torch.empty(320 * 1024 * 1024 * 188 // 148, dtype=torch.uint8, device="cuda")
     assert hasattr(fi_mod.FlashInferAttention, "_prefill_forward_read_rows")
+    SHARED_STATE["on"] = True  # one sub-plan wrapper/cache across all cases, as one engine metadata
     results = {}
     ok_all = True
     built = {}
@@ -285,12 +306,14 @@ def mode_check(ckpt):
         rows = c.last_rows()
         rr = c.read_rows_fn()
         out = torch.full((c.M, H), float("nan"), dtype=torch.bfloat16, device="cuda")
-        n_calls = WARMUP + 2 * ITERS  # same calls as the timing run (warmup + 2 timed loops)
+        # same calls as the timing run: warmup (re-plan + cached) then the re-plan
+        # and plan-cached loops; odd calls re-plan, even calls reuse the cached plan
+        n_calls = 2 * WARMUP + 4 * ITERS
         first = None
         rep_equal = True
         meta = None
         for i in range(n_calls):
-            meta = rr(out)
+            meta = rr(out, miss=(i % 2 == 1))
             if i == 0:
                 first = out.clone()
             elif not torch.equal(out.view(torch.int16), first.view(torch.int16)):

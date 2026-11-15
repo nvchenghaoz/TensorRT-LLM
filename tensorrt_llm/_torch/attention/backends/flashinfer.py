@@ -2802,13 +2802,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             READ_ROWS_STATS["fallback"] += 1
             return False
         _, host_qo_indptr, paged_kv_indptr, paged_kv_last_page_len = host_inputs
-        qo_np = host_qo_indptr.numpy()
-        group_size = plan_params.num_heads // plan_params.num_kv_heads
-        n = read_rows_subset_lengths(qo_np[1:] - qo_np[:-1], group_size)
-        if n is None:
-            READ_ROWS_STATS["fallback"] += 1
-            return False
-        sub_indptr, q_rows, keep, dst = build_read_rows_indices(qo_np, n)
 
         state = getattr(metadata, "_read_rows_state", None)
         if state is None:
@@ -2820,49 +2813,78 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     backend="fa2"),
                 "event":
                 None,
+                "key":
+                None,
             }
             metadata._read_rows_state = state
         sub_wrapper = state["wrapper"]
-        # The wrapper's pinned staging buffer may still feed its previous
-        # plan's H2D copy: wait for that copy alone (as main's host plan).
-        if state["event"] is not None:
-            state["event"].synchronize()
-        sub_wrapper.plan(
-            maybe_pin_memory(torch.from_numpy(sub_indptr)),
-            paged_kv_indptr,
-            metadata._paged_kv_indices[:metadata.num_context_blocks],
-            paged_kv_last_page_len,
-            plan_params.num_heads,
-            plan_params.num_kv_heads,
-            plan_params.head_dim,
-            metadata.page_size,
-            causal=True,
-            sm_scale=plan_params.sm_scale,
-            window_left=plan_params.window_left,
-            q_data_type=plan_params.q_dtype,
-            kv_data_type=plan_params.kv_dtype,
-            o_data_type=None,
-            custom_mask=None,
-            disable_split_kv=True,
-        )
-        if state["event"] is None:
-            state["event"] = torch.cuda.Event()
-        state["event"].record()
-        sub_info = sub_wrapper._plan_info
+        page_indices = metadata._paged_kv_indices[:metadata.num_context_blocks]
+        # The sub-plan depends only on these host inputs (the page ids are read
+        # at run time from the same device buffer), so a step with the same
+        # ones reuses the wrapper's plan and index tensor as they stand.
+        key = (host_qo_indptr.numpy().tobytes(),
+               paged_kv_indptr.numpy().tobytes(),
+               paged_kv_last_page_len.numpy().tobytes(),
+               page_indices.data_ptr(), page_indices.shape[0],
+               metadata.page_size, plan_params)
+        if state["key"] != key:
+            state["key"] = None
+            qo_np = host_qo_indptr.numpy()
+            group_size = plan_params.num_heads // plan_params.num_kv_heads
+            n = read_rows_subset_lengths(qo_np[1:] - qo_np[:-1], group_size)
+            if n is None:
+                READ_ROWS_STATS["fallback"] += 1
+                return False
+            sub_indptr, q_rows, keep, dst = build_read_rows_indices(qo_np, n)
+            # The wrapper's pinned staging buffer may still feed its previous
+            # plan's H2D copy: wait for that copy alone (as main's host plan).
+            if state["event"] is not None:
+                state["event"].synchronize()
+            sub_wrapper.plan(
+                maybe_pin_memory(torch.from_numpy(sub_indptr)),
+                paged_kv_indptr,
+                page_indices,
+                paged_kv_last_page_len,
+                plan_params.num_heads,
+                plan_params.num_kv_heads,
+                plan_params.head_dim,
+                metadata.page_size,
+                causal=True,
+                sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
+                q_data_type=plan_params.q_dtype,
+                kv_data_type=plan_params.kv_dtype,
+                o_data_type=None,
+                custom_mask=None,
+                disable_split_kv=True,
+            )
+            if state["event"] is None:
+                state["event"] = torch.cuda.Event()
+            state["event"].record()
+            sub_info = sub_wrapper._plan_info
+            state["infos"] = {
+                "main": (int(main_info[3]), int(main_info[14]),
+                         int(main_info[0])),
+                "sub":
+                (int(sub_info[3]), int(sub_info[14]), int(sub_info[0])),
+                "rows": int(sub_indptr[-1]),
+            }
+            if (int(sub_info[3]) != int(main_info[3])
+                    or int(sub_info[14]) != 0):
+                metadata._read_rows_plan_infos = state["infos"]
+                READ_ROWS_STATS["fallback"] += 1
+                return False
+            idx_host = maybe_pin_memory(
+                torch.from_numpy(np.concatenate([q_rows, keep, dst])))
+            state["idx"] = idx_host.to(q.device, non_blocking=True)
+            state["total"] = q_rows.shape[0]
+            state["key"] = key
         metadata._read_rows_plan_infos = {
-            "main": (int(main_info[3]), int(main_info[14]),
-                     int(main_info[0])),
-            "sub": (int(sub_info[3]), int(sub_info[14]), int(sub_info[0])),
-            "rows": int(sub_indptr[-1]),
+            **state["infos"], "main":
+            (int(main_info[3]), int(main_info[14]), int(main_info[0]))
         }
-        if (int(sub_info[3]) != int(main_info[3]) or int(sub_info[14]) != 0):
-            READ_ROWS_STATS["fallback"] += 1
-            return False
-
-        idx_host = maybe_pin_memory(
-            torch.from_numpy(np.concatenate([q_rows, keep, dst])))
-        idx = idx_host.to(q.device, non_blocking=True)
-        total = q_rows.shape[0]
+        idx = state["idx"]
+        total = state["total"]
         q_idx = idx[:total]
         keep_idx = idx[total:total + num_contexts]
         dst_idx = idx[total + num_contexts:]
