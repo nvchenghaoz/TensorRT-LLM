@@ -38,6 +38,7 @@ from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..attention.backends import flashinfer as _fi_backend
 from ..attention.backends import (
     AttentionMetadata,
     FlashInferAttentionMetadata,
@@ -1606,26 +1607,56 @@ class Gemma4TextModel(DecoderModel):
         ple_ids = ple_input_ids if ple_input_ids is not None else input_ids
         per_layer_inputs = self._compute_per_layer_inputs(ple_ids, hidden_states)
 
+        # Only the caller's final-norm gather (rows cumsum(seq_lens) - 1)
+        # reads the last layer's output, so its context attention may run on
+        # those rows alone (bitwise; FlashInfer FA2 decides per call and
+        # falls back to the full-row call on any guard).
+        read_rows_layer = -1
+        if (
+            not apply_final_norm
+            and _fi_backend._LAST_LAYER_ATTN_ROWS
+            and isinstance(attn_metadata, FlashInferAttentionMetadata)
+            and attn_metadata.num_contexts > 0
+            and attn_metadata.num_generations == 0
+            and attn_metadata.padded_num_tokens is None
+            and not attn_metadata.is_cuda_graph
+            and local_attention_mask_data is None
+            and local_variable_window_token_starts is None
+            and local_variable_window_token_ends is None
+            and not kwargs.get("lora_params")
+            and not self.model_config.mapping.enable_attention_dp
+            and not is_torch_compiling()
+            and not torch.cuda.is_current_stream_capturing()
+            and not self.layers[-1].is_sliding
+        ):
+            read_rows_layer = len(self.layers) - 1
+
         for i, decoder_layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, i, :] if per_layer_inputs is not None else None
 
-            layer_out = decoder_layer(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                attention_mask_data=(
-                    local_attention_mask_data if decoder_layer.is_sliding else None
-                ),
-                variable_window_token_starts=(
-                    local_variable_window_token_starts if decoder_layer.is_sliding else None
-                ),
-                variable_window_token_ends=(
-                    local_variable_window_token_ends if decoder_layer.is_sliding else None
-                ),
-                per_layer_input=per_layer_input,
-                pre_normed=pre_normed,
-                **kwargs,
-            )
+            if i == read_rows_layer:
+                attn_metadata.last_layer_read_rows = True
+            try:
+                layer_out = decoder_layer(
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    attention_mask_data=(
+                        local_attention_mask_data if decoder_layer.is_sliding else None
+                    ),
+                    variable_window_token_starts=(
+                        local_variable_window_token_starts if decoder_layer.is_sliding else None
+                    ),
+                    variable_window_token_ends=(
+                        local_variable_window_token_ends if decoder_layer.is_sliding else None
+                    ),
+                    per_layer_input=per_layer_input,
+                    pre_normed=pre_normed,
+                    **kwargs,
+                )
+            finally:
+                if i == read_rows_layer:
+                    attn_metadata.last_layer_read_rows = False
             # A layer whose fused tail also produced the next layer's input
             # norm returns a (hidden, pre_normed) pair.
             if isinstance(layer_out, tuple):

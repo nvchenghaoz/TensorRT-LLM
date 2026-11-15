@@ -71,6 +71,56 @@ _HOST_PREFILL_PLAN = os.environ.get("TRTLLM_FI_HOST_PREFILL_PLAN",
 TRTLLM_FI_HOST_PREFILL_PLAN=0 restores the synchronizing device-indptr plan
 (an A/B and debugging switch; the outputs are the same either way)."""
 
+_LAST_LAYER_ATTN_ROWS = os.environ.get("TRTLLM_GEMMA4_LAST_LAYER_ATTN_ROWS",
+                                       "1").strip() != "0"
+"""Let a model run its last decoder layer's context attention on the read
+rows only (see ``FlashInferAttention._prefill_forward_read_rows``).
+
+TRTLLM_GEMMA4_LAST_LAYER_ATTN_ROWS=0 restores the full-row prefill call."""
+
+_READ_ROWS_CTA_TILE_Q = 32
+"""FA2 query tile (packed rows) of a long-q head_dim-512 plan."""
+
+READ_ROWS_STATS = {"ran": 0, "fallback": 0}
+"""Read-rows dispatch counters (tests and A/B harnesses read them)."""
+
+
+def read_rows_subset_lengths(seq_lens: np.ndarray,
+                             group_size: int) -> Optional[np.ndarray]:
+    """Trailing query rows per request for a bitwise last-row attention pass.
+
+    n is the smallest count with n * group_size > CTA_TILE_Q (so FA2 picks the
+    long-q CTA_TILE_Q=32 template, as for the full rows) and with
+    (seq_len - n) * group_size a multiple of CTA_TILE_Q. The second condition
+    puts every kept row at the same packed offset inside its query tile as in
+    the full-row plan, so each CTA's KV range, iteration count and mask
+    iteration (prefill.cuh, BatchPrefillWithPagedKVCacheKernel) are those of
+    the full-row CTA that holds the row. Returns None when a request is too
+    short for that.
+    """
+    tile = _READ_ROWS_CTA_TILE_Q
+    n_min = tile // group_size + 1
+    period = tile // math.gcd(tile, group_size)
+    seq_lens = seq_lens.astype(np.int64, copy=False)
+    n = n_min + (seq_lens - n_min) % period
+    if (n > seq_lens).any():
+        return None
+    return n
+
+
+def build_read_rows_indices(host_qo_indptr: np.ndarray, n: np.ndarray):
+    """Sub-plan qo_indptr (int32) and the int64 index arrays of the read-rows
+    pass: query rows to gather, the kept row of each request inside the
+    sub-batch, and its destination row (qo_indptr[i + 1] - 1) in the output."""
+    ends = host_qo_indptr[1:].astype(np.int64)
+    sub_indptr = np.concatenate([[0], np.cumsum(n)]).astype(np.int64)
+    total = int(sub_indptr[-1])
+    q_rows = (np.repeat(ends - n, n) + np.arange(total, dtype=np.int64) -
+              np.repeat(sub_indptr[:-1], n))
+    keep = sub_indptr[1:] - 1
+    dst = ends - 1
+    return sub_indptr.astype(np.int32), q_rows, keep, dst
+
 _MAX_CUDA_THREADS_PER_BLOCK = 1024
 
 
@@ -2712,6 +2762,121 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     out=output[:num_tokens].view(-1, self.num_heads,
                                                  self.kv_lora_rank))
 
+    def _prefill_forward_read_rows(self, metadata: FlashInferAttentionMetadata,
+                                   plan_params: PlanParams, q: torch.Tensor,
+                                   kv_cache, output: torch.Tensor) -> bool:
+        """Context attention on the rows anything reads: each request's last.
+
+        Set by the model for its last decoder layer only
+        (``metadata.last_layer_read_rows``), whose output feeds nothing but
+        the final-norm gather of rows qo_indptr[1:] - 1. K/V of every row is
+        already appended. Each request's trailing n rows (see
+        ``read_rows_subset_lengths``) run through FA2 with main's plan template
+        (CTA_TILE_Q=32, unsplit, same variant), so the kept row is bitwise
+        main's; every other output row is zero. Returns False, before any
+        work, when a guard fails, and the caller runs main's full-row call.
+        """
+        if not (_LAST_LAYER_ATTN_ROWS
+                and getattr(metadata, "last_layer_read_rows", False)):
+            return False
+        host_inputs = metadata._host_prefill_plan_inputs
+        num_contexts = metadata.num_contexts
+        if not (_HOST_PREFILL_PLAN and self.flashinfer_backend == "fa2"
+                and num_contexts > 0 and metadata.num_generations == 0
+                and not metadata.is_cuda_graph
+                and not torch.cuda.is_current_stream_capturing()
+                and plan_params.attention_mask_data is None
+                and plan_params.attention_mask_type == AttentionMaskType.causal
+                and plan_params.window_left < 0
+                and plan_params.q_dtype == torch.bfloat16
+                and host_inputs is not None and host_inputs[0] == num_contexts
+                and q.shape[0] == metadata.num_ctx_tokens
+                and output.shape[0] == metadata.num_ctx_tokens):
+            READ_ROWS_STATS["fallback"] += 1
+            return False
+        main_wrapper = metadata.get_prefill_wrapper(plan_params)
+        main_info = getattr(main_wrapper, "_plan_info", None)
+        if (main_info is None or getattr(main_wrapper, "_backend", None) != "fa2"
+                or int(main_info[3]) != _READ_ROWS_CTA_TILE_Q
+                or int(main_info[14]) != 0):
+            READ_ROWS_STATS["fallback"] += 1
+            return False
+        _, host_qo_indptr, paged_kv_indptr, paged_kv_last_page_len = host_inputs
+        qo_np = host_qo_indptr.numpy()
+        group_size = plan_params.num_heads // plan_params.num_kv_heads
+        n = read_rows_subset_lengths(qo_np[1:] - qo_np[:-1], group_size)
+        if n is None:
+            READ_ROWS_STATS["fallback"] += 1
+            return False
+        sub_indptr, q_rows, keep, dst = build_read_rows_indices(qo_np, n)
+
+        state = getattr(metadata, "_read_rows_state", None)
+        if state is None:
+            state = {
+                "wrapper":
+                flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                    metadata.workspace_buffer,
+                    metadata.kv_layout,
+                    backend="fa2"),
+                "event":
+                None,
+            }
+            metadata._read_rows_state = state
+        sub_wrapper = state["wrapper"]
+        # The wrapper's pinned staging buffer may still feed its previous
+        # plan's H2D copy: wait for that copy alone (as main's host plan).
+        if state["event"] is not None:
+            state["event"].synchronize()
+        sub_wrapper.plan(
+            maybe_pin_memory(torch.from_numpy(sub_indptr)),
+            paged_kv_indptr,
+            metadata._paged_kv_indices[:metadata.num_context_blocks],
+            paged_kv_last_page_len,
+            plan_params.num_heads,
+            plan_params.num_kv_heads,
+            plan_params.head_dim,
+            metadata.page_size,
+            causal=True,
+            sm_scale=plan_params.sm_scale,
+            window_left=plan_params.window_left,
+            q_data_type=plan_params.q_dtype,
+            kv_data_type=plan_params.kv_dtype,
+            o_data_type=None,
+            custom_mask=None,
+            disable_split_kv=True,
+        )
+        if state["event"] is None:
+            state["event"] = torch.cuda.Event()
+        state["event"].record()
+        sub_info = sub_wrapper._plan_info
+        metadata._read_rows_plan_infos = {
+            "main": (int(main_info[3]), int(main_info[14]),
+                     int(main_info[0])),
+            "sub": (int(sub_info[3]), int(sub_info[14]), int(sub_info[0])),
+            "rows": int(sub_indptr[-1]),
+        }
+        if (int(sub_info[3]) != int(main_info[3]) or int(sub_info[14]) != 0):
+            READ_ROWS_STATS["fallback"] += 1
+            return False
+
+        idx_host = maybe_pin_memory(
+            torch.from_numpy(np.concatenate([q_rows, keep, dst])))
+        idx = idx_host.to(q.device, non_blocking=True)
+        total = q_rows.shape[0]
+        q_idx = idx[:total]
+        keep_idx = idx[total:total + num_contexts]
+        dst_idx = idx[total + num_contexts:]
+
+        q_sub = q.index_select(0, q_idx)
+        sub_out = torch.empty_like(q_sub)
+        sub_wrapper.run(q_sub, kv_cache, out=sub_out)
+        out2d = output.view(output.shape[0], -1)
+        out2d.zero_()
+        out2d.index_copy_(0, dst_idx,
+                          sub_out.view(total, -1).index_select(0, keep_idx))
+        READ_ROWS_STATS["ran"] += 1
+        return True
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -2939,7 +3104,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             if num_contexts == 0:
                 decode_forward(plan_params, output)
             elif num_generations == 0:
-                prefill_forward(plan_params, output)
+                if not self._prefill_forward_read_rows(
+                        metadata, plan_params, q, kv_cache, output):
+                    prefill_forward(plan_params, output)
             else:
                 prefill_forward(plan_params, output[:num_ctx_tokens, :])
                 decode_forward(plan_params, output[num_ctx_tokens:, :])
