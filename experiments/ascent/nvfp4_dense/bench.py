@@ -229,13 +229,16 @@ def mode_check(args, dims, weights):
             alpha = (1.0 / (xgs * wgs)).float()
             snap = [t.clone() for t in (xq, xsf, wq, wsf, alpha)]
             set_dense(True)
-            outs = [gemm(xq, xsf, wq, wsf, alpha) for _ in range(WARMUP + ITERS)]
+            first = gemm(xq, xsf, wq, wsf, alpha)
+            rep_bad = 0
+            for _ in range(WARMUP + ITERS - 1):
+                o = gemm(xq, xsf, wq, wsf, alpha)
+                rep_bad += int16_mismatch(o, first)[0]
+                del o
             set_dense(False)
             main_out = gemm(xq, xsf, wq, wsf, alpha)
             set_dense(True)
             torch.cuda.synchronize()
-            first = outs[0]
-            rep_bad = sum(int16_mismatch(o, first)[0] for o in outs[1:])
             vs_main, fm = int16_mismatch(first, main_out)
             unchanged = all(torch.equal(a.view(torch.uint8) if a.dtype != torch.float32 else a,
                                         b.view(torch.uint8) if b.dtype != torch.float32 else b)
@@ -267,7 +270,7 @@ def mode_check(args, dims, weights):
             passed &= ok
             if not ok:
                 log(f"[check] FAIL {key} rep={rep_bad} vs_main={vs_main} first={fm} unchanged={unchanged}")
-            del outs, main_out
+            del first, main_out
     cache_after = dict(AutoTuner.get().profiling_cache.cache)
     mutated = cache_before != cache_after
     passed &= not mutated
@@ -302,10 +305,37 @@ def mode_smoke(args, dims, weights):
     print(json.dumps({"passed": True, "tune_seconds": tune_s}))
 
 
+def mode_cache(args, dims, weights):
+    """phase save: tune, save the autotuner cache to --cache-path; phase load: load it without tuning.
+    Both print the picks and an int16 hash of the op's output per (shape, M)."""
+    import hashlib
+    from tensorrt_llm._torch.autotuner import autotune
+    if args.phase == "save" and os.path.exists(args.cache_path):
+        os.remove(args.cache_path)
+    with autotune(tune_mode=args.phase == "save", cache_path=args.cache_path):
+        for name, (wq, wsf, wgs) in weights.items():
+            n, k = dims[name]
+            xq, xsf, xgs = make_act(8192, k, 7)
+            gemm(xq, xsf, wq, wsf, (1.0 / (xgs * wgs)).float())
+    torch.cuda.synchronize()
+    res = {}
+    for name, (wq, wsf, wgs) in weights.items():
+        n, k = dims[name]
+        for m in M_DECODE + M_PREFILL:
+            xq, xsf, xgs = make_act(m, k, 21 + m)
+            o = gemm(xq, xsf, wq, wsf, (1.0 / (xgs * wgs)).float())
+            torch.cuda.synchronize()
+            h = hashlib.sha256(o.view(torch.int16).cpu().numpy().tobytes()).hexdigest()[:16]
+            res[f"{name}@{m}"] = {"picks": picks_for(name, m, n, k), "out_sha": h}
+    print(json.dumps(res))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="pair")
     ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--phase", default="save")
+    ap.add_argument("--cache-path", default="/tmp/nvfp4_dense_cache.json")
     args = ap.parse_args()
     import tensorrt_llm  # noqa: F401
     dims = read_dims(args.checkpoint)
@@ -315,7 +345,8 @@ def main():
         n, k = dims[name]
         log(f"[case] {name} N={n} K={k}")
         weights[name] = make_weight(n, k, 100 + i)
-    {"pair": mode_pair, "check": mode_check, "smoke": mode_smoke}[args.mode](args, dims, weights)
+    {"pair": mode_pair, "check": mode_check, "smoke": mode_smoke, "cache": mode_cache}[args.mode](
+        args, dims, weights)
 
 
 if __name__ == "__main__":
