@@ -136,6 +136,189 @@ def _rmsnorm_residual_add_kernel(
         tl.store(n2_ptr + rows[:, None] * SN2 + cols[None, :], n2, mask=mask)
 
 
+@triton.jit
+def _rcp_approx(x):
+    return tl.inline_asm_elementwise(
+        "rcp.approx.ftz.f32 $0, $1;", "=f,f", [x], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _rmsnorm_residual_add_fp4_kernel(
+    x_ptr,  # [M, H] bf16 kernel input (the branch output being normed)
+    r_ptr,  # [M, H] bf16 residual
+    w_ptr,  # [H] bf16 RMSNorm weight for x
+    o_ptr,  # [M, H] bf16 out (the new residual stream h)
+    w2_ptr,  # [H] bf16 secondary norm weight
+    q_ptr,  # [M, H//2] uint8 packed e2m1 payload of rmsnorm(h, w2)
+    sf_ptr,  # [pad128(M) * 4 * NKT] uint8 e4m3 scales, swizzled 128x4
+    gs_ptr,  # [1] fp32 global scale (consumer input_scale)
+    M,
+    SX,
+    SR,
+    SO,
+    EPS,
+    EPS2,
+    NKT,  # numKTiles = ceil((H/16) / 4)
+    H: tl.constexpr,
+    BH: tl.constexpr,  # next_power_of_2(H)
+    DIV_RN: tl.constexpr,
+):
+    # Primary stage: identical to _rmsnorm_residual_add_kernel(BM=1,
+    # HAS_SCALE=False) so h stays bitwise equal to rmsnorm_residual_add.
+    rows = tl.program_id(0) * 1 + tl.arange(0, 1).to(tl.int64)
+    rmask = rows < M
+    cols = tl.arange(0, BH)
+    cmask = cols < H
+    mask = rmask[:, None] & cmask[None, :]
+
+    x = tl.load(x_ptr + rows[:, None] * SX + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    ssq = tl.sum(x * x, axis=1)
+    rcp = tl.inline_asm_elementwise(
+        "rsqrt.approx.ftz.f32 $0, $1;",
+        "=f,f",
+        [ssq / H + EPS],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    w = tl.load(w_ptr + cols, mask=cmask, other=0.0).to(tl.float32)
+    normed = ((x * rcp[:, None]) * w[None, :]).to(tl.bfloat16)
+    r = tl.load(r_ptr + rows[:, None] * SR + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    out = (r + normed.to(tl.float32)).to(tl.bfloat16)
+    tl.store(o_ptr + rows[:, None] * SO + cols[None, :], out, mask=mask)
+
+    # Secondary stage: flashinfer CuTe-DSL rmsnorm_fp4quant (block 16, e4m3,
+    # swizzled) on the bf16-rounded h, without an intermediate bf16 round:
+    #   rstd = rsqrt.approx(sum(h^2)/H + eps); y = (h * rstd) * w2
+    #   sf = e4m3(min((gs * amax16(y)) * rcp.approx(6), 448))
+    #   q = e2m1(y * (sf != 0 ? rcp.approx(f32(sf)) * gs : 0))
+    # Rows in [M, pad128(M)) load zeros and store zero scales (the padding
+    # the fused flashinfer kernel zero-fills).
+    outf = out.to(tl.float32)
+    ssq2 = tl.sum(outf * outf, axis=1)
+    if DIV_RN:
+        ms2 = tl.div_rn(ssq2, tl.full(ssq2.shape, H, tl.float32))
+    else:
+        ms2 = ssq2 / H
+    rstd = tl.inline_asm_elementwise(
+        "rsqrt.approx.ftz.f32 $0, $1;",
+        "=f,f",
+        [ms2 + EPS2],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    w2 = tl.load(w2_ptr + cols, mask=cmask, other=0.0).to(tl.float32)
+    y = (outf * rstd[:, None]) * w2[None, :]
+    y16 = tl.reshape(y, (1, BH // 16, 16))
+    vmax = tl.max(tl.abs(y16), axis=2)  # [1, BH/16]
+
+    gs = tl.load(gs_ptr)
+    rcp6 = _rcp_approx(tl.full((1, BH // 16), 6.0, tl.float32))
+    sfv = tl.minimum((gs * vmax) * rcp6, 448.0)
+    sf8 = sfv.to(tl.float8e4nv)
+    sf8f = sf8.to(tl.float32)
+    inv = tl.where(sf8f == 0.0, 0.0, _rcp_approx(sf8f) * gs)
+
+    kvec = tl.arange(0, BH // 16).to(tl.int64)
+    m2 = rows[:, None]
+    k2 = kvec[None, :]
+    sfoff = (
+        (m2 // 128) * (NKT * 512)
+        + (k2 // 4) * 512
+        + (m2 % 32) * 16
+        + ((m2 % 128) // 32) * 4
+        + (k2 % 4)
+    )
+    # Every program (including the padding rows) writes its whole swizzled
+    # row: valid k-blocks plus the k padding up to NKT * 4 (zeros there).
+    tl.store(sf_ptr + sfoff, sf8.to(tl.uint8, bitcast=True), mask=k2 < NKT * 4)
+
+    qv = tl.reshape(y16 * inv[:, :, None], (1, BH))
+    lo, hi = tl.split(tl.reshape(qv, (1, BH // 2, 2)))
+    byte = tl.inline_asm_elementwise(
+        "{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u16.u8 $0, t; }",
+        "=h,f,f",
+        [lo, hi],
+        dtype=tl.uint16,
+        is_pure=True,
+        pack=1,
+    ).to(tl.uint8)
+    ocols = tl.arange(0, BH // 2)
+    omask = rmask[:, None] & (ocols[None, :] < H // 2)
+    tl.store(q_ptr + rows[:, None] * (H // 2) + ocols[None, :], byte, mask=omask)
+
+
+def rmsnorm_residual_add_fp4_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    next_norm_weight: torch.Tensor,
+    next_norm_eps: float,
+    global_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused ``h = residual + rmsnorm(x)`` plus NVFP4 quantize of ``rmsnorm(h)``.
+
+    Replaces ``rmsnorm_residual_add`` followed by ``rmsnorm_fp4_quant`` (the
+    flashinfer CuTe-DSL fused norm+quant) on ``h``: one kernel reads x and
+    residual once, writes h, and emits the packed E2M1 payload plus the
+    128x4-swizzled E4M3 scales of ``rmsnorm(h, next_norm_weight)`` without
+    re-reading h. h is bitwise identical to ``rmsnorm_residual_add``; the
+    quantized output replicates rmsnorm_fp4quant's math op-for-op (only the
+    fp32 sum-of-squares reduction order differs).
+
+    Returns:
+        (h, fp4, sf): h [M, H] bf16; fp4 [M, H//2] uint8 (element 2j in the
+        low nibble of byte j); sf 1D uint8 swizzled scales padded to 128 rows
+        (padding zero-filled) - consumable as ``Fp4QuantizedTensor(fp4, sf)``.
+    """
+    assert x.dim() == 2 and x.stride(-1) == 1
+    assert x.dtype == torch.bfloat16 and residual.dtype == torch.bfloat16
+    assert residual.shape == x.shape and residual.stride(-1) == 1
+    assert global_scale.dtype == torch.float32
+    m, h = x.shape
+    assert h % 16 == 0
+    assert norm_weight.shape == (h,) and next_norm_weight.shape == (h,)
+    nkt = triton.cdiv(h // 16, 4)
+    m_pad = triton.cdiv(m, 128) * 128
+    o = torch.empty_like(x)
+    fp4 = torch.empty((m, h // 2), dtype=torch.uint8, device=x.device)
+    sf = torch.empty((m_pad * nkt * 4,), dtype=torch.uint8, device=x.device)
+    if m == 0:
+        return o, fp4, sf
+    bh = triton.next_power_of_2(h)
+    assert bh // 16 >= nkt * 4
+    _rmsnorm_residual_add_fp4_kernel[(m_pad,)](
+        x,
+        residual,
+        norm_weight,
+        o,
+        next_norm_weight,
+        fp4,
+        sf,
+        global_scale,
+        m,
+        x.stride(0),
+        residual.stride(0),
+        o.stride(0),
+        eps,
+        next_norm_eps,
+        nkt,
+        H=h,
+        BH=bh,
+        DIV_RN=_FP4_DIV_RN,
+        num_warps=4,
+    )
+    return o, fp4, sf
+
+
+# mean(h^2) as an IEEE (div.rn) divide: matches the CuTe-DSL kernel more
+# often than Triton's default approximate fp32 divide (measured).
+_FP4_DIV_RN = True
+
+
 def _launch_norm_add(
     x: torch.Tensor,
     residual: torch.Tensor,
