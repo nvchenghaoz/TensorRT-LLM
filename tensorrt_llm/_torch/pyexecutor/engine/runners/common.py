@@ -26,8 +26,11 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
 
 # Prefill CUDA graphs replay only steps whose token count equals a captured size
-# (no padding to the next bucket); other steps run eager. Default off (stock padding).
-_PREFILL_GRAPH_EXACT_ONLY = os.environ.get("TRTLLM_PREFILL_GRAPH_EXACT_ONLY", "0") == "1"
+# (no padding to the next bucket); other steps run eager and unpadded, so a replay runs
+# the same kernels at the same M as eager and stays bitwise equal to it. A padded replay
+# can pick other GEMM tactics (cuBLAS heuristics, NVFP4 AutoTuner M buckets).
+# TRTLLM_PREFILL_GRAPH_EXACT_ONLY=0 restores padding to the next captured size.
+_PREFILL_GRAPH_EXACT_ONLY = os.environ.get("TRTLLM_PREFILL_GRAPH_EXACT_ONLY", "1") == "1"
 
 
 def get_all_rank_num_tokens(
