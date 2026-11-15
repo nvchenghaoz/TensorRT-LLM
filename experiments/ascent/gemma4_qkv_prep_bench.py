@@ -115,17 +115,20 @@ class Layer:
     def make_inputs(self, seqs, device, seed):
         g = torch.Generator(device="cpu").manual_seed(seed)
         n = sum(seqs)
-        w = self.q_size + 2 * self.kv_size
+        # K=V global layers: main's _QKOnlyLinear emits [q | k] only (width q + kv).
+        w = self.q_size + (1 if self.k_eq_v else 2) * self.kv_size
         qkv = (torch.randn(n, w, generator=g) * 2.0).to(torch.bfloat16)
-        if self.k_eq_v:  # weight mapper duplicates k_proj into v_proj
-            qkv[:, self.q_size + self.kv_size:] = qkv[:, self.q_size:self.q_size + self.kv_size]
         pos = torch.cat([torch.arange(s, dtype=torch.int32) for s in seqs])
         return qkv.to(device), pos.to(device)
 
     # --- main's unfused FA2 chain (modeling_gemma4.apply_rope + flashinfer forward_impl casts)
     def main_chain(self, qkv, pos):
         from tensorrt_llm._torch.custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.k_eq_v:  # modeling_gemma4.apply_rope qk-only branch: v = raw k
+            q, k = qkv.split([self.q_size, self.kv_size], dim=-1)
+            v = k
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         v = self.v_norm(v.reshape(-1, self.hd)).reshape(-1, self.kv_size)
         q = self.q_norm(q.reshape(-1, self.hd)).reshape(-1, self.q_size)
         k = self.k_norm(k.reshape(-1, self.hd)).reshape(-1, self.kv_size)
@@ -138,6 +141,8 @@ class Layer:
     def fused_chain(self, qkv, pos, cute=True):
         from tensorrt_llm._torch.modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
         kw = {"cute_norm_order": cute} if has_cute_mode() else {}
+        if self.k_eq_v:
+            kw["k_eq_v"] = True
         q, k, v = gemma4_fused_qkv_norm_rope_quant(
             qkv, pos, self.cos_sin, self.q_norm.weight, self.k_norm.weight, self.eps,
             self.nq, self.nkv, self.hd, out_fp8=False, packed_output=False, kv_out_fp8=True, **kw)
@@ -148,7 +153,11 @@ class Layer:
 
     def fp32_ref(self, qkv, pos):
         x = qkv.float()
-        q, k, v = x.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.k_eq_v:
+            q, k = x.split([self.q_size, self.kv_size], dim=-1)
+            v = k
+        else:
+            q, k, v = x.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         def nrm(t, w):
             t = t.reshape(-1, self.hd)
@@ -182,17 +191,24 @@ def has_cute_mode():
     return "cute_norm_order" in inspect.signature(gemma4_fused_qkv_norm_rope_quant).parameters
 
 
-def bench(ckpt, variant="auto", sliding_only=True):
+def has_keqv_mode():
+    from tensorrt_llm._torch.modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
+    return "k_eq_v" in inspect.signature(gemma4_fused_qkv_norm_rope_quant).parameters
+
+
+def bench(ckpt, variant="auto", sliding_only=False):
     dev = torch.device("cuda")
     log("device:", torch.cuda.get_device_name(), torch.cuda.get_device_capability())
     shapes, eps = load_shapes(ckpt)
-    fused = has_mixed_mode() and variant != "unfused"
     cute = variant != "old"
-    log("chain:", (f"fused (branch, cute_norm_order={cute})" if fused else "unfused (main)"))
     out = {}
     for li, (lname, sh) in enumerate(shapes.items()):
         if sliding_only and lname != "sliding":
-            continue  # global K=V layers run the unfused chain in both trees
+            continue
+        # A tree runs the fused kernel on a layer shape only if it can: global
+        # K=V layers ([q | k] input) need the k_eq_v mode.
+        fused = has_mixed_mode() and variant != "unfused" and (not sh["k_eq_v"] or has_keqv_mode())
+        log(f"{lname} chain:", (f"fused (branch, cute_norm_order={cute})" if fused else "unfused (main)"))
         layer = Layer(sh, eps, dev, seed=100 + li)
         fn = (lambda a, b, _l=layer: _l.fused_chain(a, b, cute=cute)) if fused else layer.main_chain
         for cname, seqs in CASES:

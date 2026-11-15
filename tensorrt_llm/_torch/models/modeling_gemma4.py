@@ -586,8 +586,9 @@ class Gemma4Attention(QKNormRoPEAttention):
             use_trtllm_bf16 = self._use_trtllm_fused_qkv_prep
             self._fused_qkv_prep = (
                 not self.is_kv_shared
-                # The kernel reads V from a packed [q | k | v] GEMM output.
-                and not self._qk_only_proj
+                # The kernel reads V from a packed [q | k | v] GEMM output, or
+                # on FA2 (k_eq_v mode) from the raw K of a [q | k] output.
+                and (not self._qk_only_proj or use_flashinfer_fa2_fp8_kv)
                 and not self.fuse_qk_norm_rope
                 and not self.skip_rope
                 # FlashInfer trtllm-gen consumes separate FP8 tensors, FA2
@@ -676,6 +677,7 @@ class Gemma4Attention(QKNormRoPEAttention):
                     packed_output=self._use_trtllm_fused_qkv_prep,
                     kv_out_fp8=self._fused_qkv_prep_kv_out_fp8,
                     cute_norm_order=self._fused_qkv_prep_cute_norm,
+                    k_eq_v=self._qk_only_proj,
                 )
 
             if self._qk_only_proj and k is None and v is None:

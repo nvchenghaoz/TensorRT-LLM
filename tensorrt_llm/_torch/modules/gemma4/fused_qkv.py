@@ -151,6 +151,7 @@ def _gemma4_qkv_norm_rope_quant_kernel(
     Q_OUT_FP8: tl.constexpr,
     KV_OUT_FP8: tl.constexpr,
     CUTE_NORM_ORDER: tl.constexpr,  # sum of squares in FlashInfer CuTe RMSNorm order
+    K_EQ_V: tl.constexpr,  # qkv is the [q | k] GEMM output; V = v_norm(raw K)
     BLOCK_N: tl.constexpr,  # tokens per program (power of two)
 ):
     h = tl.program_id(0)
@@ -158,8 +159,13 @@ def _gemma4_qkv_norm_rope_quant_kernel(
     rmask = rows < N
     offs = tl.arange(0, HALF)
 
-    # Head h occupies columns [h*HD, (h+1)*HD) of the packed qkv rows.
-    base = qkv_ptr + rows[:, None] * SW + h * HD + offs[None, :]
+    # Head h occupies columns [h*HD, (h+1)*HD) of the packed qkv rows. With
+    # K_EQ_V there is no V block: V head j reads the raw K head j at column
+    # (NQ + j) * HD (only inputs are read, so K's norm/RoPE never reach V).
+    src_h = h
+    if K_EQ_V:
+        src_h = tl.where(h >= NQ + NK, h - NK, h)
+    base = qkv_ptr + rows[:, None] * SW + src_h * HD + offs[None, :]
     x1 = tl.load(base, mask=rmask[:, None], other=0.0).to(tl.float32)
     x2 = tl.load(base + HALF, mask=rmask[:, None], other=0.0).to(tl.float32)
 
@@ -235,6 +241,7 @@ def gemma4_fused_qkv_norm_rope_quant(
     packed_output: bool = False,
     kv_out_fp8: Optional[bool] = None,
     cute_norm_order: bool = False,
+    k_eq_v: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Run the fused per-head norm + rope + quant over a packed QKV tensor.
 
@@ -259,6 +266,10 @@ def gemma4_fused_qkv_norm_rope_quant(
             xor-1,2,4,8,16 butterfly), so Q/K/V are bitwise equal to the
             unfused RMSNorm -> FlashInfer RoPE -> .to(fp8) chain. Needs
             head_dim 256 or 512.
+        k_eq_v: ``qkv`` is the [q | k] output of a K=V layer's Q/K-only GEMM
+            (width num_q_heads*head_dim + num_kv_heads*head_dim). V is
+            v_norm of the raw K projection, taken before k_norm or RoPE.
+            Separate outputs only (packed_output is refused).
 
     Returns:
         Separate mode returns contiguous ``(q, k, v)`` tensors in the
@@ -278,7 +289,12 @@ def gemma4_fused_qkv_norm_rope_quant(
     assert cos_sin.dim() == 3 and cos_sin.shape[1] == 2 and cos_sin.shape[2] == half
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
-    assert qkv.shape[-1] == q_size + 2 * kv_size
+    if k_eq_v:
+        if packed_output:
+            raise ValueError("k_eq_v does not support packed_output")
+        assert qkv.shape[-1] == q_size + kv_size
+    else:
+        assert qkv.shape[-1] == q_size + 2 * kv_size
     if cute_norm_order and head_dim not in (256, 512):
         raise ValueError("cute_norm_order supports head_dim 256 and 512")
 
@@ -334,6 +350,7 @@ def gemma4_fused_qkv_norm_rope_quant(
         Q_OUT_FP8=out_fp8,
         KV_OUT_FP8=kv_out_fp8,
         CUTE_NORM_ORDER=cute_norm_order,
+        K_EQ_V=k_eq_v,
         BLOCK_N=block_n,
         num_warps=8,
         # Exact mode spells out every FMA; keep LLVM from contracting others.
