@@ -100,6 +100,7 @@ def main():
 
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm._torch.custom_ops import torch_custom_ops as tco
+    from tensorrt_llm._torch.models import modeling_gemma4 as mg
     from tensorrt_llm._torch.modules import linear as lin
     from tensorrt_llm.llmapi import KvCacheConfig
 
@@ -164,9 +165,25 @@ def main():
 
     def apply(self, module, input, bias):
         out = _apply(self, module, input, bias)
-        if not cap["on"]:
-            return out
-        n, kp = module.weight.shape[0], module.weight.shape[1] * 2
+        if cap["on"]:
+            act_fp4, act_sf, alpha = stash.last
+            record(module.weight, module.weight_scale, act_fp4, act_sf, alpha, out, "apply")
+        return out
+
+    _chunked = mg.gate_up_gelu_fp4_chunked
+
+    def chunked(act_fp4, act_sf, weight, weight_scale, alpha, *a, **k):
+        res = _chunked(act_fp4, act_sf, weight, weight_scale, alpha, *a, **k)
+        cap["chunked_calls"] += res is not None
+        if cap["on"] and res is not None:
+            record(weight, weight_scale, act_fp4, act_sf, alpha, None, "chunked")
+        return res
+
+    mg.gate_up_gelu_fp4_chunked = chunked
+    cap["chunked_calls"] = 0
+
+    def record(weight, weight_scale, act_fp4, act_sf, alpha, out, path):
+        n, kp = weight.shape[0], weight.shape[1] * 2
         if (n, kp) == GU:
             shape, idx = "gate_up", cap["gu_calls"]
             cap["gu_calls"] += 1
@@ -174,25 +191,24 @@ def main():
             shape, idx = "down", cap["dn_calls"]
             cap["dn_calls"] += 1
         else:
-            return out
+            return
         layer = idx % nl
         step = idx // nl
         if layer not in CAPTURE_LAYERS:
-            return out
+            return
         if torch.cuda.is_current_stream_capturing():
             cap["skipped_capturing"] += 1
-            return out
-        act_fp4, act_sf, alpha = stash.last
+            return
         m = int(act_fp4.shape[0])
         base = f"{cap['label']}_s{step}_L{layer}_{shape}_M{m}"
         ent = {"prompt": cap["label"], "step": step, "layer": layer, "shape": shape, "M": m,
-               "N": n, "K": kp,
+               "N": n, "K": kp, "path": path,
                "act_shape": list(act_fp4.shape), "act_dtype": str(act_fp4.dtype),
                "sf_shape": list(act_sf.shape), "sf_dtype": str(act_sf.dtype),
                "alpha": float(alpha.float().reshape(-1)[0].item()) if torch.is_tensor(alpha) else float(alpha)}
         tensors = {"act_fp4": act_fp4.detach().cpu().clone(), "act_sf": act_sf.detach().cpu().clone(),
                    "alpha": alpha.detach().cpu().clone() if torch.is_tensor(alpha) else torch.tensor(alpha)}
-        if m < 4096:
+        if m < 4096 and out is not None:
             o = out.reshape(-1, out.shape[-1])
             tensors["out"] = o.detach().cpu().clone()
             ent["out_shape"] = list(o.shape)
@@ -200,14 +216,13 @@ def main():
         cap["entries"].append(ent)
         wkey = f"L{layer}_{shape}"
         if wkey not in cap["weights"]:
-            wt = {"weight": module.weight.detach().cpu().clone(),
-                  "weight_scale": module.weight_scale.detach().cpu().clone()}
+            wt = {"weight": weight.detach().cpu().clone(),
+                  "weight_scale": weight_scale.detach().cpu().clone()}
             cap["weights"][wkey] = {"file": save(wt, f"weight_{wkey}.pt"), "layer": layer, "shape": shape,
-                                    "w_shape": list(module.weight.shape), "w_dtype": str(module.weight.dtype),
-                                    "ws_shape": list(module.weight_scale.shape),
-                                    "ws_dtype": str(module.weight_scale.dtype)}
-        print(f"[capture] {base} act={tuple(act_fp4.shape)} sf={tuple(act_sf.shape)}", flush=True)
-        return out
+                                    "w_shape": list(weight.shape), "w_dtype": str(weight.dtype),
+                                    "ws_shape": list(weight_scale.shape),
+                                    "ws_dtype": str(weight_scale.dtype)}
+        print(f"[capture] {base} path={path} act={tuple(act_fp4.shape)} sf={tuple(act_sf.shape)}", flush=True)
 
     lin.NVFP4LinearMethod._input_prepare = prep
     lin.NVFP4LinearMethod.apply = apply
@@ -300,7 +315,9 @@ def main():
         producers = {}
         for rel in ("tensorrt_llm/_torch/models/modeling_gemma4.py",
                     "tensorrt_llm/_torch/kernels/fused_ops/gelu_tanh_mul_fp4_quant.py",
-                    "tensorrt_llm/_torch/modules/gated_mlp.py"):
+                    "tensorrt_llm/_torch/modules/gated_mlp.py",
+                    "tensorrt_llm/_torch/kernels/fused_ops/gate_up_gelu_fp4_chunked.py",
+                    "tensorrt_llm/_torch/modules/linear.py"):
             p = os.path.join(repo, rel)
             if os.path.exists(p):
                 producers[rel] = sha256(p)
@@ -367,11 +384,13 @@ def main():
           and sum(v for k, v in calls["A"].items() if k.startswith("dense")) == 0)
     out.update({"passed": bool(ok), "compared": "in-process LLM, dense NVFP4 tuning OFF/ON/OFF (A/X/A'), "
                 "first-token id + top-20 logprobs bitwise; re-send 8k,1k,8k no reset vs first send, ON and OFF",
-                "n_prompts": n_prompts, "A_vs_A2": aa, "A_vs_X": ax, "resend": resend, "dispatch_calls": calls})
+                "n_prompts": n_prompts, "A_vs_A2": aa, "A_vs_X": ax, "resend": resend, "dispatch_calls": calls,
+                "chunked_gate_up_calls_total": cap["chunked_calls"]})
     with open(os.path.join(art, "llm_ab.json"), "w") as f:
         json.dump(out, f, indent=1)
     print(json.dumps({k: out[k] for k in ("passed", "compared", "n_prompts", "A_vs_A2", "A_vs_X", "resend",
-                                          "dispatch_calls")} | {"capture_dir": out.get("capture_dir")}))
+                                          "dispatch_calls", "chunked_gate_up_calls_total")}
+                     | {"capture_dir": out.get("capture_dir")}))
 
 
 if __name__ == "__main__":
