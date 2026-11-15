@@ -28,6 +28,10 @@ import time
 HERE = pathlib.Path(__file__).resolve().parent
 PAGE = 32
 TILE64_FLAG = "FLASHINFER_FA2_D512_TILE64"
+CASE_LABELS = {"1x300": "isl300@1", "16x300": "isl300@16", "27x300": "isl300@64",
+               "1x1000": "isl1k@1", "8x1000": "isl1k@16", "1x2000": "isl2k@1",
+               "4x2000": "isl2k@4", "16x512": "8192", "1x4000": "isl4k@1",
+               "2x4000": "isl4k@4", "1x8000": "isl8k@1"}
 CASES = "1x300,16x300,27x300,1x1000,8x1000,1x2000,4x2000,16x512,1x4000,2x4000,1x8000"
 # ragged / prefix / split-KV numerics cases: name -> (q_lens, kv_lens, plan kwargs)
 EXTRA = {
@@ -304,8 +308,12 @@ def run_arm(a):
         results.append(rec)
         del c, out, first, w
         torch.cuda.empty_cache()
-    batch = {r["case"]: {"kernel_ms": r.get("median_ms"), "noise_floor": r.get("noise")}
-             for r in results}
+    # Evidence keys: the served case each op shape is (max_num_tokens 8192 packs the
+    # concurrent requests: isl300@64 -> 27x300, isl1k@16 -> 8x1000, isl2k@4 -> 4x2000,
+    # isl4k@4 -> 2x4000); (16,512) has no served label and is keyed by its total tokens.
+    batch = {CASE_LABELS[r["case"]]: {"kernel_ms": r.get("median_ms"),
+                                       "noise_floor": r.get("noise")}
+             for r in results if r["case"] in CASE_LABELS}
     exact = all(r.get("vs_path32", {}).get("bitwise", False) for r in results) if \
         a.self_compare else False
     final = {"batch": batch, "output": {"class": "exact" if exact else "reordered"},
