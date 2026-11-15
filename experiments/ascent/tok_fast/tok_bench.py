@@ -209,7 +209,7 @@ def check():
     res["mismatches"] = fails
     res["passed"] = all(v == 0 for v in fails.values())
     res["compared_against"] = "stock tokenizer(text, return_tensors='pt')['input_ids'][0].to(int32).tolist()"
-    print(json.dumps(res))
+    return res
 
 
 def pct(xs, q):
@@ -280,7 +280,7 @@ def timing():
                                                  "p90_ms": round(p90, 4), "noise_floor": round((p90 - p10) / med, 4),
                                                  "n": len(mks)}
         log(f"8k x{thr} threads makespan: median {med:.3f} p10 {p10:.3f} p90 {p90:.3f}")
-    print(json.dumps({"batch": batch, "output": {"class": "exact"}}))
+    return {"batch": batch, "output": {"class": "exact"}}
 
 
 def sweep():
@@ -323,8 +323,15 @@ if __name__ == "__main__":
     threading.Thread(target=_hb, daemon=True).start()
     ckpt, mode = sys.argv[1], sys.argv[2]
     if mode == "check":
-        check()
+        print(json.dumps(check()))
     elif mode == "sweep":
         sweep()
+    elif mode == "all":
+        # Timing first (clean process state), then the untimed id-equality check.
+        t = timing()
+        c = check()
+        t["check"] = c
+        t["passed"] = c["passed"]
+        print(json.dumps(t))
     else:
-        timing()
+        print(json.dumps(timing()))
