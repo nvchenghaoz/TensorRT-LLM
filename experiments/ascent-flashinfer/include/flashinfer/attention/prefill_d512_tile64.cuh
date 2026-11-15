@@ -245,7 +245,9 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
   const uint32_t gq = warp >> 2;  // row group
   const uint32_t w = warp & 3u;   // KV/VO warp within the group (warp_kv_idx)
   const uint32_t g = lane >> 2, t = lane & 3u;
-  const uint32_t bx = blockIdx.x, kv_head_idx = blockIdx.z;
+  // FA2PagedPrefillGrid may launch item-major (d512_tile64_config.cuh).
+  uint32_t bx, kv_head_idx;
+  FA2PagedPrefillBlockCoords(params.paged_kv.num_heads, bx, kv_head_idx);
 
   if (params.block_valid_mask && !params.block_valid_mask[bx]) {
     return;
@@ -257,7 +259,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
   const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                  window_left = variant.window_left;
   const uint_fastdiv& group_size = params.group_size;
-  const uint32_t num_qo_heads = gridDim.z * group_size;
+  const uint32_t num_qo_heads = params.paged_kv.num_heads * group_size;
   const bool partition_kv = params.partition_kv;
   const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
   const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
@@ -710,7 +712,8 @@ cudaError_t BatchPrefillPagedD512Tile64Dispatched(Params params, typename Params
     }
     const uint32_t num_kv_heads = params.paged_kv.num_heads;
     const uint32_t num_qo_heads = params.num_qo_heads;
-    dim3 nblks(padded_batch_size, 1, num_kv_heads);
+    dim3 nblks =
+        FA2PagedPrefillGrid(padded_batch_size, num_kv_heads, params.block_valid_mask != nullptr);
     dim3 nthrs(kNumThreads, 1, 1);
     auto kernel = BatchPrefillPagedD512Tile64Kernel<SAME_KV_STRIDES, MASK_MODE, AttentionVariant,
                                                     Params>;
