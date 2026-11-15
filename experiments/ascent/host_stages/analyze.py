@@ -296,7 +296,11 @@ def waves(case_rows, reqs):
                 "stage_median_ms": {k: r3(med([r["seg"][k] for r in rs])) for k in STAGES},
                 "nctx_of_step_median": med([r["nctx"] for r in rs])}
 
-    return {"leaders": s(lead), "followers": s(foll)}
+    by_n = defaultdict(list)
+    for r in ok:
+        by_n[r["nctx"]].append(r)
+    return {"leaders": s(lead), "followers": s(foll),
+            "by_step_nctx": {str(k): s(v) for k, v in sorted(by_n.items())}}
 
 
 def analyze_lifetime(results, tdir):
@@ -470,6 +474,50 @@ def analyze_nsys(sq, results, tdir):
         return False
 
     gstarts = [g[0] for g in gpu]
+    gpu_by_corr = {g[2]: g for g in gpu}
+    fwd_ranges = [r for r in ranges if r[2] == "AT:model_forward"]
+
+    def forward_steps(w0, w1):
+        """Per eager model forward in the window: kernels it launched, their
+        busy union, first-to-last span, enqueue (NVTX) and in-span idle."""
+        out_steps = []
+        for st, en, _ in fwd_ranges:
+            if not (w0 <= st <= w1):
+                continue
+            out_steps.append((st, en))
+        res = []
+        if not out_steps:
+            return res
+        # Build per-thread runtime list with correlation ids once.
+        for st, en in out_steps:
+            ops = [gpu_by_corr[c] for c, (rs, re_, tid, nm) in rt_items_sorted_window(st, en)
+                   if c in gpu_by_corr]
+            if not ops:
+                continue
+            ops.sort()
+            busy, end = 0, None
+            for o in ops:
+                if end is None or o[0] > end:
+                    busy += o[1] - o[0]
+                    end = o[1]
+                elif o[1] > end:
+                    busy += o[1] - end
+                    end = o[1]
+            span = max(o[1] for o in ops) - ops[0][0]
+            res.append({"enqueue_ms": r3((en - st) / 1e6), "kernels": sum(1 for o in ops if o[3] == "K"),
+                        "gpu_busy_ms": r3(busy / 1e6), "gpu_span_ms": r3(span / 1e6),
+                        "in_span_idle_ms": r3((span - busy) / 1e6),
+                        "gpu_end_after_enqueue_ms": r3((max(o[1] for o in ops) - en) / 1e6)})
+        return res
+
+    ex_corr = sorted((rs, c) for c, (rs, re_, tid, nm) in rt.items() if tid == ex_tid)
+    ex_corr_starts = [x[0] for x in ex_corr]
+
+    def rt_items_sorted_window(st, en):
+        i = bisect.bisect_left(ex_corr_starts, st)
+        j = bisect.bisect_right(ex_corr_starts, en)
+        return [(c, rt[c]) for _, c in ex_corr[i:j]]
+
     cases = {}
     for name, case in results.items():
         w0, w1 = ns(case["t0"]), ns(case["t1"])
@@ -567,6 +615,13 @@ def analyze_nsys(sq, results, tdir):
             "kernel_records": n_kern, "launch_api_calls": n_launch,
             "gaps_over_0p3ms": len(big), "largest_gaps": sorted(big, key=lambda x: -x["ms"])[:12],
         }
+        fs = forward_steps(w0, w1)
+        cases[name]["forward_steps"] = fs[:12]
+        if fs:
+            cases[name]["forward_median"] = {k: r3(med([s[k] for s in fs])) for k in fs[0]}
+        # Big D2H/H2D copies in the window (host-tier KV offload signature).
+        cp = [o for o in ops if o[3] == "C"]
+        cases[name]["memcpy_ms_per_request"] = r3(sum(o[1] - o[0] for o in cp) / 1e6 / nreq)
     out["cases"] = cases
     out["executor_tid"] = ex_tid
     return out

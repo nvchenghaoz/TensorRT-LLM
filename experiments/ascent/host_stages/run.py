@@ -134,8 +134,7 @@ class Server:
         cmd = [sys.executable, "-m", "tensorrt_llm.commands.serve", "serve", ckpt,
                "--host", "127.0.0.1", "--port", str(self.port), "--config", str(cfgp)]
         if nsys_session:
-            cmd = ["nsys", "launch", f"--session-new={nsys_session}", "--trace=cuda,nvtx",
-                   "--trace-fork-before-exec=true"] + cmd
+            cmd = ["nsys", "launch", f"--session-new={nsys_session}", "--trace=cuda,nvtx"] + cmd
         env = dict(os.environ)
         env.update(env_extra)
         env["TLLM_ASCENT_OWNER"] = OWNER
@@ -437,7 +436,8 @@ def main():
                                ("isl1k@4", 12), ("isl300@16", 16), ("isl2k@64", 64)])
             sess = f"asc{uuid.uuid4().hex[:8]}"
             res, tdir, rep = lifetime(ckpt, out, "N_nsys", pf, rng, cases,
-                                      {"ASCENT_TRACE_DIR": "@", "ASCENT_NVTX": "1", "TLLM_NVTX_DEBUG": "1"},
+                                      {"ASCENT_TRACE_DIR": "@", "ASCENT_NVTX": "1", "TLLM_NVTX_DEBUG": "1",
+                                       "TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
                                       nsys_session=sess)
             summary["N"] = analyze.analyze_lifetime(res, tdir)
             repf = (rep or "") + ".nsys-rep"
