@@ -126,13 +126,13 @@ def free_port():
 
 
 class Server:
-    def __init__(self, ckpt, out, tag, env_extra, nsys_session=None):
+    def __init__(self, ckpt, out, tag, env_extra, nsys_session=None, extra_cli=None):
         self.port = free_port()
         cfg = {"kv_cache_config": {"enable_partial_reuse": False}}
         cfgp = Path(out) / f"{tag}_config.yaml"
         cfgp.write_text(json.dumps(cfg))
         cmd = [sys.executable, "-m", "tensorrt_llm.commands.serve", "serve", ckpt,
-               "--host", "127.0.0.1", "--port", str(self.port), "--config", str(cfgp)]
+               "--host", "127.0.0.1", "--port", str(self.port), "--config", str(cfgp)] + list(extra_cli or [])
         if nsys_session:
             cmd = ["nsys", "launch", f"--session-new={nsys_session}", "--trace=cuda,nvtx"] + cmd
         env = dict(os.environ)
@@ -362,12 +362,12 @@ def tokenization_test(ckpt, pf, rng):
 
 
 # ----------------------------------------------------------------- main
-def lifetime(ckpt, out, tag, pf, rng, cases, env_extra, nsys_session=None):
+def lifetime(ckpt, out, tag, pf, rng, cases, env_extra, nsys_session=None, extra_cli=None):
     tdir = Path(out) / f"{tag}_trace"
     if env_extra.get("ASCENT_TRACE_DIR") == "@":
         tdir.mkdir(parents=True, exist_ok=True)
         env_extra = dict(env_extra, ASCENT_TRACE_DIR=str(tdir))
-    srv = Server(ckpt, out, tag, env_extra, nsys_session)
+    srv = Server(ckpt, out, tag, env_extra, nsys_session, extra_cli)
     rep = None
     try:
         srv.wait_ready()
@@ -434,11 +434,20 @@ def main():
         elif mode == "nsys":
             cases = case_list([("isl300@1", 6), ("isl1k@1", 6), ("isl8k@1", 4), ("isl300@4", 12),
                                ("isl1k@4", 12), ("isl300@16", 16), ("isl2k@64", 64)])
-            sess = f"asc{uuid.uuid4().hex[:8]}"
-            res, tdir, rep = lifetime(ckpt, out, "N_nsys", pf, rng, cases,
-                                      {"ASCENT_TRACE_DIR": "@", "ASCENT_NVTX": "1", "TLLM_NVTX_DEBUG": "1",
-                                       "TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
-                                      nsys_session=sess)
+            env = {"ASCENT_TRACE_DIR": "@", "ASCENT_NVTX": "1", "TLLM_NVTX_DEBUG": "1"}
+            try:
+                sess = f"asc{uuid.uuid4().hex[:8]}"
+                res, tdir, rep = lifetime(ckpt, out, "N_nsys", pf, rng, cases, env, nsys_session=sess)
+                summary["topology"] = "multi-process (MPI worker, default frontends)"
+            except RuntimeError as e:
+                log(f"MPI-topology nsys lifetime failed ({str(e)[:300]}); falling back to single process")
+                _cleanup()
+                time.sleep(5)
+                sess = f"asc{uuid.uuid4().hex[:8]}"
+                res, tdir, rep = lifetime(ckpt, out, "N1_nsys", pf, rng, cases,
+                                          dict(env, TLLM_WORKER_USE_SINGLE_PROCESS="1"), nsys_session=sess,
+                                          extra_cli=["--num_serve_frontends", "1"])
+                summary["topology"] = "single process worker, 1 frontend (fallback)"
             summary["N"] = analyze.analyze_lifetime(res, tdir)
             repf = (rep or "") + ".nsys-rep"
             if rep and os.path.exists(repf):
