@@ -65,6 +65,7 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
@@ -1850,6 +1851,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             self.spec_worker is None
             and spec_metadata is None
             and not return_context_logits
+            and type(self.logits_processor) is LogitsProcessor
             and attn_metadata is not None
             and getattr(attn_metadata, "seq_lens_cuda", None) is not None
             and not is_torch_compiling()
@@ -1877,13 +1879,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                 torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
             )
             hidden = self.model.norm(output[last_tokens])
-            # The rows are already gathered: project them as they are.
-            logits = self.logits_processor.forward(
-                hidden,
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
+            # The rows are already gathered: project them as LogitsProcessor
+            # does after its own gather (lm_head, then FP32).
+            logits = self.lm_head(hidden).float()
             if self.config.final_logit_softcapping is not None:
                 cap = self.config.final_logit_softcapping
                 logits = torch.tanh(logits / cap) * cap
