@@ -602,9 +602,6 @@ class BaseWorker(GenerationExecutor):
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """
-        from tensorrt_llm import _ascent_trace as _AT
-        if _AT.ENABLED:
-            _AT.ev("w_submit0", cid=request.id)
         self.start()
 
         if self.rank != 0:
@@ -638,8 +635,6 @@ class BaseWorker(GenerationExecutor):
                 self._results.pop(client_id, None)
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
-        if _AT.ENABLED:
-            _AT.ev("w_submit1", cid=client_id)
 
         self._handle_background_error()
 
@@ -1597,10 +1592,6 @@ class AwaitResponseHelper:
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''
-        from tensorrt_llm import _ascent_trace as _AT
-        if _AT.ENABLED:
-            _AT.ev("w_ipc0",
-                   cids=[getattr(r, "client_id", None) for r in responses])
         postproc_batches = [
             []
             for _ in range(self.worker.postproc_config.num_postprocess_workers)
@@ -1645,8 +1636,6 @@ class AwaitResponseHelper:
                         lanes[frontend_id].put(sub_batch)
             else:
                 self.worker.result_queue.put(rsp_batch)
-        if _AT.ENABLED:
-            _AT.ev("w_ipc1", nr=len(rsp_batch))
 
 
 def _get_params_for_first_rsp(

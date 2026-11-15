@@ -802,11 +802,6 @@ class DecoderRunner(ScheduledModelRunner):
                 and not self.cuda_graph_runner.needs_capture(key)
             ):
                 step_inputs.begin()
-            from tensorrt_llm import _ascent_trace as _AT
-
-            if _AT.ENABLED and not is_dummy:
-                _AT.ev("pi0")
-                _AT.rpush("AT:prepare_inputs")
             with self._cuda_graph_metadata_prepare_scope(
                 attn_metadata,
                 key,
@@ -830,9 +825,6 @@ class DecoderRunner(ScheduledModelRunner):
                     is_dummy=is_dummy,
                     gather_context_logits=gather_context_logits,
                 )
-            if _AT.ENABLED and not is_dummy:
-                _AT.rpop()
-                _AT.ev("pi1")
             inputs = prepared.kwargs
             runtime_draft_len = prepared.runtime_draft_len
             if moe_warmup_placement.active() and not torch.cuda.is_current_stream_capturing():

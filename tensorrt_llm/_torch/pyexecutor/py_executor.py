@@ -27,7 +27,6 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm import _ascent_trace as _AT
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
@@ -7864,12 +7863,6 @@ class PyExecutor:
                 self.hang_detector.checkpoint()
                 profile_step()
                 self._stage_begin()
-                _atr = None
-                if _AT.ENABLED:
-                    _atr = {"top": _AT.now()}
-                    _AT.gpu_ev("anchor", self.execution_stream,
-                               it=self.iter_counter)
-                    _AT.clk_mark()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 self._start_response_staging_iteration()
@@ -7910,26 +7903,9 @@ class PyExecutor:
                 # behind the step in flight; it is posted after _update_requests.
                 # Preparing a receive reports it to a KV connector, which must
                 # see it after that work, so a connector keeps the wait.
-                _AT.rpush("AT:schedule")
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch(
                     defer_gen_receives=self.previous_batch is not None
                     and self.kv_connector_manager is None)
-                _AT.rpop()
-                if _atr is not None:
-                    _atr["sched"] = _AT.now()
-                    if scheduled_batch is not None:
-                        try:
-                            _atr["ctx"] = [
-                                r.py_client_id
-                                for r in scheduled_batch.context_requests
-                            ]
-                            _atr["ntok"] = int(
-                                sum(r.context_chunk_size
-                                    for r in scheduled_batch.context_requests))
-                            _atr["ngen"] = len(
-                                scheduled_batch.generation_requests)
-                        except Exception as _e:  # noqa: BLE001
-                            _atr["ctx_err"] = str(_e)[:120]
                 self._stage_mark('schedule')
 
                 if scheduled_batch is None:
@@ -7996,11 +7972,7 @@ class PyExecutor:
 
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
-                    _AT.rpush("AT:prepare_resources")
                     self.resource_manager.prepare_resources(scheduled_batch)
-                    _AT.rpop()
-                    if _atr is not None:
-                        _atr["prep"] = _AT.now()
 
                 if self._kv_connector_moves_kv:
                     self.kv_connector_manager.handle_metadata()
@@ -8058,19 +8030,9 @@ class PyExecutor:
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         self._stage_mark('pre_forward')
-                        if _atr is not None:
-                            _atr["fwd0"] = _AT.now()
-                            _AT.gpu_ev("g_fwd0", self.execution_stream,
-                                       it=self.iter_counter)
-                        _AT.rpush("AT:forward_step")
                         with self._step_scope(scheduled_batch):
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device)
-                        _AT.rpop()
-                        if _atr is not None:
-                            _atr["fwd1"] = _AT.now()
-                            _AT.gpu_ev("g_fwd1", self.execution_stream,
-                                       it=self.iter_counter)
 
                     self._stage_mark('forward')
                     if batch_outputs is None:
@@ -8107,17 +8069,11 @@ class PyExecutor:
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._intake_window_started = time.monotonic()
                     self._intake_window.set()
-                    if _atr is not None:
-                        _atr["upd0"] = _AT.now()
-                    _AT.rpush("AT:update_requests_prev")
                     try:
                         self._update_requests(self.previous_batch.sample_state)
                     finally:
                         if not self.is_shutdown:
                             self._intake_window.clear()
-                    _AT.rpop()
-                    if _atr is not None:
-                        _atr["upd1"] = _AT.now()
                     # Turning off speculative decoding when Acceptance Rate is low.
                     # In overlap scheduler path, it will do an extra iter with spec decode on.
                     if self.speculation_gate is not None:
@@ -8189,15 +8145,8 @@ class PyExecutor:
                                     batch_outputs['logits'])
 
                             self._stage_mark('update_prev')
-                            if _atr is not None:
-                                _atr["s0"] = _AT.now()
-                            _AT.rpush("AT:sample_async")
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
-                            _AT.rpop()
-                            if _atr is not None:
-                                _atr["s1"] = _AT.now()
-                                _AT.gpu_ev("g_s1", None, it=self.iter_counter)
 
                     assert sample_state is not None, "Sampling failed"
 
@@ -8229,15 +8178,8 @@ class PyExecutor:
                     # indices used by the current batch's input preparation.
                     self._wait_for_model_engine_input_copy()
                     self._stage_mark('sample')
-                    if _atr is not None:
-                        _atr["pp0"] = _AT.now()
-                        _atr["prev_it"] = self.previous_batch.iter_id
-                    _AT.rpush("AT:process_previous_batch")
                     self._process_previous_batch(
                         scheduled_batch if can_queue else None)
-                    _AT.rpop()
-                    if _atr is not None:
-                        _atr["pp1"] = _AT.now()
                     self._stage_mark('process_prev')
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
@@ -8305,14 +8247,6 @@ class PyExecutor:
                     self.disagg.pace_idle()
 
                 self._stage_mark('tail')
-                if _atr is not None:
-                    if not can_queue:
-                        _atr["ctx"] = []
-                    _AT.ev("ex_pass",
-                           it=self.iter_counter,
-                           cq=bool(can_queue),
-                           tail=_AT.now(),
-                           **_atr)
                 self._stage_end(can_queue)
                 self.iter_counter += 1
 
@@ -9421,10 +9355,6 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
-        if _AT.ENABLED and validated_requests:
-            _AT.ev("ex_fetch",
-                   cids=[r.py_client_id for r in validated_requests],
-                   it=self.iter_counter)
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             with disagg_diagnostics.suppress_diagnostic_errors():
                 for request in validated_requests:
@@ -12247,13 +12177,6 @@ class PyExecutor:
     def _publish_responses(self,
                            responses: Iterable[Tuple[int, LlmResponse,
                                                      Optional["ActorHandle"]]]):
-        if _AT.ENABLED:
-            responses = list(responses)
-            if responses:
-                _AT.ev("ex_pub",
-                       cids=[getattr(r, "client_id", None)
-                             for _, r, _ in responses],
-                       it=self.iter_counter)
         with self.response_cv:
             for req_id, resp, result_wait_queue in responses:
                 if req_id in self.responses.keys():
