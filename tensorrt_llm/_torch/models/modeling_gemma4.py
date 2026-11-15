@@ -56,6 +56,14 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from ..kernels.fused_ops.embed_scale_rmsnorm import embed_scale_rmsnorm, rmsnorm_replay_supported
 from ..kernels.fused_ops.gate_up_gelu_fp4_chunked import gate_up_gelu_fp4_chunked
 from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
+from ..kernels.fused_ops.nvfp4_gelu_gemm_sm120 import (
+    ensure_gelu_gemm_workspace,
+    gate_up_gelu_fp4_permuted,
+    gate_up_perm,
+    gelu_gemm_epi_supported,
+    get_gelu_gemm_module,
+    permute_gate_up_rows,
+)
 from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
 from ..kernels.fused_ops.rmsnorm_residual_add import (
     rmsnorm_residual_add,
@@ -414,11 +422,133 @@ class _Gemma4GeluQuantMLP(GatedMLP):
     remains only for configurations the kernel does not support.
     """
 
+    # Fused gate_up GEMM + gelu_tanh*up + NVFP4-quant epilogue (SM120). It runs
+    # TRT-LLM's FP4GemmRunner tactic-2 mainloop (256x128x128), so it is used
+    # exactly where the in-process AutoTuner's gate_up pick is that tactic
+    # (gate_up_gelu_fp4_permuted). With gate_up rows permuted, every other path
+    # (the M-chunked chain and the unchunked one) uses the permuted-gather act.
+    gelu_epi_calls = [0, 0]  # [fused, unfused-on-permuted-rows], for A/B accounting
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Decided lazily on first use: down_proj quant attributes are
         # finalized after __init__.
         self._fused_gelu_quant: Optional[bool] = None
+        config = kwargs.get("config")
+        self._gelu_epi_allowed = config is None or getattr(config, "lora_config", None) is None
+        # True once gate_up's FP4 rows and swizzled SF rows are in the
+        # fused-epilogue order (set by post_load_weights on fresh weights).
+        self._gelu_epi_permuted = False
+        self._gelu_epi_inv_perm: Optional[torch.Tensor] = None
+
+    def _gelu_epi_eligible(self) -> bool:
+        if self.split_gate_up or not self._gelu_epi_allowed or not gelu_gemm_epi_supported():
+            return False
+        gp = self.gate_up_proj
+        n = gp.weight.shape[0]
+        return (
+            self._fused_gelu_quant_enabled()
+            and getattr(gp, "has_nvfp4", False)
+            and not getattr(gp, "force_dynamic_quantization", True)
+            and getattr(gp, "input_scale", None) is not None
+            and getattr(gp, "pre_quant_scale", None) is None
+            and getattr(gp, "scaling_vector_size", None) == 16
+            and getattr(gp, "bias", None) is None
+            and gp.weight.dim() == 2
+            and n == gp.out_features
+            and n % 128 == 0
+            and gp.in_features % 64 == 0
+            and "marlin" not in getattr(gp, "nvfp4_allowed_backends", ())
+        )
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        gp = getattr(self, "gate_up_proj", None)
+        # Only fresh weights: Linear.load_weights clears _weights_transformed and
+        # gate_up's own transform (run after this parent hook) sets it again,
+        # so a repeated post-load walk never permutes twice.
+        if gp is None or getattr(gp, "_weights_transformed", True):
+            return
+        self._gelu_epi_permuted = False
+        self._gelu_epi_inv_perm = None
+        if not self._gelu_epi_eligible() or get_gelu_gemm_module() is None:
+            return
+        w, ws = permute_gate_up_rows(gp.weight.data, gp.weight_scale.data, gp.in_features)
+        gp.weight.data.copy_(w)
+        gp.weight_scale.data.copy_(ws)
+        del w, ws
+        ensure_gelu_gemm_workspace(gp.weight.device)  # before any CUDA-graph capture
+        self._gelu_epi_permuted = True
+        logger.info_once(
+            "Gemma4 fused gate_up NVFP4 GEMM + gelu_tanh*up + NVFP4-quant epilogue: enabled "
+            "(set TRTLLM_GEMMA4_GATEUP_GELU_EPI=0 to disable)",
+            key="gemma4_gateup_gelu_epi",
+        )
+
+    def _gelu_epi_forward(self, x, final_all_reduce_params=None, lora_params=None) -> torch.Tensor:
+        """forward() on permuted gate_up rows: (a) fused op at ('cutlass', 2),
+        (b) main's M-chunked chain with the permuted-gather act, (c) the tuned
+        gate_up GEMM + permuted-gather act. Never the unpermuted act."""
+        if bool(lora_params):
+            raise NotImplementedError("Gemma4 gate_up gelu epilogue: LoRA is not supported")
+        gp = self.gate_up_proj
+        if is_torch_compiling():
+            # gate_up's columns are on the fused-epilogue order: restore them.
+            if self._gelu_epi_inv_perm is None:
+                self._gelu_epi_inv_perm = torch.argsort(
+                    gate_up_perm(gp.weight.shape[0], gp.weight.device)
+                )
+            h1 = gp(x)
+            h1 = h1.index_select(-1, self._gelu_epi_inv_perm)
+            h2 = self._apply_activation(h1)
+            return self.down_proj(
+                h2, all_reduce_params=final_all_reduce_params, layer_idx=self.layer_idx
+            )
+
+        # Same chunk-band conditions as main's forward, on the caller's x.
+        chunk_rows = _MLP_CHUNK_ROWS if self._chunk_applies(x) else None
+        lead_shape = None
+        if isinstance(x, Fp4QuantizedTensor) or isinstance(x, tuple):
+            t = x.fp4_tensor if isinstance(x, Fp4QuantizedTensor) else x[0]
+            if t.dim() > 2:
+                lead_shape = t.shape[:-1]
+        elif x.dim() > 2:
+            lead_shape = x.shape[:-1]
+            x = x.reshape(-1, x.shape[-1])
+        if lead_shape is not None and not isinstance(x, torch.Tensor):
+            if isinstance(x, Fp4QuantizedTensor):
+                x = Fp4QuantizedTensor(
+                    x.fp4_tensor.reshape(-1, x.fp4_tensor.shape[-1]),
+                    x.scaling_factor,
+                    x.is_sf_swizzled,
+                    unquantized_hidden_states=x.unquantized_hidden_states,
+                    reciprocal_scale=x.reciprocal_scale,
+                )
+            else:
+                x = (x[0].reshape(-1, x[0].shape[-1]), x[1])
+        act_fp4, act_sf, alpha = gp.quant_method._input_prepare(gp, x)
+        gx = x if not isinstance(x, torch.Tensor) else Fp4QuantizedTensor(act_fp4, act_sf)
+        fp4, sf, path = gate_up_gelu_fp4_permuted(
+            act_fp4,
+            act_sf,
+            gp.weight,
+            gp.weight_scale,
+            alpha,
+            gp.dtype,
+            gp.nvfp4_allowed_backends,
+            self.down_proj.input_scale,
+            chunk_rows,
+            lambda: gp(gx),
+        )
+        _Gemma4GeluQuantMLP.gelu_epi_calls[0 if path == "fused" else 1] += 1
+        output = self.down_proj(
+            Fp4QuantizedTensor(fp4, sf),
+            all_reduce_params=final_all_reduce_params,
+            layer_idx=self.layer_idx,
+        )
+        if lead_shape is not None:
+            output = output.reshape(*lead_shape, output.shape[-1])
+        return output
 
     def _fused_gelu_quant_enabled(self) -> bool:
         if self._fused_gelu_quant is None:
@@ -454,9 +584,8 @@ class _Gemma4GeluQuantMLP(GatedMLP):
             return Fp4QuantizedTensor(fp4, sf)
         return super()._apply_activation(x, has_lora=has_lora)
 
-    def _chunked_gate_up_act(self, x) -> Optional[Fp4QuantizedTensor]:
-        """M-chunked gate_up -> gelu+quant (bitwise equal to the full-M chain),
-        or None when it does not apply."""
+    def _chunk_applies(self, x) -> bool:
+        """Main's conditions for the M-chunked gate_up -> gelu+quant chain."""
         if not (
             _MLP_CHUNK_ENABLED
             and isinstance(x, Fp4QuantizedTensor)
@@ -467,9 +596,9 @@ class _Gemma4GeluQuantMLP(GatedMLP):
             and not self.split_gate_up
             and self._fused_gelu_quant_enabled()
         ):
-            return None
+            return False
         gu = self.gate_up_proj
-        if not (
+        return (
             type(gu.quant_method) is NVFP4LinearMethod
             and gu.tp_mode == TensorParallelMode.COLUMN
             and not gu.gather_output
@@ -479,8 +608,14 @@ class _Gemma4GeluQuantMLP(GatedMLP):
             and gu.all_reduce is None
             and gu.weight.shape[0] == gu.out_features
             and "marlin" not in gu.nvfp4_allowed_backends
-        ):
+        )
+
+    def _chunked_gate_up_act(self, x) -> Optional[Fp4QuantizedTensor]:
+        """M-chunked gate_up -> gelu+quant (bitwise equal to the full-M chain),
+        or None when it does not apply. Unpermuted gate_up rows only."""
+        if not self._chunk_applies(x):
             return None
+        gu = self.gate_up_proj
         act_fp4, act_sf, alpha = gu.quant_method._input_prepare(gu, x)
         res = gate_up_gelu_fp4_chunked(
             act_fp4,
@@ -499,6 +634,10 @@ class _Gemma4GeluQuantMLP(GatedMLP):
 
     def forward(self, x, all_rank_num_tokens=None, final_all_reduce_params=None,
                 lora_params=None, **kwargs):
+        if self._gelu_epi_permuted:
+            return self._gelu_epi_forward(
+                x, final_all_reduce_params=final_all_reduce_params, lora_params=lora_params
+            )
         if not lora_params:
             h2 = self._chunked_gate_up_act(x)
             if h2 is not None:
