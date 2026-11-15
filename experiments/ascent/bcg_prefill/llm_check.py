@@ -80,10 +80,11 @@ def run_arm(arm, checkpoint, buckets, out_path):
     result = {"arm": arm, "startup_s": startup_s, "cases": {}}
     for L in LENGTHS:
         prompt = make_prompt(L, 0)
-        times, outs = [], []
+        times, outs, all_times = [], [], []
         for i in range(WARMUP + REPEATS):
             dt, toks, lps = one(prompt)
             outs.append((toks, lps))
+            all_times.append(dt)
             if i >= WARMUP:
                 times.append(dt)
         first = outs[0]
@@ -98,6 +99,7 @@ def run_arm(arm, checkpoint, buckets, out_path):
             "median_ms": med,
             "p10_ms": pct(times, 0.1),
             "p90_ms": pct(times, 0.9),
+            "first_call_ms": all_times[0],
             "tokens": first[0],
             "logprobs": first[1],
             "repeat_tokens_same": rep_same,
@@ -135,6 +137,7 @@ def main():
     ap.add_argument("--buckets", default="300,320,512,1000,1024,1200,2000")
     ap.add_argument("--arms", default="eager,bcg")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--diag", action="store_true")
     args = ap.parse_args()
     buckets = [int(x) for x in args.buckets.split(",") if x]
     if args.arm:
@@ -142,11 +145,44 @@ def main():
         return
     art = os.environ.get("AUTO_DEV_ARTIFACTS", "/tmp")
     res = {}
+    step_timing = {}
     for arm in args.arms.split(","):
         out = os.path.join(art, f"arm_{arm}.json")
         log(f"starting arm {arm}")
-        p = subprocess.run([sys.executable, __file__, "--arm", arm, "--checkpoint",
-                            args.checkpoint, "--buckets", args.buckets, "--out", out])
+        env = dict(os.environ)
+        if args.diag:
+            env["TRTLLM_PREFILL_STEP_TIMING"] = "1"
+        p = subprocess.Popen([sys.executable, __file__, "--arm", arm, "--checkpoint",
+                              args.checkpoint, "--buckets", args.buckets, "--out", out],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             env=env)
+        rows = {}
+        import re
+
+        ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+        filt = open(os.path.join(art, f"filtered_{arm}.txt"), "w")
+        for line in p.stdout:
+            line = ansi.sub("", line)
+            if any(s in line for s in ("BCG", "PREFILL_STEP", "prefill CUDA graph", "Captured",
+                                       "Breakable", "KV cache", "kv cache", "Memory",
+                                       "memory", "breakable")):
+                filt.write(line)
+                filt.flush()
+            if "PREFILL_STEP_TIMING" in line:
+                kv = dict(t.split("=", 1) for t in line.split("PREFILL_STEP_TIMING", 1)[1].split()
+                          if "=" in t)
+                key = f"{kv['tokens']}->{kv['run_as']}:{kv['mode']}"
+                rows.setdefault(key, {"host": [], "gpu": []})
+                rows[key]["host"].append(float(kv["host_enqueue_ms"]))
+                rows[key]["gpu"].append(float(kv["gpu_ms"]))
+                continue
+            print(line, end="", flush=True)
+        p.wait()
+        step_timing[arm] = {
+            k: {"n": len(v["host"]), "host_enqueue_ms_median": statistics.median(v["host"]),
+                "gpu_ms_median": statistics.median(v["gpu"]),
+                "host_p10_p90": [pct(v["host"], 0.1), pct(v["host"], 0.9)]}
+            for k, v in rows.items() if len(v["host"]) >= 3}
         if p.returncode != 0 or not os.path.exists(out):
             print(json.dumps({"passed": False, "error": f"arm {arm} failed rc={p.returncode}"}))
             return
@@ -154,13 +190,16 @@ def main():
             res[arm] = json.load(f)
     base = res.get("eager")
     summary = {"passed": True, "compared": "bcg vs eager main path, same process settings",
-               "startup_s": {a: r["startup_s"] for a, r in res.items()}, "cases": {}}
+               "startup_s": {a: r["startup_s"] for a, r in res.items()}, "cases": {},
+            "step_timing": step_timing}
     for arm, r in res.items():
         for case, c in r["cases"].items():
             row = summary["cases"].setdefault(case, {})
             row[f"{arm}_median_ms"] = round(c["median_ms"], 3)
             row[f"{arm}_p10_p90"] = [round(c["p10_ms"], 3), round(c["p90_ms"], 3)]
             row[f"{arm}_repeat_same"] = c["repeat_tokens_same"]
+            if "first_call_ms" in c:
+                row[f"{arm}_first_call_ms"] = round(c["first_call_ms"], 3)
             if not c["repeat_tokens_same"]:
                 summary["passed"] = False
             if base is not None and arm != "eager":

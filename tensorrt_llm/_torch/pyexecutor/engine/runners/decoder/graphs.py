@@ -6,6 +6,7 @@
 import contextlib
 import functools
 import os
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, NamedTuple, Protocol
@@ -69,6 +70,9 @@ _BREAK_GRAPH_NUM_CONTEXTS = (1, 2)
 # fixed cadence so a server log shows which steps replayed.
 _BCG_STEP_COUNTS = {"replayed": 0, "eager": 0}
 _BCG_STEP_LOG_EVERY = int(os.environ.get("TRTLLM_BCG_STEP_LOG_EVERY", "64"))
+# Diagnostics only (default off): synchronize around each non-dummy no-key step
+# and log its host enqueue time and GPU time.
+_STEP_TIMING_DIAG = os.environ.get("TRTLLM_PREFILL_STEP_TIMING", "0") == "1"
 
 
 def _count_bcg_step(replayed: bool, num_tokens: int, real_num_tokens: int) -> None:
@@ -590,11 +594,30 @@ class DecoderCudaGraphs:
                     num_tokens,
                     int(getattr(attn_metadata, "num_tokens", num_tokens) or num_tokens),
                 )
-            if can_run_breakable_graph and not breakable_runner.is_warming_up:
+            replay = bool(
+                can_run_breakable_graph and not breakable_runner.is_warming_up
+            )
+            diag = _STEP_TIMING_DIAG and not is_dummy
+            if diag:
+                torch.cuda.synchronize()
+                ev0 = torch.cuda.Event(enable_timing=True)
+                ev1 = torch.cuda.Event(enable_timing=True)
+                t0 = time.perf_counter()
+                ev0.record()
+            if replay:
                 outputs = breakable_runner.execute(num_tokens, lambda: run_model(inputs))
             else:
                 # real eager or BCG warmup or PCG
                 outputs = run_model(inputs)
+            if diag:
+                host_ms = (time.perf_counter() - t0) * 1e3
+                ev1.record()
+                torch.cuda.synchronize()
+                logger.info(
+                    f"PREFILL_STEP_TIMING tokens={int(getattr(attn_metadata, 'num_tokens', 0))} "
+                    f"run_as={num_tokens} mode={'replay' if replay else 'eager'} "
+                    f"host_enqueue_ms={host_ms:.3f} gpu_ms={ev0.elapsed_time(ev1):.3f}"
+                )
         else:
             needs_capture = self.cuda_graph_runner.needs_capture(key)
             if needs_capture:
