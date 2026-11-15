@@ -132,8 +132,36 @@ def summarize(o):
     return {"ids": list(c.token_ids), "lp": lps}
 
 
+def proof_output_class():
+    """output.class is not asserted by the timing run: it is derived from the pinned-tactic
+    proof (pin_proof.py) whose summary lives in BCG_PROOF_DIR with a sha256 manifest. Without a
+    verified, passing proof no class is claimed."""
+    d = os.environ.get("BCG_PROOF_DIR")
+    if not d:
+        return {"class_source": "none: BCG_PROOF_DIR unset, no output class claimed"}
+    try:
+        import hashlib
+        man = json.load(open(os.path.join(d, "manifest.json")))
+        p = os.path.join(d, "pin_proof_summary.json")
+        with open(p, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        if sha != man["files"]["pin_proof_summary.json"]:
+            return {"class_source": f"none: sha256 mismatch for {p}"}
+        s = json.load(open(p))
+    except Exception as e:  # noqa: BLE001
+        return {"class_source": f"none: proof unreadable ({e!r})"}
+    src = {"proof_summary": p, "sha256": sha, "proof_passed": bool(s.get("passed")),
+           "proof_head": (s.get("provenance") or {}).get("rev-parse HEAD")}
+    if s.get("passed"):
+        return {"class": "exact", "class_source": src}
+    return {"class_source": dict(src, note="proof did not pass; no output class claimed")}
+
+
 def mode_time():
     print_dims()
+    log(f"TRTLLM_FI_HOST_PREFILL_PLAN={os.environ.get('TRTLLM_FI_HOST_PREFILL_PLAN', '<unset>')} "
+        f"BCG_OVERLAY={os.environ.get('BCG_OVERLAY', '<unset: 1>')} "
+        f"TLLM_AUTOTUNER_CACHE_PATH={os.environ.get('TLLM_AUTOTUNER_CACHE_PATH')}")
     llm = build_llm()
     params = sp()
     pf = Prompts(1234)
@@ -191,7 +219,7 @@ def mode_time():
         res[name] = {"step_ms": round(med, 3), "p10": round(p10, 3), "p90": round(p90, 3),
                      "noise_floor": round((p90 - p10) / med, 4), "n": len(ts)}
         log(f"{name}: median {med:.2f} ms p10 {p10:.2f} p90 {p90:.2f}")
-    print(json.dumps({"batch": res, "output": {"class": "exact"}, "overlay": overlay(),
+    print(json.dumps({"batch": res, "output": proof_output_class(), "overlay": overlay(),
                       "bcg_context_steps": steps, "memory": mem}), flush=True)
 
 
