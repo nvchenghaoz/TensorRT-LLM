@@ -65,6 +65,22 @@ from .warmup import WarmupAgreement
 # schedule more, and their breaks run eagerly.
 _BREAK_GRAPH_NUM_CONTEXTS = (1, 2)
 
+# Context steps served by breakable prefill graph replay vs eager, logged at a
+# fixed cadence so a server log shows which steps replayed.
+_BCG_STEP_COUNTS = {"replayed": 0, "eager": 0}
+_BCG_STEP_LOG_EVERY = int(os.environ.get("TRTLLM_BCG_STEP_LOG_EVERY", "64"))
+
+
+def _count_bcg_step(replayed: bool, num_tokens: int, real_num_tokens: int) -> None:
+    _BCG_STEP_COUNTS["replayed" if replayed else "eager"] += 1
+    total = _BCG_STEP_COUNTS["replayed"] + _BCG_STEP_COUNTS["eager"]
+    if _BCG_STEP_LOG_EVERY > 0 and (total <= 8 or total % _BCG_STEP_LOG_EVERY == 0):
+        logger.info(
+            f"BCG context steps: replayed={_BCG_STEP_COUNTS['replayed']} "
+            f"eager={_BCG_STEP_COUNTS['eager']} (last: tokens={real_num_tokens}, "
+            f"run as {num_tokens}, {'replay' if replayed else 'eager'})"
+        )
+
 
 def _make_single_token_context_graph_batch(
     scheduled_requests: ScheduledRequests,
@@ -568,6 +584,12 @@ class DecoderCudaGraphs:
                 and not gather_context_logits
                 and breakable_runner.has_graph(num_tokens)
             )
+            if breakable_runner is not None and not is_dummy:
+                _count_bcg_step(
+                    bool(can_run_breakable_graph and not breakable_runner.is_warming_up),
+                    num_tokens,
+                    int(getattr(attn_metadata, "num_tokens", num_tokens) or num_tokens),
+                )
             if can_run_breakable_graph and not breakable_runner.is_warming_up:
                 outputs = breakable_runner.execute(num_tokens, lambda: run_model(inputs))
             else:
