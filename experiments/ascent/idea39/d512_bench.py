@@ -291,7 +291,9 @@ def driver(a):
         env = dict(os.environ)
         if arm == "overlay":
             env["FLASHINFER_WORKSPACE_BASE"] = tempfile.mkdtemp(prefix="idea39_ws_")
+            # VERBOSE=1 alone also turns on --device-debug -O0 (jit/core.py); DEBUG=0 keeps -O3
             env["FLASHINFER_JIT_VERBOSE"] = "1"
+            env["FLASHINFER_JIT_DEBUG"] = "0"
             env["FLASHINFER_EXTRA_CUDAFLAGS"] = "-Xptxas=-v"
         cmd = [sys.executable, __file__, "--arm", arm] + common
         log("DRIVER run", arm, "ws", env.get("FLASHINFER_WORKSPACE_BASE", "<default>"))
