@@ -4,8 +4,8 @@ per-row split-KV merge (stage 2), kernel A/B and byte checks on synthetic Gemma4
 Arms (all in one process, same GPU, interleaved per round):
   base  the tree's default (run in the baseline = main tree; env switches do not exist there)
   off   FLASHINFER_FA2_LPT=0 FLASHINFER_FA2_MERGE_ROWS=0   (branch code paths == main's)
-  s1    FLASHINFER_FA2_LPT=1 FLASHINFER_FA2_MERGE_ROWS=0   (stage 1)
-  s12   FLASHINFER_FA2_LPT=1 FLASHINFER_FA2_MERGE_ROWS=1   (stage 1 + 2)
+  s1    FLASHINFER_FA2_LPT=1 FLASHINFER_FA2_MERGE_ROWS=0   (stage 1, auto order)
+  s12   FLASHINFER_FA2_LPT=1 FLASHINFER_FA2_MERGE_ROWS=1   (stage 1 + 2; the branch default)
 
 Calls are made exactly as TRT-LLM's FLASHINFER backend makes them: HND paged FP8 E4M3 KV,
 page 32, BF16 Q/O, causal, window_left = sliding_window - 1 on sliding layers, plan() then
@@ -39,6 +39,12 @@ ARM_ENV = {
     "off": {"FLASHINFER_FA2_LPT": "0", "FLASHINFER_FA2_MERGE_ROWS": "0"},
     "s1": {"FLASHINFER_FA2_LPT": "1", "FLASHINFER_FA2_MERGE_ROWS": "0"},
     "s12": {"FLASHINFER_FA2_LPT": "1", "FLASHINFER_FA2_MERGE_ROWS": "1"},
+    # order variants (stage 2 on): 2 requests longest-first with each request's items
+    # descending, 3 item-major grid without any sort (diagnostic)
+    "rm": {"FLASHINFER_FA2_LPT": "2", "FLASHINFER_FA2_MERGE_ROWS": "1"},
+    "grid": {"FLASHINFER_FA2_LPT": "3", "FLASHINFER_FA2_MERGE_ROWS": "1"},
+    "rm1": {"FLASHINFER_FA2_LPT": "2", "FLASHINFER_FA2_MERGE_ROWS": "0"},
+    "glob": {"FLASHINFER_FA2_LPT": "4", "FLASHINFER_FA2_MERGE_ROWS": "1"},
 }
 DIGEST_FILE = "/tmp/ascent_b38_lpt95_base_digests.json"
 
@@ -142,8 +148,12 @@ class Case:
         return out
 
 
-def bench_cases(dims):
-    shapes = [(1, 300), (1, 1000), (3, 1000), (1, 2000), (4, 2000), (16, 300), (1, 8000)]
+ACCEPT_SHAPES = "1x300,1x1000,3x1000,1x2000,4x2000,16x300,1x8000"
+PROTOCOL_EXTRA_SHAPES = "27x300,8x1000,1x4000,2x4000"
+
+
+def bench_cases(dims, shapes_arg=ACCEPT_SHAPES + "," + PROTOCOL_EXTRA_SHAPES):
+    shapes = [tuple(int(x) for x in s.split("x")) for s in shapes_arg.split(",")]
     cs = []
     for layer in ("sliding", "global"):
         for b, s in shapes:
@@ -467,6 +477,7 @@ def main():
     ap.add_argument("--rounds", type=int, default=15)
     ap.add_argument("--only", default="", help="comma list of case labels to keep")
     ap.add_argument("--no-extras", action="store_true")
+    ap.add_argument("--shapes", default=ACCEPT_SHAPES + "," + PROTOCOL_EXTRA_SHAPES)
     ap.add_argument("--ref-limit", type=float, default=2.0e7)
     a = ap.parse_args()
     t0 = time.time()
@@ -480,7 +491,7 @@ def main():
     log("flashinfer", getattr(flashinfer, "__version__", "?"), flashinfer.__file__)
     log("ARMS", arms, "R", a.R, "W", a.W, "rounds", a.rounds)
 
-    cases = bench_cases(dims)
+    cases = bench_cases(dims, a.shapes)
     extras = [] if a.no_extras else [make_extra(s, dims) for s in extra_case_specs()]
     if a.only:
         keep = set(a.only.split(","))

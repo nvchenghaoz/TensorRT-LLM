@@ -552,7 +552,8 @@ inline void FA2SortPrefillItemsLongestFirst(
     std::vector<IdType>& kv_tile_indices, const IdType* qo_indptr_h, const IdType* kv_indptr_h,
     uint32_t batch_size, uint32_t gqa_group_size, uint32_t page_size, uint32_t cta_tile_q,
     int64_t kv_chunk_size_pages, bool disable_split_kv,
-    const std::vector<int64_t>& effective_kv_len_arr, int32_t window_left) {
+    const std::vector<int64_t>& effective_kv_len_arr, int32_t window_left,
+    bool request_major) {
   const size_t n = request_indices.size();
   std::vector<int64_t> num_chunks(batch_size);
   for (uint32_t r = 0; r < batch_size; ++r) {
@@ -582,8 +583,25 @@ inline void FA2SortPrefillItemsLongestFirst(
   }
   std::vector<uint32_t> order(n);
   for (size_t i = 0; i < n; ++i) order[i] = static_cast<uint32_t>(i);
-  std::stable_sort(order.begin(), order.end(),
-                   [&work](uint32_t a, uint32_t b) { return work[a] > work[b]; });
+  if (request_major) {
+    // Requests by their longest item, descending; items of one request stay together.
+    std::vector<int64_t> req_max(batch_size, 0);
+    for (size_t i = 0; i < n; ++i) {
+      req_max[request_indices[i]] = std::max(req_max[request_indices[i]], work[i]);
+    }
+    std::vector<uint32_t> reqs(batch_size), rank(batch_size);
+    for (uint32_t r = 0; r < batch_size; ++r) reqs[r] = r;
+    std::stable_sort(reqs.begin(), reqs.end(),
+                     [&req_max](uint32_t a, uint32_t b) { return req_max[a] > req_max[b]; });
+    for (uint32_t k = 0; k < batch_size; ++k) rank[reqs[k]] = k;
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+      const uint32_t ra = rank[request_indices[a]], rb = rank[request_indices[b]];
+      return ra != rb ? ra < rb : work[a] > work[b];
+    });
+  } else {
+    std::stable_sort(order.begin(), order.end(),
+                     [&work](uint32_t a, uint32_t b) { return work[a] > work[b]; });
+  }
   std::vector<IdType> req(n), qtile(n), kvtile(n);
   for (size_t i = 0; i < n; ++i) {
     req[i] = request_indices[order[i]];
@@ -741,11 +759,28 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   // FLASHINFER_FA2_LPT (d512_tile64_config.cuh): paged plans without CUDA graphs emit their
   // items longest-first. Items only name (request, q tile, kv chunk); the kernels address Q,
   // O, LSE and the partial outputs by those, so the permutation moves no result.
-  if (!enable_cuda_graph && page_size > 1 && new_batch_size > 1 && FA2LptEnabled()) {
-    FA2SortPrefillItemsLongestFirst(request_indices, qo_tile_indices, kv_tile_indices,
-                                    qo_indptr_h, kv_indptr_h, batch_size, gqa_group_size,
-                                    page_size, cta_tile_q, kv_chunk_size, disable_split_kv,
-                                    effective_kv_len_arr, window_left);
+  const int lpt_mode = FA2LptMode();
+  if (!enable_cuda_graph && page_size > 1 && new_batch_size > 1 && lpt_mode != 0 &&
+      lpt_mode != 3) {
+    // Only the 64-row d512 kernel plans cta_tile_q 64 at head_dim 512 (FA2PromoteD512Tile64).
+    const bool d512_tile64_plan = head_dim >= 512 && cta_tile_q == 64;
+    bool sort = true, request_major = lpt_mode == 2;
+    if (lpt_mode == 1 && d512_tile64_plan) {
+      int dev_id = 0, num_sm = 0;
+      if (cudaGetDevice(&dev_id) == cudaSuccess &&
+          cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id) ==
+              cudaSuccess &&
+          uint64_t(new_batch_size) * num_kv_heads <= uint64_t(num_sm)) {
+        sort = false;
+      }
+      request_major = true;
+    }
+    if (sort) {
+      FA2SortPrefillItemsLongestFirst(request_indices, qo_tile_indices, kv_tile_indices,
+                                      qo_indptr_h, kv_indptr_h, batch_size, gqa_group_size,
+                                      page_size, cta_tile_q, kv_chunk_size, disable_split_kv,
+                                      effective_kv_len_arr, window_left, request_major);
+    }
   }
 
   const size_t padded_batch_size =

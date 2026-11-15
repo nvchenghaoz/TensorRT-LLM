@@ -102,10 +102,20 @@ inline bool FA2PromoteD512Tile64(uint32_t cta_tile_q, bool split_kv, bool enable
 // tiles. Each CTA still reads its (request, q tile, kv chunk) from the plan arrays and its
 // kv head from the grid, so every CTA does exactly the same work; only the dispatch order
 // moves.
-inline bool FA2LptEnabled() {
+// Item order. 1 (default) auto: 64-row d512 plans run requests longest-first with each
+// request's items descending (on SM120 this beats one global descending list once several
+// requests share the grid: 16x300 -3% vs +3.5%, 3x1000 -10% vs -8%), and keep the planner's
+// order when the grid fits in one wave of its one CTA per SM (1x300: no tail to fix); every
+// other plan uses one global descending list. 2 request-major always; 3 no sort (item-major
+// grid only); 4 global always. 0 is main's order and grid.
+inline int FA2LptMode() {
   const char* env = std::getenv("FLASHINFER_FA2_LPT");
-  return !(env != nullptr && env[0] == '0');
+  if (env == nullptr || env[0] == '\0') return 1;
+  if (env[0] >= '0' && env[0] <= '4') return env[0] - '0';
+  return 1;
 }
+
+inline bool FA2LptEnabled() { return FA2LptMode() != 0; }
 
 // Grid of a paged prefill launch. Plans with a block_valid_mask (CUDA-graph plans) and grids
 // whose item count exceeds gridDim.z's limit keep the heads-major layout.
