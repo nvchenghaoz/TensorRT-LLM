@@ -152,6 +152,7 @@ def main():
         env = dict(os.environ)
         if args.diag:
             env["TRTLLM_PREFILL_STEP_TIMING"] = "1"
+            env["TLLM_LOG_LEVEL"] = "INFO"
         p = subprocess.Popen([sys.executable, __file__, "--arm", arm, "--checkpoint",
                               args.checkpoint, "--buckets", args.buckets, "--out", out],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

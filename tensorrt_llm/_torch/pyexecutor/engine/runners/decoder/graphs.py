@@ -613,10 +613,11 @@ class DecoderCudaGraphs:
                 host_ms = (time.perf_counter() - t0) * 1e3
                 ev1.record()
                 torch.cuda.synchronize()
-                logger.info(
+                print(
                     f"PREFILL_STEP_TIMING tokens={int(getattr(attn_metadata, 'num_tokens', 0))} "
                     f"run_as={num_tokens} mode={'replay' if replay else 'eager'} "
-                    f"host_enqueue_ms={host_ms:.3f} gpu_ms={ev0.elapsed_time(ev1):.3f}"
+                    f"host_enqueue_ms={host_ms:.3f} gpu_ms={ev0.elapsed_time(ev1):.3f}",
+                    flush=True,
                 )
         else:
             needs_capture = self.cuda_graph_runner.needs_capture(key)
