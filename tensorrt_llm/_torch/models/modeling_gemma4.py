@@ -201,6 +201,8 @@ class Gemma4TextScaledWordEmbedding(Embedding):
         if embed_scale is None:
             embed_scale = math.sqrt(hidden_size)
         self.embed_scale = torch.tensor(embed_scale, dtype=self.dtype)
+        # The same rounded value on the host (no device read at forward time).
+        self.embed_scale_value = float(torch.tensor(embed_scale, dtype=self.dtype, device="cpu"))
 
     @torch.inference_mode()
     def forward(self, input_ids):
@@ -1431,7 +1433,7 @@ class Gemma4TextModel(DecoderModel):
                 and scale.numel() == 1
             )
             if self._fused_embed:
-                self._embed_scale_value = float(scale.float().item())
+                self._embed_scale_value = emb.embed_scale_value
                 layer0 = self.layers[0] if len(self.layers) > 0 else None
                 norm = getattr(layer0, "input_layernorm", None)
                 self._fused_embed_norm = (

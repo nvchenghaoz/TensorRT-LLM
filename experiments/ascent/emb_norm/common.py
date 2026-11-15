@@ -85,7 +85,8 @@ def main_chain(emb, norm0, normf, ids, x_last, seq_lens):
 
 def fused_chain(emb, norm0, normf, ids, x_last, seq_lens):
     from tensorrt_llm._torch.kernels.fused_ops.embed_scale_rmsnorm import embed_scale_rmsnorm
-    h, n0 = embed_scale_rmsnorm(ids, emb.weight, float(emb.embed_scale.float().item()),
+    # As Gemma4TextModel does: the host copy of the bf16 scale (no device read).
+    h, n0 = embed_scale_rmsnorm(ids, emb.weight, emb.embed_scale_value,
                                 norm_weight=norm0.weight, eps=norm0.variance_epsilon)
     last = torch.cumsum(seq_lens, dim=0, dtype=torch.long) - 1
     return h, n0, normf(x_last[last])

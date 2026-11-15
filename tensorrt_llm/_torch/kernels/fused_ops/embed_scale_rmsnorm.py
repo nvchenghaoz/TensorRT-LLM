@@ -227,7 +227,10 @@ def embed_scale_rmsnorm(
             VEC=vec,
             NVB=nvb,
             HAS_NORM=has_norm,
-            num_warps=4,
+            # Measured on SM120 at H=5376: 2 warps 4.1/16.6/180 us at
+            # M=300/2000/8000 vs 5.1/20.8/181 for 4; outputs bitwise equal
+            # for 2-16 warps (every reduction step is an explicit add).
+            num_warps=2,
         )
     return h.view(*input_ids.shape, hidden), normed
 
