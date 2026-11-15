@@ -1,0 +1,246 @@
+"""Table generator v3 for the SM120 BF16 cuBLASLt range table (Gemma-4-31B attention projections).
+
+Served token counts: the frozen benchmark sends exact-length prompts (ISL 300/1k/2k/4k/8k) and packs up to
+max_num_tokens=8192, so forward M values are S = {300k} U {1000k} U {2000k} U {4000k} U {8000} (<= 8192).
+Table per shape (K, N):
+  * exact entry at every served M in S: the best config at that M, re-validated against F.linear with
+    interleaved CUDA-event timing (warmup 5, 20 timed, x2) among the sweep's top 4; kept only if it beats
+    F.linear by >= 1% (else the M is not routed, i.e. stays F.linear, or below 1280 / heuristic above);
+  * M in [1280, 8192] between served points: 64-row grid intervals (G[i-1], G[i]] get the config minimizing
+    max(t_cfg / t_F.linear) over both endpoints; if that worst ratio > 1.0 the interval keeps the cuBLASLt heuristic;
+  * below 1280 only the exact served M are routed (Python token gate); everything else stays on F.linear.
+Pool: union of cuBLASLt heuristic lists (32 per query) over all shapes and grid M; pruned by a pre-pass at S to
+configs within 3% of the best at any served M (plus each grid point's heuristic top-1). In-place (atomic) split-K
+reductions are excluded. Cold L2: 4 rotated weight copies (>= 704 MB per shape), CUDA events.
+Prints @@TABLE (C++) and @@ROUTES (Python token gate) blocks and an off-grid validation.
+
+usage: python sweep3.py <checkpoint>
+"""
+import json
+import os
+import random
+import sys
+import time
+
+import torch
+import torch.nn.functional as F
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lt import Lt, read_shapes  # noqa: E402
+
+NCOPY = 4
+LO = 1280
+HI = 8192
+T0 = time.time()
+
+
+def log(*a):
+    print(f"[{time.time() - T0:7.1f}s]", *a, flush=True)
+
+
+def timeit(fn, warm, iters):
+    for i in range(warm):
+        fn(i)
+    evs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(iters)]
+    for i, (s, e) in enumerate(evs):
+        s.record()
+        fn(warm + i)
+        e.record()
+    torch.cuda.synchronize()
+    t = sorted(s.elapsed_time(e) for s, e in evs)
+    return t[len(t) // 2]
+
+
+def served():
+    s = set()
+    for isl in (300, 1000, 2000, 4000, 8000):
+        k = 1
+        while isl * k <= HI:
+            s.add(isl * k)
+            k += 1
+    return sorted(s)
+
+
+def main():
+    ckpt = sys.argv[1]
+    shapes, info = read_shapes(ckpt)
+    log("config", json.dumps(info), "shapes", json.dumps(shapes))
+    lt = Lt()
+    log("cublasLt", lt.path, lt.version, torch.cuda.get_device_name())
+    S = served()
+    grid = sorted(set(list(range(LO, HI + 1, 64)) + [m for m in S if m >= LO]))
+    log("served M", S)
+    pool = set()
+    top1 = {}
+    for sname, (N, K) in shapes.items():
+        for M in sorted(set(grid + S)):
+            h = lt.heuristics(M, N, K, 32)
+            for (cfg8, inner), wsz, waves, orig in h:
+                if cfg8[4] != 1:
+                    pool.add(cfg8)
+            if h and h[0][0][0][4] != 1:
+                top1.setdefault(sname, set()).add(h[0][0][0])
+    pool = sorted(pool)
+    algos = {c: lt.make_algo(c) for c in pool}
+    log("pool size", len(pool))
+    tables, routes, summary = {}, {}, {}
+    for sname, (N, K) in shapes.items():
+        torch.manual_seed(0)
+        Ws = [torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02 for _ in range(NCOPY)]
+        xmax = torch.randn(HI, K, device="cuda", dtype=torch.bfloat16)
+        obuf = torch.empty(HI, N, device="cuda", dtype=torch.bfloat16)
+
+        def measure(M, cfgs, warm=3, iters=12):
+            x, out = xmax[:M], obuf[:M]
+            fl0 = timeit(lambda i: F.linear(x, Ws[i % NCOPY]), warm, iters)
+            row = {}
+            for c in cfgs:
+                if lt.check(M, N, K, algos[c]):
+                    row[c] = timeit(lambda i: lt.matmul(x, Ws[i % NCOPY], out, algos[c]), warm, iters)
+            fl1 = timeit(lambda i: F.linear(x, Ws[i % NCOPY]), warm, iters)
+            return min(fl0, fl1), row
+
+        # ---- pre-pass at served M with the whole pool -> shortlist
+        pre = {}
+        short = set(top1.get(sname, set()))
+        for M in S:
+            fl, row = measure(M, pool)
+            pre[M] = (fl, row)
+            b = min(row.values())
+            short |= {c for c, t in row.items() if t <= 1.03 * b}
+            log(f"{sname} pre M={M}: F.linear {fl:.4f} best {b:.4f} {(fl / b - 1) * 100:+.1f}% "
+                f"{lt.name(min(row, key=row.get))}")
+        short = sorted(short)
+        log(f"{sname} shortlist {len(short)}")
+        # ---- exact served entries: re-validate top-4 interleaved
+        exact = {}
+        for M in S:
+            fl, row = pre[M]
+            cands = sorted(row, key=row.get)[:4]
+            x, out = xmax[:M], obuf[:M]
+            best = None
+            res = {}
+            for rep in range(2):
+                f = timeit(lambda i: F.linear(x, Ws[i % NCOPY]), 5, 20)
+                res.setdefault("fl", []).append(f)
+                for c in cands:
+                    res.setdefault(c, []).append(timeit(lambda i: lt.matmul(x, Ws[i % NCOPY], out, algos[c]), 5, 20))
+            flv = min(res["fl"])
+            for c in cands:
+                r = min(res[c]) / flv
+                if best is None or r < best[1]:
+                    best = (c, r)
+            exact[M] = best
+            log(f"{sname} exact M={M}: F.linear {flv:.4f} best {lt.name(best[0])} ratio {best[1]:.3f}")
+        # ---- dense intervals for M >= LO
+        tim = {}
+        for M in grid:
+            if M in pre:
+                fl, row = pre[M]
+                row = {c: t for c, t in row.items() if c in short}
+            else:
+                fl, row = measure(M, short)
+            tim[M] = (fl, row)
+        intervals = []
+        for i, M in enumerate(grid):
+            ends = [grid[i - 1], M] if i > 0 else [M]
+            best = None
+            for c in short:
+                if not all(c in tim[e][1] for e in ends):
+                    continue
+                sc = max(tim[e][1][c] / tim[e][0] for e in ends)
+                if best is None or sc < best[1]:
+                    best = (c, sc)
+            if best is None:
+                best = (None, 9.0)
+            intervals.append((M, best[0] if best[1] <= 1.0 else None, best[1]))
+        # ---- assemble entries {m_max: cfg or None}
+        ents = []
+        small_routed = []
+        for M in [m for m in S if m < LO]:
+            c, r = exact[M]
+            ents.append((M - 1, None))
+            if r <= 0.99:
+                ents.append((M, c))
+                small_routed.append(M)
+            else:
+                ents.append((M, None))
+        ents.append((LO - 1, None))
+        for M, c, sc in intervals:
+            if M in exact:
+                ce, re_ = exact[M]
+                ents.append((M - 1, c))
+                ents.append((M, ce if re_ <= 0.99 else c))
+            else:
+                ents.append((M, c))
+        # drop empty / duplicate m_max, merge consecutive equal configs
+        clean = []
+        for m, c in ents:
+            if clean and m <= clean[-1][0]:
+                continue
+            if clean and clean[-1][1] == c:
+                clean[-1] = (m, c)
+            else:
+                clean.append((m, c))
+        tables[sname] = clean
+        routes[sname] = small_routed
+
+        def lookup(m):
+            if m < LO and m not in small_routed:
+                return "F.linear"
+            for mm, c in clean:
+                if m <= mm:
+                    return c
+            return "F.linear"
+
+        log(f"{sname} table {len(clean)} entries; small routed {small_routed}")
+        for m, c in clean:
+            log(f"   m<={m}: {lt.name(c) if c else 'heuristic'}")
+        # ---- off-grid + served validation, interleaved, warm 5 / 20 timed
+        random.seed(17)
+        vals = sorted(set(S + [m + 1 for m in S if m < HI] + [1281, 1500, 4100, 4500, 7040, 7500, 7999, 8050, 8191]
+                          + random.sample(range(LO, HI), 24)))
+        worst = (0.0, None)
+        gains = []
+        for M in vals:
+            c = lookup(M)
+            if c == "F.linear":
+                continue
+            x, out = xmax[:M], obuf[:M]
+            a = algos[c] if c is not None else None
+            fl = min(timeit(lambda i: F.linear(x, Ws[i % NCOPY]), 5, 20) for _ in range(2))
+            tc = min(timeit(lambda i: lt.matmul(x, Ws[i % NCOPY], out, a), 5, 20) for _ in range(2))
+            r = tc / fl
+            gains.append(1 - r)
+            worst = max(worst, (r, M))
+            log(f"  validate {sname} M={M}{' (served)' if M in S else ''}: F.linear {fl:.4f} "
+                f"{lt.name(c) if c else 'heuristic'} {tc:.4f} ratio {r:.3f}")
+        summary[sname] = {"entries": len(clean), "worst_ratio": round(worst[0], 4), "worst_M": worst[1],
+                          "mean_gain": round(sum(gains) / max(len(gains), 1), 4), "small_routed": small_routed}
+        log(f"{sname} summary {summary[sname]}")
+        del Ws, xmax, obuf
+        torch.cuda.empty_cache()
+    lines = ["inline const RangeAlgoListType sm120_bf16_range_algo_list = {"]
+    for sname, (N, K) in shapes.items():
+        lines.append(f"    // {sname}: N={N} K={K}")
+        lines.append(f"    {{{{{K}, {N}}},")
+        lines.append("        {")
+        for m, c in tables[sname]:
+            if c is None:
+                lines.append(f"            {{{m}, {{-1, 0, 0, 0, 0, 0, 0, 0}}}}, // cuBLASLt heuristic")
+            else:
+                lines.append(f"            {{{m}, {{{', '.join(str(v) for v in c)}}}}}, // {lt.name(c)}")
+        lines.append("        }},")
+    lines.append("};")
+    print("@@TABLE_BEGIN", flush=True)
+    print("\n".join(lines), flush=True)
+    print("@@TABLE_END", flush=True)
+    print("@@ROUTES_BEGIN", flush=True)
+    for sname, (N, K) in shapes.items():
+        print(f"    ({K}, {N}): ({sorted(routes[sname])}, {LO}, {HI}),  # {sname}", flush=True)
+    print("@@ROUTES_END", flush=True)
+    print(json.dumps({"done": True, "pool": len(pool), "summary": summary}))
+
+
+if __name__ == "__main__":
+    main()

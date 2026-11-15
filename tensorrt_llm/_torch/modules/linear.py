@@ -716,6 +716,15 @@ class LinearMethodBase(ABC):
         return 1
 
 
+def _custom_cublas_mm_covers(module: Linear, input: torch.Tensor) -> bool:
+    """A module may limit cublas_mm to 2D inputs whose token count is ``in``
+    ``module.custom_cublas_mm_tokens``; other inputs keep F.linear."""
+    tokens = getattr(module, "custom_cublas_mm_tokens", None)
+    if tokens is None:
+        return True
+    return input.dim() == 2 and input.shape[0] in tokens
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method for unquantized (BF16 / FP16 / FP32) weights.
 
@@ -801,7 +810,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             output = output.view(*input.shape[:-1], n)
             if bias is not None:
                 output = output + bias
-        elif module.use_custom_cublas_mm:
+        elif module.use_custom_cublas_mm and _custom_cublas_mm_covers(
+                module, input):
             output_buffer_kind = (
                 int(BufferKind.NCCL_WINDOW)
                 if self.supports_nccl_symmetric_memory_window_output
