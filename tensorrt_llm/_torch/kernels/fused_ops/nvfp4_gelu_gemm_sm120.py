@@ -187,14 +187,19 @@ def _gelu_tanh_mul_fp4_permuted_kernel(
     IDIM: tl.constexpr,  # intermediate size (elements, multiple of 64)
     BM: tl.constexpr,
     BK: tl.constexpr,  # multiple of 64
+    REV_COLS: tl.constexpr = False,  # visit column blocks last-to-first (program order only)
 ):
     # Identical to _gelu_tanh_mul_fp4_kernel (gelu_tanh_mul_fp4_quant.py) except
     # for the gather: output column j reads gate at 128*(j//64) + 32*((j%64)//16)
-    # + j%16 and up 16 columns further.
+    # + j%16 and up 16 columns further. REV_COLS only changes which column block
+    # a program id maps to; every program's math and stores are unchanged.
+    pid1 = tl.program_id(1)
+    if REV_COLS:
+        pid1 = tl.num_programs(1) - 1 - pid1
     rows = tl.program_id(0) * BM + tl.arange(0, BM).to(tl.int64)
     rmask = rows < M
     smask = rows < M_PAD
-    cols = tl.program_id(1) * BK + tl.arange(0, BK)
+    cols = pid1 * BK + tl.arange(0, BK)
     mask = rmask[:, None] & (cols[None, :] < IDIM)
     gcols = (cols // 64) * 128 + ((cols % 64) // 16) * 32 + (cols % 16)
     # Runs of 16 contiguous source columns starting at multiples of 16: lets the
@@ -223,7 +228,7 @@ def _gelu_tanh_mul_fp4_permuted_kernel(
     oscale = _rcp_approx(sf8.to(tl.float32) * rcpgs)
     oscale = tl.where(vmax != 0.0, oscale, 0.0)
 
-    kvec = (tl.program_id(1) * (BK // 16) + tl.arange(0, BK // 16)).to(tl.int64)
+    kvec = (pid1 * (BK // 16) + tl.arange(0, BK // 16)).to(tl.int64)
     kvmask = smask[:, None] & (kvec[None, :] < NKT * 4)
     m2 = rows[:, None]
     k2 = kvec[None, :]
@@ -247,7 +252,7 @@ def _gelu_tanh_mul_fp4_permuted_kernel(
         pack=1,
     ).to(tl.uint8)
 
-    ocols = tl.program_id(1) * (BK // 2) + tl.arange(0, BK // 2)
+    ocols = pid1 * (BK // 2) + tl.arange(0, BK // 2)
     omask = rmask[:, None] & (ocols[None, :] * 2 < IDIM)
     tl.store(out_ptr + rows[:, None] * (IDIM // 2) + ocols[None, :], byte, mask=omask)
 
@@ -257,8 +262,12 @@ def gelu_tanh_mul_fp4_quant_permuted(
     global_scale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     sf_out: Optional[torch.Tensor] = None,
+    rev_cols: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """gelu_tanh_mul_fp4_quant for a gate_up output on the fused-epilogue row order.
+
+    ``rev_cols`` (default PERM_ACT_REV_COLS) visits column blocks last-to-first:
+    program order only, the bytes written are identical.
 
     ``out`` / ``sf_out`` follow gelu_tanh_mul_fp4_quant's contract (caller-owned
     contiguous uint8 destinations of exactly the returned shapes, e.g. the row
@@ -290,9 +299,13 @@ def gelu_tanh_mul_fp4_quant_permuted(
     grid = (triton.cdiv(m_pad, bm), triton.cdiv(i, bk))
     _gelu_tanh_mul_fp4_permuted_kernel[grid](
         x, out, sf, global_scale, m, m_pad, x.stride(0), nkt, IDIM=i, BM=bm, BK=bk,
+        REV_COLS=PERM_ACT_REV_COLS if rev_cols is None else bool(rev_cols),
         num_warps=num_warps
     )
     return out, sf
+
+
+PERM_ACT_REV_COLS = False
 
 
 # --------------------------------------------------------------------------

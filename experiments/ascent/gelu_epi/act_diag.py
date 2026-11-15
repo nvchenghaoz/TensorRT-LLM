@@ -129,10 +129,17 @@ def main():
                 "chain_perm": timeit(lambda i: ge.gelu_tanh_mul_fp4_quant_permuted(
                     runner(inputs=[af, copies[i % 3][2], asf, copies[i % 3][3], alphas[i % 3]], tactic=T), gs_d)),
             }
-            # bitwise: permuted chain == main chain
+            r["act_perm_rev"] = timeit(lambda i: ge.gelu_tanh_mul_fp4_quant_permuted(yps[i % 3], gs_d,
+                                                                                      rev_cols=True))
+            r["chain_perm_rev"] = timeit(lambda i: ge.gelu_tanh_mul_fp4_quant_permuted(
+                runner(inputs=[af, copies[i % 3][2], asf, copies[i % 3][3], alphas[i % 3]], tactic=T), gs_d,
+                rev_cols=True))
+            # bitwise: permuted chain (both column orders) == main chain
             fm, sm = gelu_tanh_mul_fp4_quant(ys[0], gs_d)
-            fp_, sp_ = ge.gelu_tanh_mul_fp4_quant_permuted(yps[0], gs_d)
+            fp_, sp_ = ge.gelu_tanh_mul_fp4_quant_permuted(yps[0], gs_d, rev_cols=False)
+            fr_, sr_ = ge.gelu_tanh_mul_fp4_quant_permuted(yps[0], gs_d, rev_cols=True)
             r["bitwise"] = bool(torch.equal(fm, fp_) and torch.equal(sm, sp_))
+            r["bitwise_rev"] = bool(torch.equal(fm, fr_) and torch.equal(sm, sr_))
             out[f"{M}|{T[0]}{T[1]}"] = r
             log(f"M={M} T={T} {r}")
             del ys, yps
