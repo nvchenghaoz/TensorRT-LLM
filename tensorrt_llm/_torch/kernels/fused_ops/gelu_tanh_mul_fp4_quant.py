@@ -63,14 +63,19 @@ def _gelu_tanh_mul_fp4_kernel(
     sf_ptr,  # [pad128(M) * 4 * NKT] uint8, swizzled 128x4 layout
     gs_ptr,  # [1] fp32 global scale (down_proj.input_scale)
     M,
+    M_PAD,  # pad128(M): rows [M, M_PAD) get zero scales (the 128-row padding)
     SX,  # x row stride (elements)
     NKT,  # numKTiles = ceil((IDIM/16) / 4)
     IDIM: tl.constexpr,  # intermediate size (elements, multiple of 16)
     BM: tl.constexpr,
-    BK: tl.constexpr,  # multiple of 16
+    BK: tl.constexpr,  # multiple of 64 (so the column grid covers NKT*4 kvecs)
 ):
     rows = tl.program_id(0) * BM + tl.arange(0, BM).to(tl.int64)
     rmask = rows < M
+    # Padding rows (and padding kvec columns) load zeros -> vmax == 0 ->
+    # sf8 == e4m3(+0) == 0x00, so the kernel itself zero-fills the SF padding
+    # the consumer GEMM reads (no separate memset of the whole SF buffer).
+    smask = rows < M_PAD
     cols = tl.program_id(1) * BK + tl.arange(0, BK)
     mask = rmask[:, None] & (cols[None, :] < IDIM)
 
@@ -104,7 +109,7 @@ def _gelu_tanh_mul_fp4_kernel(
 
     # Scale store at the swizzled 128x4 offsets (get_sf_out_offset_128x4).
     kvec = (tl.program_id(1) * (BK // 16) + tl.arange(0, BK // 16)).to(tl.int64)
-    kvmask = rmask[:, None] & (kvec[None, :] * 16 < IDIM)
+    kvmask = smask[:, None] & (kvec[None, :] < NKT * 4)
     m2 = rows[:, None]
     k2 = kvec[None, :]
     sfoff = (
@@ -154,6 +159,36 @@ def sf_swizzled_offsets(m: int, nvec: int, device: torch.device) -> torch.Tensor
     return off.reshape(-1)
 
 
+# Fixed launch configs (no runtime autotune) so launches stay deterministic
+# under CUDA-graph capture; every config is bitwise-identical (only tiling and
+# CTA count change; the block amax is an order-insensitive max).
+# Default (B200-tuned): measured 234 -> 145 us vs the unfused pair at
+# [6455, 2x21504]; 13.6 -> 7.6 us graph-replayed at the 228-token decode shape.
+_DEFAULT_CONFIG = (8, 512, 8)  # (BM, BK, num_warps)
+# SM120 (RTX PRO 6000, 128 MB L2): single-row CTAs with 1024-wide column
+# tiles. Measured right after the gate_up nvfp4_gemm (I=21504), act time in
+# us, default -> this: M=300 14.3 -> 10.2 (input L2-resident), and it ties or
+# beats the default (and 8 other configs) at every M up to 8000 (8000: 555 ->
+# 551), so it applies at every M. _SM120_CONFIG_MAX_M bounds it if a larger M
+# ever prefers the default.
+_SM120_CONFIG = (1, 1024, 4)
+_SM120_CONFIG_MAX_M = 1 << 62
+
+_DEVICE_CAPABILITY = {}
+
+
+def _launch_config(m: int, device: torch.device) -> Tuple[int, int, int]:
+    """Fixed (BM, BK, num_warps) per arch, keyed only on M; BK % 64 == 0."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cap = _DEVICE_CAPABILITY.get(idx)
+    if cap is None:
+        cap = torch.cuda.get_device_capability(idx)
+        _DEVICE_CAPABILITY[idx] = cap
+    if cap == (12, 0) and m <= _SM120_CONFIG_MAX_M:
+        return _SM120_CONFIG
+    return _DEFAULT_CONFIG
+
+
 def gelu_tanh_mul_fp4_quant(
     x: torch.Tensor, global_scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -180,18 +215,27 @@ def gelu_tanh_mul_fp4_quant(
     assert two_i % 32 == 0, "intermediate size must be a multiple of 16"
 
     nkt = triton.cdiv(i // 16, 4)
+    m_pad = ((m + 127) // 128) * 128
     out = torch.empty((m, i // 2), dtype=torch.uint8, device=x.device)
-    sf = torch.zeros((((m + 127) // 128) * 128 * nkt * 4,), dtype=torch.uint8, device=x.device)
+    # The kernel writes every SF byte, padding rows/columns included (as 0x00).
+    sf = torch.empty((m_pad * nkt * 4,), dtype=torch.uint8, device=x.device)
     if m == 0:
         return out, sf
 
-    # B200-tuned; fixed (no runtime autotune) so launches stay deterministic
-    # under CUDA-graph capture. Measured 234 -> 145 us vs the unfused pair
-    # at [6455, 2x21504]; 13.6 -> 7.6 us graph-replayed at the 228-token
-    # decode shape.
-    bm, bk = 8, 512
-    grid = (triton.cdiv(m, bm), triton.cdiv(i, bk))
+    bm, bk, num_warps = _launch_config(m, x.device)
+    grid = (triton.cdiv(m_pad, bm), triton.cdiv(i, bk))
     _gelu_tanh_mul_fp4_kernel[grid](
-        x, out, sf, global_scale, m, x.stride(0), nkt, IDIM=i, BM=bm, BK=bk, num_warps=8
+        x,
+        out,
+        sf,
+        global_scale,
+        m,
+        m_pad,
+        x.stride(0),
+        nkt,
+        IDIM=i,
+        BM=bm,
+        BK=bk,
+        num_warps=num_warps,
     )
     return out, sf
