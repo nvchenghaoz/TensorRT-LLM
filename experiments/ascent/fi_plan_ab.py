@@ -52,13 +52,13 @@ class Prompts:
         return [int(x) for x in self.rng.integers(1000, 200000, size=isl)]
 
 
-def build_llm():
+def build_llm(**extra):
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import KvCacheConfig
     llm = LLM(model=CKPT,
               kv_cache_config=KvCacheConfig(dtype="fp8", enable_block_reuse=False,
                                             free_gpu_memory_fraction=0.8),
-              max_num_tokens=8192, max_batch_size=64, max_seq_len=9216)
+              max_num_tokens=8192, max_batch_size=64, max_seq_len=9216, **extra)
     return llm
 
 
@@ -127,7 +127,9 @@ def mode_time():
 
 def mode_stress():
     print_dims()
-    llm = build_llm()
+    # Arrival timing decides the first step's batch (job 138: off vs off differed on prompt 0 only).
+    # Waiting for max_batch_size requests makes the batch composition repeatable across passes.
+    llm = build_llm(batch_wait_timeout_ms=1500.0)
     pf = Prompts(777)
     params = sp(logprobs=20)
     groups = [(300, 64), (1000, 16), (2000, 8), (4000, 4), (8000, 2)]
