@@ -52,7 +52,7 @@ from ..attention.backends.interface import (
     RopeParams,
 )
 from ..distributed import AllReduce
-from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from ..kernels.fused_ops.embed_scale_rmsnorm import embed_scale_rmsnorm, rmsnorm_replay_supported
 from ..kernels.fused_ops.gate_up_gelu_fp4_chunked import gate_up_gelu_fp4_chunked
 from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
@@ -100,6 +100,30 @@ if TYPE_CHECKING:
 # One kernel for the post-attention junction (norm + residual add + pre-ffn
 # norm + gate_up NVFP4 quant); bitwise equal to the two-kernel chain.
 _FUSE_POST_ATTN_FP4 = True
+
+# Host trims that keep every launch and its inputs unchanged (e.g. reuse
+# per-layer invariants resolved on the first forward). Off = main's path.
+_HOST_TRIMS = True
+
+if IS_FLASHINFER_AVAILABLE:
+    from flashinfer.norm import rmsnorm as _flashinfer_rmsnorm
+else:
+    _flashinfer_rmsnorm = None
+
+
+def _plain_flashinfer_rmsnorm(norm: RMSNorm, x: torch.Tensor) -> bool:
+    """Whether RMSNorm.forward(x) (no residual) reaches exactly
+    trtllm::flashinfer_rmsnorm(x, norm.weight, norm.variance_epsilon)."""
+    return (
+        _flashinfer_rmsnorm is not None
+        and isinstance(norm, RMSNorm)
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and not norm.use_gemma
+        and not norm.use_cuda_tile
+        and not norm.fp8_per_token_out
+        and not norm.return_hp_output
+        and not (norm.is_nvfp4 and norm.nvfp4_scale is not None)
+    )
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
 if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
@@ -849,6 +873,18 @@ class Gemma4Attention(QKNormRoPEAttention):
         if k is not None and v is not None:
             qkv = torch.concat([q, k, v], dim=-1)
         return self.apply_qk_norm_rope(qkv, position_ids)
+
+    def _get_output_quant_flags(self):
+        # Both flags depend only on the loaded quant config and o_proj, which
+        # are final before the first forward; the base class caches them only
+        # with cache_context_plan, so Gemma4 re-derived them every layer call.
+        if not _HOST_TRIMS:
+            return super()._get_output_quant_flags()
+        flags = self.__dict__.get("_g4_output_quant_flags")
+        if flags is None:
+            flags = super()._get_output_quant_flags()
+            self.__dict__["_g4_output_quant_flags"] = flags
+        return flags
 
     def convert_qkv(self, q, k, v):
         """Override: KV-shared layers return q-only, skip convert/split."""
@@ -2077,7 +2113,20 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             last_tokens = (
                 torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
             )
-            hidden = self.model.norm(output[last_tokens])
+            gathered = output[last_tokens]
+            final_norm = self.model.norm
+            if _HOST_TRIMS and _plain_flashinfer_rmsnorm(final_norm, gathered):
+                # Eager (norm_gathered_rows excludes torch.compile): call the
+                # kernel trtllm::flashinfer_rmsnorm wraps, with its arguments,
+                # without the custom-op dispatch.
+                hidden = _flashinfer_rmsnorm(
+                    gathered,
+                    final_norm.weight,
+                    final_norm.variance_epsilon,
+                    enable_pdl=get_env_enable_pdl(),
+                )
+            else:
+                hidden = final_norm(gathered)
             # The rows are already gathered: project them as LogitsProcessor
             # does after its own gather (lm_head, then FP32).
             logits = self.lm_head(hidden).float()
