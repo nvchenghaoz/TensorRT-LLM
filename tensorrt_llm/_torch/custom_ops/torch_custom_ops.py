@@ -1440,15 +1440,17 @@ def _(
 
 
 # Dense-bucket NVFP4 GEMM tuning (SM120). For listed (N, K) and M in
-# [min_m, NVFP4_DENSE_TUNING_MAX_M], trtllm::nvfp4_gemm profiles at the dense
-# grid point at or above M (nvfp4_dense_bucket) with L2 flushed before every
-# timed repeat, instead of at the power of 2 below M with hot L2. Shapes, and M
-# outside that range, keep main's buckets, profiling and tactic list.
+# [min_m, max_m], trtllm::nvfp4_gemm profiles at the dense grid point at or
+# above M (nvfp4_dense_bucket) with L2 flushed before every timed repeat,
+# instead of at the power of 2 below M with hot L2. Shapes, and M outside that
+# range, keep main's buckets, profiling and tactic list.
 # The table holds only shapes whose order-preserving tactics were all found
-# bitwise equal on real activations over the whole range (Gemma-4-31B NVFP4
-# MLP: gate_up N=43008 K=5376 from M=256; down N=5376 K=21504 from M=4096).
+# bitwise equal on real activations over the range (Gemma-4-31B NVFP4 MLP:
+# gate_up N=43008 K=5376 at M 256-2048, where main mis-picks at M=300 and
+# above which main's pick is already the best; down N=5376 K=21504 at M
+# 4096-8192, where every tactic is bitwise and M=8000 runs the 4096 pick).
 # TRTLLM_NVFP4_DENSE_TUNING=0 disables it; TRTLLM_NVFP4_DENSE_SHAPES
-# ("N:K:min_m,...") replaces the table.
+# ("N:K:min_m[:max_m],...") replaces the table.
 NVFP4_DENSE_TUNING = os.environ.get("TRTLLM_NVFP4_DENSE_TUNING", "1") != "0"
 _NVFP4_DENSE_SM = (120, )
 _NVFP4_DENSE_COLD_L2_FLUSH_BYTES = 256 << 20
@@ -1456,12 +1458,14 @@ _NVFP4_DENSE_COLD_L2_FLUSH_BYTES = 256 << 20
 
 def _parse_nvfp4_dense_shapes(spec: Optional[str]) -> Mapping:
     if spec is None:
-        return {(43008, 5376): 256, (5376, 21504): 4096}
+        return {(43008, 5376): (256, 2048), (5376, 21504): (4096, 8192)}
     table = {}
     for item in spec.split(","):
         if item.strip():
-            n, k, min_m = (int(v) for v in item.split(":"))
-            table[(n, k)] = min_m
+            vals = [int(v) for v in item.split(":")]
+            n, k, min_m = vals[:3]
+            max_m = vals[3] if len(vals) > 3 else NVFP4_DENSE_TUNING_MAX_M
+            table[(n, k)] = (min_m, min(max_m, NVFP4_DENSE_TUNING_MAX_M))
     return table
 
 
@@ -1470,11 +1474,12 @@ _NVFP4_DENSE_SHAPES = _parse_nvfp4_dense_shapes(
 
 
 @lru_cache(maxsize=None)
-def _nvfp4_dense_tuning_config(min_m: int) -> TuningConfig:
+def _nvfp4_dense_tuning_config(min_m: int, max_m: int) -> TuningConfig:
     import functools
     return TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, functools.partial(_nvfp4_dense_gen, min_m=min_m),
+            0, 0,
+            functools.partial(_nvfp4_dense_gen, min_m=min_m, max_m=max_m),
             functools.partial(_nvfp4_dense_map, min_m=min_m)), ),
         constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
@@ -1482,8 +1487,8 @@ def _nvfp4_dense_tuning_config(min_m: int) -> TuningConfig:
     )
 
 
-def _nvfp4_dense_gen(x: int, min_m: int):
-    return nvfp4_dense_buckets(x, min_m)
+def _nvfp4_dense_gen(x: int, min_m: int, max_m: int):
+    return nvfp4_dense_buckets(min(x, max_m), min_m)
 
 
 def _nvfp4_dense_map(m: int, min_m: int) -> int:
@@ -1495,14 +1500,14 @@ def _nvfp4_dense_sm_ok() -> bool:
     return get_sm_version() in _NVFP4_DENSE_SM
 
 
-def _nvfp4_dense_min_m(n: int, k: int) -> Optional[int]:
-    """min_m of the dense-bucket mode for an (N, K) NVFP4 GEMM, else None."""
+def _nvfp4_dense_range(n: int, k: int) -> Optional[Tuple[int, int]]:
+    """(min_m, max_m) of the dense-bucket mode for an (N, K) NVFP4 GEMM, else None."""
     if not NVFP4_DENSE_TUNING:
         return None
-    min_m = _NVFP4_DENSE_SHAPES.get((n, k))
-    if min_m is None or not _nvfp4_dense_sm_ok():
+    rng = _NVFP4_DENSE_SHAPES.get((n, k))
+    if rng is None or not _nvfp4_dense_sm_ok():
         return None
-    return min_m
+    return rng
 
 
 class NVFP4GemmUnifiedRunner(TunableRunner):
@@ -1852,10 +1857,11 @@ def nvfp4_gemm(
     tuner = AutoTuner.get()
     inputs = [act_fp4, weight, act_sf, weight_scale, alpha]
 
-    dense_min_m = _nvfp4_dense_min_m(weight.shape[0], act_fp4.shape[1] * 2)
-    if dense_min_m is not None:
+    dense_range = _nvfp4_dense_range(weight.shape[0], act_fp4.shape[1] * 2)
+    if dense_range is not None:
+        dense_min_m, dense_max_m = dense_range
         m = act_fp4.shape[0]
-        in_range = dense_min_m <= m <= NVFP4_DENSE_TUNING_MAX_M
+        in_range = dense_min_m <= m <= dense_max_m
         tuning = tuner.is_tuning_mode
         if in_range or (tuning and m >= dense_min_m):
             if tuning:
@@ -1876,7 +1882,7 @@ def nvfp4_gemm(
             _, dense_tactic = tuner.choose_one(
                 "trtllm::nvfp4_gemm::gemm_dense",
                 [dense_runner],
-                _nvfp4_dense_tuning_config(dense_min_m),
+                _nvfp4_dense_tuning_config(dense_min_m, dense_max_m),
                 inputs,
                 bias=bias,
             )

@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bench  # noqa: E402
 
 log = bench.log
-GU_M = [300, 301, 320, 1000, 1023, 1200, 1856, 2000, 4000, 4800, 8000, 8100, 8192]
+GU_M = [300, 301, 320, 1000, 1023, 1200, 1856, 2000, 2048]
 DN_M = [4096, 4097, 4800, 8000, 8100, 8192]
 
 
@@ -227,8 +227,10 @@ def main():
     if args.mode == "picks":
         return mode_picks(args, dims, man, d)
     t = tco()
-    min_ms = {name: t._NVFP4_DENSE_SHAPES[dims[name]] for name in dims}
-    log(f"[policy] min_m={min_ms} sm_ok={t._nvfp4_dense_sm_ok()}")
+    ranges = {name: t._NVFP4_DENSE_SHAPES[dims[name]] for name in dims}
+    min_ms = {name: r[0] for name, r in ranges.items()}
+    max_ms = {name: r[1] for name, r in ranges.items()}
+    log(f"[policy] ranges={ranges} sm_ok={t._nvfp4_dense_sm_ok()}")
     result = {"capture_dir": d, "capture_commit": man["commit"], "sha_mismatch": bad,
               "producer_sources_sha256": man.get("producer_sources_sha256")}
     # main/dense picks in two separate processes
@@ -265,7 +267,7 @@ def main():
             name, m = e["shape"], e["M"]
             n, k = dims[name]
             min_m = min_ms[name]
-            in_range = min_m <= m <= 8192
+            in_range = min_m <= m <= max_ms[name]
             tag = f"{e['prompt']}|s{e['step']}|L{layer}|{name}|M{m}|{e.get('path')}"
             if not in_range:
                 rows.append({"case": tag, "M": m, "N": n, "in_dense_range": False})

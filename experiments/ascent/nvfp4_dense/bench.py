@@ -135,9 +135,9 @@ def picks_for(name, m, n, k):
     m_main = t.last_positive_power_of_2(m)
     want = {("trtllm::nvfp4_gemm::gemm", m_main)}
     if has_dense():
-        mn = t._NVFP4_DENSE_SHAPES.get((n, k))
-        if mn is not None:
-            want.add(("trtllm::nvfp4_gemm::gemm_dense", t.nvfp4_dense_bucket(m, mn)))
+        rng = t._NVFP4_DENSE_SHAPES.get((n, k))
+        if rng is not None and rng[0] <= m <= rng[1]:
+            want.add(("trtllm::nvfp4_gemm::gemm_dense", t.nvfp4_dense_bucket(m, rng[0])))
     for key, val in cache.items():
         op, shapes = key[0], key[3]
         if shapes[1][0] == n and shapes[0][1] * 2 == k and (op, shapes[0][0]) in want:

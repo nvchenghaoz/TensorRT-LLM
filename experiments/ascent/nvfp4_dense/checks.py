@@ -9,6 +9,8 @@ Runs, in order, each in its own process on this GPU:
     inputs unchanged.
  3. bench.py --mode cache: tune+save the autotuner cache in one process, load
     it in another; picks and output int16 hashes must match.
+ 4. llm_ab.py (no recapture): in-process A/X/A' over 100 own prompts plus the
+    same-process re-send, switch ON and OFF.
 The last stdout line is {"passed": ...} over all three.
 
 usage: checks.py <checkpoint> <capture_dir>
@@ -52,9 +54,14 @@ def main():
     diffs = [k for k in save if save.get(k) != load.get(k)] if "error" not in save else ["error"]
     out["cache_reload"] = {"passed": not diffs and os.path.exists(cache_path), "diffs": diffs,
                            "n_cases": len(save), "save": save}
+    # 4. in-process LLM A/X/A' + re-send (own prompts; no recapture)
+    out["llm_ab"] = run([py, os.path.join(HERE, "llm_ab.py"), ck, "-"], "llm_ab")
     rep = out["repeat"]
     summary = {
-        "passed": bool(out["census"].get("passed") and rep.get("passed") and out["cache_reload"]["passed"]),
+        "passed": bool(out["census"].get("passed") and rep.get("passed") and out["cache_reload"]["passed"]
+                       and out["llm_ab"].get("passed")),
+        "llm_ab": {k: out["llm_ab"].get(k) for k in ("passed", "n_prompts", "A_vs_A2", "A_vs_X", "resend",
+                                                     "dispatch_calls", "chunked_gate_up_calls_total")},
         "compared": "gate 0 census (every offered dense tactic + dense pick vs main's pick, int16, real "
                     "captures L0/30/59 + synthetic seeds 1/2/heavy); repeated sequence vs call 1 and main; "
                     "autotuner cache save/reload picks + output hashes",
