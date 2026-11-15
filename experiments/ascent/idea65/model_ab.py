@@ -160,11 +160,13 @@ def dump(a):
     log("config: " + json.dumps({k: tc.get(k) for k in (
         "hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
         "head_dim", "global_head_dim", "num_global_key_value_heads", "sliding_window")}))
+    extra = {"enable_autotuner": False} if a.autotuner == "off" else {}
+    log(f"autotuner {a.autotuner}")
     llm = LLM(model=a.ckpt,
               kv_cache_config=KvCacheConfig(dtype="fp8", enable_block_reuse=False,
                                             free_gpu_memory_fraction=0.8),
               max_num_tokens=8192, max_batch_size=64, max_seq_len=9216,
-              batch_wait_timeout_ms=1500.0)
+              batch_wait_timeout_ms=1500.0, **extra)
     params = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True, logprobs=20)
     import numpy as np
     wrng = np.random.default_rng(5)
@@ -206,7 +208,7 @@ def drive(a):
     for idx, arm in enumerate(arms):
         out = os.path.join(tempfile.mkdtemp(prefix="idea65_mab_out_"), f"{idx}_{arm}.json")
         cmd = [sys.executable, os.path.abspath(__file__), "dump", "--arm", arm, "--ckpt", a.ckpt,
-               "--out", out, "--passes", str(a.passes)]
+               "--out", out, "--passes", str(a.passes), "--autotuner", a.autotuner]
         if arm == "main":
             cmd += ["--base", main_base]
         env = {k: v for k, v in os.environ.items() if k not in ENV_NAMES}
@@ -232,9 +234,15 @@ def drive(a):
         if len(o) > 1:
             res[f"{arm}#{i} pass0 vs pass1 (repeated execution)"] = cmp_runs(o["pass0"],
                                                                              o["pass1"])
-    for i in range(1, len(arms)):
-        res[f"{arms[i]}#{i} vs {arms[0]}#0 (pass0)"] = cmp_runs(outs[0]["pass0"],
-                                                                outs[i]["pass0"])
+    for i in range(len(arms)):
+        for j in range(i + 1, len(arms)):
+            res[f"{arms[j]}#{j} vs {arms[i]}#{i} (pass0)"] = cmp_runs(outs[i]["pass0"],
+                                                                      outs[j]["pass0"])
+    art = os.environ.get("AUTO_DEV_ARTIFACTS")
+    if art:
+        os.makedirs(art, exist_ok=True)
+        with open(os.path.join(art, "model_ab_outputs.json"), "w") as f:
+            json.dump({"arms": arms, "outs": outs, "meta": meta}, f)
     passed = all(v["bitwise_equal"] == v["prompts"] for v in res.values())
     rr = [m["read_rows_stats"] for m in meta]
     rr_ok = all(r.get("ran", 0) > 0 for r in rr) and len({json.dumps(r, sort_keys=True)
@@ -248,6 +256,7 @@ def drive(a):
                       f"bitwise, arms {a.arms}, one in-process LLM per arm, 33 chat-template "
                       "prompts: c=1 isl300x4/1kx4/2kx3/4kx3/8kx3 + 2x(4xisl8k) + 2x(4xisl1k) "
                       "groups sent together",
+                      "autotuner": a.autotuner,
                       "env_both_arms": {k: "<unset: main default>" for k in ENV_NAMES},
                       "read_rows_stats_equal_and_ran": rr_ok, "logprobs_present": has_lp,
                       "results": res, "arms_meta": meta}), flush=True)
@@ -262,6 +271,7 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--base", default="")
     ap.add_argument("--passes", type=int, default=2)
+    ap.add_argument("--autotuner", choices=["on", "off"], default="on")
     a = ap.parse_args()
     if a.mode == "dump":
         dump(a)
