@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 PAGE = 32
-SHARED_STATE = {"on": False, "state": None}
+SHARED_STATE = {"on": False, "state": None, "allow_fallback": False}
 WARMUP = 5
 ITERS = 25
 # (label, batch, seq_len): workload case labels for the packed batches the
@@ -173,7 +173,11 @@ class Case:
             if miss and st is not None:
                 st["key"] = None  # force the sub-plan (a step with new shapes)
             ok = cls._prefill_forward_read_rows(me, meta, pp, self.q, self.kv, out)
-            assert ok, "read-rows path fell back"
+            if not ok:
+                # the engine's caller then runs main's full-row call
+                assert SHARED_STATE.get("allow_fallback"), "read-rows path fell back"
+                self.run_main(out)
+            meta.took_read_rows = ok
             if SHARED_STATE.get("on"):
                 SHARED_STATE["state"] = meta._read_rows_state
             return meta
@@ -227,6 +231,7 @@ def mode_time(ckpt):
     ws = torch.empty(320 * 1024 * 1024 * 188 // 148, dtype=torch.uint8, device="cuda")
     candidate = hasattr(fi_mod.FlashInferAttention, "_prefill_forward_read_rows")
     log(f"arm={'read_rows' if candidate else 'main'} gpu={torch.cuda.get_device_name()}")
+    SHARED_STATE["allow_fallback"] = True  # below the min-token gate the engine runs main's call
     batch = {}
     extra = {}
     for label, b, L in CASES:
@@ -267,7 +272,8 @@ def mode_time(ckpt):
         extra[label] = {"gpu_ms_plan_cached": hmed_, "gpu_cached_p10": hp10, "gpu_cached_p90": hp90,
                         "span_ms_no_preroll": smed, "span_p10": sp10, "span_p90": sp90,
                         "span_ms_no_preroll_plan_cached": shmed,
-                        "host_ms_replan": h_miss, "host_ms_plan_cached": h_hit}
+                        "host_ms_replan": h_miss, "host_ms_plan_cached": h_hit,
+                        "read_rows_path": bool(candidate and c.M >= getattr(fi_mod, "_READ_ROWS_MIN_TOKENS", 0))}
         log(f"{label:10s} B={b:2d} L={L:5d} M={c.M:5d} gpu {med:8.4f} ms [p10 {p10:.4f} p90 {p90:.4f}] "
             f"cached {hmed_:8.4f} span {smed:8.4f}/{shmed:8.4f} host replan {h_miss:.4f} cached {h_hit:.4f} ms")
         del c, out
@@ -282,6 +288,8 @@ def mode_check(ckpt):
     ws = torch.empty(320 * 1024 * 1024 * 188 // 148, dtype=torch.uint8, device="cuda")
     assert hasattr(fi_mod.FlashInferAttention, "_prefill_forward_read_rows")
     SHARED_STATE["on"] = True  # one sub-plan wrapper/cache across all cases, as one engine metadata
+    min_tokens_default = fi_mod._READ_ROWS_MIN_TOKENS
+    fi_mod._READ_ROWS_MIN_TOKENS = 0  # exercise the read-rows path at every size, 300 included
     results = {}
     ok_all = True
     built = {}
@@ -399,6 +407,16 @@ def mode_check(ckpt):
     cs_info = (int(cs.main_wrapper._plan_info[3]), int(cs.main_wrapper._plan_info[14]))
     log("short-request main plan (cta_tile_q, split_kv):", cs_info)
     guards["main_cta_tile_q_16"] = cs_info[0] == 16 and untouched_false(cs, cs.metadata(), cs.plan_params())
+    # default min-token gate: a 1x300 step keeps main's full-row call
+    fi_mod._READ_ROWS_MIN_TOKENS = min_tokens_default
+    c3 = get_case("isl300@1", 1, 300)
+    c3.plan_main()
+    guards[f"below_min_tokens_{min_tokens_default}_1x300"] = untouched_false(c3, c3.metadata(), c3.plan_params())
+    c4 = get_case("isl300@4", 4, 300)
+    c4.plan_main()
+    o4 = torch.full((c4.M, H), 7.0, dtype=torch.bfloat16, device="cuda")
+    guards[f"at_or_above_min_tokens_4x300_takes_path"] = bool(
+        cls._prefill_forward_read_rows(me, c4.metadata(), c4.plan_params(), c4.q, c4.kv, o4))
     log("guards:", json.dumps(guards))
     ok_all &= all(guards.values())
     log("READ_ROWS_STATS", fi_mod.READ_ROWS_STATS)

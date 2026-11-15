@@ -83,7 +83,13 @@ _READ_ROWS_CTA_TILES_Q = (32, 64)
 FA2 template) and 64 (the d512 64-row kernel the planner promotes unsplit,
 full-attention FP8-KV plans to when the average packed length exceeds 64)."""
 
-READ_ROWS_STATS = {"ran": 0, "fallback": 0}
+_READ_ROWS_MIN_TOKENS = int(
+    os.environ.get("TRTLLM_GEMMA4_LAST_LAYER_ATTN_ROWS_MIN_TOKENS", "512"))
+"""Context steps below this many rows keep the full-row call: there the
+sub-plan, gather, zero-fill and scatter cost about what the dead rows do
+(1x300: 0.047 ms full-row vs 0.055-0.066 ms read-rows, SM120), plus host time."""
+
+READ_ROWS_STATS = {"ran": 0, "fallback": 0, "below_min_tokens": 0}
 """Read-rows dispatch counters (tests and A/B harnesses read them)."""
 
 
@@ -2781,6 +2787,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         """
         if not (_LAST_LAYER_ATTN_ROWS
                 and getattr(metadata, "last_layer_read_rows", False)):
+            return False
+        if metadata.num_ctx_tokens < _READ_ROWS_MIN_TOKENS:
+            READ_ROWS_STATS["below_min_tokens"] += 1
             return False
         host_inputs = metadata._host_prefill_plan_inputs
         num_contexts = metadata.num_contexts

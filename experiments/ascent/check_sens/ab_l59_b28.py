@@ -391,7 +391,8 @@ def main():
     ok = (aa["bitwise_equal"] == aa["total"] and ax["bitwise_equal"] == ax["total"]
           and xa["bitwise_equal"] == xa["total"] and calls["X"]["read_rows_ran"] > 0
           and calls["A"]["read_rows_ran"] == 0 and calls["A2"]["read_rows_ran"] == 0
-          and calls["X"]["read_rows_ran"] == calls["X"]["final_norm_gather"]
+          and calls["X"]["read_rows_ran"] + calls["X"].get("read_rows_below_min_tokens", 0)
+          == calls["X"]["final_norm_gather"] and calls["X"]["read_rows_fallback"] == 0
           and all(v["equal_to_A"] for v in kv_cmp.values()) and resend_ok and inv_ok)
     print(json.dumps({"passed": bool(ok), "compared": "in-process LLM, layer-59 read-rows attention off/on/off "
                       "(kill switch), first-token id + top-20 logprobs bitwise on the knowledge-618 mix; layer-59 "
