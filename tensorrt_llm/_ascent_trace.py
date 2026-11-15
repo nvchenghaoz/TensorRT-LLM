@@ -49,9 +49,32 @@ def ev(name, **kw):
     _ensure_thread()
 
 
+ARMED = [False]
+_arm_check = [0.0]
+
+
+def armed():
+    """GPU events are recorded (and queried by the flusher thread) only once
+    the driver has created $ASCENT_TRACE_DIR/ARM after the server reported
+    healthy (warmup and CUDA-graph capture finished): a cudaEventQuery from
+    another thread during a global-mode stream capture invalidates it."""
+    if ARMED[0]:
+        return True
+    t = now()
+    if t - _arm_check[0] > 0.5:
+        _arm_check[0] = t
+        if os.path.exists(os.path.join(_DIR, "ARM")):
+            ARMED[0] = True
+    return ARMED[0]
+
+
+def arm():
+    pass
+
+
 def gpu_ev(name, stream=None, **kw):
     """Record a timing event on `stream` (default current); resolved async."""
-    if not ENABLED:
+    if not ENABLED or not armed():
         return None
     import torch
     e = torch.cuda.Event(enable_timing=True)

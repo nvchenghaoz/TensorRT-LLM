@@ -372,6 +372,8 @@ def lifetime(ckpt, out, tag, pf, rng, cases, env_extra, nsys_session=None):
     rep = None
     try:
         srv.wait_ready()
+        if tdir.exists():
+            (tdir / "ARM").write_text("1")  # GPU events only after warmup/capture
         warmup(srv.port, pf, rng)
         time.sleep(2)
         if nsys_session:
