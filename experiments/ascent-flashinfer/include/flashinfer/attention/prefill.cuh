@@ -1452,6 +1452,17 @@ __device__ __forceinline__ void repack_fp8_tile_to_bf16(typename KTraits::DTypeK
 #pragma unroll
   for (uint32_t idx = thread_id; idx < NUM_B128; idx += NUM_THREADS) {
     uint32_t row = idx / FP8_COLS, col = idx % FP8_COLS;
+    if constexpr (FP8_COLS == 16 && SWIZZLE == SwizzleMode::k128B && NUM_THREADS % 32 == 0) {
+      // Each warp converts 2 rows x 16 b128 columns. With the row-major map, the 8 lanes of a
+      // quarter-warp write columns 2*col of one row, which land on 4 of the 8 16-byte bank groups
+      // (2-way conflict on both staging stores). Here each quarter-warp takes 4 columns of the
+      // even row and the paired 4 columns of the odd row: the k128B XOR (row % 8) then spreads
+      // both the b128 reads and the two b128 writes over all 8 bank groups. Same data, same
+      // layout, only the thread that moves each chunk changes.
+      const uint32_t lane = idx % 32, quarter = lane / 8, half = (lane % 8) / 4;
+      row = (idx / 32) * 2 + half;
+      col = 8 * (quarter / 2) + 4 * ((quarter % 2) ^ half) + (lane % 4);
+    }
     b128_t packed = src[get_permuted_offset<SWIZZLE, FP8_COLS>(row, col)];
     // alignas(16): conv is reinterpreted as b128_t (16B) for the smem stores below,
     // so it must be 16-byte aligned (DTypeQ alone only guarantees 2B alignment).
