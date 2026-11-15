@@ -42,7 +42,7 @@ torch.compile, ...); see the gelu_tanh + down_proj quantize fusion in
 modeling_gemma4.py.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -190,7 +190,10 @@ def _launch_config(m: int, device: torch.device) -> Tuple[int, int, int]:
 
 
 def gelu_tanh_mul_fp4_quant(
-    x: torch.Tensor, global_scale: torch.Tensor
+    x: torch.Tensor,
+    global_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    sf_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused gelu_tanh(gate) * up + NVFP4 block-scale quantize.
 
@@ -206,6 +209,10 @@ def gelu_tanh_mul_fp4_quant(
         swizzled 128x4 layout padded to 128 rows, padding zero-filled) -
         byte-compatible with ``trtllm::fp4_quantize``'s outputs and
         consumable as ``Fp4QuantizedTensor(fp4, sf)``.
+
+    ``out`` / ``sf_out`` (optional) are caller-owned destinations of exactly
+    those shapes (contiguous uint8; e.g. row slices of a larger buffer, the
+    SF slice starting at a 128-row boundary); None allocates them here.
     """
     assert x.dim() == 2 and x.stride(-1) == 1
     assert x.dtype == torch.bfloat16
@@ -216,9 +223,17 @@ def gelu_tanh_mul_fp4_quant(
 
     nkt = triton.cdiv(i // 16, 4)
     m_pad = ((m + 127) // 128) * 128
-    out = torch.empty((m, i // 2), dtype=torch.uint8, device=x.device)
+    if out is None:
+        out = torch.empty((m, i // 2), dtype=torch.uint8, device=x.device)
+    else:
+        assert out.shape == (m, i // 2) and out.dtype == torch.uint8 and out.is_contiguous()
     # The kernel writes every SF byte, padding rows/columns included (as 0x00).
-    sf = torch.empty((m_pad * nkt * 4,), dtype=torch.uint8, device=x.device)
+    if sf_out is None:
+        sf = torch.empty((m_pad * nkt * 4,), dtype=torch.uint8, device=x.device)
+    else:
+        assert sf_out.shape == (m_pad * nkt * 4,) and sf_out.dtype == torch.uint8
+        assert sf_out.is_contiguous()
+        sf = sf_out
     if m == 0:
         return out, sf
 
