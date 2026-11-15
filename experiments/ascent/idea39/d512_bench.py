@@ -207,8 +207,15 @@ def run_arm(a):
         first_plan_s = time.perf_counter() - t0
         pi = [int(x) for x in w._plan_info]
 
+        lse = None
+        if a.lse:
+            lse = torch.empty(c.total_q, c.Hq, dtype=torch.float32, device="cuda")
+
         def run():
-            w.run(c.q, c.kv_fp8, out=out)
+            if lse is None:
+                w.run(c.q, c.kv_fp8, out=out)
+            else:
+                w.run(c.q, c.kv_fp8, out=out, lse=lse, return_lse=True)
         rec = dict(case=label, q_lens=ql if len(ql) <= 8 else f"{len(ql)}x{ql[0]}",
                    cta_tile_q=pi[3], split_kv=bool(pi[14]), padded_batch=pi[0],
                    first_plan_s=round(first_plan_s, 2), gflop=c.flops / 1e9)
@@ -234,15 +241,29 @@ def run_arm(a):
             all_ok &= rec["err_vs_fp32"]["finite"]
             del ref
         if save_dir is not None:
+            lse_first = lse.clone() if lse is not None else None
             if a.arm == "tree":
-                torch.save(first.cpu(), save_dir / f"{label}.pt")
+                torch.save({"o": first.cpu(), "lse": None if lse_first is None else lse_first.cpu()},
+                           save_dir / f"{label}.pt")
             else:
                 bp = save_dir / f"{label}.pt"
                 if bp.exists():
-                    base = torch.load(bp).cuda()
+                    saved = torch.load(bp)
+                    base = saved["o"].cuda()
                     d = (first.float() - base.float()).abs()
-                    rec["vs_base"] = dict(max_abs=float(d.max()),
-                                          bitwise=bool(torch.equal(first, base)))
+                    # raw byte compare (torch.equal would hide -0.0 vs +0.0)
+                    nbad = int((first.view(torch.int16) != base.view(torch.int16)).sum())
+                    rec["vs_base"] = dict(max_abs=float(d.max()), byte_mismatch_elems=nbad,
+                                          elems=first.numel(), bitwise=nbad == 0)
+                    if lse_first is not None and saved.get("lse") is not None:
+                        bl = saved["lse"].cuda()
+                        nl = int((lse_first.view(torch.int32) != bl.view(torch.int32)).sum())
+                        rec["vs_base"]["lse_byte_mismatch"] = nl
+                        rec["vs_base"]["bitwise"] = rec["vs_base"]["bitwise"] and nl == 0
+                    if nbad:
+                        bad = (first.view(torch.int16) != base.view(torch.int16))
+                        idx = bad.nonzero()[:8].tolist()
+                        rec["vs_base"]["first_bad"] = idx
                     del base
         log("RESULT", json.dumps(rec))
         results.append(rec)
@@ -263,6 +284,8 @@ def driver(a):
         common.append("--no-ref")
     if a.no_time:
         common.append("--no-time")
+    if a.lse:
+        common.append("--lse")
     finals = {}
     for arm in (["tree", "overlay"] if not a.only_overlay else ["overlay"]):
         env = dict(os.environ)
@@ -315,12 +338,12 @@ def driver(a):
                        vs_base=r.get("vs_base"), cand_repeat=r["repeat"])
             if row["base_ms"] and row["cand_ms"]:
                 row["speedup"] = row["base_ms"] / row["cand_ms"]
-            ok = True
-            be, ce = row["base_err"], row["cand_err"]
-            if be and ce:
-                # protocol: cand error <= 1.10 x main's error (+1 bf16 ulp at output magnitude)
-                ok = ce["finite"] and ce["rel_fro"] <= 1.10 * be["rel_fro"] + 1e-6 and \
-                    ce["max_abs"] <= 1.10 * be["max_abs"] + 2 ** -8
+            # gate: byte-equal to main's kernel output (and LSE when checked), deterministic
+            vb = r.get("vs_base") or {}
+            ok = bool(vb.get("bitwise", False))
+            ce = row["cand_err"]
+            if ce:
+                ok &= ce["finite"]
             ok &= r["repeat"]["mismatches"] == 0
             row["passed"] = bool(ok)
             table.append(row)
@@ -343,6 +366,7 @@ def main():
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--no-ref", action="store_true")
     ap.add_argument("--no-time", action="store_true")
+    ap.add_argument("--lse", action="store_true", help="also return and byte-compare LSE")
     ap.add_argument("--save-dir", default="")
     ap.add_argument("--overlay-dir", default="")
     a = ap.parse_args()

@@ -64,20 +64,15 @@ EDITS = [
      "                                   bool d512_tile64_kv = false) {\n"
      "  std::vector<IdType> request_indices,"),
     ("include/flashinfer/attention/scheduler.cuh",
-     "      cta_tile_q = FA2DetermineCtaTileQ(packed_uniform_len, head_dim, head_dim_qk, kv_dtype_bytes);\n",
-     "      cta_tile_q = FA2MaybeD512Tile64(\n"
-     "          FA2DetermineCtaTileQ(packed_uniform_len, head_dim, head_dim_qk, kv_dtype_bytes),\n"
-     "          packed_uniform_len, head_dim, head_dim_qk, page_size, d512_tile64_kv);\n"),
-    ("include/flashinfer/attention/scheduler.cuh",
-     "      cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim, head_dim_qk, kv_dtype_bytes);\n",
-     "      cta_tile_q = FA2MaybeD512Tile64(\n"
-     "          FA2DetermineCtaTileQ(max_qo_len, head_dim, head_dim_qk, kv_dtype_bytes), max_qo_len,\n"
-     "          head_dim, head_dim_qk, page_size, d512_tile64_kv);\n"),
-    ("include/flashinfer/attention/scheduler.cuh",
-     "    cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim, head_dim_qk, kv_dtype_bytes);\n",
-     "    cta_tile_q = FA2MaybeD512Tile64(\n"
-     "        FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim, head_dim_qk, kv_dtype_bytes),\n"
-     "        avg_packed_qo_len, head_dim, head_dim_qk, page_size, d512_tile64_kv);\n"),
+     "  // step 3: split qo_indptr and kv_indptr\n",
+     "  // head_dim-512 FP8-KV plans that run every request as one KV chunk at 32-row tiles use the\n"
+     "  // 64-row kernel, which keeps the 32-row kernel's arithmetic (d512_tile64_config.cuh).\n"
+     "  if (FA2PromoteD512Tile64(cta_tile_q, split_kv, enable_cuda_graph, window_left,\n"
+     "                           fixed_split_size, disable_split_kv, page_size, head_dim,\n"
+     "                           head_dim_qk, packed_qo_len_arr, d512_tile64_kv)) {\n"
+     "    cta_tile_q = 64;\n"
+     "  }\n"
+     "  // step 3: split qo_indptr and kv_indptr\n"),
     ("include/flashinfer/attention/scheduler.cuh",
      "    int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,\n"
      "    uint32_t kv_dtype_bytes = 2) {\n"

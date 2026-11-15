@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <type_traits>
+#include <vector>
 
 #include "../pos_enc.cuh"
 
@@ -66,17 +67,30 @@ inline bool FA2D512Tile64Enabled() {
   return enabled;
 }
 
-// Planner hook: promote a 32-row d512 tile to the 64-row kernel. Ragged plans pass
-// page_size 1 and have no 64-row d512 instantiation, so they keep 32. Short packed
-// lengths (decode, speculative verify) keep their tile.
-inline uint32_t FA2MaybeD512Tile64(uint32_t cta_tile_q, int64_t packed_qo_len,
-                                   uint32_t head_dim_vo, uint32_t head_dim_qk, uint32_t page_size,
-                                   bool d512_tile64_kv) {
-  if (!d512_tile64_kv || cta_tile_q != 32 || packed_qo_len <= 64 || page_size <= 1 ||
-      head_dim_vo != 512 || (head_dim_qk != 0 && head_dim_qk != 512)) {
-    return cta_tile_q;
+// Planner hook, called after the 32-row plan's split-KV decision. The 64-row kernel computes
+// each 32-row half exactly as the 32-row kernel does, so its output is bitwise equal only
+// when both plans run every request as one KV chunk from key 0: no split, no sliding
+// window, no CUDA-graph padding plan (which always splits). Ragged plans pass page_size 1
+// and have no 64-row instantiation; short packed lengths (decode, speculative verify) keep
+// their tile.
+inline bool FA2PromoteD512Tile64(uint32_t cta_tile_q, bool split_kv, bool enable_cuda_graph,
+                                 int32_t window_left, int32_t fixed_split_size,
+                                 bool disable_split_kv, uint32_t page_size, uint32_t head_dim_vo,
+                                 uint32_t head_dim_qk, const std::vector<int64_t>& packed_qo_len,
+                                 bool d512_tile64_kv) {
+  if (!d512_tile64_kv || cta_tile_q != 32 || split_kv || enable_cuda_graph || window_left >= 0 ||
+      page_size <= 1 || head_dim_vo != 512 || (head_dim_qk != 0 && head_dim_qk != 512)) {
+    return false;
   }
-  return FA2D512Tile64Enabled() ? 64u : cta_tile_q;
+  if (fixed_split_size > 0 && !disable_split_kv) {
+    return false;  // the split is decided per request later; keep the 32-row plan
+  }
+  int64_t sum = 0;
+  for (const int64_t len : packed_qo_len) sum += len;
+  if (packed_qo_len.empty() || sum / static_cast<int64_t>(packed_qo_len.size()) <= 64) {
+    return false;
+  }
+  return FA2D512Tile64Enabled();
 }
 
 }  // namespace flashinfer
