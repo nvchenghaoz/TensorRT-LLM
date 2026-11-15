@@ -18,6 +18,7 @@ import bisect
 import copy
 import dataclasses
 import math
+import os
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
@@ -101,6 +102,11 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import Gemma4TextConfig  # noqa: E402
+
+# Kill switch for the fused Gemma4 QKV prep kernel (TRTLLM_GEMMA4_FUSED_QKV_PREP=0
+# runs the unfused chain). Read on every apply_rope call, so in-process A/B
+# runs can flip it between eager forwards.
+_FUSED_QKV_PREP = os.environ.get("TRTLLM_GEMMA4_FUSED_QKV_PREP", "1") != "0"
 
 
 class _CublasMmTokenGate:
@@ -633,22 +639,30 @@ class Gemma4Attention(QKNormRoPEAttention):
         # unfused path below stays as the reference / fallback.
         self._fused_qkv_prep: Optional[bool] = None
         self._fused_qkv_prep_out_fp8 = False
+        self._fused_qkv_prep_kv_out_fp8 = False
+        self._fused_qkv_prep_cute_norm = False
         self._fused_prep_blocked = False
 
     def _fused_qkv_prep_enabled(self) -> bool:
         if self._fused_qkv_prep is None:
             rot = self.rotary_emb
-            use_flashinfer_fp8 = getattr(self.attn, "flashinfer_backend", None) == "trtllm-gen"
+            flashinfer_backend = getattr(self.attn, "flashinfer_backend", None)
+            use_flashinfer_fp8 = flashinfer_backend == "trtllm-gen"
+            # FlashInfer FA2 (SM120 and other non-SM100 GPUs) runs BF16 Q
+            # against the FP8 paged KV cache: emit BF16 Q and FP8 K/V.
+            use_flashinfer_fa2_fp8_kv = flashinfer_backend == "fa2"
             use_trtllm_bf16 = self._use_trtllm_fused_qkv_prep
             self._fused_qkv_prep = (
                 not self.is_kv_shared
-                # The kernel reads V from a packed [q | k | v] GEMM output.
-                and not self._qk_only_proj
+                # The kernel reads V from a packed [q | k | v] GEMM output, or
+                # on FA2 (k_eq_v mode) from the raw K of a [q | k] output.
+                and (not self._qk_only_proj or use_flashinfer_fa2_fp8_kv)
                 and not self.fuse_qk_norm_rope
                 and not self.skip_rope
-                # FlashInfer trtllm-gen consumes separate FP8 tensors. Native
-                # TRTLLM instead consumes the kernel's packed BF16 output.
-                and (use_flashinfer_fp8 or use_trtllm_bf16)
+                # FlashInfer trtllm-gen consumes separate FP8 tensors, FA2
+                # BF16 Q with FP8 K/V. Native TRTLLM instead consumes the
+                # kernel's packed BF16 output.
+                and (use_flashinfer_fp8 or use_flashinfer_fa2_fp8_kv or use_trtllm_bf16)
                 and getattr(self.attn, "has_fp8_kv_cache", False)
                 and rot is not None
                 and getattr(rot, "is_neox", False)
@@ -666,8 +680,16 @@ class Gemma4Attention(QKNormRoPEAttention):
                 and self.k_norm.weight.shape == (self.head_dim,)
                 and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
                 and self.q_norm.variance_epsilon == self.v_norm.variance_epsilon
+                # FA2 runs the kernel in FlashInfer CuTe RMSNorm order, which
+                # it reproduces bitwise at these head dims.
+                and (not use_flashinfer_fa2_fp8_kv or self.head_dim in (256, 512))
             )
             self._fused_qkv_prep_out_fp8 = use_flashinfer_fp8
+            self._fused_qkv_prep_kv_out_fp8 = use_flashinfer_fp8 or use_flashinfer_fa2_fp8_kv
+            # The unfused FA2 chain it replaces is RMSNorm.forward ->
+            # FlashInfer CuTe-DSL RMSNormKernel -> FlashInfer RoPE -> .to(fp8);
+            # match its sum-of-squares order so Q/K/V stay bitwise equal.
+            self._fused_qkv_prep_cute_norm = use_flashinfer_fa2_fp8_kv
         return self._fused_qkv_prep
 
     def apply_rope(
@@ -705,6 +727,7 @@ class Gemma4Attention(QKNormRoPEAttention):
                 and position_ids is not None
                 and q.dtype == torch.bfloat16
                 and not self._fused_prep_blocked
+                and _FUSED_QKV_PREP
                 and not is_torch_compiling()
                 and self._fused_qkv_prep_enabled()
             ):
@@ -720,6 +743,9 @@ class Gemma4Attention(QKNormRoPEAttention):
                     self.head_dim,
                     out_fp8=self._fused_qkv_prep_out_fp8,
                     packed_output=self._use_trtllm_fused_qkv_prep,
+                    kv_out_fp8=self._fused_qkv_prep_kv_out_fp8,
+                    cute_norm_order=self._fused_qkv_prep_cute_norm,
+                    k_eq_v=self._qk_only_proj,
                 )
 
             if self._qk_only_proj and k is None and v is None:
