@@ -307,9 +307,69 @@ def mode_stress():
                       "comparisons": cmp}), flush=True)
 
 
+_TEXT = ("The river bends twice before it reaches the old mill, where the water slows and turns green under the "
+         "willows. In spring the farmers bring their grain down the valley road, and the miller weighs each sack "
+         "on a scale his grandfather built from oak and iron. Children wait by the wheel to watch it turn, counting "
+         "the buckets as they rise and spill. Travellers who stop at the inn hear stories of floods and dry summers, "
+         "of a bridge that washed away and was rebuilt stone by stone, and of the night the bells rang without a "
+         "hand to pull them. ")
+
+
+def natural_prompts(tok, isl, n, tag):
+    out = []
+    for i in range(n):
+        ids = tok.encode(f"Story {tag}-{i}: " + _TEXT * (isl // 60 + 4), add_special_tokens=False)
+        out.append(ids[:isl])
+    return out
+
+
+def mode_resend():
+    """Ruling 1055 (ii): own natural-text prompts, one process, no reset. With the table ON: send the groups
+    (c1 and c4 for isl8k and isl1k), then re-send them in the order 8k, 1k, 8k and compare token ids + top-20
+    logprobs bitwise with the first send. Then the same with the table OFF, and ON vs OFF on the first sends."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(CKPT)
+    llm = build_llm(batch_wait_timeout_ms=1500.0)
+    params = sp(logprobs=20)
+    groups = {
+        "isl8k@1": [[p] for p in natural_prompts(tok, 8000, 2, "8k1")],
+        "isl8k@4": [natural_prompts(tok, 8000, 4, "8k4")],
+        "isl1k@1": [[p] for p in natural_prompts(tok, 1000, 2, "1k1")],
+        "isl1k@4": [natural_prompts(tok, 1000, 4, "1k4")],
+    }
+    order8 = ["isl8k@1", "isl8k@4"]
+    order1 = ["isl1k@1", "isl1k@4"]
+
+    def send(names):
+        return {n: [summarize(o) for b in groups[n] for o in run_batch(llm, b, params)[1]] for n in names}
+
+    res = {}
+    first = {}
+    for flag in (True, False):
+        set_flag(flag)
+        tag = "on" if flag else "off"
+        first[tag] = send(order8 + order1)
+        diffs = {}
+        for k, names in enumerate([order8, order1, order8]):
+            again = send(names)
+            for n in names:
+                d = sum(1 for a, b in zip(first[tag][n], again[n]) if a != b)
+                diffs[f"resend{k}/{n}"] = {"n": len(again[n]), "n_diff": d}
+        res[tag] = diffs
+        log(f"table {tag}: " + json.dumps(diffs))
+    set_flag(True)
+    onoff = {n: sum(1 for a, b in zip(first["on"][n], first["off"][n]) if a != b) for n in first["on"]}
+    ok = all(v["n_diff"] == 0 for d in res.values() for v in d.values()) and all(v == 0 for v in onoff.values())
+    print(json.dumps({"passed": bool(ok), "compared": "own natural-text prompts; re-sends 8k,1k,8k in one process "
+                      "without reset vs first send (token ids + top-20 logprobs, bitwise), table on and off; "
+                      "first sends on vs off", "resend": res, "on_vs_off_first_send_diffs": onoff}), flush=True)
+
+
 if __name__ == "__main__":
     m = sys.argv[1] if len(sys.argv) > 1 else "time"
     if m == "time":
         mode_time()
+    elif m == "resend":
+        mode_resend()
     else:
         mode_stress()
