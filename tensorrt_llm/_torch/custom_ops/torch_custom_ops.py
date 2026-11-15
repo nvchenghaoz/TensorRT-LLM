@@ -1510,6 +1510,28 @@ def _nvfp4_dense_range(n: int, k: int) -> Optional[Tuple[int, int]]:
     return rng
 
 
+# Second dense-bucket band, TRT CUTLASS (data-parallel) tactics only, under
+# its own op key trtllm::nvfp4_gemm::gemm_dense_dp. Gemma-4-31B NVFP4 down
+# (N=5376 K=21504) at M 513-1023: main runs its power-of-2 bucket-512 pick,
+# TRT CUTLASS 128x128x128 (1.79 waves at M=1000), while 256x128x128 fits one
+# round; all TRT CUTLASS configs are int16-equal there on real activations.
+# cuBLASLt is left out because main's own pick in this band is CUTLASS DP and
+# cuBLASLt indices re-resolve per M. Off with TRTLLM_NVFP4_DENSE_DP=0 or
+# TRTLLM_NVFP4_DENSE_TUNING=0.
+NVFP4_DENSE_DP = os.environ.get("TRTLLM_NVFP4_DENSE_DP", "1") != "0"
+_NVFP4_DENSE_DP_SHAPES = {(5376, 21504): (513, 1023)}
+
+
+def _nvfp4_dense_dp_range(n: int, k: int) -> Optional[Tuple[int, int]]:
+    """(min_m, max_m) of the CUTLASS-only dense band for (N, K), else None."""
+    if not (NVFP4_DENSE_TUNING and NVFP4_DENSE_DP):
+        return None
+    rng = _NVFP4_DENSE_DP_SHAPES.get((n, k))
+    if rng is None or not _nvfp4_dense_sm_ok():
+        return None
+    return rng
+
+
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(
@@ -1525,8 +1547,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                  output_dtype: torch.dtype,
                  allowed_backends: List[str],
                  group: Optional[List[int]] = None,
-                 dense_min_m: Optional[int] = None):
+                 dense_min_m: Optional[int] = None,
+                 dense_cutlass_only: bool = False):
         super().__init__()
+        self.dense_cutlass_only = dense_cutlass_only
         self.output_buffer_kind = int(output_buffer_kind)
         self.output_dtype = output_dtype
         self.allowed_backends = allowed_backends
@@ -1713,6 +1737,8 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                 group=self.group)
             tactics.extend([("cutlass", t) for t in
                             cutlass_runner.get_valid_tactics(inputs, profile)])
+        if self.dense_cutlass_only:
+            return tactics
         if self._is_backend_allowed("cublaslt") and IS_CUBLASLT_AVAILABLE:
             cublaslt_runner = CublasLtFP4GemmRunner(self.output_buffer_kind,
                                                     self.output_dtype,
@@ -1857,6 +1883,46 @@ def nvfp4_gemm(
     tuner = AutoTuner.get()
     inputs = [act_fp4, weight, act_sf, weight_scale, alpha]
 
+    dp_range = _nvfp4_dense_dp_range(weight.shape[0], act_fp4.shape[1] * 2)
+    dp_tuned = False
+
+    def _dense_dp_choose():
+        # CUTLASS-only dense band (see _NVFP4_DENSE_DP_SHAPES); tuned after
+        # main's and the first band's entries, so those are tuned as before.
+        nonlocal dp_tuned
+        dp_tuned = True
+        if tuner.is_tuning_mode:
+            tuner.choose_one(
+                "trtllm::nvfp4_gemm::gemm",
+                [runner],
+                NVFP4GemmUnifiedRunner.tuning_config,
+                inputs,
+                bias=bias,
+            )
+        dp_runner = NVFP4GemmUnifiedRunner(output_buffer_kind,
+                                           output_dtype,
+                                           backends_list,
+                                           group=group,
+                                           dense_min_m=dp_range[0],
+                                           dense_cutlass_only=True)
+        _, dp_tactic = tuner.choose_one(
+            "trtllm::nvfp4_gemm::gemm_dense_dp",
+            [dp_runner],
+            _nvfp4_dense_tuning_config(dp_range[0], dp_range[1]),
+            inputs,
+            bias=bias,
+        )
+        return dp_runner, dp_tactic
+
+    if dp_range is not None and "cutlass" in backends_list:
+        m = act_fp4.shape[0]
+        if dp_range[0] <= m <= dp_range[1] and not tuner.is_tuning_mode:
+            dp_runner, dp_tactic = _dense_dp_choose()
+            if dp_tactic != -1:
+                return dp_runner(inputs=inputs, tactic=dp_tactic, bias=bias)
+    else:
+        dp_range = None
+
     dense_range = _nvfp4_dense_range(weight.shape[0], act_fp4.shape[1] * 2)
     if dense_range is not None:
         dense_min_m, dense_max_m = dense_range
@@ -1887,9 +1953,18 @@ def nvfp4_gemm(
                 bias=bias,
             )
             if in_range and dense_tactic != -1:
+                if (dp_range is not None and tuning
+                        and m >= dp_range[0]):
+                    _dense_dp_choose()
                 return dense_runner(inputs=inputs,
                                     tactic=dense_tactic,
                                     bias=bias)
+
+    if (dp_range is not None and tuner.is_tuning_mode and not dp_tuned
+            and act_fp4.shape[0] >= dp_range[0]):
+        dp_runner, dp_tactic = _dense_dp_choose()
+        if dp_range[0] <= act_fp4.shape[0] <= dp_range[1] and dp_tactic != -1:
+            return dp_runner(inputs=inputs, tactic=dp_tactic, bias=bias)
 
     try:
         _, best_tactic = tuner.choose_one(
