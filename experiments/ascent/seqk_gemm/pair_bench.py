@@ -167,6 +167,48 @@ def main():
         batch[f"{sn}@{M}"] = {"kernel_ms": med, "noise_floor": (p90 - p10) / med, "p10": p10, "p90": p90,
                               "n": len(ts)}
         print(f"{sn}@{M}: {med*1e3:.1f} us (p10 {p10*1e3:.1f} p90 {p90*1e3:.1f})", flush=True)
+    # 60-layer graph chain: one CUDA graph of every layer's qkv projection in config layer order
+    # (distinct weights per layer, so each is cold), replayed; median of 20 timed replays.
+    del lins
+    torch.cuda.empty_cache()
+    order = [("sl_qkv" if x == "sliding_attention" else "gl_qkv") for x in types] or (
+        ["sl_qkv"] * 5 + ["gl_qkv"]) * 10
+    chain = []
+    for sn in order:
+        N, K = shapes[sn]
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
+        chain.append(make_linear(K, N, w, mg)[0])
+    for M in (300, 310):
+        x = torch.randn(M, shapes["sl_qkv"][1], device="cuda", dtype=torch.bfloat16)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for lin in chain:
+                lin(x)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            outs = [lin(x) for lin in chain]
+        for _ in range(5):
+            g.replay()
+        torch.cuda.synchronize()
+        ts = []
+        nvml.start()
+        for _ in range(20):
+            a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            a.record()
+            g.replay()
+            b.record()
+            b.synchronize()
+            ts.append(a.elapsed_time(b))
+        c = nvml.stop()
+        if c:
+            clocks.append(c)
+        med, p10, p90 = stats(ts)
+        batch[f"chain{len(chain)}@{M}"] = {"kernel_ms": med, "noise_floor": (p90 - p10) / med, "p10": p10,
+                                           "p90": p90, "n": len(ts)}
+        print(f"chain{len(chain)}@{M}: {med:.3f} ms (p10 {p10:.3f} p90 {p90:.3f})", flush=True)
+        del g, outs
     sl, gl = batch["sl_qkv@300"], batch["gl_qkv@300"]
     batch["qkv_per_forward@300"] = {
         "kernel_ms": n_sl * sl["kernel_ms"] + n_gl * gl["kernel_ms"],
