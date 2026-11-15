@@ -59,7 +59,9 @@ from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
                      get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
                      is_nvfp4_marlin_supported_sm, is_torch_compiling,
-                     last_positive_power_of_2, next_positive_power_of_2)
+                     last_positive_power_of_2, next_positive_power_of_2,
+                     NVFP4_DENSE_TUNING_MAX_M, nvfp4_dense_bucket,
+                     nvfp4_dense_buckets)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
@@ -1057,10 +1059,16 @@ class CublasLtFP4GemmRunner(TunableRunner):
         output_buffer_kind: int,
         output_dtype: torch.dtype,
         group: Optional[List[int]] = None,
+        bucket_fn: Optional[callable] = None,
     ):
         self.output_dtype = output_dtype
         self.output_buffer_kind = int(output_buffer_kind)
         self.group = group
+        # bucket_fn(m) -> the M a tuned tactic was profiled at. When set, a
+        # tactic indexes the cuBLASLt heuristic list of that M (checked at the
+        # actual M), so the algorithm that runs is the one that was profiled.
+        # None keeps the original semantics: the list of the actual M.
+        self.bucket_fn = bucket_fn
         instance_key = (output_dtype, )
 
         if instance_key not in CublasLtFP4GemmRunner.runner_dict:
@@ -1092,7 +1100,19 @@ class CublasLtFP4GemmRunner(TunableRunner):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         mat1, mat2, mat1_scale, mat2_scale, alpha = inputs
-        result = self.cublaslt_runner.run_gemm_bucketed(
+        if self.bucket_fn is None or tactic is None or tactic < 0:
+            return self.cublaslt_runner.run_gemm(
+                mat1,
+                mat2,
+                mat1_scale,
+                mat2_scale,
+                alpha,
+                self.output_buffer_kind,
+                tactic,
+                self.group,
+                bias,
+            )
+        return self.cublaslt_runner.run_gemm_bucketed(
             mat1,
             mat2,
             mat1_scale,
@@ -1100,31 +1120,20 @@ class CublasLtFP4GemmRunner(TunableRunner):
             alpha,
             self.output_buffer_kind,
             tactic,
-            self.heuristic_m(mat1.shape[0], tactic),
+            int(self.bucket_fn(mat1.shape[0])),
             self.group,
             bias,
         )
-        return result
 
-    @classmethod
-    def heuristic_m(cls, m: int, tactic: int) -> int:
-        """The M whose cuBLASLt heuristic list a tuned tactic indexes.
-
-        A tactic is an index into the heuristic list cuBLASLt returns for one
-        M, and the list changes with M. The AutoTuner profiles at the bucket
-        ``map_to_tuning_buckets(M)`` (clamped to ``tune_max_num_tokens``) and
-        returns that bucket's tactic for every M mapped to it, so the
-        algorithm must come from the bucket's list, not from the list of the
-        actual M. A fallback tactic (-1) uses the actual M.
-        """
-        if tactic is None or tactic < 0 or m <= 0:
-            return m
-        spec = cls.tuning_config.dynamic_tensor_specs[0]
-        bucket = spec.map_to_tuning_buckets(m)
-        tune_max = cls.tuning_config.tune_max_num_tokens
-        if tune_max is not None:
-            bucket = min(bucket, tune_max)
-        return int(bucket)
+    def is_reduction_free(self, inputs: List[torch.Tensor],
+                          tactic: int) -> bool:
+        """True when cuBLASLt tactic ``tactic`` at this M has no split-K and
+        no reduction scheme (so each output is one K-ordered accumulation)."""
+        mat1, mat2, mat1_scale, mat2_scale, _ = inputs
+        cfg = self.cublaslt_runner.get_algo_config(mat1, mat2, mat1_scale,
+                                                   mat2_scale, tactic, -1)
+        # [has_algo, fallback, algo_id, tile, stages, splitK, reduction, ...]
+        return bool(cfg[0]) and not cfg[1] and cfg[5] <= 1 and cfg[6] == 0
 
 
 class CudaCoreNVFP4Runner(TunableRunner):
@@ -1430,6 +1439,72 @@ def _(
                              dtype=output_dtype)
 
 
+# Dense-bucket NVFP4 GEMM tuning (SM120). For listed (N, K) and M in
+# [min_m, NVFP4_DENSE_TUNING_MAX_M], trtllm::nvfp4_gemm profiles at the dense
+# grid point at or above M (nvfp4_dense_bucket) with L2 flushed before every
+# timed repeat, instead of at the power of 2 below M with hot L2. Shapes, and M
+# outside that range, keep main's buckets, profiling and tactic list.
+# The table holds only shapes whose order-preserving tactics were all found
+# bitwise equal on real activations over the whole range (Gemma-4-31B NVFP4
+# MLP: gate_up N=43008 K=5376 from M=256; down N=5376 K=21504 from M=4096).
+# TRTLLM_NVFP4_DENSE_TUNING=0 disables it; TRTLLM_NVFP4_DENSE_SHAPES
+# ("N:K:min_m,...") replaces the table.
+NVFP4_DENSE_TUNING = os.environ.get("TRTLLM_NVFP4_DENSE_TUNING", "1") != "0"
+_NVFP4_DENSE_SM = (120, )
+_NVFP4_DENSE_COLD_L2_FLUSH_BYTES = 256 << 20
+
+
+def _parse_nvfp4_dense_shapes(spec: Optional[str]) -> Mapping:
+    if spec is None:
+        return {(43008, 5376): 256, (5376, 21504): 4096}
+    table = {}
+    for item in spec.split(","):
+        if item.strip():
+            n, k, min_m = (int(v) for v in item.split(":"))
+            table[(n, k)] = min_m
+    return table
+
+
+_NVFP4_DENSE_SHAPES = _parse_nvfp4_dense_shapes(
+    os.environ.get("TRTLLM_NVFP4_DENSE_SHAPES"))
+
+
+@lru_cache(maxsize=None)
+def _nvfp4_dense_tuning_config(min_m: int) -> TuningConfig:
+    import functools
+    return TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, functools.partial(_nvfp4_dense_gen, min_m=min_m),
+            functools.partial(_nvfp4_dense_map, min_m=min_m)), ),
+        constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+        cold_l2_flush_bytes=_NVFP4_DENSE_COLD_L2_FLUSH_BYTES,
+    )
+
+
+def _nvfp4_dense_gen(x: int, min_m: int):
+    return nvfp4_dense_buckets(x, min_m)
+
+
+def _nvfp4_dense_map(m: int, min_m: int) -> int:
+    return nvfp4_dense_bucket(m, min_m)
+
+
+@lru_cache(maxsize=None)
+def _nvfp4_dense_sm_ok() -> bool:
+    return get_sm_version() in _NVFP4_DENSE_SM
+
+
+def _nvfp4_dense_min_m(n: int, k: int) -> Optional[int]:
+    """min_m of the dense-bucket mode for an (N, K) NVFP4 GEMM, else None."""
+    if not NVFP4_DENSE_TUNING:
+        return None
+    min_m = _NVFP4_DENSE_SHAPES.get((n, k))
+    if min_m is None or not _nvfp4_dense_sm_ok():
+        return None
+    return min_m
+
+
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(
@@ -1444,12 +1519,20 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                  output_buffer_kind: int,
                  output_dtype: torch.dtype,
                  allowed_backends: List[str],
-                 group: Optional[List[int]] = None):
+                 group: Optional[List[int]] = None,
+                 dense_min_m: Optional[int] = None):
         super().__init__()
         self.output_buffer_kind = int(output_buffer_kind)
         self.output_dtype = output_dtype
         self.allowed_backends = allowed_backends
         self.group = group
+        # Dense-bucket mode (see _nvfp4_dense_min_m): tactics are profiled at
+        # nvfp4_dense_bucket(M, dense_min_m), only data-parallel CUTLASS and
+        # reduction-free cuBLASLt tactics are offered, and a cuBLASLt tactic
+        # runs the algorithm of the bucket's heuristic list.
+        self.dense_min_m = dense_min_m
+        self._dense_bucket_fn = (None if dense_min_m is None else
+                                 lambda m: nvfp4_dense_bucket(m, dense_min_m))
 
     def unique_id(self):
         """Include allowed_backends in cache key to avoid sharing cache across different backend configs."""
@@ -1507,6 +1590,9 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         # return valid nvfp4 gemm implementations from allowed_backends
         tactics = []
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
+
+        if self.dense_min_m is not None:
+            return self._dense_valid_tactics(inputs, profile)
 
         # Add Marlin tactics (SM89 Ada / SM90 Hopper) — users must opt-in explicitly
         # by listing "marlin" in ``allowed_backends``.
@@ -1604,6 +1690,33 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
 
         return tactics
 
+    def _dense_valid_tactics(self, inputs: List[torch.Tensor],
+                             profile: OptimizationProfile) -> List[Tuple]:
+        """Tactics of the dense-bucket mode: order-preserving ones only.
+
+        The SM120 CUTLASS NVFP4 configs all use the static persistent
+        (data-parallel) scheduler. cuBLASLt algorithms with split-K or a
+        reduction scheme are dropped. The census behind the shapes the mode
+        covers found every remaining tactic bitwise equal on real activations.
+        """
+        tactics = []
+        if self._is_backend_allowed("cutlass"):
+            cutlass_runner = FP4GemmRunner(
+                fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                self.output_buffer_kind,
+                self.output_dtype,
+                group=self.group)
+            tactics.extend([("cutlass", t) for t in
+                            cutlass_runner.get_valid_tactics(inputs, profile)])
+        if self._is_backend_allowed("cublaslt") and IS_CUBLASLT_AVAILABLE:
+            cublaslt_runner = CublasLtFP4GemmRunner(self.output_buffer_kind,
+                                                    self.output_dtype,
+                                                    group=self.group)
+            for t in cublaslt_runner.get_valid_tactics(inputs, profile):
+                if cublaslt_runner.is_reduction_free(inputs, t):
+                    tactics.append(("cublaslt", t))
+        return tactics
+
     def forward(
         self,
         inputs: List[torch.Tensor],
@@ -1642,11 +1755,13 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                    tactic=sub_tactic,
                                                    bias=bias)
         elif backend == "cublaslt":
-            return CublasLtFP4GemmRunner(self.output_buffer_kind,
-                                         self.output_dtype,
-                                         group=self.group)(inputs,
-                                                           tactic=sub_tactic,
-                                                           bias=bias)
+            return CublasLtFP4GemmRunner(
+                self.output_buffer_kind,
+                self.output_dtype,
+                group=self.group,
+                bucket_fn=self._dense_bucket_fn)(inputs,
+                                                 tactic=sub_tactic,
+                                                 bias=bias)
         elif backend == "cutedsl":
             cutedsl_runner = self._get_cutedsl_runner(required=True)
             assert cutedsl_runner is not None
@@ -1735,6 +1850,40 @@ def nvfp4_gemm(
     # - For 'auto' mode: compare across all backends, find global optimum
     # - For forced backend: only one backend in list, but still find its best tactic
     tuner = AutoTuner.get()
+    inputs = [act_fp4, weight, act_sf, weight_scale, alpha]
+
+    dense_min_m = _nvfp4_dense_min_m(weight.shape[0], act_fp4.shape[1] * 2)
+    if dense_min_m is not None:
+        m = act_fp4.shape[0]
+        in_range = dense_min_m <= m <= NVFP4_DENSE_TUNING_MAX_M
+        tuning = tuner.is_tuning_mode
+        if in_range or (tuning and m >= dense_min_m):
+            if tuning:
+                # Tune main's entries first, as main does: M outside the
+                # dense range, and a dense cache miss, run main's pick.
+                tuner.choose_one(
+                    "trtllm::nvfp4_gemm::gemm",
+                    [runner],
+                    NVFP4GemmUnifiedRunner.tuning_config,
+                    inputs,
+                    bias=bias,
+                )
+            dense_runner = NVFP4GemmUnifiedRunner(output_buffer_kind,
+                                                  output_dtype,
+                                                  backends_list,
+                                                  group=group,
+                                                  dense_min_m=dense_min_m)
+            _, dense_tactic = tuner.choose_one(
+                "trtllm::nvfp4_gemm::gemm_dense",
+                [dense_runner],
+                _nvfp4_dense_tuning_config(dense_min_m),
+                inputs,
+                bias=bias,
+            )
+            if in_range and dense_tactic != -1:
+                return dense_runner(inputs=inputs,
+                                    tactic=dense_tactic,
+                                    bias=bias)
 
     try:
         _, best_tactic = tuner.choose_one(

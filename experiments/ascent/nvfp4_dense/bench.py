@@ -1,0 +1,322 @@
+"""Idea 9 / branch 30: trtllm::nvfp4_gemm kernel pair and repeated-execution check.
+
+Runs unchanged on main (base arm) and on the branch (candidate arm). Synthetic
+operands of the model's MLP shapes (read from <checkpoint>/config.json),
+quantized with trtllm::fp4_quantize. Tuning is what the engine's warmup does:
+one call per shape at M=8192 under autotune(), on fresh inputs.
+
+modes
+  pair   time the op per (shape, M), L2 flushed (256 MiB write) before every
+         warmup/timed iteration; 5 warmup + 30 timed, CUDA events, median/p10/p90.
+  check  untimed sequence with the same warmup+iters per case, shape order A,B,A:
+         every output int16-equal to call 1, to main's pick (switch OFF in the
+         same process) and FP32-reference error within 1.10x main's + 1 ulp;
+         inputs unchanged. Seeds 1, 2 and heavy-tailed randn*2^U(-8,8) rows.
+  smoke  quick functional test of the dense policy (branch only).
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+import torch
+
+M_PREFILL = [300, 301, 1000, 1023, 1200, 1856, 2000, 4000, 4096, 4800, 8000, 8100, 8192]
+M_DECODE = [1, 8, 32, 64]
+WARMUP = 5
+ITERS = 30
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def read_dims(ckpt):
+    with open(os.path.join(ckpt, "config.json")) as f:
+        cfg = json.load(f)
+    tc = cfg.get("text_config", cfg)
+    hidden, inter = tc["hidden_size"], tc["intermediate_size"]
+    q = {}
+    p = os.path.join(ckpt, "hf_quant_config.json")
+    if os.path.exists(p):
+        with open(p) as f:
+            q = json.load(f)
+    q = q.get("quantization", q)
+    log(f"[dims] hidden={hidden} intermediate={inter} layers={tc.get('num_hidden_layers')} "
+        f"quant_algo={q.get('quant_algo')} group_size={q.get('group_size')} kv={q.get('kv_cache_quant_algo')}")
+    return {"gate_up": (2 * inter, hidden), "down": (hidden, inter)}
+
+
+def quantize(x):
+    amax = x.abs().amax().float()
+    gs = (448.0 * 6.0 / amax).reshape(1).to(torch.float32)
+    q, sf = torch.ops.trtllm.fp4_quantize(x, gs, 16, False)
+    return q, sf, gs
+
+
+_LUT = None
+
+
+def dequant(q, sf, gs, rows, k):
+    global _LUT
+    if _LUT is None:
+        _LUT = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6],
+                            dtype=torch.float32, device=q.device)
+    qb = q.view(torch.uint8)
+    lo = (qb & 0xF).long()
+    hi = (qb >> 4).long()
+    vals = torch.stack([_LUT[lo], _LUT[hi]], dim=-1).reshape(rows, k)
+    rows_pad = (rows + 127) // 128 * 128
+    sf_lin = torch.ops.trtllm.block_scale_interleave_reverse(sf.view(torch.uint8).reshape(rows_pad, -1))
+    sf_f = sf_lin[:rows, :k // 16].view(torch.float8_e4m3fn).float()
+    return vals * sf_f.repeat_interleave(16, dim=1) / gs
+
+
+def make_weight(n, k, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    w = (torch.randn(n, k, generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    wq, wsf, wgs = quantize(w)
+    return wq, wsf, wgs
+
+
+def make_act(m, k, seed, heavy=False):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(m, k, generator=g, device="cuda")
+    if heavy:
+        e = torch.rand(m, 1, generator=g, device="cuda") * 16 - 8
+        x = x * torch.exp2(e)
+    return quantize(x.to(torch.bfloat16))
+
+
+BACKENDS = "cutlass,cublaslt,cutedsl,cuda_core"
+
+
+def gemm(xq, xsf, wq, wsf, alpha):
+    return torch.ops.trtllm.nvfp4_gemm(xq, wq, xsf, wsf, alpha, torch.bfloat16, allowed_backends=BACKENDS)
+
+
+def tco():
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops
+    return torch_custom_ops
+
+
+def has_dense():
+    return hasattr(tco(), "NVFP4_DENSE_TUNING")
+
+
+def set_dense(flag):
+    if has_dense():
+        tco().NVFP4_DENSE_TUNING = flag
+
+
+def tune(weights, dims):
+    from tensorrt_llm._torch.autotuner import autotune
+    t0 = time.time()
+    with autotune():
+        for name, (wq, wsf, wgs) in weights.items():
+            n, k = dims[name]
+            xq, xsf, xgs = make_act(8192, k, 7)
+            alpha = (1.0 / (xgs * wgs)).float()
+            t1 = time.time()
+            gemm(xq, xsf, wq, wsf, alpha)
+            torch.cuda.synchronize()
+            log(f"[tune] {name} {time.time() - t1:.1f}s")
+    torch.cuda.synchronize()
+    return time.time() - t0
+
+
+def picks_for(name, m, n, k):
+    """Tuner cache entries (main and dense) that the lookup of (name, M) hits."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    t = tco()
+    cache = AutoTuner.get().profiling_cache.cache
+    res = {}
+    m_main = t.last_positive_power_of_2(m)
+    want = {("trtllm::nvfp4_gemm::gemm", m_main)}
+    if has_dense():
+        mn = t._NVFP4_DENSE_SHAPES.get((n, k))
+        if mn is not None:
+            want.add(("trtllm::nvfp4_gemm::gemm_dense", t.nvfp4_dense_bucket(m, mn)))
+    for key, val in cache.items():
+        op, shapes = key[0], key[3]
+        if shapes[1][0] == n and shapes[0][1] * 2 == k and (op, shapes[0][0]) in want:
+            res[op.split("::")[-1] + f"@{shapes[0][0]}"] = str(val[1])
+    return res
+
+
+def timed(fn, flush):
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(ITERS)]
+    for _ in range(WARMUP):
+        flush.zero_()
+        fn()
+    for i in range(ITERS):
+        flush.zero_()
+        starts[i].record()
+        fn()
+        ends[i].record()
+    torch.cuda.synchronize()
+    ts = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
+    q = lambda f: ts[int(round(f * (len(ts) - 1)))]  # noqa: E731
+    return q(0.5), q(0.1), q(0.9)
+
+
+def gpu_state():
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+        return {"sm_clock_mhz": pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM),
+                "temp_c": pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU),
+                "power_w": pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0,
+                "throttle_reasons": int(pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(h))}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+
+
+def mode_pair(args, dims, weights):
+    log(f"[gpu] start {gpu_state()}")
+    tune_s = tune(weights, dims)
+    log(f"[tune] total {tune_s:.1f}s dense_available={has_dense()}")
+    flush = torch.empty(512 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
+    batch = {}
+    picks = {}
+    for name, (wq, wsf, wgs) in weights.items():
+        n, k = dims[name]
+        for m in M_DECODE + M_PREFILL:
+            xq, xsf, xgs = make_act(m, k, 11)
+            alpha = (1.0 / (xgs * wgs)).float()
+            med, p10, p90 = timed(lambda: gemm(xq, xsf, wq, wsf, alpha), flush)
+            pk = picks_for(name, m, n, k)
+            picks[f"{name}@{m}"] = pk
+            log(f"[time] {name} M={m} med={med * 1e3:.1f}us p10={p10 * 1e3:.1f} p90={p90 * 1e3:.1f} picks={pk}")
+            batch[f"{name}@{m}"] = {"kernel_ms": med, "p10_ms": p10, "p90_ms": p90,
+                                    "noise_floor": (p90 - p10) / med}
+    log(f"[gpu] end {gpu_state()}")
+    print(json.dumps({"batch": batch, "output": {"class": "exact"}, "tune_seconds": tune_s, "picks": picks,
+                      "dense_available": has_dense()}))
+
+
+def int16_mismatch(a, b):
+    d = a.view(torch.int16) != b.view(torch.int16)
+    cnt = int(d.sum().item())
+    first = None
+    if cnt:
+        idx = d.nonzero()[0].tolist()
+        first = {"row": idx[0], "col": idx[1], "a": float(a[idx[0], idx[1]]), "b": float(b[idx[0], idx[1]])}
+    return cnt, first
+
+
+def mode_check(args, dims, weights):
+    tune_s = tune(weights, dims)
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    cache_before = dict(AutoTuner.get().profiling_cache.cache)
+    passed = True
+    results = {}
+    order = []
+    for m in M_DECODE + M_PREFILL:
+        order += [("gate_up", m), ("down", m), ("gate_up", m)]  # A, B, A
+    wrefs = {}
+    for name, (wq, wsf, wgs) in weights.items():
+        n, k = dims[name]
+        wrefs[name] = dequant(wq, wsf, wgs, n, k)
+    for variant, seed, heavy in (("seed1", 1, False), ("seed2", 2, False), ("heavy", 3, True)):
+        for name, m in order:
+            wq, wsf, wgs = weights[name]
+            n, k = dims[name]
+            xq, xsf, xgs = make_act(m, k, seed + m, heavy)
+            alpha = (1.0 / (xgs * wgs)).float()
+            snap = [t.clone() for t in (xq, xsf, wq, wsf, alpha)]
+            set_dense(True)
+            outs = [gemm(xq, xsf, wq, wsf, alpha) for _ in range(WARMUP + ITERS)]
+            set_dense(False)
+            main_out = gemm(xq, xsf, wq, wsf, alpha)
+            set_dense(True)
+            torch.cuda.synchronize()
+            first = outs[0]
+            rep_bad = sum(int16_mismatch(o, first)[0] for o in outs[1:])
+            vs_main, fm = int16_mismatch(first, main_out)
+            unchanged = all(torch.equal(a.view(torch.uint8) if a.dtype != torch.float32 else a,
+                                        b.view(torch.uint8) if b.dtype != torch.float32 else b)
+                            for a, b in zip(snap, (xq, xsf, wq, wsf, alpha)))
+            finite = bool(torch.isfinite(first.float()).all())
+            ok = rep_bad == 0 and vs_main == 0 and unchanged and finite and first.shape == (m, n) \
+                and first.dtype == torch.bfloat16
+            key = f"{variant}|{name}@{m}"
+            if key not in results:
+                xref = dequant(xq, xsf, xgs, m, k)
+                ref = xref @ wrefs[name].t()
+                e_c = first.float() - ref
+                e_m = main_out.float() - ref
+                ulp = 2.0 ** (torch.floor(torch.log2(ref.abs().max())).item() - 7)
+                r = {"maxabs": e_c.abs().max().item(), "relfro": (e_c.norm() / ref.norm()).item(),
+                     "main_maxabs": e_m.abs().max().item(), "main_relfro": (e_m.norm() / ref.norm()).item()}
+                tol = r["maxabs"] <= 1.10 * r["main_maxabs"] + ulp and r["relfro"] <= 1.10 * r["main_relfro"]
+                ok = ok and tol
+                r.update({"repeat_mismatch": rep_bad, "vs_main_int16_mismatch": vs_main, "first_mismatch": fm,
+                          "inputs_unchanged": unchanged, "finite": finite, "tol_ok": tol, "ok": ok,
+                          "picks": picks_for(name, m, n, k)})
+                results[key] = r
+                del xref, ref, e_c, e_m
+                log(f"[check] {key} " + json.dumps(r))
+            else:
+                results[key]["ok"] = results[key]["ok"] and ok
+                results[key]["repeat_mismatch"] += rep_bad
+                results[key]["vs_main_int16_mismatch"] += vs_main
+            passed &= ok
+            if not ok:
+                log(f"[check] FAIL {key} rep={rep_bad} vs_main={vs_main} first={fm} unchanged={unchanged}")
+            del outs, main_out
+    cache_after = dict(AutoTuner.get().profiling_cache.cache)
+    mutated = cache_before != cache_after
+    passed &= not mutated
+    print(json.dumps({"passed": bool(passed), "compared": "dense-policy trtllm::nvfp4_gemm vs main's pick "
+                      "(switch OFF, same process) int16 on every row; every call vs call 1; FP32 dequant ref; "
+                      "inputs unchanged; shape order A,B,A; seeds 1,2 + heavy-tailed",
+                      "dense_available": has_dense(), "autotuner_cache_mutated": mutated,
+                      "n_cases": len(results), "tune_seconds": tune_s,
+                      "fails": [k for k, v in results.items() if not v["ok"]], "results": results}))
+
+
+def mode_smoke(args, dims, weights):
+    t = tco()
+    from tensorrt_llm._torch import utils as u
+    log(f"[smoke] buckets256={u.nvfp4_dense_buckets(8192, 256)}")
+    log(f"[smoke] buckets4096={u.nvfp4_dense_buckets(8192, 4096)}")
+    for m in (1, 255, 256, 300, 1000, 1025, 2000, 4000, 4096, 4097, 4800, 8000, 8192, 9000):
+        log(f"[smoke] m={m} b256={u.nvfp4_dense_bucket(m, 256)} b4096={u.nvfp4_dense_bucket(m, 4096)}")
+    tune_s = tune(weights, dims)
+    log(f"[smoke] tune {tune_s:.1f}s")
+    for name, (wq, wsf, wgs) in weights.items():
+        n, k = dims[name]
+        for m in (64, 300, 2000, 4800, 8000):
+            xq, xsf, xgs = make_act(m, k, 5)
+            alpha = (1.0 / (xgs * wgs)).float()
+            set_dense(True)
+            a = gemm(xq, xsf, wq, wsf, alpha)
+            set_dense(False)
+            b = gemm(xq, xsf, wq, wsf, alpha)
+            set_dense(True)
+            log(f"[smoke] {name} M={m} int16_mismatch={int16_mismatch(a, b)[0]} picks={picks_for(name, m, n, k)}")
+    print(json.dumps({"passed": True, "tune_seconds": tune_s}))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="pair")
+    ap.add_argument("--checkpoint", required=True)
+    args = ap.parse_args()
+    import tensorrt_llm  # noqa: F401
+    dims = read_dims(args.checkpoint)
+    log(f"[gpu] {torch.cuda.get_device_name()} sm={torch.cuda.get_device_capability()}")
+    weights = {}
+    for i, name in enumerate(("gate_up", "down")):
+        n, k = dims[name]
+        log(f"[case] {name} N={n} K={k}")
+        weights[name] = make_weight(n, k, 100 + i)
+    {"pair": mode_pair, "check": mode_check, "smoke": mode_smoke}[args.mode](args, dims, weights)
+
+
+if __name__ == "__main__":
+    main()
