@@ -6,6 +6,7 @@
 import contextlib
 import functools
 import os
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, NamedTuple, Protocol
@@ -64,6 +65,25 @@ from .warmup import WarmupAgreement
 # CUDA graphs; the short prefill iterations these graphs speed up rarely
 # schedule more, and their breaks run eagerly.
 _BREAK_GRAPH_NUM_CONTEXTS = (1, 2)
+
+# Context steps served by breakable prefill graph replay vs eager, logged at a
+# fixed cadence so a server log shows which steps replayed.
+_BCG_STEP_COUNTS = {"replayed": 0, "eager": 0}
+_BCG_STEP_LOG_EVERY = int(os.environ.get("TRTLLM_BCG_STEP_LOG_EVERY", "64"))
+# Diagnostics only (default off): synchronize around each non-dummy no-key step
+# and log its host enqueue time and GPU time.
+_STEP_TIMING_DIAG = os.environ.get("TRTLLM_PREFILL_STEP_TIMING", "0") == "1"
+
+
+def _count_bcg_step(replayed: bool, num_tokens: int, real_num_tokens: int) -> None:
+    _BCG_STEP_COUNTS["replayed" if replayed else "eager"] += 1
+    total = _BCG_STEP_COUNTS["replayed"] + _BCG_STEP_COUNTS["eager"]
+    if _BCG_STEP_LOG_EVERY > 0 and (total <= 8 or total % _BCG_STEP_LOG_EVERY == 0):
+        logger.info(
+            f"BCG context steps: replayed={_BCG_STEP_COUNTS['replayed']} "
+            f"eager={_BCG_STEP_COUNTS['eager']} (last: tokens={real_num_tokens}, "
+            f"run as {num_tokens}, {'replay' if replayed else 'eager'})"
+        )
 
 
 def _make_single_token_context_graph_batch(
@@ -568,11 +588,37 @@ class DecoderCudaGraphs:
                 and not gather_context_logits
                 and breakable_runner.has_graph(num_tokens)
             )
-            if can_run_breakable_graph and not breakable_runner.is_warming_up:
+            if breakable_runner is not None and not is_dummy:
+                _count_bcg_step(
+                    bool(can_run_breakable_graph and not breakable_runner.is_warming_up),
+                    num_tokens,
+                    int(getattr(attn_metadata, "num_tokens", num_tokens) or num_tokens),
+                )
+            replay = bool(
+                can_run_breakable_graph and not breakable_runner.is_warming_up
+            )
+            diag = _STEP_TIMING_DIAG and not is_dummy
+            if diag:
+                torch.cuda.synchronize()
+                ev0 = torch.cuda.Event(enable_timing=True)
+                ev1 = torch.cuda.Event(enable_timing=True)
+                t0 = time.perf_counter()
+                ev0.record()
+            if replay:
                 outputs = breakable_runner.execute(num_tokens, lambda: run_model(inputs))
             else:
                 # real eager or BCG warmup or PCG
                 outputs = run_model(inputs)
+            if diag:
+                host_ms = (time.perf_counter() - t0) * 1e3
+                ev1.record()
+                torch.cuda.synchronize()
+                print(
+                    f"PREFILL_STEP_TIMING tokens={int(getattr(attn_metadata, 'num_tokens', 0))} "
+                    f"run_as={num_tokens} mode={'replay' if replay else 'eager'} "
+                    f"host_enqueue_ms={host_ms:.3f} gpu_ms={ev0.elapsed_time(ev1):.3f}",
+                    flush=True,
+                )
         else:
             needs_capture = self.cuda_graph_runner.needs_capture(key)
             if needs_capture:

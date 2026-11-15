@@ -1,0 +1,5 @@
+{
+  "prefill_cuda_graph_backend": "breakable",
+  "disable_mm_encoder": true,
+  "prefill_capture_num_tokens": [300, 600, 900, 1000, 1200, 1500, 1800, 2000]
+}

@@ -5,6 +5,7 @@
 
 import bisect
 import math
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -23,6 +24,13 @@ from .interface import ScheduledInputs
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleStateTensors
+
+# Prefill CUDA graphs replay only steps whose token count equals a captured size
+# (no padding to the next bucket); other steps run eager and unpadded, so a replay runs
+# the same kernels at the same M as eager and stays bitwise equal to it. A padded replay
+# can pick other GEMM tactics (cuBLAS heuristics, NVFP4 AutoTuner M buckets).
+# TRTLLM_PREFILL_GRAPH_EXACT_ONLY=0 restores padding to the next captured size.
+_PREFILL_GRAPH_EXACT_ONLY = os.environ.get("TRTLLM_PREFILL_GRAPH_EXACT_ONLY", "1") == "1"
 
 
 def get_all_rank_num_tokens(
@@ -102,6 +110,11 @@ def get_padding_params(
             can_run_prefill_cuda_graph = (
                 has_ctx_requests and max(attn_all_rank_num_tokens) <= max_captured_num_tokens
             )
+            if can_run_prefill_cuda_graph and _PREFILL_GRAPH_EXACT_ONLY:
+                can_run_prefill_cuda_graph = all(
+                    get_padded_prefill_tokens(max(attn_all_rank_num_tokens)) == n
+                    for n in attn_all_rank_num_tokens
+                )
             if can_run_prefill_cuda_graph:
                 padded_num_tokens = get_padded_prefill_tokens(max(attn_all_rank_num_tokens))
                 logger.debug(
@@ -113,6 +126,10 @@ def get_padding_params(
                 return total_num_tokens, False, attn_all_rank_num_tokens
         elif num_ctx_requests != 0 and total_num_tokens <= max_captured_num_tokens:
             padded_num_tokens = get_padded_prefill_tokens(total_num_tokens)
+            if _PREFILL_GRAPH_EXACT_ONLY and padded_num_tokens != total_num_tokens:
+                # Exact-only: a padded replay may pick other GEMM tactics than eager at the
+                # real M, so steps off a captured size run eager and unpadded.
+                return total_num_tokens, False, None
             logger.debug(f"Pad tensor with {total_num_tokens} tokens to {padded_num_tokens} tokens")
             return padded_num_tokens, True, None
         else:
