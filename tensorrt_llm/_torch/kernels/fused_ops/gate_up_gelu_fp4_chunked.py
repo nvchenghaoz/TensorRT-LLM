@@ -31,7 +31,7 @@ Exact by construction:
 Callers fall back to the unchunked path when this returns None.
 """
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -91,6 +91,7 @@ def gate_up_gelu_fp4_chunked(
     allowed_backends: List[str],
     down_input_scale: torch.Tensor,
     chunk_rows: int,
+    act_fn: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """gelu_tanh_mul_fp4_quant(nvfp4_gemm(act)) computed in row chunks.
 
@@ -102,12 +103,17 @@ def gate_up_gelu_fp4_chunked(
         output_dtype / allowed_backends: as Linear passes them.
         down_input_scale: [1] fp32 static input scale of down_proj.
         chunk_rows: rows per chunk, a positive multiple of 128.
+        act_fn: the activation+quant kernel (default gelu_tanh_mul_fp4_quant);
+            it must take out= / sf_out= like gelu_tanh_mul_fp4_quant. Permuted
+            gate_up rows pass gelu_tanh_mul_fp4_quant_permuted.
 
     Returns:
         (fp4, sf) byte-identical to gelu_tanh_mul_fp4_quant(nvfp4_gemm(...)),
         or None when the chunked path does not apply (the caller then runs
         the unchunked chain).
     """
+    if act_fn is None:
+        act_fn = gelu_tanh_mul_fp4_quant
     if chunk_rows <= 0 or chunk_rows % 128 != 0:
         return None
     if act_fp4.dim() != 2 or not act_fp4.is_contiguous() or not act_sf.is_contiguous():
@@ -150,7 +156,7 @@ def gate_up_gelu_fp4_chunked(
             ],
             tactic=tactic,
         )
-        gelu_tanh_mul_fp4_quant(
+        act_fn(
             h1,
             down_input_scale,
             out=out[r0:r1],
