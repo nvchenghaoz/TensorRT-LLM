@@ -159,6 +159,35 @@ def main():
         import io
         import pstats
 
+        # Host us per Triton JITFunction.run call (binder, specialization key,
+        # cache lookup, launcher), per kernel, on unprofiled forwards.
+        from triton.runtime import jit as tjit
+        _run = tjit.JITFunction.run
+        jt = {}
+
+        def timed_run(self, *a, **k):
+            t = time.perf_counter()
+            r = _run(self, *a, **k)
+            d = time.perf_counter() - t
+            name = getattr(getattr(self, "fn", None), "__name__", str(self))
+            e = jt.setdefault(name, [0, 0.0])
+            e[0] += 1
+            e[1] += d
+            return r
+
+        tjit.JITFunction.run = timed_run
+        rows = run(300, 10)
+        tjit.JITFunction.run = _run
+        nf = len(rows)
+        print(f"=== Triton JITFunction.run host time over {nf} unprofiled 300-token forwards ===")
+        tot = 0.0
+        for name, (c, s) in sorted(jt.items(), key=lambda kv: -kv[1][1]):
+            print(f"{c / nf:6.1f} calls/fwd {s * 1e6 / c:8.2f} us/call {s * 1e3 / nf:8.3f} ms/fwd  {name}")
+            tot += s * 1e3 / nf
+        print(f"Triton JIT run total: {tot:.3f} ms/fwd; enqueue med of these forwards "
+              f"{statistics.median([r[2] for r in rows]):.2f} ms")
+        result["triton_jit_ms_per_fwd"] = tot
+
         cp = cProfile.Profile()
         rec["cprof"] = cp
         rows = run(300, 10)
@@ -200,7 +229,10 @@ def main():
                 d[0] += 1
                 d[1] += getattr(e, "device_time", None) or getattr(e, "cuda_time", 0.0)
                 nk += 1
-            print(f"=== kineto: {nk} GPU ops in one 300-token forward ===")
+            busy = sum(us for _, us in kern.values()) / 1e3
+            print(f"=== kineto: {nk} GPU ops in one 300-token forward, sum of op durations "
+                  f"{busy:.2f} ms ===")
+            result["gpu_ops_sum_ms"] = busy
             for name, (c, us) in sorted(kern.items(), key=lambda kv: -kv[1][0]):
                 print(f"{c:5d} {us / c:9.1f} us/each {us:10.1f} us  {name}")
             kin.export_chrome_trace(os.path.join(art, "fwd300_kineto.json"))

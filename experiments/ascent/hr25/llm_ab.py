@@ -125,6 +125,14 @@ def main():
         return _ai(self, *a, **k)
 
     attn_mod.Attention._attn_impl = ai
+    counts["final_norm_direct"] = 0
+    _fin = mg._flashinfer_rmsnorm
+
+    def fin(*a, **k):
+        counts["final_norm_direct"] += 1
+        return _fin(*a, **k)
+
+    mg._flashinfer_rmsnorm = fin
 
     llm = LLM(
         model=ck,
@@ -239,6 +247,7 @@ def main():
           # trims taken in B: no per-call KV views / PlanParams / flag derivations
           and calls["B"]["kv_view_built"] == 0 and calls["B"]["planparams_built"] == 0
           and calls["B"]["quant_flags_derived"] == 0
+          and calls["B"]["final_norm_direct"] > 0 and calls["A"]["final_norm_direct"] == 0
           # bypassed in A: main's per-call work runs
           and calls["A"]["kv_view_built"] == calls["A"]["get_buffers"] > 0
           and calls["A"]["quant_flags_derived"] == calls["A"]["attn_impl"])
