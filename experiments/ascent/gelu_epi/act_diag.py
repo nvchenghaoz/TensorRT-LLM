@@ -61,12 +61,56 @@ def main():
         return {"med_us": round(statistics.median(ts), 1), "p10": round(ts[3], 1), "p90": round(ts[26], 1)}
 
     out = {}
-    for M in (1000, 1200, 1500, 2000):
+    Ms = [int(x) for x in os.environ.get("ACT_DIAG_MS", "1000,1200,1500,2000").split(",")]
+    Ts = [tuple([t.split(":")[0], int(t.split(":")[1])])
+          for t in os.environ.get("ACT_DIAG_TACTICS", "cublaslt:1,cublaslt:2,cutlass:0").split(",")]
+    if os.environ.get("ACT_DIAG_HOST"):
+        # host-only enqueue time (no sync inside the loop) of main's vs the candidate's dispatch,
+        # the same calls bench.py times (tuned nvfp4_gemm + act vs gate_up_gelu_fp4_permuted)
+        from tensorrt_llm._torch.autotuner import autotune
+        bk = "cutlass,cublaslt,cutedsl,cuda_core"
+        for M in Ms:
+            a = torch.randn(M, K, device=dev, generator=g).to(torch.bfloat16)
+            gs_a = (448 * 6 / a.float().abs().max()).reshape(1).float()
+            af, asf = torch.ops.trtllm.fp4_quantize(a, gs_a, 16, False)
+            al = [(1.0 / (gs_a * c[4])).float() for c in copies]
+            with autotune():
+                torch.ops.trtllm.nvfp4_gemm(af, copies[0][0], asf, copies[0][1], al[0], torch.bfloat16,
+                                            allowed_backends=bk)
+
+            def f_main(i):
+                c = copies[i % 3]
+                return gelu_tanh_mul_fp4_quant(torch.ops.trtllm.nvfp4_gemm(
+                    af, c[0], asf, c[1], al[i % 3], torch.bfloat16, allowed_backends=bk), gs_d)
+
+            def f_cand(i):
+                c = copies[i % 3]
+                return ge.gate_up_gelu_fp4_permuted(
+                    af, asf, c[2], c[3], al[i % 3], torch.bfloat16, bk.split(","), gs_d, None,
+                    lambda: torch.ops.trtllm.nvfp4_gemm(af, c[2], asf, c[3], al[i % 3], torch.bfloat16,
+                                                        allowed_backends=bk))
+            row = {}
+            for name, fn in (("main", f_main), ("cand", f_cand), ("main2", f_main), ("cand2", f_cand)):
+                for i in range(5):
+                    fn(i)
+                torch.cuda.synchronize()
+                hs = []
+                for i in range(30):
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    fn(i)
+                    hs.append((time.perf_counter() - t0) * 1e6)
+                hs.sort()
+                row[name] = {"host_us_med": round(hs[15], 1), "p10": round(hs[3], 1), "p90": round(hs[26], 1),
+                             "gpu": timeit(fn)}
+            out[f"host|{M}"] = row
+            log(f"host M={M} {row}")
+    for M in Ms:
         a = torch.randn(M, K, device=dev, generator=g).to(torch.bfloat16)
         gs_a = (448 * 6 / a.float().abs().max()).reshape(1).float()
         af, asf = torch.ops.trtllm.fp4_quantize(a, gs_a, 16, False)
         alphas = [(1.0 / (gs_a * c[4])).float() for c in copies]
-        for T in (("cublaslt", 1), ("cublaslt", 2), ("cutlass", 0)):
+        for T in Ts:
             try:
                 ys = [runner(inputs=[af, c[0], asf, c[1], alphas[j]], tactic=T) for j, c in enumerate(copies)]
                 yps = [runner(inputs=[af, c[2], asf, c[3], alphas[j]], tactic=T) for j, c in enumerate(copies)]
