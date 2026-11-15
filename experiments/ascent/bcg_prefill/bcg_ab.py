@@ -119,6 +119,17 @@ def mode_time():
     cases = [("isl300@1", 300, 1), ("isl300@4", 300, 4), ("isl1k@1", 1000, 1), ("isl1k@4", 1000, 4),
              ("isl2k@1", 2000, 1), ("isl2k@4", 2000, 4), ("isl4k@1", 4000, 1), ("isl8k@1", 8000, 1),
              ("isl300@16", 300, 16), ("isl4k@16", 4000, 16), ("isl8k@64", 8000, 64)]
+    sel = os.environ.get("BCG_CASES")
+    if sel:
+        extra_cases = {"isl8k@4": ("isl8k@4", 8000, 4), "isl8k@16": ("isl8k@16", 8000, 16)}
+        known = {c[0]: c for c in cases}
+        known.update(extra_cases)
+        cases = [known[s] for s in sel.split(",")]
+    import torch
+    free_b, total_b = torch.cuda.mem_get_info()
+    mem = {"after_startup_free_gib": round(free_b / 2**30, 3),
+           "torch_reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 3)}
+    log(f"memory after startup: {mem}")
     log("warmup")
     for _, isl, c in cases:
         for _ in range(3 if c * isl < 60000 else 1):
@@ -139,10 +150,15 @@ def mode_time():
         if c * isl >= 200000:
             rounds = 5
         before = dict(counts) if counts is not None else None
+        st0 = torch.cuda.memory_stats()
         for i in range(rounds):
             ps = [pf.make(isl) for _ in range(c)]
             dt, _ = run_batch(llm, ps, params)
             ts.append(dt * 1e3)
+        st1 = torch.cuda.memory_stats()
+        mem[name] = {k: st1.get(k, 0) - st0.get(k, 0)
+                     for k in ("num_alloc_retries", "num_ooms", "num_device_alloc", "num_device_free")}
+        log(f"{name}: allocator {mem[name]}")
         if counts is not None:
             steps[name] = {"replayed": counts["replayed"] - before["replayed"],
                            "eager": counts["eager"] - before["eager"]}
@@ -155,7 +171,7 @@ def mode_time():
                      "noise_floor": round((p90 - p10) / med, 4), "n": len(ts)}
         log(f"{name}: median {med:.2f} ms p10 {p10:.2f} p90 {p90:.2f}")
     print(json.dumps({"batch": res, "output": {"class": "exact"}, "overlay": overlay(),
-                      "bcg_context_steps": steps}), flush=True)
+                      "bcg_context_steps": steps, "memory": mem}), flush=True)
 
 
 def mode_arm(arm, out_path):
