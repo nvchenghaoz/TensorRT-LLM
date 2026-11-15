@@ -211,8 +211,9 @@ _SEQK_GEMM = os.environ.get("TRTLLM_GEMMA4_SEQK_GEMM", "1") != "0"
 # faster in the same-GPU sweep (experiments/ascent/seqk_gemm/sweep.py) and checked bitwise at every
 # routed M (experiments/ascent/seqk_gemm/gate.py). Wave-filling non-pow2 tiles at M=300:
 _SM120_SEQK_GEMM_ROUTES = {
-    # sliding qkv: 160 tokens x 176 weights, 94 x 2 = 188 CTAs (one wave)
-    (5376, 16384): (((288, 320),), 0),
+    # sliding qkv: 160 tokens x 176 weights, 94 x 2 = 188 CTAs (one wave). Not M=288, where main's
+    # F.linear tile is as fast.
+    (5376, 16384): (((289, 320),), 0),
     # global qkv, k_eq_v V-dedup ([q | k]): 160 tokens x 208 weights, 89 x 2 = 178 CTAs
     (5376, 18432): (((288, 320),), 1),
 }

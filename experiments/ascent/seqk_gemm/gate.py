@@ -173,7 +173,7 @@ def main():
             hits = {"routed": 0, "fallback": 0}
             orig = torch.ops.trtllm.sm120_bf16_seqk_gemm
             row = {}
-            for M in (287, 288, 300, 301, 320, 321, 600, 1000, 1200):
+            for M in (287, 288, 289, 300, 301, 320, 321, 600, 1000, 1200):
                 x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
                 ref = main_op(x, lin.weight)
                 mg._SEQK_GEMM = True

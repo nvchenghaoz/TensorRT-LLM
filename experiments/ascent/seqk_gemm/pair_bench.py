@@ -132,8 +132,8 @@ def main():
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.models import modeling_gemma4 as mg
     nvml = Nvml()
-    cases = [("sl_qkv", 300), ("gl_qkv", 300), ("sl_qkv", 288), ("sl_qkv", 301), ("sl_qkv", 320),
-             ("gl_qkv", 301), ("gl_qkv", 320), ("sl_qkv", 1200), ("gl_qkv", 1200)]
+    cases = [("sl_qkv", 300), ("gl_qkv", 300), ("sl_qkv", 289), ("sl_qkv", 301), ("sl_qkv", 320),
+             ("gl_qkv", 288), ("gl_qkv", 301), ("gl_qkv", 320), ("sl_qkv", 1200), ("gl_qkv", 1200)]
     torch.manual_seed(0)
     lins = {}
     routed_any = {}
@@ -178,9 +178,18 @@ def main():
                "sm_clock_min": min(c["sm_clock_min"] for c in clocks),
                "temp_c_max": max(c["temp_c_max"] for c in clocks),
                "throttle_reasons_or": hex(eval("|".join(c["throttle_reasons_or"] for c in clocks)))}
+    # useful FLOP per (SM clock x SM), from the median time and the in-loop NVML SM clock
+    rate = {}
+    mhz = clk.get("sm_clock_mhz_median_of_cases")
+    if mhz:
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        for (sn, M) in cases:
+            N, K = shapes[sn]
+            t_s = batch[f"{sn}@{M}"]["kernel_ms"] * 1e-3
+            rate[f"{sn}@{M}"] = round(2.0 * M * N * K / (t_s * mhz * 1e6 * sms), 1)
     print("receipt_end", gpu_receipt(), flush=True)
     print(json.dumps({"batch": batch, "output": {"class": "exact"}, "seqk_routed": routed_any,
-                      "nvml": clk}))
+                      "nvml": clk, "useful_flop_per_clk_sm": rate}))
 
 
 if __name__ == "__main__":
