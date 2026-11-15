@@ -41,7 +41,17 @@ def main():
         out[label] = {"kernel_ms": med, "p10_ms": p10, "p90_ms": p90,
                       "noise_floor": (p90 - p10) / med, "M": int(ids.numel())}
         print(label, out[label], flush=True)
-    print(json.dumps({"batch": out, "output": {"class": "exact"}, "arm": "fused" if fused else "main"}))
+    res = {"batch": out, "output": {"class": "exact"}, "arm": "fused" if fused else "main"}
+    if fused:
+        # Untimed correctness in the same process (queue hold: one job): bitwise
+        # vs main's chain, repeated-call sequence (5 warmup + 30 calls, as
+        # timed), FP32 reference, out-of-range ids, A,B,A order.
+        from check import run as run_check
+        print("correctness (untimed)", flush=True)
+        chk = run_check(dims, (emb, norm0, normf))
+        res["correctness"] = chk
+        res["passed"] = chk["passed"]
+    print(json.dumps(res))
 
 
 if __name__ == "__main__":

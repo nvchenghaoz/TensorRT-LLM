@@ -43,8 +43,11 @@ def err(o, r):
 
 
 def main():
-    dims = read_dims(sys.argv[1])
-    emb, norm0, normf = build_modules(dims)
+    print(json.dumps(run(read_dims(sys.argv[1]))))
+
+
+def run(dims, modules=None):
+    emb, norm0, normf = modules if modules is not None else build_modules(dims)
     import tensorrt_llm._torch.models.modeling_gemma4 as m4  # noqa: F401
     from tensorrt_llm._torch.kernels.fused_ops.embed_scale_rmsnorm import rmsnorm_replay_supported
     replay = rmsnorm_replay_supported(dims["hidden"], torch.bfloat16, torch.device("cuda"))
@@ -102,11 +105,11 @@ def main():
     table_ok = bits_eq(emb.weight, w_before)
     report["table_unchanged"] = table_ok
     passed &= table_ok
-    print(json.dumps({"passed": bool(passed), "compared": "fused embed_scale_rmsnorm + gathered final norm vs main "
-                      "chain (masked embedding * embed_scale, flashinfer rmsnorm, final norm on all rows then gather), "
-                      "bitwise; FP32 torch reference errors reported", "summary": {
-                          k: (v if not isinstance(v, dict) else {"bitwise": v["bitwise"], "repeat_ok": v["repeat_ok"]})
-                          for k, v in report.items()}}))
+    return {"passed": bool(passed), "compared": "fused embed_scale_rmsnorm + gathered final norm vs main "
+            "chain (masked embedding * embed_scale, flashinfer rmsnorm, final norm on all rows then gather), "
+            "bitwise; FP32 torch reference errors reported", "summary": {
+                k: (v if not isinstance(v, dict) else {"bitwise": v["bitwise"], "repeat_ok": v["repeat_ok"]})
+                for k, v in report.items()}}
 
 
 if __name__ == "__main__":
