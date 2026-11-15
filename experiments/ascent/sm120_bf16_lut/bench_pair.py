@@ -37,7 +37,7 @@ def tree_gating():
     src = inspect.getsource(mg.Gemma4Attention.__init__)
     if get_sm_version() != 120 or "use_custom_cublas_mm = True" not in src:
         return None
-    return {k: mg._CublasMmTokenGate(*v) for k, v in mg._SM120_BF16_CUBLAS_MM_ROUTES.items()}
+    return {k: mg._CublasMmTokenGate(v) for k, v in mg._SM120_BF16_CUBLAS_MM_ROUTES.items()}
 
 
 def timeit(fn, warm=5, iters=20):
@@ -80,7 +80,7 @@ def main():
                 return torch.ops.trtllm.cublas_mm(x, W.t(), None, None)
             return F.linear(x, W)
         path = "trtllm::cublas_mm where " + "; ".join(
-            f"{k}: exact {sorted(g.exact)} or [{g.lo},{g.hi}]" for k, g in gating.items()) + ", else F.linear"
+            f"{k}: {len(g._starts)} ranges" for k, g in gating.items()) + ", else F.linear"
     else:
         def op(x, W):
             return F.linear(x, W)
@@ -91,13 +91,23 @@ def main():
     batch = {}
     passes = {}
     host = {}
-    for pass_i in range(2):
-        order = list(shapes.items()) if pass_i == 0 else list(reversed(list(shapes.items())))
+    # Pre-heat: ~25 s of large BF16 GEMMs so both arms start at the same steady clock/temperature.
+    a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+    t_end = time.time() + 25
+    while time.time() < t_end:
+        for _ in range(20):
+            torch.matmul(a, a)
+        torch.cuda.synchronize()
+    del a
+    torch.cuda.empty_cache()
+    log("pre-heat done")
+    for pass_i in range(3):
+        order = list(shapes.items()) if pass_i % 2 == 0 else list(reversed(list(shapes.items())))
         for sname, (N, K) in order:
             torch.manual_seed(0)
             Ws = [torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02 for _ in range(NCOPY)]
             xmax = torch.randn(max(PROTO_M), K, device="cuda", dtype=torch.bfloat16)
-            Ms = PROTO_M if pass_i == 0 else list(reversed(PROTO_M))
+            Ms = PROTO_M if pass_i % 2 == 0 else list(reversed(PROTO_M))
             for M in Ms:
                 x = xmax[:M]
                 med, nf = timeit(lambda i: op(x, Ws[i % NCOPY]))

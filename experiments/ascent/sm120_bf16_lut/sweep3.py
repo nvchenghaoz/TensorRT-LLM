@@ -31,6 +31,8 @@ from lt import Lt, read_shapes  # noqa: E402
 NCOPY = 4
 LO = 1280
 HI = 8192
+EXACT_THR = 0.97  # exact served-M entry kept only if >= 3% faster than F.linear (interleaved re-validation)
+INTERVAL_THR = 0.99  # interval pinned only if its monotonicity bound (below) is >= 1% under F.linear
 T0 = time.time()
 
 
@@ -76,7 +78,8 @@ def main():
         for M in sorted(set(grid + S)):
             h = lt.heuristics(M, N, K, 32)
             for (cfg8, inner), wsz, waves, orig in h:
-                if cfg8[4] != 1:
+                # nvjet only, no split-K: same K accumulation order as main's kernels (bitwise-equality candidates)
+                if cfg8[0] in (66, 67) and cfg8[3] == 1:
                     pool.add(cfg8)
             if h and h[0][0][0][4] != 1:
                 top1.setdefault(sname, set()).add(h[0][0][0])
@@ -90,12 +93,27 @@ def main():
         xmax = torch.randn(HI, K, device="cuda", dtype=torch.bfloat16)
         obuf = torch.empty(HI, N, device="cuda", dtype=torch.bfloat16)
 
+        nonbitwise = {}
+
+        def bitwise(M, c):
+            """Config c gives exactly main's F.linear output at M (checked on two weight copies)."""
+            x, out = xmax[:M], obuf[:M]
+            for j in (0, 1):
+                ref = F.linear(x, Ws[j])
+                lt.matmul(x, Ws[j], out, algos[c])
+                if not torch.equal(out, ref):
+                    return False
+            return True
+
         def measure(M, cfgs, warm=3, iters=12):
             x, out = xmax[:M], obuf[:M]
             fl0 = timeit(lambda i: F.linear(x, Ws[i % NCOPY]), warm, iters)
             row = {}
             for c in cfgs:
                 if lt.check(M, N, K, algos[c]):
+                    if not bitwise(M, c):
+                        nonbitwise[(M, c)] = True
+                        continue
                     row[c] = timeit(lambda i: lt.matmul(x, Ws[i % NCOPY], out, algos[c]), warm, iters)
             fl1 = timeit(lambda i: F.linear(x, Ws[i % NCOPY]), warm, iters)
             return min(fl0, fl1), row
@@ -143,24 +161,30 @@ def main():
             tim[M] = (fl, row)
         intervals = []
         for i, M in enumerate(grid):
-            ends = [grid[i - 1], M] if i > 0 else [M]
+            # Bound for every m in (G[i-1], G[i]]: a fixed kernel is no faster at m than at G[i], and F.linear
+            # is no faster at m than at G[i-1], so ratio(m) <= t_cfg(G[i]) / t_F.linear(G[i-1]).
+            prev = grid[i - 1] if i > 0 else M
             best = None
             for c in short:
-                if not all(c in tim[e][1] for e in ends):
+                if c not in tim[M][1]:
                     continue
-                sc = max(tim[e][1][c] / tim[e][0] for e in ends)
+                if i > 0 and c not in tim[prev][1]:
+                    continue
+                sc = max(tim[M][1][c] / tim[prev][0], tim[M][1][c] / tim[M][0])
                 if best is None or sc < best[1]:
                     best = (c, sc)
             if best is None:
                 best = (None, 9.0)
-            intervals.append((M, best[0] if best[1] <= 1.0 else None, best[1]))
+            intervals.append((M, best[0] if best[1] <= INTERVAL_THR else None, best[1]))
+            log(f"{sname} interval (.., {M}]: {lt.name(best[0]) if best[0] else '-'} worst ratio {best[1]:.3f}"
+                f"{'' if best[1] <= INTERVAL_THR else ' -> F.linear'}")
         # ---- assemble entries {m_max: cfg or None}
         ents = []
         small_routed = []
         for M in [m for m in S if m < LO]:
             c, r = exact[M]
             ents.append((M - 1, None))
-            if r <= 0.99:
+            if r <= EXACT_THR:
                 ents.append((M, c))
                 small_routed.append(M)
             else:
@@ -170,7 +194,7 @@ def main():
             if M in exact:
                 ce, re_ = exact[M]
                 ents.append((M - 1, c))
-                ents.append((M, ce if re_ <= 0.99 else c))
+                ents.append((M, ce if re_ <= EXACT_THR else c))
             else:
                 ents.append((M, c))
         # drop empty / duplicate m_max, merge consecutive equal configs
@@ -183,10 +207,20 @@ def main():
             else:
                 clean.append((m, c))
         tables[sname] = clean
-        routes[sname] = small_routed
+        # Python token gate: exactly the pinned ranges; everything else (heuristic entries included) stays F.linear
+        ranges = []
+        prev = 0
+        for m, c in clean:
+            if c is not None:
+                if ranges and ranges[-1][1] == prev:
+                    ranges[-1] = (ranges[-1][0], m)
+                else:
+                    ranges.append((prev + 1, m))
+            prev = m
+        routes[sname] = ranges
 
         def lookup(m):
-            if m < LO and m not in small_routed:
+            if not any(lo <= m <= hi for lo, hi in ranges):
                 return "F.linear"
             for mm, c in clean:
                 if m <= mm:
@@ -198,10 +232,11 @@ def main():
             log(f"   m<={m}: {lt.name(c) if c else 'heuristic'}")
         # ---- off-grid + served validation, interleaved, warm 5 / 20 timed
         random.seed(17)
-        vals = sorted(set(S + [m + 1 for m in S if m < HI] + [1281, 1500, 4100, 4500, 7040, 7500, 7999, 8050, 8191]
-                          + random.sample(range(LO, HI), 24)))
+        vals = sorted(set(S + [m + 1 for m in S if m < HI] + [g + 1 for g in grid if g < HI]
+                          + [1281, 1500, 4100, 4500, 7040, 7500, 7999, 8050, 8191] + random.sample(range(LO, HI), 24)))
         worst = (0.0, None)
         gains = []
+        bw_fail = []
         for M in vals:
             c = lookup(M)
             if c == "F.linear":
@@ -210,13 +245,19 @@ def main():
             a = algos[c] if c is not None else None
             fl = min(timeit(lambda i: F.linear(x, Ws[i % NCOPY]), 5, 20) for _ in range(2))
             tc = min(timeit(lambda i: lt.matmul(x, Ws[i % NCOPY], out, a), 5, 20) for _ in range(2))
+            bw = c is not None and bitwise(M, c)
+            if not bw:
+                bw_fail.append(M)
             r = tc / fl
             gains.append(1 - r)
             worst = max(worst, (r, M))
             log(f"  validate {sname} M={M}{' (served)' if M in S else ''}: F.linear {fl:.4f} "
-                f"{lt.name(c) if c else 'heuristic'} {tc:.4f} ratio {r:.3f}")
+                f"{lt.name(c) if c else 'heuristic'} {tc:.4f} ratio {r:.3f} bitwise={bw}")
+        log(f"{sname} configs rejected as non-bitwise: {len(nonbitwise)}; routed M not bitwise: {bw_fail}")
         summary[sname] = {"entries": len(clean), "worst_ratio": round(worst[0], 4), "worst_M": worst[1],
-                          "mean_gain": round(sum(gains) / max(len(gains), 1), 4), "small_routed": small_routed}
+                          "nonbitwise_rejected": len(nonbitwise), "routed_not_bitwise": bw_fail,
+                          "mean_gain": round(sum(gains) / max(len(gains), 1), 4), "small_routed": small_routed,
+                          "routed_ranges": len(ranges)}
         log(f"{sname} summary {summary[sname]}")
         del Ws, xmax, obuf
         torch.cuda.empty_cache()
@@ -237,7 +278,8 @@ def main():
     print("@@TABLE_END", flush=True)
     print("@@ROUTES_BEGIN", flush=True)
     for sname, (N, K) in shapes.items():
-        print(f"    ({K}, {N}): ({sorted(routes[sname])}, {LO}, {HI}),  # {sname}", flush=True)
+        rs = ", ".join(f"({lo}, {hi})" for lo, hi in routes[sname])
+        print(f"    # {sname}\n    ({K}, {N}): ({rs}),", flush=True)
     print("@@ROUTES_END", flush=True)
     print(json.dumps({"done": True, "pool": len(pool), "summary": summary}))
 

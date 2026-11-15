@@ -14,6 +14,7 @@
 # limitations under the License.
 """TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
 
+import bisect
 import copy
 import dataclasses
 import math
@@ -95,30 +96,28 @@ from transformers import Gemma4TextConfig  # noqa: E402
 
 
 class _CublasMmTokenGate:
-    """Token counts (rows of the 2D input) a projection sends to trtllm::cublas_mm; others keep F.linear."""
+    """Token counts (rows of the 2D input) a projection sends to trtllm::cublas_mm: the union of sorted,
+    disjoint inclusive ranges. Other token counts keep F.linear."""
 
-    __slots__ = ("exact", "lo", "hi")
+    __slots__ = ("_starts", "_ends")
 
-    def __init__(self, exact, lo: int, hi: int):
-        self.exact = frozenset(exact)
-        self.lo = lo
-        self.hi = hi
+    def __init__(self, ranges):
+        ranges = sorted(ranges)
+        self._starts = tuple(lo for lo, _ in ranges)
+        self._ends = tuple(hi for _, hi in ranges)
 
     def __contains__(self, num_tokens: int) -> bool:
-        return self.lo <= num_tokens <= self.hi or num_tokens in self.exact
+        i = bisect.bisect_right(self._starts, num_tokens) - 1
+        return i >= 0 and num_tokens <= self._ends[i]
 
 
 # SM120 routes for the Gemma-4-31B BF16 attention projections, keyed (in_features, out_features), i.e. the
 # {k, n} keys of sm120_bf16_range_algo_list in cpp/tensorrt_llm/thop/cublasScaledMMLut.h: sliding qkv, global
-# qkv (with and without the duplicated k_eq_v V block), sliding and global o_proj. Each value is
-# (token counts below the dense range that the table pins, dense range lo, hi). Generated together with the
+# qkv (with and without the duplicated k_eq_v V block), sliding and global o_proj. Each value lists the
+# inclusive token-count ranges where that table pins a measured cuBLASLt algo; generated together with the
 # table by experiments/ascent/sm120_bf16_lut/sweep3.py.
 _SM120_BF16_CUBLAS_MM_ROUTES = {
-    (5376, 16384): ((300, 900, 1000, 1200), 1280, 8192),  # sliding qkv
-    (5376, 20480): ((600, 900, 1000, 1200), 1280, 8192),  # global qkv (V duplicated from K)
-    (5376, 18432): ((600, 900, 1000, 1200), 1280, 8192),  # global qkv (k_eq_v V-dedup)
-    (8192, 5376): ((300, 600, 900, 1000), 1280, 8192),  # sliding o_proj
-    (16384, 5376): ((900, 1000), 1280, 8192),  # global o_proj
+    # @@ROUTES@@
 }
 
 
@@ -458,7 +457,7 @@ class Gemma4Attention(QKNormRoPEAttention):
                 route = _SM120_BF16_CUBLAS_MM_ROUTES.get((proj.in_features, proj.out_features))
                 if route is not None:
                     proj.use_custom_cublas_mm = True
-                    proj.custom_cublas_mm_tokens = _CublasMmTokenGate(*route)
+                    proj.custom_cublas_mm_tokens = _CublasMmTokenGate(route)
 
         # Fix proportional RoPE for full-attention layers.
         #

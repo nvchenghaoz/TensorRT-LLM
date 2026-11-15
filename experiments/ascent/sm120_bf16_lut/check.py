@@ -70,18 +70,28 @@ def main():
     import inspect
     from tensorrt_llm._utils import get_sm_version
     gemma_flag = "use_custom_cublas_mm = True" in inspect.getsource(mg.Gemma4Attention.__init__)
-    routes = {k: mg._CublasMmTokenGate(*v) for k, v in mg._SM120_BF16_CUBLAS_MM_ROUTES.items()}
+    routes = {k: mg._CublasMmTokenGate(v) for k, v in mg._SM120_BF16_CUBLAS_MM_ROUTES.items()}
     log("sm", get_sm_version(), "gemma4 sets cublas_mm:", gemma_flag,
-        {str(k): (sorted(g.exact), g.lo, g.hi) for k, g in routes.items()}, json.dumps(info))
+        {str(k): list(v) for k, v in mg._SM120_BF16_CUBLAS_MM_ROUTES.items()}, json.dumps(info))
     wt = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
     tables = parse_table(os.path.join(wt, "cpp/tensorrt_llm/thop/cublasScaledMMLut.h"))
     log("parsed table keys", {str(k): len(v) for k, v in tables.items()})
+    # Every token count Gemma4 routes to cublas_mm must hit a pinned (non-heuristic) table entry.
+    consistent = set(routes) == set(tables)
+    for key, rs in mg._SM120_BF16_CUBLAS_MM_ROUTES.items():
+        for lo, hi in rs:
+            for m in range(lo, hi + 1):
+                if lookup(tables.get(key, []), m) is None:
+                    consistent = False
+                    log(f"!! route {key} m={m} has no pinned table entry")
+                    break
+    log("routes/table consistent:", consistent)
     lt = Lt()
 
     def cand(x, W):
         return torch.ops.trtllm.cublas_mm(x, W.t(), None, None)
 
-    ok = True
+    ok = consistent
     report = {}
     worst = {"err_ratio_maxabs": 0.0, "err_ratio_frob": 0.0, "cand_vs_main_maxabs": 0.0}
     a_outputs = {}
@@ -254,6 +264,7 @@ def main():
                       "reference and main F.linear; 25-call repeated sequence bitwise; A,B,A permutation; CUDA graph "
                       "replay; table config recomputed via cuBLASLt; Linear routing and absent-shape fall-through",
                       "graph_ok": graph_ok, "perm_ok": perm_ok, "route_ok": route_ok,
+                      "routes_table_consistent": consistent,
                       "worst": worst, "n_cases": len(report),
                       "failed": [k for k, v in report.items() if not v["ok"]]}))
 
