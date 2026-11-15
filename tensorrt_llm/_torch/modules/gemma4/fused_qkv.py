@@ -55,6 +55,80 @@ import triton.language as tl
 
 
 @triton.jit
+def _split8(t):
+    """[BN, L, 8] -> the eight [BN, L] tensors t[..., j], j = 0..7."""
+    BN: tl.constexpr = t.shape[0]
+    L: tl.constexpr = t.shape[1]
+    t = tl.reshape(t, (BN, L, 2, 2, 2))  # j = 4*a2 + 2*a1 + a0, a0 innermost
+    e0, e1 = tl.split(t)
+    e00, e01 = tl.split(e0)
+    e10, e11 = tl.split(e1)
+    t0, t4 = tl.split(e00)
+    t2, t6 = tl.split(e01)
+    t1, t5 = tl.split(e10)
+    t3, t7 = tl.split(e11)
+    return t0, t1, t2, t3, t4, t5, t6, t7
+
+
+@triton.jit
+def _lane_sq_seq(s, x, FIRST: tl.constexpr):
+    """Per-lane sequential sum of squares over 8 contiguous columns.
+
+    x: [BN, L*8] fp32, lane l owns columns [8l, 8l+8). Returns [BN, L]: s plus
+    x[8l]^2, x[8l+1]^2, ... added left to right (bf16 squares are exact in fp32).
+    """
+    BN: tl.constexpr = x.shape[0]
+    L: tl.constexpr = x.shape[1] // 8
+    x0, x1, x2, x3, x4, x5, x6, x7 = _split8(tl.reshape(x, (BN, L, 8)))
+    if FIRST:
+        s = x0 * x0
+    else:
+        s = s + x0 * x0
+    s = s + x1 * x1
+    s = s + x2 * x2
+    s = s + x3 * x3
+    s = s + x4 * x4
+    s = s + x5 * x5
+    s = s + x6 * x6
+    s = s + x7 * x7
+    return s
+
+
+@triton.jit
+def _pair_tree16(p):
+    """[BN, 16] -> [BN]: adjacent pairwise tree (warp butterfly, xor 1, 2, 4, 8)."""
+    BN: tl.constexpr = p.shape[0]
+    a, b = tl.split(tl.reshape(p, (BN, 8, 2)))
+    p = a + b
+    a, b = tl.split(tl.reshape(p, (BN, 4, 2)))
+    p = a + b
+    a, b = tl.split(tl.reshape(p, (BN, 2, 2)))
+    p = a + b
+    a, b = tl.split(p)
+    return a + b
+
+
+@triton.jit
+def _cute_rmsnorm_ssq(x1, x2, HD: tl.constexpr):
+    """Sum of squares of [x1 | x2] in FlashInfer's CuTe-DSL RMSNormKernel order.
+
+    For HD 256 and 512 that kernel (flashinfer/norm/kernels/rmsnorm.py) runs one
+    warp per row with vec_size 8: lane t owns columns [8t, 8t+8) and, at HD 512,
+    [256+8t, 256+8t+8); it sums its squares left to right, then reduces lanes
+    with a butterfly over xor offsets 1, 2, 4, 8, 16.
+    """
+    if HD == 256:
+        # x1 holds lanes 0..15, x2 lanes 16..31.
+        return _pair_tree16(_lane_sq_seq(0.0, x1, True)) + _pair_tree16(_lane_sq_seq(0.0, x2, True))
+    else:
+        # x1 holds every lane's first 8 columns, x2 its second 8.
+        BN: tl.constexpr = x1.shape[0]
+        p = _lane_sq_seq(_lane_sq_seq(0.0, x1, True), x2, False)  # [BN, 32]
+        a, b = tl.split(tl.reshape(p, (BN, 16, 2)))
+        return _pair_tree16(a + b)
+
+
+@triton.jit
 def _gemma4_qkv_norm_rope_quant_kernel(
     qkv_ptr,  # [N, W] bf16, row stride SW; heads packed [q | k | v], head h at col h*HD
     q_out_ptr,  # [N, NQ*HD] fp8/bf16, possibly a view of packed QKV
@@ -76,6 +150,7 @@ def _gemma4_qkv_norm_rope_quant_kernel(
     HALF: tl.constexpr,  # HD // 2 (power of two)
     Q_OUT_FP8: tl.constexpr,
     KV_OUT_FP8: tl.constexpr,
+    CUTE_NORM_ORDER: tl.constexpr,  # sum of squares in FlashInfer CuTe RMSNorm order
     BLOCK_N: tl.constexpr,  # tokens per program (power of two)
 ):
     h = tl.program_id(0)
@@ -88,7 +163,11 @@ def _gemma4_qkv_norm_rope_quant_kernel(
     x1 = tl.load(base, mask=rmask[:, None], other=0.0).to(tl.float32)
     x2 = tl.load(base + HALF, mask=rmask[:, None], other=0.0).to(tl.float32)
 
-    ssq = tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)
+    if CUTE_NORM_ORDER:
+        # Bitwise equal to the unfused chain's FlashInfer RMSNorm (SM120 FA2).
+        ssq = _cute_rmsnorm_ssq(x1, x2, HD)
+    else:
+        ssq = tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)
     rms = tl.math.rsqrt(ssq / HD + EPS)  # [BLOCK_N]
 
     if h < NQ + NK:
@@ -148,6 +227,7 @@ def gemma4_fused_qkv_norm_rope_quant(
     out_fp8: bool,
     packed_output: bool = False,
     kv_out_fp8: Optional[bool] = None,
+    cute_norm_order: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Run the fused per-head norm + rope + quant over a packed QKV tensor.
 
@@ -167,6 +247,11 @@ def gemma4_fused_qkv_norm_rope_quant(
         kv_out_fp8: K/V output dtype override. None (default) follows
             ``out_fp8``; ``out_fp8=False, kv_out_fp8=True`` emits BF16 Q with
             FP8 K/V (FlashInfer FA2 with an FP8 paged KV cache).
+        cute_norm_order: sum the squares in the order of FlashInfer's CuTe-DSL
+            RMSNormKernel (per-lane sequential over 8 columns, then a
+            xor-1,2,4,8,16 butterfly), so Q/K/V are bitwise equal to the
+            unfused RMSNorm -> FlashInfer RoPE -> .to(fp8) chain. Needs
+            head_dim 256 or 512.
 
     Returns:
         Separate mode returns contiguous ``(q, k, v)`` tensors in the
@@ -187,6 +272,8 @@ def gemma4_fused_qkv_norm_rope_quant(
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
     assert qkv.shape[-1] == q_size + 2 * kv_size
+    if cute_norm_order and head_dim not in (256, 512):
+        raise ValueError("cute_norm_order supports head_dim 256 and 512")
 
     n = qkv.shape[0]
     out_dtype = torch.float8_e4m3fn if out_fp8 else torch.bfloat16
@@ -239,6 +326,7 @@ def gemma4_fused_qkv_norm_rope_quant(
         HALF=half,
         Q_OUT_FP8=out_fp8,
         KV_OUT_FP8=kv_out_fp8,
+        CUTE_NORM_ORDER=cute_norm_order,
         BLOCK_N=block_n,
         num_warps=8,
     )

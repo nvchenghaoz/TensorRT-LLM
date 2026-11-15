@@ -27,7 +27,12 @@ WARMUP = 10
 ITERS = 50
 
 CASES = [
+    ("1", [1]),
+    ("27", [27]),
     ("300", [300]),
+    ("1200", [1200]),
+    ("4800", [4800]),
+    ("3x333+7", [333, 333, 333, 7]),
     ("1000", [1000]),
     ("2000", [2000]),
     ("4000", [4000]),
@@ -130,11 +135,12 @@ class Layer:
         v = v.view(-1, self.nkv, self.hd).to(torch.float8_e4m3fn)
         return q, k, v
 
-    def fused_chain(self, qkv, pos):
+    def fused_chain(self, qkv, pos, cute=True):
         from tensorrt_llm._torch.modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
+        kw = {"cute_norm_order": cute} if has_cute_mode() else {}
         q, k, v = gemma4_fused_qkv_norm_rope_quant(
             qkv, pos, self.cos_sin, self.q_norm.weight, self.k_norm.weight, self.eps,
-            self.nq, self.nkv, self.hd, out_fp8=False, packed_output=False, kv_out_fp8=True)
+            self.nq, self.nkv, self.hd, out_fp8=False, packed_output=False, kv_out_fp8=True, **kw)
         # forward_impl view + (now no-op) cast
         k = k.view(-1, self.nkv, self.hd).to(torch.float8_e4m3fn)
         v = v.view(-1, self.nkv, self.hd).to(torch.float8_e4m3fn)
@@ -171,16 +177,24 @@ def has_mixed_mode():
     return "kv_out_fp8" in inspect.signature(gemma4_fused_qkv_norm_rope_quant).parameters
 
 
-def bench(ckpt):
+def has_cute_mode():
+    from tensorrt_llm._torch.modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
+    return "cute_norm_order" in inspect.signature(gemma4_fused_qkv_norm_rope_quant).parameters
+
+
+def bench(ckpt, variant="auto", sliding_only=True):
     dev = torch.device("cuda")
     log("device:", torch.cuda.get_device_name(), torch.cuda.get_device_capability())
     shapes, eps = load_shapes(ckpt)
-    fused = has_mixed_mode()
-    log("chain:", "fused (branch)" if fused else "unfused (main)")
+    fused = has_mixed_mode() and variant != "unfused"
+    cute = variant != "old"
+    log("chain:", (f"fused (branch, cute_norm_order={cute})" if fused else "unfused (main)"))
     out = {}
     for li, (lname, sh) in enumerate(shapes.items()):
+        if sliding_only and lname != "sliding":
+            continue  # global K=V layers run the unfused chain in both trees
         layer = Layer(sh, eps, dev, seed=100 + li)
-        fn = layer.fused_chain if fused else layer.main_chain
+        fn = (lambda a, b, _l=layer: _l.fused_chain(a, b, cute=cute)) if fused else layer.main_chain
         for cname, seqs in CASES:
             qkv, pos = layer.make_inputs(seqs, dev, seed=1)
             for _ in range(WARMUP):
@@ -204,7 +218,7 @@ def bench(ckpt):
                         "noise_floor": (p90 - p10) / med}
             n = sum(seqs)
             log(f"{key}: n={n} median={med*1e3:.1f}us p10={p10*1e3:.1f} p90={p90*1e3:.1f}")
-    print(json.dumps({"batch": out, "output": {"class": "reordered"}}))
+    print(json.dumps({"batch": out, "output": {"class": "exact"}}))
 
 
 def stats(a, b):
@@ -265,22 +279,25 @@ def check(ckpt, real=False):
             q, k, v = first
             assert q.dtype == torch.bfloat16 and k.dtype == v.dtype == torch.float8_e4m3fn
             mq, mk, mv = layer.main_chain(qkv, pos)
+            oq, ok_, ov = layer.fused_chain(qkv, pos, cute=False)
             rq, rk, rv = layer.fp32_ref(qkv, pos)
             finite = all(torch.isfinite(t.float()).all().item() for t in (q, k, v))
             shapes_ok = (q.shape == mq.shape and k.shape == mk.shape and v.shape == mv.shape)
             r = {}
-            for nm, c, m, ref in (("q", q, mq, rq), ("k", k, mk, rk), ("v", v, mv, rv)):
+            for nm, c, m, ref, old in (("q", q, mq, rq, oq), ("k", k, mk, rk, ok_), ("v", v, mv, rv, ov)):
                 cb, mb = c.contiguous().view(torch.uint8), m.contiguous().view(torch.uint8)
-                mism = (cb.view(-1) != mb.view(-1)).float().mean().item() if c.dtype == torch.float8_e4m3fn \
-                    else (c.view(torch.int16) != m.view(torch.int16)).float().mean().item()
+                n_mism = int((cb.view(-1) != mb.view(-1)).sum().item())
+                mism = n_mism / cb.numel()
+                old_mism = int((old.contiguous().view(torch.uint8).view(-1) != mb.view(-1)).sum().item())
                 cand = stats(c, ref)
                 base = stats(m, ref)
                 ulp = 2.0 ** (math.floor(math.log2(max(ref.abs().max().item(), 1e-30))) - 7)
                 if c.dtype == torch.float8_e4m3fn:
                     ulp = 2.0 ** (math.floor(math.log2(max(ref.abs().max().item(), 1e-30))) - 3)
-                ok = (cand["max_abs"] <= 1.10 * base["max_abs"] + ulp
-                      and cand["rel_fro"] <= 1.10 * base["rel_fro"] + 1e-3)
-                r[nm] = dict(mismatch_frac_vs_main=mism, cand_vs_ref=cand, main_vs_ref=base,
+                del ulp
+                ok = n_mism == 0  # bitwise gate (byte view, -0.0 counts)
+                r[nm] = dict(mismatch_frac_vs_main=mism, mismatch_bytes_vs_main=n_mism,
+                             old_kernel_mismatch_bytes_vs_main=old_mism, cand_vs_ref=cand, main_vs_ref=base,
                              cand_vs_main_max_abs=stats(c, m)["max_abs"],
                              max_abs_value=c.float().abs().max().item(), ok=ok)
                 passed &= ok
@@ -290,9 +307,13 @@ def check(ckpt, real=False):
                                shapes_ok=shapes_ok, **r)
             log(key, json.dumps(report[key]))
     print(json.dumps({"passed": bool(passed),
-                      "compared": "fused BF16-Q/FP8-KV prep vs main unfused chain "
-                                  "(flashinfer rmsnorm+rope+.to(fp8)) and FP32 torch reference; "
-                                  f"{WARMUP + ITERS} repeated calls bitwise vs first",
+                      "compared": "fused BF16-Q/FP8-KV prep (cute_norm_order) vs main unfused chain "
+                                  "(flashinfer rmsnorm+rope+.to(fp8)), byte-wise; FP32 torch reference as "
+                                  f"sanity; {WARMUP + ITERS} repeated calls bitwise vs first",
+                      "mismatch_bytes": {k: {t: report[k][t]["mismatch_bytes_vs_main"] for t in "qkv"}
+                                         for k in report},
+                      "old_kernel_mismatch_bytes": {k: {t: report[k][t]["old_kernel_mismatch_bytes_vs_main"]
+                                                        for t in "qkv"} for k in report},
                       "m8000": {k: report[k] for k in report if k.endswith("_8000")}}))
 
 
@@ -301,9 +322,10 @@ if __name__ == "__main__":
     ap.add_argument("mode", choices=["bench", "check"])
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--real-norm-weights", action="store_true")
+    ap.add_argument("--variant", choices=["auto", "old", "unfused"], default="auto")
     a = ap.parse_args()
     with torch.inference_mode():
         if a.mode == "bench":
-            bench(a.ckpt)
+            bench(a.ckpt, variant=a.variant)
         else:
             check(a.ckpt, real=a.real_norm_weights)

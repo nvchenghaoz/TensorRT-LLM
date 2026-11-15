@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""Gemma4 fused QKV prep (branch 7): real-activation per-layer dump and in-process on/off A/B.
+
+Modes (argv[1]):
+  dump : in-process LLM (TLLM_WORKER_USE_SINGLE_PROCESS=1, CUDA graphs off for this debug pass).
+         Gemma4Attention.apply_rope is wrapped: on every call where the fused prep is eligible it runs
+         main's unfused chain (split views -> v_norm -> apply_qk_norm -> flashinfer RoPE, then the
+         backend's .to(fp8) of K/V) and the fused kernel in both reduction orders ("old" = tl.sum,
+         "new" = cute_norm_order) on the SAME qkv and position_ids, byte-compares Q/K/V, and RETURNS
+         THE UNFUSED RESULT so the trajectory stays main's. Covers c=1 prompts, packed batches
+         (16x300, 4x2000, uneven lengths), and decode steps (max_tokens=8).
+  ab   : in-process A/B with main's default engine settings (CUDA graphs on) and batch_wait_timeout_ms.
+         modeling_gemma4._FUSED_QKV_PREP flips between passes off, on, off, on; 200 fresh random-token
+         prompts (20 per ISL in {300,1000,2000,4000,8000} at c=1, 20 per ISL at c=4) plus chat-template
+         prompts and a mixed batch; then an off/on pair with flashinfer._HOST_PREFILL_PLAN=False.
+         Compares first-token ids + top-20 logprobs bitwise.
+Last stdout line: {"passed": ..., ...}.
+"""
+import json
+import os
+import sys
+import time
+
+os.environ.setdefault("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+CKPT = os.environ.get("CKPT") or (sys.argv[2] if len(sys.argv) > 2 else None)
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def print_dims():
+    cfg = json.load(open(os.path.join(CKPT, "config.json")))
+    tc = cfg.get("text_config", cfg)
+    keys = ["hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads", "head_dim",
+            "global_head_dim", "num_global_key_value_heads", "sliding_window", "rms_norm_eps",
+            "attention_k_eq_v"]
+    log("config: " + json.dumps({k: tc.get(k) for k in keys}))
+    lt = tc.get("layer_types") or []
+    log(f"layer types: {sum(t == 'sliding_attention' for t in lt)} sliding, "
+        f"{sum(t == 'full_attention' for t in lt)} full")
+
+
+class Prompts:
+    def __init__(self, seed):
+        self.rng = np.random.default_rng(seed)
+
+    def make(self, isl):
+        return [int(x) for x in self.rng.integers(1000, 200000, size=isl)]
+
+
+def build_llm(**extra):
+    from tensorrt_llm import LLM
+    from tensorrt_llm.llmapi import KvCacheConfig
+    return LLM(model=CKPT,
+               kv_cache_config=KvCacheConfig(dtype="fp8", enable_block_reuse=False, free_gpu_memory_fraction=0.8),
+               max_num_tokens=8192, max_batch_size=64, max_seq_len=9216, **extra)
+
+
+def sp(logprobs=20, max_tokens=1):
+    from tensorrt_llm import SamplingParams
+    kw = dict(max_tokens=max_tokens, temperature=0.0, ignore_eos=True)
+    if logprobs:
+        kw["logprobs"] = logprobs
+    return SamplingParams(**kw)
+
+
+def summarize(o):
+    c = o.outputs[0]
+    lps = []
+    if c.logprobs:
+        for d in c.logprobs:
+            if isinstance(d, dict):
+                lps.append(sorted((int(k), float(getattr(v, "logprob", v))) for k, v in d.items()))
+            else:
+                lps.append(float(d))
+    return {"ids": list(c.token_ids), "lp": lps}
+
+
+def top1(s):
+    """(token, logprob) of the first generated token."""
+    lp = s["lp"][0] if s["lp"] else []
+    tok = s["ids"][0]
+    v = [l for t, l in lp if t == tok] if isinstance(lp, list) else []
+    return tok, (v[0] if v else None)
+
+
+# ----------------------------------------------------------------------------- dump
+def _bf16_ulps(a, b):
+    ai = a.view(torch.int16).to(torch.int32)
+    bi = b.view(torch.int16).to(torch.int32)
+    ai = torch.where(ai < 0, -32768 - ai, ai)  # sign-magnitude -> monotone line
+    bi = torch.where(bi < 0, -32768 - bi, bi)
+    return (ai - bi).abs()
+
+
+def _fp8_ulps(a, b):
+    ai = a.view(torch.uint8).to(torch.int32)
+    bi = b.view(torch.uint8).to(torch.int32)
+    ai = torch.where(ai >= 128, 128 - ai, ai)
+    bi = torch.where(bi >= 128, 128 - bi, bi)
+    return (ai - bi).abs()
+
+
+def mode_dump():
+    print_dims()
+    import tensorrt_llm._torch.models.modeling_gemma4 as mg
+    from tensorrt_llm._torch.modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant as fused
+    orig = mg.Gemma4Attention.apply_rope
+    stats = {}
+    info = {}
+    calls = {"eligible": 0, "ineligible": 0, "capturing": 0, "rows_hist": {}}
+    first_bad = []
+
+    def compare(layer, var, nm, c, m, pos, hd):
+        e = stats.setdefault(layer, {}).setdefault(var, {}).setdefault(
+            nm, {"mismatch": 0, "total": 0, "max_ulp": 0, "nonfinite": 0, "calls": 0})
+        assert c.shape == m.shape, (c.shape, m.shape)
+        if c.dtype == torch.bfloat16:
+            ne = (c.contiguous().view(torch.int16) != m.contiguous().view(torch.int16))
+            ul = _bf16_ulps(c.contiguous(), m.contiguous())
+        else:
+            ne = (c.contiguous().view(torch.uint8) != m.contiguous().view(torch.uint8))
+            ul = _fp8_ulps(c.contiguous(), m.contiguous())
+        n = int(ne.sum().item())
+        e["mismatch"] += n
+        e["total"] += ne.numel()
+        e["calls"] += 1
+        e["max_ulp"] = max(e["max_ulp"], int(ul.max().item()) if ul.numel() else 0)
+        e["nonfinite"] += int((~torch.isfinite(c.float())).sum().item())
+        if n and len(first_bad) < 40:
+            r, col = ne.view(ne.shape[0], -1).nonzero()[0].tolist()
+            first_bad.append({"layer": layer, "var": var, "t": nm, "row": r, "head": col // hd, "col": col % hd,
+                              "pos": int(pos.view(-1)[r].item()), "rows": int(c.shape[0]),
+                              "cand": float(c.reshape(c.shape[0], -1)[r, col].float()),
+                              "main": float(m.reshape(m.shape[0], -1)[r, col].float())})
+
+    def hooked(self, q, k, v, position_ids):
+        if torch.cuda.is_current_stream_capturing():
+            calls["capturing"] += 1
+            return orig(self, q, k, v, position_ids)
+        eligible = (k is None and v is None and position_ids is not None and q.dtype == torch.bfloat16
+                    and not self.is_kv_shared and not self.fuse_qk_norm_rope and not self._fused_prep_blocked
+                    and self._fused_qkv_prep_enabled())
+        li = int(self.layer_idx)
+        if li not in info:
+            info[li] = {"sliding": self.attention_window_size is not None, "qk_only_proj": bool(self._qk_only_proj),
+                        "fused_eligible": bool(eligible), "head_dim": self.head_dim,
+                        "backend": getattr(self.attn, "flashinfer_backend", None),
+                        "q_out_fp8": bool(self._fused_qkv_prep_out_fp8),
+                        "kv_out_fp8": bool(self._fused_qkv_prep_kv_out_fp8),
+                        "cute_norm": bool(getattr(self, "_fused_qkv_prep_cute_norm", False)),
+                        "cos_sin": list(self.rotary_emb.rotary_cos_sin.shape) if self.rotary_emb is not None
+                        else None, "qkv_width": int(q.shape[-1])}
+        if not eligible:
+            calls["ineligible"] += 1
+            return orig(self, q, k, v, position_ids)
+        calls["eligible"] += 1
+        rh = calls["rows_hist"]
+        rh[str(q.shape[0])] = rh.get(str(q.shape[0]), 0) + 1
+        qkv = q
+        snap = qkv.clone()
+        mg._FUSED_QKV_PREP = False
+        try:
+            uq, uk, uv = orig(self, qkv, None, None, position_ids)
+        finally:
+            mg._FUSED_QKV_PREP = True
+        assert torch.equal(snap.view(torch.int16), qkv.view(torch.int16)), "unfused chain mutated qkv"
+        nkv, hd = self.num_key_value_heads, self.head_dim
+        uk8 = uk.reshape(-1, nkv, hd).to(torch.float8_e4m3fn).reshape(uk.shape[0], -1)
+        uv8 = uv.reshape(-1, nkv, hd).to(torch.float8_e4m3fn).reshape(uv.shape[0], -1)
+        for var, cute in (("old", False), ("new", True)):
+            fq, fk, fv = fused(qkv, position_ids, self.rotary_emb.rotary_cos_sin, self.q_norm.weight,
+                               self.k_norm.weight, self.q_norm.variance_epsilon, self.num_heads, nkv, hd,
+                               out_fp8=self._fused_qkv_prep_out_fp8, packed_output=False,
+                               kv_out_fp8=self._fused_qkv_prep_kv_out_fp8, cute_norm_order=cute)
+            assert fq.dtype == torch.bfloat16 and fk.dtype == fv.dtype == torch.float8_e4m3fn
+            compare(li, var, "q", fq, uq, position_ids, hd)
+            compare(li, var, "k", fk, uk8, position_ids, hd)
+            compare(li, var, "v", fv, uv8, position_ids, hd)
+        assert torch.equal(snap.view(torch.int16), qkv.view(torch.int16)), "fused kernel mutated qkv"
+        return uq, uk, uv
+
+    mg.Gemma4Attention.apply_rope = hooked
+    llm = build_llm(cuda_graph_config=None, batch_wait_timeout_ms=500.0)
+    pf = Prompts(4242)
+    params = sp(logprobs=20)
+    cases = [("isl300@1#a", [300]), ("isl300@1#b", [300]), ("isl300@1#c", [300]), ("isl300@1#d", [300]),
+             ("isl1k@1", [1000]), ("isl8k@1", [8000]), ("16x300", [300] * 16), ("4x2000", [2000] * 4),
+             ("uneven", [333, 1201, 77, 2048, 513, 4097]), ("isl8k@4", [8000] * 4), ("isl1k@8", [1000] * 8)]
+    t0 = time.time()
+    for name, isls in cases:
+        outs = llm.generate([pf.make(i) for i in isls], sampling_params=params, use_tqdm=False)
+        log(f"dump case {name}: {len(outs)} prompts, eligible calls so far {calls['eligible']}")
+    # decode steps (eager, CUDA graphs off in this pass)
+    outs = llm.generate([pf.make(500), pf.make(900)], sampling_params=sp(logprobs=0, max_tokens=8), use_tqdm=False)
+    log(f"decode case: tokens {[len(o.outputs[0].token_ids) for o in outs]}; calls {calls}")
+    tot = {var: {t: [0, 0, 0, 0] for t in "qkv"} for var in ("old", "new")}
+    for li, d in stats.items():
+        for var, dd in d.items():
+            for t, e in dd.items():
+                tot[var][t][0] += e["mismatch"]
+                tot[var][t][1] += e["total"]
+                tot[var][t][2] = max(tot[var][t][2], e["max_ulp"])
+                tot[var][t][3] += e["nonfinite"]
+    first_layer = {}
+    for var in ("old", "new"):
+        bad = sorted(li for li, d in stats.items() if any(d[var][t]["mismatch"] for t in "qkv"))
+        first_layer[var] = bad[0] if bad else None
+    per_layer = {str(li): {var: {t: [d[var][t]["mismatch"], d[var][t]["max_ulp"]] for t in "qkv"}
+                           for var in d} for li, d in sorted(stats.items())}
+    summary = {var: {t: {"mismatch": tot[var][t][0], "total": tot[var][t][1],
+                         "frac": tot[var][t][0] / max(1, tot[var][t][1]), "max_ulp": tot[var][t][2],
+                         "nonfinite": tot[var][t][3]}
+                     for t in "qkv"} for var in tot}
+    layers_fused = sorted(li for li, i in info.items() if i["fused_eligible"])
+    log("per-layer [mismatch, max_ulp]: " + json.dumps(per_layer))
+    log("first mismatches: " + json.dumps(first_bad[:20]))
+    log("layer info: " + json.dumps({str(k): v for k, v in sorted(info.items())}))
+    new_zero = all(summary["new"][t]["mismatch"] == 0 for t in "qkv")
+    print(json.dumps({"passed": bool(new_zero and len(layers_fused) > 0),
+                      "compared": "per-layer Q (bf16) / K,V (fp8) bytes of the fused kernel vs main's unfused "
+                                  "chain on the same real qkv + position_ids (unfused result returned)",
+                      "summary": summary, "first_layer_with_mismatch": first_layer,
+                      "fused_layers": layers_fused, "n_fused_layers": len(layers_fused),
+                      "unfused_layers": sorted(li for li, i in info.items() if not i["fused_eligible"]),
+                      "calls": calls, "first_mismatches": first_bad[:10], "elapsed_s": round(time.time() - t0, 1)}),
+          flush=True)
+
+
+# ----------------------------------------------------------------------------- A/B
+def mode_ab():
+    print_dims()
+    import tensorrt_llm._torch.attention.backends.flashinfer as fi
+    import tensorrt_llm._torch.models.modeling_gemma4 as mg
+    llm = build_llm(batch_wait_timeout_ms=float(os.environ.get("BATCH_WAIT_MS", "500")))
+    params = sp(logprobs=20)
+    pf = Prompts(20261114)
+    isls = [300, 1000, 2000, 4000, 8000]
+    n_per = int(os.environ.get("N_PER", "20"))
+    groups = []  # (label, [prompts]) submitted together
+    for isl in isls:
+        for _ in range(n_per):
+            groups.append((f"isl{isl}@1", [pf.make(isl)]))
+    for isl in isls:
+        for _ in range(n_per // 4):
+            groups.append((f"isl{isl}@4", [pf.make(isl) for _ in range(4)]))
+    groups.append(("mix10x1k+4x8k", [pf.make(1000) for _ in range(10)] + [pf.make(8000) for _ in range(4)]))
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(CKPT)
+        qs = ["What is the capital of France? Answer in one word.", "Explain why the sky is blue.",
+              "Write a haiku about autumn leaves.", "List three prime numbers greater than 100.",
+              "Summarize the plot of Hamlet in two sentences.", "What does a CPU cache do?",
+              "Translate 'good morning' into Spanish.", "Why do cats purr?"]
+        for qtext in qs:
+            ids = tok.apply_chat_template([{"role": "user", "content": qtext}], add_generation_prompt=True,
+                                          tokenize=True)
+            if isinstance(ids, dict) or hasattr(ids, "keys"):
+                ids = ids["input_ids"]
+            groups.append(("chat@1", [list(map(int, ids))]))
+    except Exception as e:  # noqa: BLE001
+        log(f"chat prompts skipped: {e!r}")
+    n_prompts = sum(len(g) for _, g in groups)
+    log(f"A/B set: {len(groups)} submissions, {n_prompts} prompts")
+    warm = Prompts(5)
+    for isl in (300, 1000, 8000):
+        llm.generate([warm.make(isl) for _ in range(2)], sampling_params=params, use_tqdm=False)
+
+    def run_pass(tag, subset=None):
+        res = []
+        t0 = time.time()
+        for label, ps in (groups if subset is None else subset):
+            outs = llm.generate(ps, sampling_params=params, use_tqdm=False)
+            res.extend((label, summarize(o)) for o in outs)
+        log(f"pass {tag}: fused={mg._FUSED_QKV_PREP} host_plan={getattr(fi, '_HOST_PREFILL_PLAN', None)} "
+            f"{time.time() - t0:.1f}s")
+        return res
+
+    passes = {}
+    for tag, flag in (("off0", False), ("on0", True), ("off1", False), ("on1", True)):
+        mg._FUSED_QKV_PREP = flag
+        passes[tag] = run_pass(tag)
+    sub = [g for g in groups if g[0] in ("isl300@1", "isl300@4", "isl1k@4", "isl8k@1")][:24]
+    hp_ok = hasattr(fi, "_HOST_PREFILL_PLAN")
+    if hp_ok:
+        fi._HOST_PREFILL_PLAN = False
+        for tag, flag in (("hp0_off", False), ("hp0_on", True)):
+            mg._FUSED_QKV_PREP = flag
+            passes[tag] = run_pass(tag, sub)
+        fi._HOST_PREFILL_PLAN = True
+    mg._FUSED_QKV_PREP = True
+
+    def cmp(a, b):
+        per = {}
+        n_eq = n_flip = n_big = 0
+        maxd = 0.0
+        for (la, sa), (_, sb) in zip(a, b):
+            e = per.setdefault(la, {"n": 0, "bitwise_equal": 0, "token_flips": 0, "max_abs_dlp_top1": 0.0})
+            e["n"] += 1
+            eq = sa == sb
+            e["bitwise_equal"] += int(eq)
+            n_eq += int(eq)
+            ta, la1 = top1(sa)
+            tb, lb1 = top1(sb)
+            if ta != tb:
+                e["token_flips"] += 1
+                n_flip += 1
+            elif la1 is not None and lb1 is not None:
+                d = abs(la1 - lb1)
+                e["max_abs_dlp_top1"] = max(e["max_abs_dlp_top1"], d)
+                maxd = max(maxd, d)
+                n_big += int(d > 0.125)
+        return {"n": len(a), "bitwise_equal": n_eq, "token_flips": n_flip, "dlp_gt_0.125": n_big,
+                "max_abs_dlp_top1": maxd, "per_label": per}
+
+    res = {"off1_vs_off0": cmp(passes["off0"], passes["off1"]),
+           "on0_vs_off0": cmp(passes["off0"], passes["on0"]),
+           "on1_vs_off0": cmp(passes["off0"], passes["on1"]),
+           "on1_vs_on0": cmp(passes["on0"], passes["on1"])}
+    if hp_ok:
+        res["hostplan0_on_vs_off"] = cmp(passes["hp0_off"], passes["hp0_on"])
+    for k, v in res.items():
+        log(f"{k}: " + json.dumps({kk: vv for kk, vv in v.items() if kk != "per_label"}))
+    n = res["on0_vs_off0"]["n"]
+    det = res["off1_vs_off0"]["bitwise_equal"] == n
+    exact = all(res[k]["bitwise_equal"] == res[k]["n"] for k in res)
+    print(json.dumps({"passed": bool(exact and det and passes["off0"][0][1]["lp"]),
+                      "compared": "first-token ids + top-20 logprobs, bitwise, fused QKV prep on vs off "
+                                  "(modeling_gemma4._FUSED_QKV_PREP) in one process, passes off,on,off,on "
+                                  "+ host-plan-off pair",
+                      "prompts": n, "off_vs_off_bitwise": det, "comparisons": res}), flush=True)
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "dump":
+        mode_dump()
+    else:
+        mode_ab()
