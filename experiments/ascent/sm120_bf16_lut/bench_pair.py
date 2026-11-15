@@ -71,6 +71,9 @@ def main():
     ckpt = sys.argv[1]
     shapes, info = read_shapes(ckpt)
     import tensorrt_llm  # noqa: F401  (registers torch.ops.trtllm)
+    import tensorrt_llm._torch.models.modeling_gemma4 as mg
+    # landing 1 (k_eq_v V-dedup) runs the global qkv as [q | k], N = 32*512 + 4*512 = 18432
+    dedup_on_main = hasattr(mg, "_QKOnlyLinear")
     gating = tree_gating()
     if gating is not None:
         def op(x, W):
@@ -118,17 +121,23 @@ def main():
             del Ws, xmax
             torch.cuda.empty_cache()
         log(f"pass {pass_i} done")
+    per_shape = {}
     for key, vals in passes.items():
         med, nf = min(vals)
-        batch[key] = {"kernel_ms": round(med, 5), "noise_floor": round(max(nf, 1e-4), 4)}
+        per_shape[key] = {"kernel_ms": round(med, 5), "noise_floor": round(max(nf, 1e-4), 4)}
         log(f"{key}: {med:.4f} ms (passes {[round(v[0], 4) for v in vals]}) noise {nf:.4f}")
+    # Cases = total tokens per forward: the attention-projection GEMM time of one forward
+    # (sliding layers x (sl_qkv + sl_o) + global layers x (global qkv + gl_o)) at that token count.
+    gq = "gl_qkv_dedup" if dedup_on_main else "gl_qkv"
+    fwd_layers = {"sl_qkv": layers["sl_qkv"], "sl_o": layers["sl_o"], gq: layers["gl_qkv"], "gl_o": layers["gl_o"]}
     for M in PROTO_M:
-        tot = sum(layers[s] * batch[f"{s}_M{M}"]["kernel_ms"] for s in layers)
-        nfs = max(batch[f"{s}_M{M}"]["noise_floor"] for s in layers)
-        batch[f"fwd_M{M}"] = {"kernel_ms": round(tot, 4), "noise_floor": nfs}
-        log(f"per-forward attention GEMMs at M={M}: {tot:.3f} ms")
+        tot = sum(n * per_shape[f"{s}_M{M}"]["kernel_ms"] for s, n in fwd_layers.items())
+        nfs = max(per_shape[f"{s}_M{M}"]["noise_floor"] for s in fwd_layers)
+        batch[str(M)] = {"kernel_ms": round(tot, 4), "noise_floor": nfs}
+        log(f"per-forward attention GEMMs at M={M}: {tot:.3f} ms (global qkv shape {gq})")
     log("host enqueue us/call", json.dumps(host))
-    print(json.dumps({"batch": batch, "output": {"class": "reordered"}, "path": path, "host_us": host}))
+    print(json.dumps({"batch": batch, "output": {"class": "exact"}, "path": path, "per_shape": per_shape,
+                      "host_us": host}))
 
 
 if __name__ == "__main__":

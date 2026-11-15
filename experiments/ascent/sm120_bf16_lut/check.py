@@ -28,7 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lt import Lt, read_shapes  # noqa: E402
 
 PROTO_M = [300, 512, 1000, 1200, 2000, 4000, 4800, 8000, 8100, 8192]
-EXTRA_M = [129, 600, 900, 999, 1500, 2400, 3000, 4097, 6000, 7040, 7500, 7999, 8050]
+EXTRA_M = [27, 129, 600, 900, 999, 1100, 1152, 1500, 1800, 2100, 2400, 2700, 3000, 3600, 4097, 4500, 5100,
+           5700, 6000, 6300, 6900, 7000, 7040, 7200, 7500, 7999, 8050, 8150]
+
+
+def bits_equal(a, b):
+    """Raw BF16 bit equality (torch.equal would treat -0.0 == +0.0)."""
+    return a.shape == b.shape and torch.equal(a.view(torch.int16), b.view(torch.int16))
 NCOPY = 4
 T0 = time.time()
 
@@ -93,6 +99,8 @@ def main():
 
     ok = consistent
     report = {}
+    n_routed_cases = 0
+    n_routed_bitwise = 0
     worst = {"err_ratio_maxabs": 0.0, "err_ratio_frob": 0.0, "cand_vs_main_maxabs": 0.0}
     a_outputs = {}
     for sname, (N, K) in shapes.items():
@@ -114,7 +122,7 @@ def main():
                 j = i % NCOPY
                 if j not in first:
                     first[j] = o.clone()
-                elif not torch.equal(o, first[j]):
+                elif not bits_equal(o, first[j]):
                     nmis += 1
             o = first[0]
             ref = torch.matmul(x.float(), Ws[0].float().t())
@@ -133,22 +141,33 @@ def main():
             if cfg is not None:
                 out = torch.empty_like(o)
                 lt.matmul(x, Ws[0], out, lt.make_algo(cfg))
-                table_bitwise = bool(torch.equal(out, o))
+                table_bitwise = bits_equal(out, o)
             else:
                 out = torch.empty_like(o)
                 lt.matmul(x, Ws[0], out, None)
-                table_bitwise = bool(torch.equal(out, o))
-            case_ok = nmis == 0 and pass_max and pass_frob and finite and table_bitwise and o.dtype == torch.bfloat16
+                table_bitwise = bits_equal(out, o)
+            gate = routes.get((K, N))
+            routed = gate is not None and M in gate
+            # what the model runs at this M: cublas_mm if routed, else main's F.linear
+            main_bits = bits_equal(o, main) and all(
+                bits_equal(cand(x, Ws[j]), F.linear(x, Ws[j])) for j in (1, 2))
+            n_bits_diff = int((o.view(torch.int16) != main.view(torch.int16)).sum().item())
+            case_ok = (nmis == 0 and pass_max and pass_frob and finite and table_bitwise
+                       and o.dtype == torch.bfloat16 and (main_bits or not routed))
             ok &= case_ok
             worst["err_ratio_maxabs"] = max(worst["err_ratio_maxabs"], e_c / max(e_m, 1e-30))
             worst["err_ratio_frob"] = max(worst["err_ratio_frob"], f_c / max(f_m, 1e-30))
             worst["cand_vs_main_maxabs"] = max(worst["cand_vs_main_maxabs"], d_cm)
             report[f"{sname}_M{M}"] = dict(repeat_mismatches=nmis, cand_maxabs=e_c, main_maxabs=e_m, cand_frob=f_c,
                                            main_frob=f_m, cand_vs_main_maxabs=d_cm, table_cfg=cfg,
-                                           table_bitwise=table_bitwise, ok=case_ok)
-            log(f"{sname} M={M}: repeat_mismatch={nmis} maxabs cand {e_c:.3e} main {e_m:.3e} | frob cand {f_c:.3e} "
-                f"main {f_m:.3e} | cand-main {d_cm:.3e} | cfg {cfg} table_bitwise={table_bitwise} -> "
-                f"{'OK' if case_ok else 'FAIL'}")
+                                           table_bitwise=table_bitwise, routed=routed, bitwise_vs_main=main_bits,
+                                           bits_diff=n_bits_diff, ok=case_ok)
+            if routed:
+                n_routed_cases += 1
+                n_routed_bitwise += int(main_bits)
+            log(f"{sname} M={M}: routed={routed} bitwise_vs_main={main_bits} ({n_bits_diff} elems differ) "
+                f"repeat_mismatch={nmis} maxabs cand {e_c:.3e} main {e_m:.3e} | frob cand {f_c:.3e} main {f_m:.3e} | "
+                f"cfg {cfg} table_bitwise={table_bitwise} -> {'OK' if case_ok else 'FAIL'}")
         inputs_ok = all(torch.equal(a, b) for a, b in zip(Ws, W_snap)) and torch.equal(xmax, x_snap)
         ok &= inputs_ok
         log(f"{sname} inputs unchanged: {inputs_ok}")
@@ -166,7 +185,7 @@ def main():
         _ = cand(xb[:4000], Wb)
         for M in (8000, 300, 1200):
             o = cand(xa[:M], Wa)
-            perm_ok &= bool(torch.equal(o, a_outputs[a][M]))
+            perm_ok &= bits_equal(o, a_outputs[a][M])
             _ = cand(xb[:M], Wb)
     ok &= perm_ok
     log("A,B,A permutation bitwise:", perm_ok)
@@ -192,7 +211,7 @@ def main():
                 g.replay()
                 torch.cuda.synchronize()
                 outs.append(gout.clone())
-            good = all(torch.equal(o, eager) for o in outs)
+            good = all(bits_equal(o, eager) for o in outs)
             graph_ok &= good
             log(f"cuda graph M={M} N={W.shape[0]} K={W.shape[1]}: replay==eager {good}")
     ok &= graph_ok
@@ -213,7 +232,7 @@ def main():
             o = meth.apply(mod, xs[:M], None)
             inside = gate is not None and M in gate
             exp = cand(xs[:M], W) if inside else F.linear(xs[:M], W)
-            good = bool(torch.equal(o, exp))
+            good = bits_equal(o, exp) and bits_equal(o, F.linear(xs[:M], W))
             route_ok &= good
             log(f"route {sname} M={M}: {'cublas_mm' if inside else 'F.linear'} bitwise {good}")
     # A shape absent from the table (K=4096, N=6144): Gemma4 would not flag it, so apply() runs F.linear exactly as
@@ -225,10 +244,10 @@ def main():
     modz = SimpleNamespace(weight=Wz, use_custom_cublas_mm=gz is not None, custom_cublas_mm_tokens=gz,
                            use_cute_dsl_bf16_gemm=False, all_reduce=None, mapping=None)
     oz = meth.apply(modz, xz, None)
-    absent_flinear = bool(torch.equal(oz, F.linear(xz, Wz))) and not modz.use_custom_cublas_mm
+    absent_flinear = bits_equal(oz, F.linear(xz, Wz)) and not modz.use_custom_cublas_mm
     outz = torch.empty(1000, 6144, device="cuda", dtype=torch.bfloat16)
     lt.matmul(xz, Wz, outz, None)
-    absent_cublas_fallthrough = bool(torch.equal(cand(xz, Wz), outz))
+    absent_cublas_fallthrough = bits_equal(cand(xz, Wz), outz)
     kz = {}
     try:
         from torch.profiler import ProfilerActivity, profile
@@ -265,7 +284,8 @@ def main():
                       "replay; table config recomputed via cuBLASLt; Linear routing and absent-shape fall-through",
                       "graph_ok": graph_ok, "perm_ok": perm_ok, "route_ok": route_ok,
                       "routes_table_consistent": consistent,
-                      "worst": worst, "n_cases": len(report),
+                      "worst": worst, "n_cases": len(report), "routed_cases": n_routed_cases,
+                      "routed_bitwise_vs_main": n_routed_bitwise,
                       "failed": [k for k, v in report.items() if not v["ok"]]}))
 
 

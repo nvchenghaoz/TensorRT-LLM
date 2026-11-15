@@ -78,10 +78,10 @@ def main():
         for M in sorted(set(grid + S)):
             h = lt.heuristics(M, N, K, 32)
             for (cfg8, inner), wsz, waves, orig in h:
-                # nvjet only, no split-K: same K accumulation order as main's kernels (bitwise-equality candidates)
-                if cfg8[0] in (66, 67) and cfg8[3] == 1:
+                # nvjet only, no in-place (atomic) split-K reduction; the bitwise gate below decides the rest
+                if cfg8[0] in (66, 67) and cfg8[4] != 1:
                     pool.add(cfg8)
-            if h and h[0][0][0][4] != 1:
+            if h and h[0][0][0][0] in (66, 67) and h[0][0][0][4] != 1:
                 top1.setdefault(sname, set()).add(h[0][0][0])
     pool = sorted(pool)
     algos = {c: lt.make_algo(c) for c in pool}
@@ -95,22 +95,53 @@ def main():
 
         nonbitwise = {}
 
-        def bitwise(M, c):
-            """Config c gives exactly main's F.linear output at M (checked on two weight copies)."""
+        def mismatches(M, c, j=0):
+            """Number of output elements whose raw BF16 bits differ from main's F.linear output at M."""
             x, out = xmax[:M], obuf[:M]
-            for j in (0, 1):
-                ref = F.linear(x, Ws[j])
-                lt.matmul(x, Ws[j], out, algos[c])
-                if not torch.equal(out, ref):
-                    return False
-            return True
+            ref = F.linear(x, Ws[j])
+            lt.matmul(x, Ws[j], out, algos[c])
+            return int((out.view(torch.int16) != ref.view(torch.int16)).sum().item())
+
+        def bitwise(M, c):
+            """Config c gives exactly main's F.linear bits at M (checked on two weight copies)."""
+            return all(mismatches(M, c, j) == 0 for j in (0, 1))
+
+        # ---- bitwise study for the fact entry: main's kernel vs every pooled config at selected M
+        study_ms = [300, 1000, 1100, 1152, 1200, 4800, 7040, 7500, 7999, 8000, 8050, 8150, 8192]
+        try:
+            from torch.profiler import ProfilerActivity, profile
+
+            def kname(fn):
+                with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    fn()
+                    torch.cuda.synchronize()
+                return ";".join(sorted({e.name[:90] for e in prof.events() if e.device_type.name == "CUDA"}))
+        except Exception:  # noqa: BLE001
+            def kname(fn):
+                return "?"
+        for M in study_ms:
+            x, out = xmax[:M], obuf[:M]
+            main_k = kname(lambda: F.linear(x, Ws[0]))
+            n_el = M * N
+            rows = []
+            for c in pool:
+                if not lt.check(M, N, K, algos[c]):
+                    continue
+                mm = mismatches(M, c)
+                rows.append((mm, c, kname(lambda: lt.matmul(x, Ws[0], out, algos[c]))))
+            n_bw = sum(1 for r in rows if r[0] == 0)
+            log(f"STUDY {sname} M={M} main={main_k} : {n_bw}/{len(rows)} configs bitwise")
+            for mm, c, kn in rows:
+                grp = "b" if c[3] != 1 or c[4] != 0 else "a"
+                log(f"STUDY   {sname} M={M} cfg={list(c)} {lt.name(c)} group={grp} kernel={kn} "
+                    f"bitwise={'YES' if mm == 0 else 'NO'} mismatched={mm}/{n_el}")
 
         def measure(M, cfgs, warm=3, iters=12):
             x, out = xmax[:M], obuf[:M]
             fl0 = timeit(lambda i: F.linear(x, Ws[i % NCOPY]), warm, iters)
             row = {}
             for c in cfgs:
-                if lt.check(M, N, K, algos[c]):
+                if c in algos and lt.check(M, N, K, algos[c]):
                     if not bitwise(M, c):
                         nonbitwise[(M, c)] = True
                         continue
@@ -124,6 +155,9 @@ def main():
         for M in S:
             fl, row = measure(M, pool)
             pre[M] = (fl, row)
+            if not row:
+                log(f"{sname} pre M={M}: F.linear {fl:.4f}; no bitwise config")
+                continue
             b = min(row.values())
             short |= {c for c, t in row.items() if t <= 1.03 * b}
             log(f"{sname} pre M={M}: F.linear {fl:.4f} best {b:.4f} {(fl / b - 1) * 100:+.1f}% "
@@ -148,8 +182,11 @@ def main():
                 r = min(res[c]) / flv
                 if best is None or r < best[1]:
                     best = (c, r)
+            if best is None:
+                best = (None, 9.0)
             exact[M] = best
-            log(f"{sname} exact M={M}: F.linear {flv:.4f} best {lt.name(best[0])} ratio {best[1]:.3f}")
+            log(f"{sname} exact M={M}: F.linear {flv:.4f} best {lt.name(best[0]) if best[0] else '-'} "
+                f"ratio {best[1]:.3f}")
         # ---- dense intervals for M >= LO
         tim = {}
         for M in grid:
