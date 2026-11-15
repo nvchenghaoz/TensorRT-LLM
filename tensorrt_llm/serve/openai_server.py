@@ -3125,6 +3125,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
+        from tensorrt_llm import _ascent_trace as _AT
+        _at_rec = {"entry": _AT.now()} if _AT.ENABLED else None
 
         async def completion_response(
                 promise: RequestOutput,
@@ -3177,12 +3179,19 @@ class OpenAIServer(_VideoRoutesMixin):
         async def completion_generator(promise: RequestOutput,
                                        params: Optional[PostprocParams]):
             try:
+                _at_first = _at_rec is not None
                 async for output in promise:
+                    if _at_first:
+                        _at_o0 = _AT.now()
                     if not self.postproc_worker_enabled:
                         post_processor, args = params.post_processor, params.postproc_args
                         pp_result = post_processor(output, args)
                     else:
                         pp_result = output.outputs[0]._postprocess_result
+                    if _at_first:
+                        _at_first = False
+                        _AT.ev("fe_out", cid=promise.request_id, o0=_at_o0,
+                               pp1=_AT.now(), fin=bool(output.finished))
                     for pp_res in pp_result:
                         yield pp_res
                 await self._extract_metrics(output, raw_request)
@@ -3226,6 +3235,8 @@ class OpenAIServer(_VideoRoutesMixin):
             first_response = await anext(generator)
             raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
             )
+            if _at_rec is not None and promises:
+                _AT.ev("fe_yield", cid=promises[0].request_id)
             yield first_response
             async for output in generator:
                 yield output
@@ -3292,15 +3303,34 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
                     loop = asyncio.get_event_loop()
+                    if _at_rec is not None:
+                        _at_rec["head"] = str(prompt.get("prompt"))[:40]
+                        _at_rec["sub"] = _AT.now()
+                        _at_ip = self.generator.input_processor
+
+                        def _at_tok(p, sp):
+                            _at_rec["tok0"] = _AT.now()
+                            _AT.rpush("AT:tokenize")
+                            r = _at_ip(p, sp)
+                            _AT.rpop()
+                            _at_rec["tok1"] = _AT.now()
+                            return r
+
+                        _at_fn = functools.partial(_at_tok, prompt,
+                                                   sampling_params)
+                    else:
+                        _at_fn = functools.partial(
+                            self.generator.input_processor, prompt,
+                            sampling_params)
                     prompt_token_ids, extra_processed_inputs = await loop.run_in_executor(
-                        self._input_proc_executor,
-                        functools.partial(self.generator.input_processor,
-                                          prompt, sampling_params))
+                        self._input_proc_executor, _at_fn)
                     tokens_prompt = TokensPrompt(
                         prompt_token_ids=prompt_token_ids)
                 else:
                     tokens_prompt = prompt
 
+                if _at_rec is not None:
+                    _at_rec["gen0"] = _AT.now()
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
                     sampling_params=sampling_params,
@@ -3314,6 +3344,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     kv_hints=request.kv_hints,
                     priority=request.priority if request.priority is not None
                     else DEFAULT_REQUEST_PRIORITY)
+                if _at_rec is not None:
+                    _AT.ev("fe_req", cid=promise.request_id,
+                           gen1=_AT.now(),
+                           ntok=len(promise.prompt_token_ids or []),
+                           **_at_rec)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:

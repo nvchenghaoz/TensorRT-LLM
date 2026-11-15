@@ -929,6 +929,12 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         res = res if isinstance(res, list) else [res]
 
+        from tensorrt_llm import _ascent_trace as _AT
+        if _AT.ENABLED:
+            _AT.ev("px_disp",
+                   cids=[getattr(i, "client_id", None) for i in res
+                         if i is not None])
+
         for i in res:
             global_tracer().log_instant("IPC.get")
             if i is None:
@@ -1409,8 +1415,13 @@ class GenerationExecutorProxy(GenerationExecutor):
             if tail:
                 request._prompt_tail_tokens = tail
 
+        from tensorrt_llm import _ascent_trace as _AT
+        if _AT.ENABLED:
+            _at_s0 = _AT.now()
         with nvtx_range_debug("request_queue.put"):
             self._send_request(request)
+        if _AT.ENABLED:
+            _AT.ev("px_send", cid=request.id, s0=_at_s0)
 
         self._handle_background_error()
 

@@ -84,9 +84,20 @@ class ModelCaller:
         window_scope = (
             nccl_window_tensor_scope(kwargs) if self._nccl_window_scopes_enabled else None
         )
+        from tensorrt_llm import _ascent_trace as _AT
+
+        _at = _AT.ENABLED and not torch.cuda.is_current_stream_capturing()
+        if _at:
+            _AT.ev("mc0")
+            _AT.gpu_ev("g_mc0")
+            _AT.rpush("AT:model_forward")
         with compile_scope, window_scope if window_scope is not None else contextlib.nullcontext():
             if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
                 outputs = trace_func(self._model.forward)(**kwargs)
             else:
                 outputs = self._model.forward(**kwargs)
+            if _at:
+                _AT.rpop()
+                _AT.ev("mc1")
+                _AT.gpu_ev("g_mc1")
             return window_scope.escape(outputs) if window_scope is not None else outputs
