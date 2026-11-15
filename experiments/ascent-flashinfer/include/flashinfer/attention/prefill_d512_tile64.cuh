@@ -125,8 +125,15 @@ __device__ __forceinline__ void mma_m16n8k16(float* c, const uint32_t* a, const 
 
 __device__ __forceinline__ void cp_async_16_zfill(uint32_t smem_addr, const void* gptr,
                                                   bool pred) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr), "l"(gptr),
-               "r"(pred ? 16 : 0));
+  // In-range rows: the fixed 16-byte cp.async. Rows past the chunk: 16 zero bytes stored
+  // directly (what the zero-fill form writes). On SM120 the runtime src-size (zero-fill) form
+  // and the ignore-src form are not coalesced across lanes: each 16-byte lane fetches its own
+  // 32-byte sector, so a warp's 512 bytes moved ~34 sectors and ~30 smem wavefronts.
+  if (pred) {
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::"r"(smem_addr), "l"(gptr));
+  } else {
+    asm volatile("st.shared.v4.u32 [%0], {%1, %1, %1, %1};\n" ::"r"(smem_addr), "r"(0u));
+  }
 }
 
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }

@@ -168,13 +168,50 @@ K_READ = {
             const uint32_t hi = lds_u32(k_addr + 8);""",
 }
 
+CP_OLD = """__device__ __forceinline__ void cp_async_16_zfill(uint32_t smem_addr, const void* gptr,
+                                                  bool pred) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\\n" ::"r"(smem_addr), "l"(gptr),
+               "r"(pred ? 16 : 0));
+}"""
+# C: the fixed-size cp.async for in-range rows and a 16-byte zero store for the rest (the
+# runtime src-size form may not coalesce across threads)
+CP_C = """__device__ __forceinline__ void cp_async_16_zfill(uint32_t smem_addr, const void* gptr,
+                                                  bool pred) {
+  // In-range rows: the fixed 16-byte cp.async. Rows past the chunk: 16 zero bytes stored
+  // directly (what the zero-fill form writes). On SM120 the runtime src-size (zero-fill) form
+  // and the ignore-src form are not coalesced across lanes: each 16-byte lane fetches its own
+  // 32-byte sector, so a warp's 512 bytes moved ~34 sectors and ~30 smem wavefronts.
+  if (pred) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\\n" ::"r"(smem_addr), "l"(gptr));
+  } else {
+    asm volatile("st.shared.v4.u32 [%0], {%1, %1, %1, %1};\\n" ::"r"(smem_addr), "r"(0u));
+  }
+}"""
+# D: the ignore-src predicate form
+CP_D = """__device__ __forceinline__ void cp_async_16_zfill(uint32_t smem_addr, const void* gptr,
+                                                  bool pred) {
+  asm volatile(
+      "{\\n .reg .pred ign;\\n setp.eq.u32 ign, %2, 0;\\n"
+      " cp.async.cg.shared.global [%0], [%1], 16, ign;\\n}\\n" ::"r"(smem_addr),
+      "l"(gptr), "r"(pred ? 1u : 0u));
+}"""
+# E: C with the L2 128-byte prefetch hint
+CP_E = CP_C.replace("cp.async.cg.shared.global [%0]", "cp.async.cg.shared.global.L2::128B [%0]")
+
 FILL = [P_LOADER_DOC, P_LOADER, P_INIT, P_Q, P_V, P_VLOOP]
+AB = [P_LDS32] + FILL + [(K_LANE_OLD, K_LANE["AB"]), (K_READ_OLD, K_READ["AB"])]
 ARMS = {
     "main": [],
     "A": FILL + [(K_LANE_OLD, K_LANE["A"]), (K_READ_OLD, K_READ["A"])],
     "B": [P_LDS32, (K_LANE_OLD, K_LANE["B"]), (K_READ_OLD, K_READ["B"])],
-    "AB": [P_LDS32] + FILL + [(K_LANE_OLD, K_LANE["AB"]), (K_READ_OLD, K_READ["AB"])],
+    "AB": AB,
+    "C": [(CP_OLD, CP_C)],
+    "ABC": AB + [(CP_OLD, CP_C)],
+    "ABD": AB + [(CP_OLD, CP_D)],
+    "ABE": AB + [(CP_OLD, CP_E)],
 }
+# arms a tree may carry, largest first (main_text reverses the first whose texts all match)
+TREE_ARMS = ("ABC", "ABD", "ABE", "AB")
 
 
 def log(*a):
@@ -209,9 +246,11 @@ def apply(txt, patches, tag, reverse=False):
 
 
 def main_text(tree_txt):
-    """Main's kernel text: the tree as is, or the tree with the AB patches reversed."""
-    if all(tree_txt.count(new) == 1 for _, new in ARMS["AB"]):
-        return apply(tree_txt, list(reversed(ARMS["AB"])), "reverse AB", reverse=True), "tree=AB"
+    """Main's kernel text: the tree as is, or the tree with its arm's patches reversed."""
+    for arm in TREE_ARMS:
+        if all(tree_txt.count(new) == 1 for _, new in ARMS[arm]):
+            return (apply(tree_txt, list(reversed(ARMS[arm])), f"reverse {arm}", reverse=True),
+                    f"tree={arm}")
     for old, _ in ARMS["AB"]:
         if tree_txt.count(old) != 1:
             raise RuntimeError(f"tree is neither main nor AB: {old[:90]!r}")
