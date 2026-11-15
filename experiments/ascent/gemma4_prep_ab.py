@@ -336,6 +336,124 @@ def mode_ab():
                       "prompts": n, "off_vs_off_bitwise": det, "comparisons": res}), flush=True)
 
 
+TOL = {300: 4.8174, 1000: 0.5713, 2000: 5.0, 4000: 0.125, 8000: 0.125}
+
+
+def _first(s):
+    lp = s["lp"][0] if s["lp"] else []
+    d = dict(lp) if isinstance(lp, list) else {}
+    return s["ids"][0], d
+
+
+def _check_distance(m, c):
+    """Landing-check distance (check.py): same token |dlp|; else near-tie seen from both sides."""
+    tm, dm = _first(m)
+    tc, dc = _first(c)
+    lm, lc = dm.get(tm), dc.get(tc)
+    if lm is None or lc is None:
+        return float("inf")
+    d = abs(lc - lm)
+    if tc == tm:
+        return d
+    a = dm.get(tc)
+    b = dc.get(tm)
+    a = float("inf") if a is None else max(0.0, lm - a)
+    b = float("inf") if b is None else max(0.0, lc - b)
+    return max(d, a, b)
+
+
+def mode_outcome0():
+    """Landing-3 diagnosis: OLD (tl.sum order, reordered) fused prep vs main's chain, host plan off/on."""
+    print_dims()
+    import tensorrt_llm._torch.attention.backends.flashinfer as fi
+    import tensorrt_llm._torch.models.modeling_gemma4 as mg
+    real = mg.gemma4_fused_qkv_norm_rope_quant
+    variant = {"cute": True}
+
+    def wrapped(*a, **kw):
+        kw["cute_norm_order"] = bool(variant["cute"] and kw.get("cute_norm_order", False))
+        return real(*a, **kw)
+
+    mg.gemma4_fused_qkv_norm_rope_quant = wrapped
+    llm = build_llm(batch_wait_timeout_ms=float(os.environ.get("BATCH_WAIT_MS", "1500")))
+    params = sp(logprobs=20)
+    pf = Prompts(774)
+    groups = []
+    for isl in (300, 1000, 8000):
+        for _ in range(10):
+            groups.append((isl, f"isl{isl}@1", [pf.make(isl)]))
+    groups.append((1000, "isl1k@16", [pf.make(1000) for _ in range(16)]))
+    for _ in range(3):
+        groups.append((8000, "isl8k@4", [pf.make(8000) for _ in range(4)]))
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(CKPT)
+        base = ("The history of the printing press shows how a single technical change can reshape "
+                "how knowledge spreads, who can read, and which institutions hold authority. ")
+        for i, n in enumerate((20, 60, 20, 60, 20, 60, 20, 60)):
+            ids = tok.apply_chat_template([{"role": "user", "content": base * (n // 20) +
+                                            f"Question {i}: summarize the main idea in one sentence."}],
+                                          add_generation_prompt=True, tokenize=True)
+            if isinstance(ids, dict) or hasattr(ids, "keys"):
+                ids = ids["input_ids"]
+            ids = list(map(int, ids))
+            groups.append((300 if len(ids) < 650 else 1000, "chat@1", [ids]))
+    except Exception as e:  # noqa: BLE001
+        log(f"chat prompts skipped: {e!r}")
+    warm = Prompts(5)
+    for isl in (300, 1000, 8000):
+        llm.generate([warm.make(isl) for _ in range(2)], sampling_params=params, use_tqdm=False)
+
+    def run(tag, fused, cute, hp):
+        mg._FUSED_QKV_PREP = fused
+        variant["cute"] = cute
+        fi._HOST_PREFILL_PLAN = hp
+        res = []
+        t0 = time.time()
+        for isl, label, ps in groups:
+            outs = llm.generate(ps, sampling_params=params, use_tqdm=False)
+            res.extend((isl, label, summarize(o)) for o in outs)
+        log(f"arm {tag}: fused={fused} cute={cute} host_plan={hp} {time.time() - t0:.1f}s")
+        return res
+
+    arms = [("main@0", False, True, False), ("main@1", False, True, True), ("b7old@0", True, False, False),
+            ("b7old@1", True, False, True), ("b7new@1", True, True, True), ("b7new@0", True, True, False),
+            ("main@0b", False, True, False)]
+    out = {tag: run(tag, f, c, h) for tag, f, c, h in arms}
+    mg._FUSED_QKV_PREP, variant["cute"], fi._HOST_PREFILL_PLAN = True, True, True
+    ref = out["main@0"]
+    rep = {}
+    for tag in [a[0] for a in arms[1:]]:
+        per = {}
+        for (isl, label, m), (_, _, c) in zip(ref, out[tag]):
+            e = per.setdefault(label, {"n": 0, "differ": 0, "flips": 0, "flips_margin_gt_1nat": 0,
+                                       "max_top20_dlp": 0.0, "check_fail": 0, "flip_margins": []})
+            e["n"] += 1
+            e["differ"] += int(m != c)
+            tm, dm = _first(m)
+            tc, dc = _first(c)
+            common = set(dm) & set(dc)
+            if common:
+                e["max_top20_dlp"] = max(e["max_top20_dlp"], max(abs(dm[t] - dc[t]) for t in common))
+            if tm != tc:
+                e["flips"] += 1
+                vals = sorted(dm.values(), reverse=True)
+                margin = vals[0] - vals[1] if len(vals) > 1 else float("inf")
+                e["flip_margins"].append(round(margin, 4))
+                e["flips_margin_gt_1nat"] += int(margin > 1.0)
+            e["check_fail"] += int(_check_distance(m, c) > TOL[isl])
+        tot = {k: sum(v[k] for v in per.values()) for k in ("n", "differ", "flips", "flips_margin_gt_1nat",
+                                                            "check_fail")}
+        tot["max_top20_dlp"] = max(v["max_top20_dlp"] for v in per.values())
+        rep[tag + "_vs_main@0"] = {"total": tot, "per_label": per}
+        log(f"{tag} vs main@0: {json.dumps(tot)}")
+    det = rep["main@0b_vs_main@0"]["total"]["differ"] == 0
+    print(json.dumps({"passed": bool(det), "compared": "first token + top-20 logprobs vs main@0 (main prep, host "
+                      "plan off); arms flip modeling_gemma4._FUSED_QKV_PREP, the fused kernel's cute_norm_order "
+                      "(old = landing-3 reordered kernel) and flashinfer._HOST_PREFILL_PLAN in one process",
+                      "main0_vs_main0_bitwise": det, "report": rep}), flush=True)
+
+
 def mode_both():
     """dump then ab, each in its own process (one model instance at a time); combined JSON last."""
     import subprocess
@@ -361,5 +479,7 @@ if __name__ == "__main__":
         mode_dump()
     elif sys.argv[1] == "both":
         mode_both()
+    elif sys.argv[1] == "outcome0":
+        mode_outcome0()
     else:
         mode_ab()
