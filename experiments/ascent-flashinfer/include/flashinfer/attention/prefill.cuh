@@ -38,6 +38,7 @@
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "cascade.cuh"
+#include "fa2_merge_rows.cuh"
 #include "mask.cuh"
 #include "variants.cuh"
 #include "prefill_d512_tile64.cuh"
@@ -4969,7 +4970,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     const __grid_constant__ Params params) {
   extern __shared__ uint8_t smem[];
   auto& smem_storage = reinterpret_cast<typename KTraits::SharedStoragePaged&>(smem);
-  BatchPrefillWithPagedKVCacheDevice<KTraits, SAME_KV_STRIDES>(params, smem_storage);
+  // FA2PagedPrefillGrid may launch item-major (d512_tile64_config.cuh).
+  const uint32_t num_kv_heads = params.paged_kv.num_heads;
+  uint32_t bx, kv_head_idx;
+  FA2PagedPrefillBlockCoords(num_kv_heads, bx, kv_head_idx);
+  BatchPrefillWithPagedKVCacheDevice<KTraits, SAME_KV_STRIDES>(params, smem_storage, threadIdx,
+                                                               bx, kv_head_idx, num_kv_heads);
 }
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
@@ -5254,7 +5260,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     return cudaSuccess;
   }
 
-  dim3 nblks(padded_batch_size, 1, num_kv_heads);
+  dim3 nblks =
+      FA2PagedPrefillGrid(padded_batch_size, num_kv_heads, params.block_valid_mask != nullptr);
   dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
 
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
@@ -5441,7 +5448,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
             if constexpr (AttentionVariant::use_softmax) {
-              FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+              FLASHINFER_CUDA_CALL(FA2VariableLengthMergeStates(
                   tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
                   params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
             } else {
