@@ -140,6 +140,17 @@ from transformers import Gemma4TextConfig  # noqa: E402
 # runs can flip it between eager forwards.
 _FUSED_QKV_PREP = os.environ.get("TRTLLM_GEMMA4_FUSED_QKV_PREP", "1") != "0"
 
+# FlashInfer FA2 FP8-KV route: on eager (non-captured) steps the fused prep
+# stores FP8 K/V straight into the paged KV pool, at the slots and with the
+# bytes FlashInfer's append kernel would write, and the backend skips its
+# append. TRTLLM_GEMMA4_PREP_PAGED_KV=0 keeps main's temporaries + append.
+# Read at call time, so in-process A/B runs can flip it between forwards.
+_PREP_PAGED_KV_ENV = "TRTLLM_GEMMA4_PREP_PAGED_KV"
+
+
+def _prep_paged_kv_enabled() -> bool:
+    return os.environ.get(_PREP_PAGED_KV_ENV, "1") != "0"
+
 
 class _CublasMmTokenGate:
     """Token counts (rows of the 2D input) a projection sends to trtllm::cublas_mm: the union of sorted,
@@ -745,6 +756,65 @@ class Gemma4Attention(QKNormRoPEAttention):
         self._fused_qkv_prep_kv_out_fp8 = False
         self._fused_qkv_prep_cute_norm = False
         self._fused_prep_blocked = False
+        # attn_metadata of the forward in progress (None outside forward);
+        # the direct paged-KV store reads its page tables.
+        self._prep_attn_metadata = None
+
+    def _prep_paged_kv_target(self, num_rows: int):
+        """Paged-KV store arguments for this layer's prep, or None to keep
+        main's temporaries + backend append.
+
+        Eligible only on an eager step: never while capturing a CUDA graph and
+        never for CUDA-graph metadata, so a captured body (and its replay)
+        stays main's. Decided before the launch; the prep runs once.
+        """
+        md = self._prep_attn_metadata
+        if (
+            md is None
+            or not _prep_paged_kv_enabled()
+            or not self._fused_qkv_prep_cute_norm
+            or not self._fused_qkv_prep_kv_out_fp8
+            or self._fused_qkv_prep_out_fp8
+            or self._use_trtllm_fused_qkv_prep
+            or torch.cuda.is_current_stream_capturing()
+            or not isinstance(md, FlashInferAttentionMetadata)
+            or md.is_cuda_graph
+            or md.kv_cache_manager is None
+            or num_rows != md.num_tokens
+            or num_rows == 0
+            or getattr(self.attn, "is_mla_enable", False)
+            or getattr(self.attn, "flashinfer_backend", None) != "fa2"
+            or not getattr(self.attn, "has_fp8_kv_cache", False)
+        ):
+            return None
+        layer_idx = self.attn.layer_idx
+        if md.get_mixed_precision_kv_view(layer_idx) is not None:
+            return None
+        kv_cache = md.kv_cache_manager.get_buffers(layer_idx, kv_layout=md.kv_layout)
+        if (
+            not isinstance(kv_cache, torch.Tensor)
+            or kv_cache.dtype != torch.float8_e4m3fn
+            or kv_cache.dim() != 5
+            or kv_cache.shape[1] != 2
+            or kv_cache.stride(-1) != 1
+            or kv_cache.shape[-1] != self.head_dim
+        ):
+            return None
+        target = dict(
+            paged_kv_cache=kv_cache,
+            kv_batch_indices=md.batch_indices,
+            kv_positions=md.positions,
+            kv_indptr=md.paged_kv_indptr,
+            # This layer's pool (VSWA): the indices the backend's swap copies
+            # into the shared buffer before its append.
+            kv_indices=md.get_paged_kv_indices_for_layer(layer_idx),
+            kv_layout=md.kv_layout,
+        )
+        for name in ("kv_batch_indices", "kv_positions", "kv_indptr", "kv_indices"):
+            t = target[name]
+            if t.dtype != torch.int32 or not t.is_contiguous():
+                return None
+        return target
 
     def _fused_qkv_prep_enabled(self) -> bool:
         if self._fused_qkv_prep is None:
@@ -834,6 +904,29 @@ class Gemma4Attention(QKNormRoPEAttention):
                 and not is_torch_compiling()
                 and self._fused_qkv_prep_enabled()
             ):
+                paged = self._prep_paged_kv_target(q.shape[0])
+                if paged is not None:
+                    q_out, _, _ = gemma4_fused_qkv_norm_rope_quant(
+                        q,
+                        position_ids,
+                        self.rotary_emb.rotary_cos_sin,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        self.q_norm.variance_epsilon,
+                        self.num_heads,
+                        self.num_key_value_heads,
+                        self.head_dim,
+                        out_fp8=self._fused_qkv_prep_out_fp8,
+                        packed_output=self._use_trtllm_fused_qkv_prep,
+                        kv_out_fp8=self._fused_qkv_prep_kv_out_fp8,
+                        cute_norm_order=self._fused_qkv_prep_cute_norm,
+                        k_eq_v=self._qk_only_proj,
+                        **paged,
+                    )
+                    # K/V are in the pool: the backend skips its append. Reset
+                    # in forward's finally after this layer.
+                    self.attn._kv_stored_by_prep = True
+                    return q_out, None, None
                 return gemma4_fused_qkv_norm_rope_quant(
                     q,
                     position_ids,
@@ -894,6 +987,9 @@ class Gemma4Attention(QKNormRoPEAttention):
         """Override: KV-shared layers return q-only, skip convert/split."""
         if self.is_kv_shared and k is None and v is None:
             return q, None, None
+        if k is None and v is None and self.attn.__dict__.get("_kv_stored_by_prep", False):
+            # The fused prep stored K/V in the paged pool; q is Q alone.
+            return q, None, None
         return super().convert_qkv(q, k, v)
 
     @torch.inference_mode()
@@ -920,17 +1016,24 @@ class Gemma4Attention(QKNormRoPEAttention):
         # Dense custom masks use the Triton fallback, which consumes BF16
         # q/k/v. Variable-window masks run in TRTLLM-Gen and allow fused prep.
         self._fused_prep_blocked = attention_mask_data is not None
-        return super().forward(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            attention_mask=attention_mask,
-            attention_window_size=self.attention_window_size,
-            attention_mask_data=attention_mask_data,
-            variable_window_token_starts=variable_window_token_starts,
-            variable_window_token_ends=variable_window_token_ends,
-            **kwargs,
-        )
+        self._prep_attn_metadata = attn_metadata
+        try:
+            return super().forward(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                attention_mask=attention_mask,
+                attention_window_size=self.attention_window_size,
+                attention_mask_data=attention_mask_data,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
+                **kwargs,
+            )
+        finally:
+            # Defaults: no metadata, K/V not stored. A replayed graph runs no
+            # Python here, so its eager attention break appends as main does.
+            self._prep_attn_metadata = None
+            self.attn._kv_stored_by_prep = False
 
 
 # ---------------------------------------------------------------------------

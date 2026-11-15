@@ -129,6 +129,34 @@ def _cute_rmsnorm_ssq(x1, x2, HD: tl.constexpr):
 
 
 @triton.jit
+def _paged_kv_row_offsets(
+    rows,
+    rmask,
+    batch_idx_ptr,
+    kv_pos_ptr,
+    kv_indptr_ptr,
+    kv_indices_ptr,
+    PG_STRIDE,
+    ENT_STRIDE,
+    PAGE_SIZE: tl.constexpr,
+):
+    """[BLOCK_N] int64 element offset of each row's slot (head 0, col 0) in the pool.
+
+    The address FlashInfer's AppendPagedKVCacheKernel computes for row i:
+    divmod(indptr[batch_indices[i]] * page_size + positions[i], page_size)
+    -> (page_iter, entry); page = indices[page_iter].
+    """
+    bi = tl.load(batch_idx_ptr + rows, mask=rmask, other=0)
+    kp = tl.load(kv_pos_ptr + rows, mask=rmask, other=0).to(tl.int64)
+    start = tl.load(kv_indptr_ptr + bi, mask=rmask, other=0).to(tl.int64)
+    flat = start * PAGE_SIZE + kp
+    page_iter = flat // PAGE_SIZE
+    entry = flat % PAGE_SIZE
+    page = tl.load(kv_indices_ptr + page_iter, mask=rmask, other=0).to(tl.int64)
+    return page * PG_STRIDE + entry * ENT_STRIDE
+
+
+@triton.jit
 def _gemma4_qkv_norm_rope_quant_kernel(
     qkv_ptr,  # [N, W] bf16, row stride SW; heads packed [q | k | v], head h at col h*HD
     q_out_ptr,  # [N, NQ*HD] fp8/bf16, possibly a view of packed QKV
@@ -153,6 +181,19 @@ def _gemma4_qkv_norm_rope_quant_kernel(
     CUTE_NORM_ORDER: tl.constexpr,  # sum of squares in FlashInfer CuTe RMSNorm order
     K_EQ_V: tl.constexpr,  # qkv is the [q | k] GEMM output; V = v_norm(raw K)
     BLOCK_N: tl.constexpr,  # tokens per program (power of two)
+    # PAGED_KV: K/V are stored straight into the paged FP8 KV pool at the
+    # slots FlashInfer's append kernel would write (k_out/v_out unused).
+    kv_cache_ptr,  # pool base of this layer's [pages, 2, ...] view (K at +0)
+    V_OFF,  # element offset of V from K (the view's dim-1 stride)
+    PG_STRIDE,  # page stride (elements)
+    ENT_STRIDE,  # token-in-page stride (elements)
+    HEAD_STRIDE,  # kv-head stride (elements)
+    batch_idx_ptr,  # [N] int32 request index per row
+    kv_pos_ptr,  # [N] int32 KV position per row
+    kv_indptr_ptr,  # [B + 1] int32 page indptr
+    kv_indices_ptr,  # [nnz_pages] int32 page indices (this layer's pool)
+    PAGE_SIZE: tl.constexpr,
+    PAGED_KV: tl.constexpr,
 ):
     h = tl.program_id(0)
     rows = tl.program_id(1).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
@@ -205,7 +246,14 @@ def _gemma4_qkv_norm_rope_quant_kernel(
                 tl.store(q_out, o1, mask=rmask[:, None])
                 tl.store(q_out + HALF, o2, mask=rmask[:, None])
         else:
-            k_out = k_out_ptr + rows[:, None] * K_OUT_SW + (h - NQ) * HD + offs[None, :]
+            if PAGED_KV:
+                slot = _paged_kv_row_offsets(
+                    rows, rmask, batch_idx_ptr, kv_pos_ptr, kv_indptr_ptr,
+                    kv_indices_ptr, PG_STRIDE, ENT_STRIDE, PAGE_SIZE,
+                )
+                k_out = kv_cache_ptr + slot[:, None] + (h - NQ) * HEAD_STRIDE + offs[None, :]
+            else:
+                k_out = k_out_ptr + rows[:, None] * K_OUT_SW + (h - NQ) * HD + offs[None, :]
             if KV_OUT_FP8:
                 tl.store(k_out, o1.to(tl.float8e4nv), mask=rmask[:, None])
                 tl.store(k_out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
@@ -218,7 +266,15 @@ def _gemma4_qkv_norm_rope_quant_kernel(
         # v_norm-before-k_norm ordering for K=V layers).
         o1 = (x1 * rms[:, None]).to(tl.bfloat16)
         o2 = (x2 * rms[:, None]).to(tl.bfloat16)
-        out = v_out_ptr + rows[:, None] * V_OUT_SW + (h - NQ - NK) * HD + offs[None, :]
+        if PAGED_KV:
+            slot = _paged_kv_row_offsets(
+                rows, rmask, batch_idx_ptr, kv_pos_ptr, kv_indptr_ptr,
+                kv_indices_ptr, PG_STRIDE, ENT_STRIDE, PAGE_SIZE,
+            )
+            out = (kv_cache_ptr + V_OFF + slot[:, None] + (h - NQ - NK) * HEAD_STRIDE
+                   + offs[None, :])
+        else:
+            out = v_out_ptr + rows[:, None] * V_OUT_SW + (h - NQ - NK) * HD + offs[None, :]
         if KV_OUT_FP8:
             tl.store(out, o1.to(tl.float8e4nv), mask=rmask[:, None])
             tl.store(out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
@@ -242,6 +298,12 @@ def gemma4_fused_qkv_norm_rope_quant(
     kv_out_fp8: Optional[bool] = None,
     cute_norm_order: bool = False,
     k_eq_v: bool = False,
+    paged_kv_cache: Optional[torch.Tensor] = None,
+    kv_batch_indices: Optional[torch.Tensor] = None,
+    kv_positions: Optional[torch.Tensor] = None,
+    kv_indptr: Optional[torch.Tensor] = None,
+    kv_indices: Optional[torch.Tensor] = None,
+    kv_layout: str = "NHD",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Run the fused per-head norm + rope + quant over a packed QKV tensor.
 
@@ -270,6 +332,14 @@ def gemma4_fused_qkv_norm_rope_quant(
             (width num_q_heads*head_dim + num_kv_heads*head_dim). V is
             v_norm of the raw K projection, taken before k_norm or RoPE.
             Separate outputs only (packed_output is refused).
+        paged_kv_cache: optional FP8 paged KV pool view of this layer,
+            ``[pages, 2, page_size, kv_heads, head_dim]`` (NHD) or
+            ``[pages, 2, kv_heads, page_size, head_dim]`` (HND), as
+            ``get_buffers`` returns it. When given, K/V are written straight
+            into the pool at the slots FlashInfer's ``append_paged_kv_cache``
+            would write for (``kv_batch_indices``, ``kv_positions``,
+            ``kv_indices``, ``kv_indptr``), with the same FP8 bytes, and
+            ``(q, None, None)`` is returned. Needs FP8 K/V output.
 
     Returns:
         Separate mode returns contiguous ``(q, k, v)`` tensors in the
@@ -314,8 +384,31 @@ def gemma4_fused_qkv_norm_rope_quant(
         )
     else:
         q_out = torch.empty((n, q_size), dtype=out_dtype, device=qkv.device)
-        k_out = torch.empty((n, kv_size), dtype=kv_out_dtype, device=qkv.device)
-        v_out = torch.empty((n, kv_size), dtype=kv_out_dtype, device=qkv.device)
+        if paged_kv_cache is None:
+            k_out = torch.empty((n, kv_size), dtype=kv_out_dtype, device=qkv.device)
+            v_out = torch.empty((n, kv_size), dtype=kv_out_dtype, device=qkv.device)
+        else:
+            k_out = v_out = None
+    paged_kv = paged_kv_cache is not None
+    if paged_kv:
+        if packed_output or not kv_out_fp8:
+            raise ValueError("paged_kv_cache requires separate FP8 K/V output")
+        cache = paged_kv_cache
+        assert cache.dtype == torch.float8_e4m3fn
+        assert cache.dim() == 5 and cache.shape[1] == 2 and cache.stride(-1) == 1
+        assert cache.shape[-1] == head_dim
+        if kv_layout == "NHD":
+            page_size, cache_heads = cache.shape[2], cache.shape[3]
+            ent_stride, head_stride = cache.stride(2), cache.stride(3)
+        elif kv_layout == "HND":
+            cache_heads, page_size = cache.shape[2], cache.shape[3]
+            head_stride, ent_stride = cache.stride(2), cache.stride(3)
+        else:
+            raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+        assert cache_heads == num_kv_heads
+        for t in (kv_batch_indices, kv_positions, kv_indptr, kv_indices):
+            assert t is not None and t.dtype == torch.int32 and t.is_contiguous()
+        assert kv_batch_indices.numel() >= n and kv_positions.numel() >= n
     if n == 0:
         if packed_output:
             assert packed_qkv is not None
@@ -328,19 +421,20 @@ def gemma4_fused_qkv_norm_rope_quant(
     # block_n is too (required by tl.arange).
     block_n = max(1, min(32, 4096 // head_dim))
     grid = (num_q_heads + 2 * num_kv_heads, triton.cdiv(n, block_n))
+    pos_flat = position_ids.view(-1)
     _gemma4_qkv_norm_rope_quant_kernel[grid](
         qkv,
         q_out,
-        k_out,
-        v_out,
-        position_ids.view(-1),
+        q_out if paged_kv else k_out,
+        q_out if paged_kv else v_out,
+        pos_flat,
         cos_sin,
         q_weight,
         k_weight,
         qkv.stride(0),
         q_out.stride(0),
-        k_out.stride(0),
-        v_out.stride(0),
+        0 if paged_kv else k_out.stride(0),
+        0 if paged_kv else v_out.stride(0),
         num_q_heads,
         num_kv_heads,
         eps,
@@ -352,6 +446,17 @@ def gemma4_fused_qkv_norm_rope_quant(
         CUTE_NORM_ORDER=cute_norm_order,
         K_EQ_V=k_eq_v,
         BLOCK_N=block_n,
+        kv_cache_ptr=paged_kv_cache if paged_kv else qkv,
+        V_OFF=paged_kv_cache.stride(1) if paged_kv else 0,
+        PG_STRIDE=paged_kv_cache.stride(0) if paged_kv else 0,
+        ENT_STRIDE=ent_stride if paged_kv else 0,
+        HEAD_STRIDE=head_stride if paged_kv else 0,
+        batch_idx_ptr=kv_batch_indices if paged_kv else pos_flat,
+        kv_pos_ptr=kv_positions if paged_kv else pos_flat,
+        kv_indptr_ptr=kv_indptr if paged_kv else pos_flat,
+        kv_indices_ptr=kv_indices if paged_kv else pos_flat,
+        PAGE_SIZE=page_size if paged_kv else 1,
+        PAGED_KV=paged_kv,
         num_warps=8,
         # Exact mode spells out every FMA; keep LLVM from contracting others.
         enable_fp_fusion=not cute_norm_order,
