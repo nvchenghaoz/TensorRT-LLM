@@ -3035,6 +3035,14 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # before both the KV cache append and the attention plan/run.
         metadata.swap_paged_kv_indices_for_layer(self.layer_idx)
 
+        # Set by a model-side fused prep (Gemma4) that already stored this
+        # layer's FP8 K/V in the paged pool on an eager step; then there is
+        # nothing to append. Never set on a replayed graph step.
+        if self.__dict__.get("_kv_stored_by_prep", False):
+            assert k is None and v is None, (
+                "K/V were stored in the paged KV cache by the prep; the "
+                "backend must not append them again.")
+
         if k is not None and v is not None:
             k = k.view(-1, self.num_kv_heads, self.head_dim)
             v = v.view(-1, self.num_kv_heads, self.head_dim)
