@@ -73,6 +73,14 @@ TRTLLM_FI_HOST_PREFILL_PLAN=0 restores the synchronizing device-indptr plan
 
 _MAX_CUDA_THREADS_PER_BLOCK = 1024
 
+_PLAN_PARAMS_MEMO_ENABLED = os.environ.get("TRTLLM_FI_PLAN_PARAMS_MEMO",
+                                           "1").strip() != "0"
+"""Reuse the (immutable, value-only) PlanParams that plan() builds for an
+identical argument tuple instead of constructing a frozen dataclass per layer
+call. Planning itself (needs_plan / _plan_with_params) still runs every call."""
+_PLAN_PARAMS_MEMO: Dict[tuple, "PlanParams"] = {}
+_PLAN_PARAMS_MEMO_MAX = 1024
+
 
 def _get_attention_layer_indices(kv_cache_manager: Any) -> list[int]:
     """Return layers that own key/value cache buffers."""
@@ -2089,6 +2097,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     "FlashInfer decode requires a uniform query length per "
                     f"request, but got {generation_seq_lens.tolist()}")
 
+        memo_key = None
+        if (_PLAN_PARAMS_MEMO_ENABLED and attention_mask_data is None
+                and self._multi_item_params is None):
+            memo_key = (num_heads, num_kv_heads, head_dim, q_dtype, kv_dtype,
+                        attention_mask_type, q_scaling, attention_window_size,
+                        getattr(self, "_vswa_active_pool_id",
+                                None), q_len_per_req)
+            plan_params = _PLAN_PARAMS_MEMO.get(memo_key)
+            if plan_params is not None:
+                return self._plan_with_params(plan_params, flashinfer_backend)
+
         plan_params = PlanParams(
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -2104,6 +2123,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             kv_pool_id=getattr(self, "_vswa_active_pool_id", None),
             q_len_per_req=q_len_per_req,
         )
+        if memo_key is not None:
+            if len(_PLAN_PARAMS_MEMO) >= _PLAN_PARAMS_MEMO_MAX:
+                _PLAN_PARAMS_MEMO.clear()
+            _PLAN_PARAMS_MEMO[memo_key] = plan_params
         return self._plan_with_params(plan_params, flashinfer_backend)
 
     def _use_tensor_cores(self, plan_params: PlanParams,

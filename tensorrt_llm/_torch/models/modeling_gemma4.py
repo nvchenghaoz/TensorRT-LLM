@@ -93,6 +93,10 @@ if TYPE_CHECKING:
 # norm + gate_up NVFP4 quant); bitwise equal to the two-kernel chain.
 _FUSE_POST_ATTN_FP4 = True
 
+# Host trims that keep every launch and its inputs unchanged (e.g. reuse
+# per-layer invariants resolved on the first forward). Off = main's path.
+_HOST_TRIMS = True
+
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
 if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     raise ImportError(
@@ -774,6 +778,18 @@ class Gemma4Attention(QKNormRoPEAttention):
         if k is not None and v is not None:
             qkv = torch.concat([q, k, v], dim=-1)
         return self.apply_qk_norm_rope(qkv, position_ids)
+
+    def _get_output_quant_flags(self):
+        # Both flags depend only on the loaded quant config and o_proj, which
+        # are final before the first forward; the base class caches them only
+        # with cache_context_plan, so Gemma4 re-derived them every layer call.
+        if not _HOST_TRIMS:
+            return super()._get_output_quant_flags()
+        flags = self.__dict__.get("_g4_output_quant_flags")
+        if flags is None:
+            flags = super()._get_output_quant_flags()
+            self.__dict__["_g4_output_quant_flags"] = flags
+        return flags
 
     def convert_qkv(self, q, k, v):
         """Override: KV-shared layers return q-only, skip convert/split."""

@@ -212,6 +212,13 @@ _RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
 # Storage dtypes accepted as the history half of a mixed-precision KV cache.
 _MIXED_PRECISION_LOW_DTYPES = {"nvfp4": DataType.NVFP4}
 
+# get_buffers() reuses the zero-copy torch view it built for an identical
+# descriptor (base address, dtype, shape, strides, inference mode) instead of
+# rebuilding it through __cuda_array_interface__ on every layer call. A view
+# owns no memory, so a reused view equals a freshly built one.
+_KV_VIEW_CACHE = os.environ.get("TLLM_KVCM_V2_VIEW_CACHE", "1") != "0"
+_KV_VIEW_CACHE_MAX = 4096
+
 
 def _compute_index_mapper_capacity(
     max_batch_size: int,
@@ -5731,7 +5738,26 @@ class KVCacheManagerV2(BaseResourceManager):
                 page_elements,
                 *[math.prod(shape[i + 1 :]) for i in range(2, len(shape))],
             ]
-        return convert_to_torch_tensor(wrapper)
+        if not _KV_VIEW_CACHE:
+            return convert_to_torch_tensor(wrapper)
+        strides = wrapper.strides
+        key = (
+            addr_key,
+            wrapper.dtype,
+            wrapper.shape,
+            tuple(strides) if strides is not None else None,
+            torch.is_inference_mode_enabled(),
+        )
+        cache = self.__dict__.get("_kv_view_cache")
+        if cache is None:
+            cache = self.__dict__["_kv_view_cache"] = {}
+        view = cache.get(key)
+        if view is None:
+            view = convert_to_torch_tensor(wrapper)
+            if len(cache) >= _KV_VIEW_CACHE_MAX:
+                cache.clear()
+            cache[key] = view
+        return view
 
     def get_index_k_buffer(
         self,
