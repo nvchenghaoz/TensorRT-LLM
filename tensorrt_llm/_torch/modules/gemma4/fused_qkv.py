@@ -181,8 +181,15 @@ def _gemma4_qkv_norm_rope_quant_kernel(
         cs = cos_sin_ptr + pos[:, None] * (2 * HALF) + offs[None, :]
         cos = tl.load(cs, mask=rmask[:, None], other=0.0)
         sin = tl.load(cs + HALF, mask=rmask[:, None], other=0.0)
-        o1 = (y1 * cos - y2 * sin).to(tl.bfloat16)
-        o2 = (y2 * cos + y1 * sin).to(tl.bfloat16)
+        if CUTE_NORM_ORDER:
+            # FlashInfer RoPE (pos_enc.cuh vec_apply_llama_rope_cos_sin) as
+            # nvcc contracts it: x*cos + (+-x_other*sin). The launch disables
+            # fp fusion so Triton does not pick another contraction.
+            o1 = tl.fma(y1, cos, -(y2 * sin)).to(tl.bfloat16)
+            o2 = tl.fma(y2, cos, y1 * sin).to(tl.bfloat16)
+        else:
+            o1 = (y1 * cos - y2 * sin).to(tl.bfloat16)
+            o2 = (y2 * cos + y1 * sin).to(tl.bfloat16)
         if h < NQ:
             q_out = q_out_ptr + rows[:, None] * Q_OUT_SW + h * HD + offs[None, :]
             if Q_OUT_FP8:
@@ -329,6 +336,8 @@ def gemma4_fused_qkv_norm_rope_quant(
         CUTE_NORM_ORDER=cute_norm_order,
         BLOCK_N=block_n,
         num_warps=8,
+        # Exact mode spells out every FMA; keep LLVM from contracting others.
+        enable_fp_fusion=not cute_norm_order,
     )
     if packed_output:
         assert packed_qkv is not None

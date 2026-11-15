@@ -218,6 +218,23 @@ def bench(ckpt, variant="auto", sliding_only=True):
                         "noise_floor": (p90 - p10) / med}
             n = sum(seqs)
             log(f"{key}: n={n} median={med*1e3:.1f}us p10={p10*1e3:.1f} p90={p90*1e3:.1f}")
+            if fused and cute and has_cute_mode():
+                # diagnostic: the previous (tl.sum order) fused kernel on the same inputs
+                for _ in range(WARMUP):
+                    layer.fused_chain(qkv, pos, cute=False)
+                torch.cuda.synchronize()
+                to = []
+                for _ in range(ITERS):
+                    s = torch.cuda.Event(enable_timing=True)
+                    e = torch.cuda.Event(enable_timing=True)
+                    s.record()
+                    layer.fused_chain(qkv, pos, cute=False)
+                    e.record()
+                    e.synchronize()
+                    to.append(s.elapsed_time(e))
+                to.sort()
+                out[key]["old_fused_kernel_ms"] = to[len(to) // 2]
+                log(f"{key}: old fused median={to[len(to) // 2]*1e3:.1f}us")
     print(json.dumps({"batch": out, "output": {"class": "exact"}}))
 
 

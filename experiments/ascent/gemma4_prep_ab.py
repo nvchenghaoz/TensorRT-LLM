@@ -336,8 +336,30 @@ def mode_ab():
                       "prompts": n, "off_vs_off_bitwise": det, "comparisons": res}), flush=True)
 
 
+def mode_both():
+    """dump then ab, each in its own process (one model instance at a time); combined JSON last."""
+    import subprocess
+    out = {}
+    for m in ("dump", "ab"):
+        p = subprocess.Popen([sys.executable, __file__, m, CKPT], stdout=subprocess.PIPE, text=True)
+        last = None
+        for line in p.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if line.strip().startswith("{"):
+                last = line
+        p.wait()
+        try:
+            out[m] = json.loads(last) if last else {"passed": False, "error": f"rc={p.returncode}"}
+        except json.JSONDecodeError:
+            out[m] = {"passed": False, "error": "bad json"}
+    print(json.dumps({"passed": bool(out["dump"].get("passed") and out["ab"].get("passed")), **out}), flush=True)
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "dump":
         mode_dump()
+    elif sys.argv[1] == "both":
+        mode_both()
     else:
         mode_ab()
