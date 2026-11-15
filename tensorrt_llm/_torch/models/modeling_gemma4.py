@@ -209,13 +209,15 @@ _SEQK_GEMM = os.environ.get("TRTLLM_GEMMA4_SEQK_GEMM", "1") != "0"
 # config). The kernel accumulates each output in FP32 over ascending k16 steps and rounds once, so
 # it is bitwise equal to main's non-split-K dispatch at every M; it is routed only where it was
 # faster in the same-GPU sweep (experiments/ascent/seqk_gemm/sweep.py) and checked bitwise at every
-# routed M (experiments/ascent/seqk_gemm/gate.py). Wave-filling non-pow2 tiles at M=300:
+# routed M (experiments/ascent/seqk_gemm/gate.py). Wave-filling non-pow2 tiles for M=288-320. M=300 is
+# left to its _SM120_BF16_CUBLAS_MM_ROUTES pin (192x160 / 320x112), which ties the kernel in isolation
+# and is faster in a 60-layer graph chain; the other M there run F.linear, which the kernel beats.
 _SM120_SEQK_GEMM_ROUTES = {
     # sliding qkv: 160 tokens x 176 weights, 94 x 2 = 188 CTAs (one wave). Not M=288, where main's
     # F.linear tile is as fast.
-    (5376, 16384): (((289, 320),), 0),
+    (5376, 16384): (((289, 299), (301, 320)), 0),
     # global qkv, k_eq_v V-dedup ([q | k]): 160 tokens x 208 weights, 89 x 2 = 178 CTAs
-    (5376, 18432): (((288, 320),), 1),
+    (5376, 18432): (((288, 299), (301, 320)), 1),
 }
 
 

@@ -132,8 +132,9 @@ def main():
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.models import modeling_gemma4 as mg
     nvml = Nvml()
-    cases = [("sl_qkv", 300), ("gl_qkv", 300), ("sl_qkv", 289), ("sl_qkv", 301), ("sl_qkv", 320),
-             ("gl_qkv", 288), ("gl_qkv", 301), ("gl_qkv", 320), ("sl_qkv", 1200), ("gl_qkv", 1200)]
+    cases = [("sl_qkv", 300), ("gl_qkv", 300), ("sl_qkv", 289), ("sl_qkv", 301), ("sl_qkv", 310),
+             ("sl_qkv", 320), ("gl_qkv", 288), ("gl_qkv", 301), ("gl_qkv", 310), ("gl_qkv", 320),
+             ("sl_qkv", 1200), ("gl_qkv", 1200)]
     torch.manual_seed(0)
     lins = {}
     routed_any = {}
@@ -214,6 +215,11 @@ def main():
         "kernel_ms": n_sl * sl["kernel_ms"] + n_gl * gl["kernel_ms"],
         "noise_floor": max(sl["noise_floor"], gl["noise_floor"]),
         "formula": f"{n_sl} x sl_qkv@300 + {n_gl} x gl_qkv@300"}
+    sl, gl = batch["sl_qkv@310"], batch["gl_qkv@310"]
+    batch["qkv_per_forward@310"] = {
+        "kernel_ms": n_sl * sl["kernel_ms"] + n_gl * gl["kernel_ms"],
+        "noise_floor": max(sl["noise_floor"], gl["noise_floor"]),
+        "formula": f"{n_sl} x sl_qkv@310 + {n_gl} x gl_qkv@310"}
     clk = {}
     if clocks:
         clk = {"sm_clock_mhz_median_of_cases": sorted(c["sm_clock_mhz_median"] for c in clocks)[len(clocks) // 2],
