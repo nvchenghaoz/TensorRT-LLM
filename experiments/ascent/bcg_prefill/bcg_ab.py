@@ -68,10 +68,14 @@ class Prompts:
 
 
 def build_llm(use_overlay=True, **extra):
+    ov = dict(overlay()) if use_overlay else {}
+    log(f"engine overlay: {json.dumps(ov)}")
+    # "env" is the harness's reserved key for server environment variables; set them before
+    # tensorrt_llm is imported (single-process worker reads them at import).
+    for k, v in (ov.pop("env", None) or {}).items():
+        os.environ[k] = str(v)
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import KvCacheConfig
-    ov = overlay() if use_overlay else {}
-    log(f"engine overlay: {json.dumps(ov)}")
     t0 = time.time()
     llm = LLM(model=CKPT,
               kv_cache_config=KvCacheConfig(dtype="fp8", enable_block_reuse=False,
@@ -114,22 +118,35 @@ def mode_time():
     pf = Prompts(1234)
     cases = [("isl300@1", 300, 1), ("isl300@4", 300, 4), ("isl1k@1", 1000, 1), ("isl1k@4", 1000, 4),
              ("isl2k@1", 2000, 1), ("isl2k@4", 2000, 4), ("isl4k@1", 4000, 1), ("isl8k@1", 8000, 1),
-             ("isl300@16", 300, 16), ("isl4k@16", 4000, 16)]
+             ("isl300@16", 300, 16), ("isl4k@16", 4000, 16), ("isl8k@64", 8000, 64)]
     log("warmup")
     for _, isl, c in cases:
-        for _ in range(3):
+        for _ in range(3 if c * isl < 60000 else 1):
             run_batch(llm, [pf.make(isl) for _ in range(c)], params)
+    try:
+        from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import graphs as _g
+        counts = getattr(_g, "_BCG_STEP_COUNTS", None)
+    except Exception:  # noqa: BLE001
+        counts = None
     res = {}
+    steps = {}
     n = int(os.environ.get("ROUNDS", "25"))
     for name, isl, c in cases:
         ts = []
         rounds = n if c * isl < 20000 else max(10, n // 2)
         if name == "isl300@1":
             rounds = 2 * n
+        if c * isl >= 200000:
+            rounds = 5
+        before = dict(counts) if counts is not None else None
         for i in range(rounds):
             ps = [pf.make(isl) for _ in range(c)]
             dt, _ = run_batch(llm, ps, params)
             ts.append(dt * 1e3)
+        if counts is not None:
+            steps[name] = {"replayed": counts["replayed"] - before["replayed"],
+                           "eager": counts["eager"] - before["eager"]}
+            log(f"{name}: context steps {steps[name]}")
         ts.sort()
         med = statistics.median(ts)
         p10 = ts[int(0.1 * (len(ts) - 1))]
@@ -137,7 +154,8 @@ def mode_time():
         res[name] = {"step_ms": round(med, 3), "p10": round(p10, 3), "p90": round(p90, 3),
                      "noise_floor": round((p90 - p10) / med, 4), "n": len(ts)}
         log(f"{name}: median {med:.2f} ms p10 {p10:.2f} p90 {p90:.2f}")
-    print(json.dumps({"batch": res, "output": {"class": "exact"}, "overlay": overlay()}), flush=True)
+    print(json.dumps({"batch": res, "output": {"class": "exact"}, "overlay": overlay(),
+                      "bcg_context_steps": steps}), flush=True)
 
 
 def mode_arm(arm, out_path):
@@ -183,6 +201,11 @@ def mode_arm(arm, out_path):
         out[tag + "_batches"] = b
         log(f"{arm} {tag} done; first mixed {out[tag + '_mixed'][0]['ids']}")
     out["single_lens"] = [len(x) for x in singles]
+    try:
+        from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import graphs as _g
+        out["bcg_steps"] = dict(getattr(_g, "_BCG_STEP_COUNTS", {}) or {})
+    except Exception:  # noqa: BLE001
+        out["bcg_steps"] = None
     with open(out_path, "w") as f:
         json.dump(out, f)
 
@@ -234,7 +257,9 @@ def mode_check():
                                   "same process, no reset) vs eager main path; mixed 94-prompt "
                                   "batch, 107 c=1 prompts (20 per ISL 300/1k/2k/4k/8k + 7 padded "
                                   "lengths), 3 small batches",
-                      "overlay": overlay(), "comparisons": cmp, "logprobs_present": has_lp}),
+                      "overlay": overlay(), "comparisons": cmp, "logprobs_present": has_lp,
+                      "bcg_context_steps": {"eager_arm": e.get("bcg_steps"),
+                                            "overlay_arm": o.get("bcg_steps")}}),
           flush=True)
 
 

@@ -1,8 +1,8 @@
 {
   "prefill_cuda_graph_backend": "breakable",
   "disable_mm_encoder": true,
-  "prefill_capture_num_tokens": [
-    256, 300, 320, 384, 448, 512, 600, 640, 768, 900, 1000, 1024, 1200, 1500, 1800,
-    2000, 2048
-  ]
+  "prefill_capture_num_tokens": [300, 600, 900, 1000, 1200, 1500, 1800, 2000],
+  "env": {
+    "TRTLLM_PREFILL_GRAPH_EXACT_ONLY": "1"
+  }
 }
