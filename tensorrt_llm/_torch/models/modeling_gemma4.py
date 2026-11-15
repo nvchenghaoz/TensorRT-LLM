@@ -210,6 +210,71 @@ _SM120_BF16_CUBLAS_MM_ROUTES = {
     ),
 }
 
+# Kill switch for the SM120 sequential-K BF16 qkv GEMM (TRTLLM_GEMMA4_SEQK_GEMM=0 keeps main's
+# cublas_mm / F.linear dispatch). Read from this module global on every call, so in-process A/B
+# runs can flip it between forwards.
+_SEQK_GEMM = os.environ.get("TRTLLM_GEMMA4_SEQK_GEMM", "1") != "0"
+
+# SM120 routes for trtllm::sm120_bf16_seqk_gemm (cpp/tensorrt_llm/kernels/sm120Bf16SeqKGemm/), keyed
+# (in_features, out_features) like _SM120_BF16_CUBLAS_MM_ROUTES: (inclusive token-count ranges, tile
+# config). The kernel accumulates each output in FP32 over ascending k16 steps and rounds once, so
+# it is bitwise equal to main's non-split-K dispatch at every M; it is routed only where it was
+# faster in the same-GPU sweep (experiments/ascent/seqk_gemm/sweep.py) and checked bitwise at every
+# routed M (experiments/ascent/seqk_gemm/gate.py). Wave-filling non-pow2 tiles for M=288-320. M=300 is
+# left to its _SM120_BF16_CUBLAS_MM_ROUTES pin (192x160 / 320x112), which ties the kernel in isolation
+# and is faster in a 60-layer graph chain; the other M there run F.linear, which the kernel beats.
+_SM120_SEQK_GEMM_ROUTES = {
+    # sliding qkv: 160 tokens x 176 weights, 94 x 2 = 188 CTAs (one wave). Not M=288, where main's
+    # F.linear tile is as fast.
+    (5376, 16384): (((289, 299), (301, 320)), 0),
+    # global qkv, k_eq_v V-dedup ([q | k]): 160 tokens x 208 weights, 89 x 2 = 178 CTAs
+    (5376, 18432): (((288, 299), (301, 320)), 1),
+}
+
+
+class _Sm120SeqKGemmMixin:
+    """Linear mixin: 2D BF16 inputs whose token count is in ``seqk_gemm_tokens`` run
+    trtllm::sm120_bf16_seqk_gemm with ``seqk_gemm_config``; every other input keeps
+    Linear.apply_linear (and so the cublas_mm / F.linear dispatch)."""
+
+    def apply_linear(self, input, bias, lora_params=None, layer_idx=None):
+        if (
+            _SEQK_GEMM
+            and bias is None
+            and input.dim() == 2
+            and input.shape[0] in self.seqk_gemm_tokens
+            and input.dtype == torch.bfloat16
+            and input.stride(1) == 1
+            and self.weight.dtype == torch.bfloat16
+            and self._locality_domain_weight_shards is None
+            and not (self.lora is not None and bool(lora_params))
+        ):
+            return torch.ops.trtllm.sm120_bf16_seqk_gemm(input, self.weight, self.seqk_gemm_config)
+        return super().apply_linear(input, bias, lora_params, layer_idx)
+
+
+_SEQK_GEMM_CLASSES: Dict[type, type] = {}
+
+
+def _route_sm120_seqk_gemm(proj: nn.Module) -> None:
+    """Give ``proj`` the sequential-K route for its shape, if it has one (SM120 only)."""
+    route = _SM120_SEQK_GEMM_ROUTES.get((proj.in_features, proj.out_features))
+    if route is None or not isinstance(proj, Linear) or proj.has_bias:
+        return
+    try:
+        torch.ops.trtllm.sm120_bf16_seqk_gemm
+    except (AttributeError, RuntimeError):
+        return
+    ranges, config = route
+    cls = type(proj)
+    sub = _SEQK_GEMM_CLASSES.get(cls)
+    if sub is None:
+        sub = type(f"_Sm120SeqK{cls.__name__}", (_Sm120SeqKGemmMixin, cls), {})
+        _SEQK_GEMM_CLASSES[cls] = sub
+    proj.__class__ = sub
+    proj.seqk_gemm_tokens = _CublasMmTokenGate(ranges)
+    proj.seqk_gemm_config = config
+
 
 def _get_gemma4_per_layer_config(
     config: Gemma4TextConfig,
@@ -733,6 +798,11 @@ class Gemma4Attention(QKNormRoPEAttention):
                 if route is not None:
                     proj.use_custom_cublas_mm = True
                     proj.custom_cublas_mm_tokens = _CublasMmTokenGate(route)
+
+        # SM120: the sequential-K BF16 GEMM for the qkv projection at _SM120_SEQK_GEMM_ROUTES token
+        # counts. Its apply_linear gate runs before the cublas_mm gate above; other M are unchanged.
+        if get_sm_version() == 120:
+            _route_sm120_seqk_gemm(self.qkv_proj)
 
         # v_norm: always present in Gemma4 (no learnable scale).
         # For K=V layers, weight mapper duplicates k_proj→v_proj, so v equals
