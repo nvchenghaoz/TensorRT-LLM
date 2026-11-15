@@ -59,9 +59,9 @@ V2M_OLD = """  for (uint32_t idx = thread_id; idx < NUM_B128; idx += NUM_THREADS
     uint32_t row = idx / FP8_COLS, col = idx % FP8_COLS;
 """
 HW_IFDEF = ("#ifdef FLASHINFER_HARDWARE_FP8_E4M3_TO_BF16_CONVERSION_ENABLED\n"
-            "      // Hardware paired conversion.")
+            "      // Hardware paired conversion")
 HW_OFF = ("#if 0  // idea65 arm: software conversion (main)\n"
-          "      // Hardware paired conversion.")
+          "      // Hardware paired conversion")
 # variant B (job 475's first landed form): A + a per-call NaN-code probe that re-runs the
 # software path when any byte is 0x7F/0xFF, so all 256 codes match main
 B1_OLD = """      // satfinite-quantized KV cache never holds them.
