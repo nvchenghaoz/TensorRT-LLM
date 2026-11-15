@@ -111,7 +111,117 @@ def mode_time():
     print(json.dumps({"batch": res, "output": {"class": "exact"}}), flush=True)
 
 
+def bits_equal(a, b):
+    import torch
+    return a.shape == b.shape and torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
+def heavy_tailed_check():
+    """Every pinned token range of every routed shape, on heavy-tailed data randn * 2^U(-8, 8) (activations and
+    weights), 2 seeds: trtllm::cublas_mm (table) must give F.linear's exact bits. Tested M: both ends of every
+    routed range plus the served token counts inside them."""
+    import torch
+    import torch.nn.functional as F
+    import tensorrt_llm  # noqa: F401
+    import tensorrt_llm._torch.models.modeling_gemma4 as mg
+    served = set()
+    for isl in (300, 1000, 2000, 4000, 8000):
+        served |= {isl * k for k in range(1, 8192 // isl + 1)}
+    res = {"cases": 0, "bitwise": 0, "failures": []}
+    for (K, N), ranges in mg._SM120_BF16_CUBLAS_MM_ROUTES.items():
+        gate = mg._CublasMmTokenGate(ranges)
+        ms = sorted({m for lo, hi in ranges for m in (lo, hi)} | {m for m in served if m in gate})
+        for seed in (0, 1):
+            g = torch.Generator(device="cuda").manual_seed(1000 + seed)
+
+            def heavy(r, c):
+                t = torch.randn(r, c, device="cuda", dtype=torch.bfloat16, generator=g)
+                s = torch.empty(r, c, device="cuda", dtype=torch.bfloat16).uniform_(-8, 8, generator=g)
+                return (t * torch.exp2(s)).contiguous()
+
+            W = heavy(N, K)
+            X = heavy(max(ms), K)
+            for m in ms:
+                a = F.linear(X[:m], W)
+                b = torch.ops.trtllm.cublas_mm(X[:m], W.t(), None, None)
+                res["cases"] += 1
+                if bits_equal(a, b):
+                    res["bitwise"] += 1
+                else:
+                    res["failures"].append([K, N, m, seed, int((a.view(torch.int16) != b.view(torch.int16)).sum())])
+            del W, X
+            torch.cuda.empty_cache()
+        log(f"heavy-tailed {K}x{N}: {len(ms)} M x 2 seeds done, failures so far {len(res['failures'])}")
+    res["ok"] = res["cases"] > 0 and not res["failures"]
+    log("heavy-tailed check " + json.dumps(res))
+    return res
+
+
+def real_activation_check(llm, pf, params):
+    """Capture the real inputs of qkv_proj / o_proj at layers 0, 30 and 59 while main's path runs (table off) one
+    isl8k and one isl1k prompt; then on those activations (full rows, and row prefixes at every routed served
+    token count) trtllm::cublas_mm must give F.linear's exact bits."""
+    import torch
+    import torch.nn.functional as F
+    import tensorrt_llm._torch.modules.linear as lin
+    cls = lin.UnquantizedLinearMethod
+    orig_apply = cls.apply
+    state = {"on": False, "calls": 0, "caps": []}
+    want = (0, 30, 59)
+
+    def apply(self, module, input, bias, weight=None):
+        if state["on"] and getattr(module, "custom_cublas_mm_tokens", None) is not None and input.dim() == 2:
+            k = state["calls"]
+            state["calls"] += 1
+            if k // 2 in want:
+                state["caps"].append((state["isl"], k // 2, "qkv" if k % 2 == 0 else "o_proj",
+                                      input.detach().to("cpu", copy=True), module))
+        return orig_apply(self, module, input, bias, weight)
+
+    cls.apply = apply
+    set_flag(False)
+    try:
+        for isl in (8000, 1000):
+            state.update(on=True, calls=0, isl=isl)
+            run_batch(llm, [pf.make(isl)], params)
+            state["on"] = False
+            log(f"real activations: isl{isl} captured, {state['calls']} routed-projection calls in the forward")
+    finally:
+        cls.apply = orig_apply
+        set_flag(True)
+    served = set()
+    for isl in (300, 1000, 2000, 4000, 8000):
+        served |= {isl * k for k in range(1, 8192 // isl + 1)}
+    res = {"captures": len(state["caps"]), "cases": 0, "bitwise": 0, "failures": [], "rows": []}
+    for isl, layer, which, xin, module in state["caps"]:
+        x = xin.to("cuda")
+        W = module.weight
+        gate = module.custom_cublas_mm_tokens
+        ms = sorted({x.shape[0]} | {m for m in served if m <= x.shape[0] and m in gate})
+        n_ok = 0
+        n = 0
+        for m in ms:
+            if m not in gate:
+                continue
+            a = F.linear(x[:m], W)
+            b = torch.ops.trtllm.cublas_mm(x[:m], W.t(), None, None)
+            n += 1
+            if bits_equal(a, b):
+                n_ok += 1
+            else:
+                res["failures"].append([isl, layer, which, m, int((a.view(torch.int16) != b.view(torch.int16)).sum())])
+        res["cases"] += n
+        res["bitwise"] += n_ok
+        res["rows"].append([isl, layer, which, list(W.shape), int(x.shape[0]), n_ok, n])
+        del x
+    torch.cuda.empty_cache()
+    res["ok"] = res["captures"] == 12 and res["cases"] > 0 and not res["failures"]
+    log("real-activation check " + json.dumps(res))
+    return res
+
+
 def mode_stress():
+    heavy_tailed_first = heavy_tailed_check()
     llm = build_llm(batch_wait_timeout_ms=1500.0)
     pf = Prompts(777)
     params = sp(logprobs=20)
@@ -186,7 +296,10 @@ def mode_stress():
     on_eq = tot["on0"]["bitwise_equal"] == tot["on0"]["n"]
     off_eq = tot["off1"]["bitwise_equal"] == tot["off1"]["n"]
     has_lp = top1(ref["isl300@1"][0]) is not None
-    print(json.dumps({"passed": bool(on_eq and off_eq and has_lp),
+    real = real_activation_check(llm, pf, params)
+    heavy = heavy_tailed_first
+    print(json.dumps({"passed": bool(on_eq and off_eq and has_lp and real["ok"] and heavy["ok"]),
+                      "real_activations": real, "heavy_tailed": heavy,
                       "compared": "first-token ids + top-20 logprobs, bitwise, order A(off) X(on) A'(off) in one "
                                   "process; off == main's F.linear path, on == SM120 cuBLASLt range table",
                       "prompts": n_prompts, "X_vs_A": tot["on0"], "Aprime_vs_A": tot["off1"],
