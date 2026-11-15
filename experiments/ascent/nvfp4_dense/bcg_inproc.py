@@ -52,9 +52,22 @@ def main():
     from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.custom_ops import torch_custom_ops as tco
 
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+
     counts = {}
     seen = set()
-    bad = {"lazy_init_under_capture": 0, "tuning_under_capture": 0}
+    bad = {"lazy_init_under_bcg_capture": 0, "tuning_under_bcg_capture": 0}
+    in_bcg = [False]
+    orig_capture = BreakableCUDAGraphRunner.capture
+
+    def bcg_capture(self, *a, **k):
+        in_bcg[0] = True
+        try:
+            return orig_capture(self, *a, **k)
+        finally:
+            in_bcg[0] = False
+
+    BreakableCUDAGraphRunner.capture = bcg_capture
     orig = tco.NVFP4GemmUnifiedRunner.forward
 
     def fwd(self, inputs, tactic=-1, bias=None, **kw):
@@ -62,13 +75,20 @@ def main():
         tuning = AutoTuner.get().is_tuning_mode
         n, m = int(inputs[1].shape[0]), int(inputs[0].shape[0])
         path = "dense" if self.dense_min_m is not None else "main"
-        key = f"{path}|{'capture' if cap else 'eager'}|{'tuning' if tuning else 'infer'}|N{n}|M{m}"
+        # phase: bcg-capture (inside BreakableCUDAGraphRunner.capture, stream capturing),
+        # bcg-warmup (inside capture(), eager warm-up forwards), other-capture (decode CUDA
+        # graphs, or the AutoTuner's own timing graphs in tuning mode), eager
+        if in_bcg[0]:
+            phase = "bcg-capture" if cap else "bcg-warmup"
+        else:
+            phase = "other-capture" if cap else "eager"
+        key = f"{path}|{phase}|{'tuning' if tuning else 'infer'}|N{n}|M{m}"
         counts[key] = counts.get(key, 0) + 1
         sig = (n, m, str(tactic), path)
-        if cap and sig not in seen:
-            bad["lazy_init_under_capture"] += 1
-        if cap and tuning:
-            bad["tuning_under_capture"] += 1
+        if phase == "bcg-capture" and sig not in seen:
+            bad["lazy_init_under_bcg_capture"] += 1
+        if phase == "bcg-capture" and tuning:
+            bad["tuning_under_bcg_capture"] += 1
         seen.add(sig)
         return orig(self, inputs, tactic=tactic, bias=bias, **kw)
 
@@ -80,10 +100,10 @@ def main():
     finally:
         sys.stdout = tee.inner
     res = json.loads(tee.last_json) if tee.last_json else {"passed": False, "error": "no inproc JSON"}
-    cap_dense = {k: v for k, v in counts.items() if k.startswith("dense|capture")}
-    cap_main = {k: v for k, v in counts.items() if k.startswith("main|capture")}
-    passed = bool(res.get("passed")) and bad["lazy_init_under_capture"] == 0 and bad["tuning_under_capture"] == 0 \
-        and sum(cap_dense.values()) > 0
+    cap_dense = {k: v for k, v in counts.items() if k.startswith("dense|bcg-capture")}
+    cap_main = {k: v for k, v in counts.items() if k.startswith("main|bcg-capture")}
+    passed = bool(res.get("passed")) and bad["lazy_init_under_bcg_capture"] == 0 \
+        and bad["tuning_under_bcg_capture"] == 0 and sum(cap_dense.values()) > 0
     print(json.dumps({"passed": passed, "compared": "BCG replay vs eager, one process, dense NVFP4 tuning ON "
                       "(bcg_ab.py inproc) + dispatch census during capture",
                       "inproc": res, "dense_dispatches_during_capture": cap_dense,

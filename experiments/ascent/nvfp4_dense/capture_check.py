@@ -4,7 +4,7 @@ Synthetic operands of the real MLP shapes (config.json). After the engine-style
 tuning (one M=8192 call per shape under autotune()), for gate_up and down at
 M = 300, 301 (first call at that M happens under capture), 1200 and 2000:
   - capture trtllm::nvfp4_gemm in torch.cuda.graph with
-    torch.cuda.set_sync_debug_mode("error") (a host sync raises);
+    torch.cuda.set_sync_debug_mode(1) (warn); synchronizing-call warnings are counted;
   - count allocations made during capture and compare with main's path
     (switch OFF) captured the same way;
   - record which path ran (dense / main) and the tactic;
@@ -57,19 +57,26 @@ def main():
                 g = torch.cuda.CUDAGraph()
                 s0 = torch.cuda.memory_stats().get("allocation.all.allocated", 0)
                 paths.clear()
-                torch.cuda.set_sync_debug_mode("error")
-                try:
-                    with torch.cuda.graph(g):
-                        out = bench.gemm(xq, xsf, wq, wsf, alpha)
-                    sync_ok = True
-                except Exception as e:  # noqa: BLE001
-                    sync_ok = False
-                    row[f"{arm}_error"] = str(e)[:300]
-                finally:
-                    torch.cuda.set_sync_debug_mode(0)
+                import warnings
+                with warnings.catch_warnings(record=True) as wlist:
+                    warnings.simplefilter("always")
+                    torch.cuda.set_sync_debug_mode(1)  # warn on synchronizing calls
+                    try:
+                        with torch.cuda.graph(g):
+                            out = bench.gemm(xq, xsf, wq, wsf, alpha)
+                        captured = True
+                    except Exception as e:  # noqa: BLE001
+                        captured = False
+                        row[f"{arm}_error"] = str(e)[:300]
+                    finally:
+                        torch.cuda.set_sync_debug_mode(0)
+                syncs = [str(w.message)[:160] for w in wlist if "synchroniz" in str(w.message).lower()
+                         and "prototype" not in str(w.message).lower()]
                 s1 = torch.cuda.memory_stats().get("allocation.all.allocated", 0)
                 row[f"{arm}_path_on_capture"] = list(paths)
                 row[f"{arm}_allocs_during_capture"] = s1 - s0
+                row[f"{arm}_sync_warnings"] = syncs
+                sync_ok = captured and not syncs
                 row[f"{arm}_no_host_sync"] = sync_ok
                 if not sync_ok:
                     passed = False
