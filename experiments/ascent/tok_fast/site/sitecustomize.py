@@ -31,7 +31,12 @@ def _patch(mod):
         dt = time.perf_counter() - a
         cpu = time.process_time() - c0
         after = sum(1 for t in threading.enumerate() if t.name.startswith("gemma4_tok"))
-        rec = {"t_end": time.time(), "ms": 1e3 * dt, "process_cpu_ms": 1e3 * cpu, "n_ids": len(out[0]),
+        import hashlib
+        ids_sha = hashlib.sha256(",".join(str(int(i)) for i in out[0]).encode()).hexdigest()
+        text = inputs.get("prompt") if isinstance(inputs.get("prompt"), str) else None
+        rec = {"ids_sha256": ids_sha,
+               "text_sha256": hashlib.sha256(text.encode()).hexdigest() if text is not None else None,
+               "text": text if os.environ.get("ASCENT_TOK_TEXT") else None,"t_end": time.time(), "ms": 1e3 * dt, "process_cpu_ms": 1e3 * cpu, "n_ids": len(out[0]),
                "chars": len(inputs.get("prompt") or ""), "pid": os.getpid(), "ppid": os.getppid(),
                "pool_threads_before": before, "pool_threads_after": after,
                "thread": threading.current_thread().name,

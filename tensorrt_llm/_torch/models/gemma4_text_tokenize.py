@@ -32,8 +32,9 @@ BPE merges only adjacent symbols into vocabulary tokens. A cut before position `
 vocabulary is scanned for every character that ever precedes ``"▁"`` inside a token
 (for Gemma4 only ``"▁"`` itself and ``">"``); cuts are taken only after other characters, so
 both sides merge independently and their concatenation equals the whole-text encoding.
-Byte-fallback pieces are per character, and added tokens (which contain no space) never span a
-cut. Any tokenizer that does not match this shape uses the unsplit path.
+A character without a single-character token becomes byte-fallback symbols (``"<0xNN>"``)
+ending in ``">"``, so when ``">"`` is in that set no cut is taken after such a character.
+Added tokens (which contain no space) never span a cut. Any tokenizer that does not match this shape uses the unsplit path.
 """
 
 import json
@@ -98,6 +99,8 @@ class Gemma4TextEncoder:
         self._hf = hf
         self._backend = getattr(hf, "backend_tokenizer", None)
         self._bad_prev: Optional[frozenset] = None
+        self._single: frozenset = frozenset()
+        self._guard_unknown = True
         self._prefix: List[int] = []
         self._suffix: List[int] = []
         self._inflight = 0
@@ -157,6 +160,12 @@ class Gemma4TextEncoder:
             while j != -1:
                 bad.add(t[j - 1])
                 j = t.find(_META, j + 1)
+        # A character with no single-character model token is encoded as byte-fallback symbols
+        # ("<0xNN>") or "<unk>", whose last character is ">", not the character itself. Such a
+        # symbol left of a cut can merge with "▁" exactly when ">" precedes "▁" in some token,
+        # so cuts after those characters are refused whenever ">" is in the bad set.
+        self._single = frozenset(t for t in b.get_vocab(with_added_tokens=False) if len(t) == 1)
+        self._guard_unknown = ">" in bad
         # ignore_merges looks a whole word up in the vocabulary; pieces are far longer than any
         # vocabulary token, so they never hit that lookup.
         if PIECE_CHARS // 2 <= max_tok_len:
@@ -182,13 +191,15 @@ class Gemma4TextEncoder:
             return []
         pieces = min(MAX_PIECES, max(2, n // PIECE_CHARS))
         bad = self._bad_prev
+        single = self._single
+        guard = self._guard_unknown
         cuts = []
         last = 0
         for p in range(1, pieces):
             pos = max(last + 1, (n * p) // pieces)
             stop = min(n, pos + CUT_SEARCH_CHARS)
             i = text.find(_SPACE, pos, stop)
-            while i != -1 and text[i - 1] in bad:
+            while i != -1 and (text[i - 1] in bad or (guard and text[i - 1] not in single)):
                 i = text.find(_SPACE, i + 1, stop)
             if i == -1:
                 continue
