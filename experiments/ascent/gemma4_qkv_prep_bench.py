@@ -102,6 +102,9 @@ class Layer:
         with torch.no_grad():
             self.q_norm.weight.copy_((1.0 + 0.2 * torch.randn(self.hd, generator=g)).to(torch.bfloat16))
             self.k_norm.weight.copy_((1.0 + 0.2 * torch.randn(self.hd, generator=g)).to(torch.bfloat16))
+            if sh.get("real_qw") is not None:
+                self.q_norm.weight.copy_(sh["real_qw"])
+                self.k_norm.weight.copy_(sh["real_kw"])
         self.cos_sin = make_cos_sin(self.hd, sh["theta"], sh["partial"], 16384, device)
 
     def make_inputs(self, seqs, device, seed):
@@ -212,9 +215,32 @@ def stats(a, b):
                 rel_fro=(torch.linalg.norm(d) / torch.linalg.norm(b).clamp_min(1e-30)).item())
 
 
-def check(ckpt):
+def load_real_norm_weights(ckpt, shapes):
+    """Attach one sliding and one global layer's real q_norm/k_norm weights."""
+    from safetensors import safe_open
+    with open(os.path.join(ckpt, "config.json")) as f:
+        cfg = json.load(f)
+    tc = cfg.get("text_config", cfg)
+    types = tc["layer_types"]
+    want = {"sliding": types.index("sliding_attention"), "global": types.index("full_attention")}
+    with open(os.path.join(ckpt, "model.safetensors.index.json")) as f:
+        wmap = json.load(f)["weight_map"]
+    for lname, li in want.items():
+        for nm in ("q_norm", "k_norm"):
+            key = next(k for k in wmap if f"layers.{li}.self_attn.{nm}.weight" in k)
+            with safe_open(os.path.join(ckpt, wmap[key]), "pt") as sf:
+                w = sf.get_tensor(key).to(torch.bfloat16)
+            assert w.numel() == shapes[lname]["hd"], (key, w.shape)
+            shapes[lname]["real_" + nm[0] + "w"] = w
+            log(f"{lname} layer {li} {key}: min={w.float().min():.4f} max={w.float().max():.4f} "
+                f"mean={w.float().mean():.4f}")
+
+
+def check(ckpt, real=False):
     dev = torch.device("cuda")
     shapes, eps = load_shapes(ckpt)
+    if real:
+        load_real_norm_weights(ckpt, shapes)
     assert has_mixed_mode(), "check needs the branch's kv_out_fp8 mode"
     passed = True
     report = {}
@@ -274,6 +300,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["bench", "check"])
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--real-norm-weights", action="store_true")
     a = ap.parse_args()
     with torch.inference_mode():
-        (bench if a.mode == "bench" else check)(a.ckpt)
+        if a.mode == "bench":
+            bench(a.ckpt)
+        else:
+            check(a.ckpt, real=a.real_norm_weights)
