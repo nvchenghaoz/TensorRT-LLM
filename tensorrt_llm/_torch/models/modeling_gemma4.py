@@ -340,10 +340,6 @@ class _Gemma4GeluQuantMLP(GatedMLP):
         # Decided lazily on first use: down_proj quant attributes are
         # finalized after __init__.
         self._fused_gelu_quant: Optional[bool] = None
-        # down_proj NVFP4 GEMM at prefill M 4096-8192 takes the wave-aligned
-        # M split (modules/gemma4/down_wave_split.py; bitwise equal to the
-        # single nvfp4_gemm; TRTLLM_GEMMA4_DOWN_WAVE_SPLIT=0 disables).
-        self.down_proj._gemma4_down_wave_split = True
 
     def _fused_gelu_quant_enabled(self) -> bool:
         if self._fused_gelu_quant is None:
