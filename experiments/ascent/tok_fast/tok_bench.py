@@ -239,6 +239,20 @@ def timing():
         batch[f"isl{n}"] = {"step_ms": round(med, 4), "p10_ms": round(p10, 4), "p90_ms": round(p90, 4),
                             "noise_floor": round((p90 - p10) / med, 4), "n": len(ts)}
         log(f"isl{n}: median {med:.3f} ms p10 {p10:.3f} p90 {p90:.3f}")
+        enc = getattr(ip, "_text_encoder", None)
+        if enc is not None:
+            # Same process, same prompts: main's stock call and stage 1 (unsplit list path).
+            for name, fn in (("stock_inproc", lambda t: stock_ids(ip, t)),
+                             ("stage1_inproc", enc._encode_unsplit)):
+                ts2 = []
+                for rep in range(3):
+                    for t in prompts[n]:
+                        a = time.perf_counter()
+                        fn(t)
+                        ts2.append(1e3 * (time.perf_counter() - a))
+                m2 = statistics.median(ts2)
+                batch[f"isl{n}"][f"{name}_ms"] = [round(m2, 4), round(pct(ts2, 0.1), 4), round(pct(ts2, 0.9), 4)]
+                log(f"isl{n} {name}: median {m2:.3f}")
     for thr in (4, 16):
         mks = []
         texts = prompts[8000]
