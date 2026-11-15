@@ -282,6 +282,26 @@ class _QOnlyLinear(Linear):
         super().load_weights([q_weights], allow_partial_loading=allow_partial_loading)
 
 
+class _QKOnlyLinear(Linear):
+    """Fused [q | k] projection for full-attention layers with attention_k_eq_v.
+
+    On K=V layers V = v_norm(k_proj(x)): the weight mapper copies k_proj into
+    v_proj, so a fused [q | k | v] GEMM computes the K block twice.  This
+    Linear keeps only [q | k] (loaded as a two-part fused weight, like
+    gate/up) and the attention module takes V from the raw K block.  The
+    checkpoint's [q, k, v] payload is accepted and v is ignored.
+    """
+
+    # Both quantization passes (layerwise config and exclude_modules) match
+    # the checkpoint's q_proj / k_proj names, as for the fused QKV Linear.
+    fused_checkpoint_names = ("q_proj", "k_proj")
+
+    def load_weights(self, weights, allow_partial_loading=False):
+        if isinstance(weights, list) and len(weights) == 3:
+            weights = weights[:2]
+        super().load_weights(weights, allow_partial_loading=allow_partial_loading)
+
+
 # ---------------------------------------------------------------------------
 # Gemma4 Attention
 # ---------------------------------------------------------------------------
@@ -478,6 +498,45 @@ class Gemma4Attention(QKNormRoPEAttention):
                 allreduce_strategy=model_config.allreduce_strategy,
             )
 
+        # K=V full-attention layers: V is v_norm of the raw K projection, so
+        # drop the duplicated V block from the fused GEMM ([q | k] only) and
+        # take V from K in apply_rope.  Not on SM100f, whose fused QKV prep
+        # kernel reads a packed [q | k | v] tensor, and not with LoRA, whose
+        # fused QKV adapter emits q + 2 * kv columns.
+        self._qk_only_proj = (
+            use_k_eq_v
+            and not is_kv_shared
+            and not is_sm_100f()
+            and not self.attn_output_gate
+            and getattr(model_config, "lora_config", None) is None
+        )
+        if self._qk_only_proj:
+            qkv_proj = self.qkv_proj
+            qkv_mapping = qkv_proj.mapping
+            self.qkv_proj = _QKOnlyLinear(
+                in_features=config.hidden_size,
+                out_features=qkv_mapping.tp_size * (self.q_size + self.kv_size),
+                bias=False,
+                dtype=config.torch_dtype,
+                mapping=qkv_mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                weights_loading_config=WeightsLoadingConfig(
+                    weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
+                ),
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                allreduce_strategy=model_config.allreduce_strategy,
+                force_dynamic_quantization=model_config.force_dynamic_quantization,
+                disable_deep_gemm=qkv_proj.disable_deep_gemm,
+                use_custom_cublas_mm=qkv_proj.use_custom_cublas_mm,
+                fused_weight_shard_indices_mapping={
+                    "gate": (0, self.q_size),
+                    "up": (self.q_size, self.kv_size),
+                },
+                use_cute_dsl_blockscaling_mm=qkv_proj.use_cute_dsl_blockscaling_mm,
+            )
+            del qkv_proj
+
         # v_norm: always present in Gemma4 (no learnable scale).
         # For K=V layers, weight mapper duplicates k_proj→v_proj, so v equals
         # the raw k_proj output.  v_norm is applied to that raw value BEFORE
@@ -505,6 +564,8 @@ class Gemma4Attention(QKNormRoPEAttention):
             use_trtllm_bf16 = self._use_trtllm_fused_qkv_prep
             self._fused_qkv_prep = (
                 not self.is_kv_shared
+                # The kernel reads V from a packed [q | k | v] GEMM output.
+                and not self._qk_only_proj
                 and not self.fuse_qk_norm_rope
                 and not self.skip_rope
                 # FlashInfer trtllm-gen consumes separate FP8 tensors. Native
@@ -583,7 +644,13 @@ class Gemma4Attention(QKNormRoPEAttention):
                     packed_output=self._use_trtllm_fused_qkv_prep,
                 )
 
-            q, k, v = self.split_qkv(q, k, v)
+            if self._qk_only_proj and k is None and v is None:
+                # [q | k] GEMM output: V is the raw K projection.  v_norm and
+                # k_norm both return new tensors, so the aliasing is safe.
+                q, k = q.split([self.q_size, self.kv_size], dim=-1)
+                v = k
+            else:
+                q, k, v = self.split_qkv(q, k, v)
             # For K=V layers, weight mapper duplicates k_proj weights into
             # v_proj, so after split_qkv v already equals k_proj(x).
             # HF order: v_norm is applied to the raw k_proj output, NOT
