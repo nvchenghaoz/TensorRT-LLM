@@ -227,8 +227,12 @@ def cmp(a, b):
 
 
 def cmp_dig(a, b):
+    """Per-layer-call digests (layer, rows, kv_slots_checksum, attn_out_checksum)."""
     diff = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
-    return {"n_layer_calls": len(a), "n_diff": len(diff) + abs(len(a) - len(b)), "first": diff[:5]}
+    kv_diff = [i for i, (x, y) in enumerate(zip(a, b)) if x[:3] != y[:3]]
+    out_diff_layers = sorted({a[i][0] for i in diff if a[i][:3] == b[i][:3]})
+    return {"n_layer_calls": len(a), "n_diff": len(diff) + abs(len(a) - len(b)), "first": diff[:5],
+            "n_kv_diff": len(kv_diff) + abs(len(a) - len(b)), "out_only_diff_layers": out_diff_layers}
 
 
 def mode_ab():
@@ -266,7 +270,19 @@ def mode_ab():
         item2[f"{b}_vs_{a}"] = {"outputs": cmp(passes2[a][0], passes2[b][0]),
                                 "layer_digests": cmp_dig(passes2[a][1], passes2[b][1])}
         log(f"item2 {b} vs {a}: {json.dumps(item2[f'{b}_vs_{a}'])}")
-    item2_ok = all(v["outputs"]["n_diff"] == 0 and v["layer_digests"]["n_diff"] == 0 for v in item2.values())
+    # Same graph mode (replay vs replay, eager vs eager): everything bitwise. Replay vs
+    # eager (main's own BCG property): outputs and every KV slot bitwise; the attention
+    # output may differ only on the last layer, whose eager steps run main's read-rows
+    # FA2 call (unread rows zero) and whose replayed steps run the full-row call.
+    last_layer = max(d[0] for d in passes2["E0"][1])
+    item2_ok = True
+    for k, v in item2.items():
+        same_mode = k in ("R1_vs_R0", "E1_vs_E0", "R1b_vs_R1")
+        if same_mode:
+            item2_ok &= v["outputs"]["n_diff"] == 0 and v["layer_digests"]["n_diff"] == 0
+        else:
+            item2_ok &= (v["outputs"]["n_diff"] == 0 and v["layer_digests"]["n_kv_diff"] == 0
+                         and set(v["layer_digests"]["out_only_diff_layers"]) <= {last_layer})
     r_info = [passes2[t][2] for t in ("R1", "R0", "R1b")]
     replay_ok = all(i["bcg_steps"] and i["bcg_steps"].get("eager", 0) == 0 and i["counters"]["direct"] == 0
                     for i in r_info)
