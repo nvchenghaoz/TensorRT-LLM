@@ -279,15 +279,14 @@ struct vec_cast<nv_bfloat16, __nv_fp8_e4m3> {
     } else {
       static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
 #ifdef FLASHINFER_HARDWARE_FP8_E4M3_TO_BF16_CONVERSION_ENABLED
-      // Hardware paired conversion. It equals fast_dequant_f8f16x4 bit for bit on every finite
-      // code (normals, subnormals, +-0). The two NaN codes 0x7F/0xFF, which the software path
-      // maps to +-480, take the software path below, so all 256 codes match it.
-      uint32_t words[vec_size / 4];
-      uint32_t nan_probe = 0;
+      // Hardware paired conversion: one F2FP.BF16.E4M3 per pair instead of the ~9-op software
+      // sequence. Bit-identical to fast_dequant_f8f16x4 on all 254 finite codes (normals,
+      // subnormals, +-0). The NaN codes 0x7F/0xFF give NaN (0x7FFF), as the FP16 path above
+      // (cvt.rn.f16x2.e4m3x2) and torch do; the software path turns them into +-480. A
+      // satfinite-quantized KV cache never holds them.
 #pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
         const uint32_t w = *(const uint32_t*)&src[i * 4];
-        words[i] = w;
         uint32_t lo, hi;
         asm("{\n"
             "  .reg .b16 e01, e23;\n"
@@ -299,14 +298,6 @@ struct vec_cast<nv_bfloat16, __nv_fp8_e4m3> {
             : "r"(w));
         *(uint32_t*)&dst[i * 4] = lo;
         *(uint32_t*)&dst[i * 4 + 2] = hi;
-        // Bit 7 of a byte of (b & 0x7F) + 1 is set iff b is 0x7F or 0xFF (no carry across bytes).
-        nan_probe |= (w & 0x7F7F7F7Fu) + 0x01010101u;
-      }
-      if (__builtin_expect((nan_probe & 0x80808080u) != 0u, 0)) {
-#pragma unroll
-        for (uint32_t i = 0; i < vec_size / 4; ++i) {
-          fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>(&words[i], (uint2*)&dst[i * 4]);
-        }
       }
 #else
 #pragma unroll

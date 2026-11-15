@@ -14,11 +14,11 @@ Modes
                         FLASHINFER_WORKSPACE_BASE, for --rounds interleaved rounds; then byte
                         compares of O and LSE vs the main arm and errors vs an FP32 reference.
 
-Arms are built from the job's tree (which carries v2m + variant B):
+Arms are built from the job's tree (which carries v2m + variant A):
   main  : v2m block reverted, vec_cast software path (#ifdef -> #if 0)  == main's sources
   v2m   : vec_cast software path
-  v2mA  : hardware cvt without the NaN-code fallback (0x7F/0xFF give NaN, main gives +-480)
-  v2mB  : the tree as is (hardware cvt + NaN-code fallback to the software path)
+  v2mA  : the tree as is: hardware cvt (0x7F/0xFF give NaN like torch; main gives +-480)
+  v2mB  : A + per-call NaN-code probe and software fallback (all 256 codes == main)
 """
 import argparse
 import hashlib
@@ -62,15 +62,43 @@ HW_IFDEF = ("#ifdef FLASHINFER_HARDWARE_FP8_E4M3_TO_BF16_CONVERSION_ENABLED\n"
             "      // Hardware paired conversion.")
 HW_OFF = ("#if 0  // idea65 arm: software conversion (main)\n"
           "      // Hardware paired conversion.")
-NAN_IF = "      if (__builtin_expect((nan_probe & 0x80808080u) != 0u, 0)) {"
-NAN_OFF = "      if (false) {  // idea65 arm A: no NaN-code fallback"
+# variant B (job 475's first landed form): A + a per-call NaN-code probe that re-runs the
+# software path when any byte is 0x7F/0xFF, so all 256 codes match main
+B1_OLD = """      // satfinite-quantized KV cache never holds them.
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size / 4; ++i) {
+        const uint32_t w = *(const uint32_t*)&src[i * 4];
+"""
+B1_NEW = """      // satfinite-quantized KV cache never holds them.
+      uint32_t words[vec_size / 4];  // idea65 arm B: NaN-code fallback
+      uint32_t nan_probe = 0;
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size / 4; ++i) {
+        const uint32_t w = *(const uint32_t*)&src[i * 4];
+        words[i] = w;
+        // bit 7 of a byte of (b & 0x7F) + 1 is set iff b is 0x7F or 0xFF (no carry across bytes)
+        nan_probe |= (w & 0x7F7F7F7Fu) + 0x01010101u;
+"""
+B2_OLD = """        *(uint32_t*)&dst[i * 4 + 2] = hi;
+      }
+#else"""
+B2_NEW = """        *(uint32_t*)&dst[i * 4 + 2] = hi;
+      }
+      if (__builtin_expect((nan_probe & 0x80808080u) != 0u, 0)) {
+#pragma unroll
+        for (uint32_t i = 0; i < vec_size / 4; ++i) {
+          fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>(&words[i], (uint2*)&dst[i * 4]);
+        }
+      }
+#else"""
 
 ARMS = {
     "main": [("include/flashinfer/attention/prefill.cuh", V2M_NEW, V2M_OLD),
              ("include/flashinfer/vec_dtypes.cuh", HW_IFDEF, HW_OFF)],
     "v2m": [("include/flashinfer/vec_dtypes.cuh", HW_IFDEF, HW_OFF)],
-    "v2mA": [("include/flashinfer/vec_dtypes.cuh", NAN_IF, NAN_OFF)],
-    "v2mB": [],
+    "v2mA": [],  # the tree as landed
+    "v2mB": [("include/flashinfer/vec_dtypes.cuh", B1_OLD, B1_NEW),
+             ("include/flashinfer/vec_dtypes.cuh", B2_OLD, B2_NEW)],
 }
 
 
@@ -244,11 +272,16 @@ def raw(t):
 
 # ------------------------------------------------------------------ worker
 def worker(a):
+    if a.fresh_base:
+        # build every module from this tree's sources (no .so shared with other jobs/trees)
+        os.environ["FLASHINFER_WORKSPACE_BASE"] = tempfile.mkdtemp(prefix=f"idea65_ws_{a.arm}_")
+        os.environ["FLASHINFER_JIT_DEBUG"] = "0"
+    log("FLASHINFER_WORKSPACE_BASE", os.environ.get("FLASHINFER_WORKSPACE_BASE", "<default>"))
+    from flashinfer.jit import env as jit_env
     if a.inc != "tree":
-        from flashinfer.jit import env as jit_env
         jit_env.FLASHINFER_INCLUDE_DIR = pathlib.Path(a.inc) / "include"
         jit_env.FLASHINFER_CSRC_DIR = pathlib.Path(a.inc) / "csrc"
-        jit_env.get_aot_artifacts = lambda name: ()
+    jit_env.get_aot_artifacts = lambda name: ()
     import torch
     import flashinfer
     from flashinfer.jit import env as jit_env
@@ -262,7 +295,7 @@ def worker(a):
         log("SRC", rel, "sha", hashlib.sha256(txt.encode()).hexdigest()[:16],
             "v2m" if "quarter-warp takes 4 columns" in txt else "",
             "hwcvt_block" if "FLASHINFER_HARDWARE_FP8_E4M3_TO_BF16_CONVERSION_ENABLED" in txt
-            else "", "armA" if "idea65 arm A" in txt else "",
+            else "", "armB_fallback" if "idea65 arm B" in txt else "",
             "sw_forced" if "idea65 arm: software" in txt else "")
     log("ENV FLASHINFER_FA2_D512_TILE64", os.environ.get("FLASHINFER_FA2_D512_TILE64", "<unset>"))
     dims = load_dims(a.ckpt)
@@ -453,11 +486,14 @@ int main(int argc, char** argv) {
 """
 
 
-def stage0(a, workdir):
+def stage0(a, workdir, inc=None, tag="tree", expect="A"):
     import numpy as np
     import torch
     from flashinfer.jit.cpp_ext import get_cuda_path
-    inc = package_data() / "include"
+    inc = pathlib.Path(inc) if inc else package_data() / "include"
+    workdir = pathlib.Path(workdir) / f"stage0_{tag}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    log("STAGE0", tag, "include", inc, "expect", expect)
     nvcc = os.path.join(get_cuda_path(), "bin", "nvcc")
     cuobj = os.path.join(get_cuda_path(), "bin", "cuobjdump")
     log("STAGE0 nvcc", nvcc, subprocess.run([nvcc, "--version"], capture_output=True,
@@ -511,14 +547,21 @@ def stage0(a, workdir):
             o_main, o_b4, o_b16, o_a = o[:n], o[n:2 * n], o[2 * n:3 * n], o[3 * n:4 * n]
             seg = {"all256": slice(0, 256), "finite_shuffled": slice(256, 512),
                    "random64k": slice(512, n)}
+            nanpos = (buf & 0x7F) == 0x7F
             tab = {}
             for sname, sl in seg.items():
+                fin = ~nanpos[sl]
                 tab[sname] = dict(
                     b4_eq_main=int((o_b4[sl] == o_main[sl]).sum()),
                     b16_eq_main=int((o_b16[sl] == o_main[sl]).sum()),
                     a_eq_main=int((o_a[sl] == o_main[sl]).sum()),
                     main_eq_torch=int((o_main[sl] == torch_ref[sl]).sum()),
-                    n=int(sl.stop - sl.start))
+                    n=int(sl.stop - sl.start), n_nan_codes=int(nanpos[sl].sum()),
+                    b4_eq_main_finite=int((o_b4[sl] == o_main[sl])[fin].sum()),
+                    b16_eq_main_finite=int((o_b16[sl] == o_main[sl])[fin].sum()),
+                    n_finite=int(fin.sum()),
+                    b4_nan_is_7fff=int((o_b4[sl][~fin] == 0x7FFF).sum()),
+                    b16_nan_is_7fff=int((o_b16[sl][~fin] == 0x7FFF).sum()))
             rec["table"] = tab
             # per-code table for all 256 codes: main, B(cast<4>), B(cast<16>), A, torch
             codes = {}
@@ -538,17 +581,31 @@ def stage0(a, workdir):
         rec["sass_f2fp_examples"] = f2fp[:4]
         res[name] = rec
         log("STAGE0", name, json.dumps(rec))
+    def ok_table(t, mode):
+        for sname in ("all256", "finite_shuffled", "random64k"):
+            s = t.get(sname)
+            if not s:
+                return False
+            if mode == "exact256":
+                if s["b4_eq_main"] != s["n"] or s["b16_eq_main"] != s["n"]:
+                    return False
+            else:  # A: finite codes bit-equal, NaN codes -> 0x7FFF
+                if (s["b4_eq_main_finite"] != s["n_finite"]
+                        or s["b16_eq_main_finite"] != s["n_finite"]
+                        or s["b4_nan_is_7fff"] != s["n_nan_codes"]
+                        or s["b16_nan_is_7fff"] != s["n_nan_codes"]):
+                    return False
+        return True
+
     f = res.get("sm120f", {})
-    t = f.get("table", {})
+    plain = res.get("sm120_plain", {})
     passed = (f.get("build_rc") == 0 and "hw=1" in f.get("run_out", "")
-              and t.get("all256", {}).get("b4_eq_main") == 256
-              and t.get("all256", {}).get("b16_eq_main") == 256
-              and t.get("finite_shuffled", {}).get("b4_eq_main") == 256
-              and t.get("finite_shuffled", {}).get("b16_eq_main") == 256
-              and t.get("random64k", {}).get("b4_eq_main") == t.get("random64k", {}).get("n")
-              and t.get("random64k", {}).get("b16_eq_main") == t.get("random64k", {}).get("n")
-              and res.get("sm120_plain", {}).get("build_rc") == 0)
-    return dict(passed=bool(passed), results=res)
+              and ok_table(f.get("table", {}), "exact256" if expect == "B" else "A")
+              # plain compute_120 keeps the software path: all 256 codes == main
+              and plain.get("build_rc") == 0 and "hw=0" in plain.get("run_out", "")
+              and ok_table(plain.get("table", {}), "exact256"))
+    log("STAGE0_RESULT", tag, "expect", expect, "passed", passed)
+    return dict(passed=bool(passed), tag=tag, expect=expect, results=res)
 
 
 # ------------------------------------------------------------------ driver
@@ -586,10 +643,6 @@ def driver(a):
     work = pathlib.Path(tempfile.mkdtemp(prefix="idea65_"))
     log("DRIVER work", work, "load", os.getloadavg())
     summary = {}
-    if a.stage0:
-        s0 = stage0(a, work)
-        summary["stage0"] = s0
-        log("STAGE0_PASSED", s0["passed"])
     arms = [x for x in a.arms.split(",") if x]
     trees, bases = {}, {}
     for arm in arms:
@@ -597,6 +650,14 @@ def driver(a):
         trees[arm] = d
         bases[arm] = pathlib.Path(tempfile.mkdtemp(prefix=f"idea65_ws_{arm}_"))
         log("ARM_TREE", arm, json.dumps(files))
+    if a.stage0:
+        s0 = stage0(a, work, tag="tree_A", expect="A")
+        s0b = None
+        if "v2mB" in trees:
+            s0b = stage0(a, work, inc=trees["v2mB"] / "include", tag="armB", expect="B")
+        summary["stage0"] = dict(passed=s0["passed"] and (s0b is None or s0b["passed"]),
+                                 tree_A=s0, armB=s0b)
+        log("STAGE0_PASSED", summary["stage0"]["passed"])
     save = work / "out"
     res = {arm: [] for arm in arms}
     for r in range(a.rounds):
@@ -690,6 +751,7 @@ def main():
     ap.add_argument("--stage0", action="store_true")
     ap.add_argument("--stage0-only", action="store_true")
     ap.add_argument("--sass", action="store_true")
+    ap.add_argument("--fresh-base", action="store_true")
     a = ap.parse_args()
     if a.worker:
         worker(a)
