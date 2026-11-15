@@ -17,6 +17,7 @@
 import copy
 import dataclasses
 import math
+import os
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
@@ -51,6 +52,7 @@ from ..attention.backends.interface import (
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..kernels.fused_ops.embed_scale_rmsnorm import embed_scale_rmsnorm, rmsnorm_replay_supported
+from ..kernels.fused_ops.gate_up_gelu_fp4_chunked import gate_up_gelu_fp4_chunked
 from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
 from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
 from ..kernels.fused_ops.rmsnorm_residual_add import (
@@ -64,7 +66,13 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
-from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ..modules.linear import (
+    Linear,
+    NVFP4LinearMethod,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+)
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
@@ -220,6 +228,14 @@ def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
     return nn.functional.gelu(gate, approximate="tanh") * x
 
 
+# M-chunked gate_up -> gelu+NVFP4-quant chain (bitwise equal to the full-M
+# chain; see gate_up_gelu_fp4_chunked). TRTLLM_GEMMA4_MLP_CHUNK=0 disables it.
+_MLP_CHUNK_ENABLED = os.environ.get("TRTLLM_GEMMA4_MLP_CHUNK", "1") != "0"
+_MLP_CHUNK_ROWS = int(os.environ.get("TRTLLM_GEMMA4_MLP_CHUNK_ROWS", "1280"))
+_MLP_CHUNK_MIN_M = int(os.environ.get("TRTLLM_GEMMA4_MLP_CHUNK_MIN_M", "1664"))
+_MLP_CHUNK_MAX_M = int(os.environ.get("TRTLLM_GEMMA4_MLP_CHUNK_MAX_M", str(1 << 62)))
+
+
 class _Gemma4GeluQuantMLP(GatedMLP):
     """GatedMLP that fuses gelu_tanh+mul into the down_proj NVFP4 quantize.
 
@@ -271,6 +287,65 @@ class _Gemma4GeluQuantMLP(GatedMLP):
             fp4, sf = gelu_tanh_mul_fp4_quant(x, self.down_proj.input_scale)
             return Fp4QuantizedTensor(fp4, sf)
         return super()._apply_activation(x, has_lora=has_lora)
+
+    def _chunked_gate_up_act(self, x) -> Optional[Fp4QuantizedTensor]:
+        """M-chunked gate_up -> gelu+quant (bitwise equal to the full-M chain),
+        or None when it does not apply."""
+        if not (
+            _MLP_CHUNK_ENABLED
+            and isinstance(x, Fp4QuantizedTensor)
+            and x.is_sf_swizzled
+            and x.fp4_tensor.dim() == 2
+            and _MLP_CHUNK_MIN_M <= x.fp4_tensor.shape[0] <= _MLP_CHUNK_MAX_M
+            and not is_torch_compiling()
+            and not self.split_gate_up
+            and self._fused_gelu_quant_enabled()
+        ):
+            return None
+        gu = self.gate_up_proj
+        if not (
+            type(gu.quant_method) is NVFP4LinearMethod
+            and gu.tp_mode == TensorParallelMode.COLUMN
+            and not gu.gather_output
+            and gu.bias is None
+            and gu.lora is None
+            and gu._locality_domain_weight_shards is None
+            and gu.all_reduce is None
+            and gu.weight.shape[0] == gu.out_features
+            and "marlin" not in gu.nvfp4_allowed_backends
+        ):
+            return None
+        act_fp4, act_sf, alpha = gu.quant_method._input_prepare(gu, x)
+        res = gate_up_gelu_fp4_chunked(
+            act_fp4,
+            act_sf,
+            gu.weight,
+            gu.weight_scale,
+            alpha,
+            gu.dtype,
+            gu.nvfp4_allowed_backends,
+            self.down_proj.input_scale,
+            _MLP_CHUNK_ROWS,
+        )
+        if res is None:
+            return None
+        return Fp4QuantizedTensor(res[0], res[1])
+
+    def forward(self, x, all_rank_num_tokens=None, final_all_reduce_params=None,
+                lora_params=None, **kwargs):
+        if not lora_params:
+            h2 = self._chunked_gate_up_act(x)
+            if h2 is not None:
+                return self.down_proj(
+                    h2, all_reduce_params=final_all_reduce_params, layer_idx=self.layer_idx
+                )
+        return super().forward(
+            x,
+            all_rank_num_tokens=all_rank_num_tokens,
+            final_all_reduce_params=final_all_reduce_params,
+            lora_params=lora_params,
+            **kwargs,
+        )
 
 
 # ---------------------------------------------------------------------------
