@@ -54,12 +54,23 @@ def main():
     diffs = [k for k in save if save.get(k) != load.get(k)] if "error" not in save else ["error"]
     out["cache_reload"] = {"passed": not diffs and os.path.exists(cache_path), "diffs": diffs,
                            "n_cases": len(save), "save": save}
-    # 4. in-process LLM A/X/A' + re-send (own prompts; no recapture)
+    # 4. op-level CUDA-graph capture check
+    out["capture"] = run([py, os.path.join(HERE, "capture_check.py"), ck], "capture")
+    # 5. in-process LLM A/X/A' + re-send (own prompts; no recapture)
     out["llm_ab"] = run([py, os.path.join(HERE, "llm_ab.py"), ck, "-"], "llm_ab")
+    # 6. BCG replay vs eager, one process, candidate ON
+    out["bcg"] = run([py, os.path.join(HERE, "bcg_inproc.py"), ck], "bcg")
     rep = out["repeat"]
     summary = {
         "passed": bool(out["census"].get("passed") and rep.get("passed") and out["cache_reload"]["passed"]
-                       and out["llm_ab"].get("passed")),
+                       and out["capture"].get("passed") and out["llm_ab"].get("passed")
+                       and out["bcg"].get("passed")),
+        "capture": {k: out["capture"].get(k) for k in ("passed",)},
+        "bcg": {k: out["bcg"].get(k) for k in ("passed", "dense_dispatches_during_capture",
+                                               "main_dispatches_during_capture", "capture_hazards")}
+        | {"inproc": {k: (out["bcg"].get("inproc") or {}).get(k) for k in
+                      ("passed", "comparisons", "repeat_replay_all_equal_first", "repeat_replay_equal_eager",
+                       "context_steps_per_pass")}},
         "llm_ab": {k: out["llm_ab"].get(k) for k in ("passed", "n_prompts", "A_vs_A2", "A_vs_X", "resend",
                                                      "dispatch_calls", "chunked_gate_up_calls_total")},
         "compared": "gate 0 census (every offered dense tactic + dense pick vs main's pick, int16, real "
