@@ -175,8 +175,61 @@ def gpu_state():
         return {"error": str(e)}
 
 
+def warm_gpu(seconds=10.0):
+    """Fixed back-to-back BF16 GEMM load so both arms start timing in the same power/thermal state."""
+    a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+    t0 = time.time()
+    n = 0
+    while time.time() - t0 < seconds:
+        for _ in range(10):
+            a @ b
+        torch.cuda.synchronize()
+        n += 10
+    log(f"[warm] {n} bf16 8192^3 GEMMs in {time.time() - t0:.1f}s state={gpu_state()}")
+    del a, b
+
+
+REPS = 3
+
+
 def mode_pair(args, dims, weights):
+    """Driver: REPS fresh processes (each warms the GPU, tunes, times); per key the median of the
+    process medians. Autotuner picks differ per process, so one process is one sample of them."""
+    import subprocess
+    reps = []
+    for r in range(REPS):
+        cmd = [sys.executable, os.path.abspath(__file__), "--mode", "pair1", "--checkpoint", args.checkpoint]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        last = None
+        for line in p.stdout:
+            sys.stdout.write(f"[rep{r}] {line}")
+            sys.stdout.flush()
+            if line.startswith("{"):
+                last = line
+        p.wait()
+        reps.append(json.loads(last))
+    batch = {}
+    for key in reps[0]["batch"]:
+        meds = sorted(rp["batch"][key]["kernel_ms"] for rp in reps)
+        within = sorted(rp["batch"][key]["noise_floor"] for rp in reps)[len(reps) // 2]
+        med = meds[len(meds) // 2]
+        across = (meds[-1] - meds[0]) / med
+        batch[key] = {"kernel_ms": med, "noise_floor": max(within, across), "within_process_noise": within,
+                      "across_process_spread": across, "process_medians_ms": meds,
+                      "p10_ms": sorted(rp["batch"][key]["p10_ms"] for rp in reps)[len(reps) // 2],
+                      "p90_ms": sorted(rp["batch"][key]["p90_ms"] for rp in reps)[len(reps) // 2],
+                      "picks_per_process": [rp["picks"][key] for rp in reps]}
+        log(f"[agg] {key} med={med * 1e3:.1f}us procs={[round(m * 1e3, 1) for m in meds]} "
+            f"noise={batch[key]['noise_floor']:.4f}")
+    print(json.dumps({"batch": batch, "output": {"class": "exact"},
+                      "tune_seconds_per_process": [rp["tune_seconds"] for rp in reps],
+                      "dense_available": reps[0]["dense_available"], "processes": REPS}))
+
+
+def mode_pair1(args, dims, weights):
     log(f"[gpu] start {gpu_state()}")
+    warm_gpu()
     tune_s = tune(weights, dims)
     log(f"[tune] total {tune_s:.1f}s dense_available={has_dense()}")
     flush = torch.empty(512 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
@@ -339,13 +392,15 @@ def main():
     args = ap.parse_args()
     import tensorrt_llm  # noqa: F401
     dims = read_dims(args.checkpoint)
+    if args.mode == "pair":  # driver only: the child processes touch the GPU
+        return mode_pair(args, dims, None)
     log(f"[gpu] {torch.cuda.get_device_name()} sm={torch.cuda.get_device_capability()}")
     weights = {}
     for i, name in enumerate(("gate_up", "down")):
         n, k = dims[name]
         log(f"[case] {name} N={n} K={k}")
         weights[name] = make_weight(n, k, 100 + i)
-    {"pair": mode_pair, "check": mode_check, "smoke": mode_smoke, "cache": mode_cache}[args.mode](
+    {"pair1": mode_pair1, "check": mode_check, "smoke": mode_smoke, "cache": mode_cache}[args.mode](
         args, dims, weights)
 
 
