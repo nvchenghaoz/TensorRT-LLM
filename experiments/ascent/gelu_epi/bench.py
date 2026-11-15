@@ -34,6 +34,11 @@ def _hb():
 
 MS = [1, 16, 64, 300, 1000, 1200, 2000, 4000, 4800, 8000, 8100, 8192]
 BACKENDS = "cutlass,cublaslt,cutedsl,cuda_core"
+# Timed-run protocol, imported by the check scripts (correctness.py, synced_test.py, small_m_gate.py)
+# so their repeated sequences mirror it call for call. No L2 flush: cold weights come from 3 rotating
+# gate_up weight copies (call i uses copy i % 3).
+WARMUP, ITERS = 5, 30
+FLUSH = "none (3 rotating weight copies, call i -> copy i % 3)"
 
 
 def main():
@@ -65,6 +70,8 @@ def main():
     if arm == "candidate" and (not ge.gelu_gemm_epi_supported() or ge.get_gelu_gemm_module() is None):
         arm = "base"
     log(f"arm={arm}")
+    print(f"[protocol] bench WARMUP={WARMUP} ITERS={ITERS} calls/key={WARMUP + ITERS} flush={FLUSH} "
+          f"key order={MS}", flush=True)
     dev = torch.device("cuda")
     props = torch.cuda.get_device_properties(0)
     log(f"gpu {props.name} sms={props.multi_processor_count}")
@@ -167,11 +174,11 @@ def main():
                 return fp4, sf
         PATHS.clear()
 
-        for i in range(5):
+        for i in range(WARMUP):
             fn(i)
         torch.cuda.synchronize()
         ts = []
-        for i in range(30):
+        for i in range(ITERS):
             s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             s.record()
             fn(i)
@@ -180,7 +187,7 @@ def main():
             ts.append(s.elapsed_time(e))
         ts.sort()
         med = statistics.median(ts)
-        p10, p90 = ts[3], ts[26]
+        p10, p90 = ts[int(0.1 * (ITERS - 1) + 0.5)], ts[int(0.9 * (ITERS - 1) + 0.5)]
         res[str(M)] = {"kernel_ms": round(med, 5), "p10": round(p10, 5), "p90": round(p90, 5),
                        "noise_floor": round((p90 - p10) / med, 4)}
         picks[str(M)] = {"pick": list(tac) if isinstance(tac, tuple) else tac, "hit": hit,

@@ -305,7 +305,12 @@ def gelu_tanh_mul_fp4_quant_permuted(
     return out, sf
 
 
-PERM_ACT_REV_COLS = False
+# Visit column blocks last-to-first. Measured right after the gate_up GEMM on permuted rows (SM120,
+# N=43008, K=5376, cuBLASLt#1 / CUTLASS#0 picks): forward order is 3% slower than main's chain at
+# M=1200 and 2-5% at 2000-8000 (it re-reads the GEMM output in the order least recently written to
+# L2). Reversed is equal to main's chain at M 300/1200 and 0.5-9% faster at 2000-8000. Bytes are
+# identical in either order.
+PERM_ACT_REV_COLS = True
 
 
 # --------------------------------------------------------------------------

@@ -30,7 +30,9 @@ import time
 T0 = time.time()
 MS = [1, 16, 64, 300, 512]
 MS_TUNE = [1, 16, 64, 300, 512, 1000, 2000]
-WARMUP, ITERS, PROF_ITERS = 5, 25, 15
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bench import FLUSH, ITERS, WARMUP  # noqa: E402  (the timed run's counts, not re-declared)
+PROF_ITERS = 15
 
 
 def log(m):
@@ -71,6 +73,9 @@ def main():
     tc = cfg.get("text_config", cfg)
     H, I = int(tc["hidden_size"]), int(tc["intermediate_size"])
     log(f"hidden={H} intermediate={I}")
+    print(f"[protocol] bench WARMUP={WARMUP} ITERS={ITERS} flush={FLUSH} | small_m_gate timed calls/key="
+          f"{WARMUP}+{ITERS} (+{PROF_ITERS} profiled) per arm main,cand,main2 | repeat calls/key/pass="
+          f"{WARMUP + ITERS} passes=A,B,A2 flush={FLUSH} order(A)={MS}", flush=True)
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.autotuner import autotune
     from tensorrt_llm._torch.kernels.fused_ops import gate_up_gelu_fp4_chunked as gcm
@@ -286,7 +291,7 @@ def main():
         for pname, order in (("A", MS), ("B", MS[::-1]), ("A2", MS)):
             for M in order:
                 st = rep.setdefault(str(M), {"calls": 0, "bad_vs_first": 0, "bad_vs_main": 0})
-                for i in range(WARMUP + 30):
+                for i in range(WARMUP + ITERS):
                     key = (M, i % 3)
                     r = run(arms["cand"][i % 3], M)
                     if key not in firsts:

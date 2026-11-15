@@ -58,7 +58,8 @@ MS_TUNE = [1, 16, 64, 300, 1000, 1200, 2000, 4000, 4800, 8000, 8100, 8192]
 MS_KILL = [300, 1000, 2000, 8000]
 MS_FORCE = [2000, 8000]
 MS_REP = [2000, 4000, 4096, 4800, 8000, 8100, 8192]  # bench.py order, 1664 <= M <= 8192
-WARMUP, ITERS = 5, 30
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bench import FLUSH, ITERS, WARMUP  # noqa: E402  (the timed run's counts, not re-declared)
 FORCED = [("cutlass", 0), ("cutlass", 1), ("cublaslt", 0), ("cutlass", 2)]
 EXPECT_PATH = {("cutlass", 0): "chunked", ("cutlass", 1): "chunked", ("cublaslt", 0): "unchunked",
                ("cutlass", 2): "fused"}
@@ -72,6 +73,8 @@ def main():
     tc = cfg.get("text_config", cfg)
     H, I = int(tc["hidden_size"]), int(tc["intermediate_size"])
     log(f"hidden={H} intermediate={I} TRTLLM_NVFP4_DENSE_TUNING={os.environ.get('TRTLLM_NVFP4_DENSE_TUNING')}")
+    print(f"[protocol] bench WARMUP={WARMUP} ITERS={ITERS} flush={FLUSH} | synced_test item8 calls/key/pass="
+          f"{WARMUP + ITERS} passes=A,B,A2 flush={FLUSH} order(A)={MS_REP}", flush=True)
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.autotuner import AutoTuner, autotune
     from tensorrt_llm._torch.custom_ops import torch_custom_ops as tco

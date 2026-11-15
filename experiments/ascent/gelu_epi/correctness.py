@@ -39,9 +39,11 @@ def _hb():
         log("heartbeat")
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bench import FLUSH, ITERS, WARMUP  # noqa: E402  (the timed run's counts, not re-declared)
+
 MS = [512, 1000, 1024, 1200, 2000, 4000, 4096, 4800, 8000, 8100, 8192]
 PASSES = [("A", MS), ("B", MS[::-1]), ("A2", MS)]
-WARMUP, ITERS = 5, 30
 TACTIC = ("cutlass", 2)
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
@@ -87,6 +89,8 @@ def main():
     hidden, inter = tc["hidden_size"], tc["intermediate_size"]
     N, K = 2 * inter, hidden
     log(f"config hidden={hidden} intermediate={inter} -> gate_up N={N} K={K}")
+    print(f"[protocol] bench WARMUP={WARMUP} ITERS={ITERS} flush={FLUSH} | correctness calls/key/pass="
+          f"{WARMUP + ITERS} passes={[p[0] for p in PASSES]} flush={FLUSH} order(A)={MS}", flush=True)
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import NVFP4GemmUnifiedRunner
     from tensorrt_llm._torch.kernels.fused_ops import nvfp4_gelu_gemm_sm120 as ge
