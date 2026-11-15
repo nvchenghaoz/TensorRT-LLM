@@ -93,9 +93,30 @@ def sp(logprobs=None):
     return SamplingParams(**kw)
 
 
+PACK = os.environ.get("BCG_PACK", "0") == "1"
+
+
 def run_batch(llm, prompts, params):
+    if PACK and len(prompts) > 1:
+        return run_batch_packed(llm, prompts, params)
     t0 = time.perf_counter()
     outs = llm.generate(prompts, sampling_params=params, use_tqdm=False)
+    return time.perf_counter() - t0, outs
+
+
+def run_batch_packed(llm, prompts, params):
+    """Enqueue all prompts before the in-process executor thread can fetch any of them
+    (GIL switch interval raised during submission), so every round of a c>1 case runs the
+    same step composition in both arms instead of racing arrival order (fi_plan_ab.py's
+    isl300@4 is bimodal for this reason)."""
+    old = sys.getswitchinterval()
+    t0 = time.perf_counter()
+    sys.setswitchinterval(0.5)
+    try:
+        futs = [llm.generate_async(p, sampling_params=params) for p in prompts]
+    finally:
+        sys.setswitchinterval(old)
+    outs = [f.result() for f in futs]
     return time.perf_counter() - t0, outs
 
 
