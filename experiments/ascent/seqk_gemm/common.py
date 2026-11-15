@@ -61,6 +61,23 @@ def build_ext(name="seqk_gemm_proto"):
     return ext
 
 
+def build_prod_ext(name="seqk_prod_ext"):
+    """Builds experiments/ascent/seqk_gemm/prod_ext.cu, which compiles the production kernel source
+    cpp/tensorrt_llm/kernels/sm120Bf16SeqKGemm/sm120Bf16SeqKGemm.cu (test-only binding)."""
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0a")
+    from torch.utils.cpp_extension import load
+    root = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+    bd = os.environ.get("SEQK_BUILD_DIR", "/tmp/seqk_build_" + name)
+    os.makedirs(bd, exist_ok=True)
+    ext = load(name, [os.path.join(HERE, "prod_ext.cu")], build_directory=bd,
+               extra_include_paths=[os.path.join(root, "cpp"), os.path.join(root, "cpp", "include")],
+               extra_cuda_cflags=["-O3", "-gencode=arch=compute_120a,code=sm_120a",
+                                  "--ptxas-options=-v", "-std=c++20"],
+               verbose=bool(os.environ.get("SEQK_VERBOSE")))
+    print("built", name, flush=True)
+    return ext
+
+
 def gpu_receipt():
     try:
         out = subprocess.run(

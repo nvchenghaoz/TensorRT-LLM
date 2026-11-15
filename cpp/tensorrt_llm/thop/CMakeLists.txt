@@ -82,6 +82,7 @@ add_th_common_family(
   th_common_gemm_quant
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
+  sm120Bf16SeqKGemmOp.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   marlinNvfp4MM.cpp
