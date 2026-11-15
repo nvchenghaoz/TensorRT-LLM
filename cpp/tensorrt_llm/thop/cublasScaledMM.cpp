@@ -22,6 +22,7 @@
 #include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
+#include <algorithm>
 #include <cublasLt.h>
 #include <torch/extension.h>
 #include <unordered_map>
@@ -68,6 +69,28 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
 {
     int32_t mp2 = std::max(nextPowerOfTwo(m), 8);
     AlgoListType const* algo_list = nullptr;
+    if (aType == CUDA_R_16BF && bType == CUDA_R_16BF && outType == CUDA_R_16BF && compType == CUBLAS_COMPUTE_32F
+        && tensorrt_llm::common::getSMVersion() == 120)
+    {
+        // SM120 BF16 shapes tuned per M range: the first entry with m <= m_max applies. An entry whose algo id is
+        // negative, or an m above the last entry, keeps the cuBLASLt heuristic. Other shapes fall through below.
+        if (auto range_iter = cublas_lut::sm120_bf16_range_algo_list.find({k, n});
+            range_iter != cublas_lut::sm120_bf16_range_algo_list.end())
+        {
+            auto const& ranges = range_iter->second;
+            auto entry = std::lower_bound(ranges.begin(), ranges.end(), m,
+                [](cublas_lut::RangeAlgoEntry const& e, int32_t value) { return e.first < value; });
+            if (entry == ranges.end() || entry->second[0] < 0)
+            {
+                return false;
+            }
+            check_cuda_error(cublasLtMatmulAlgoInit(cublasWrapper->getCublasLtHandle(), compType, scaleType, aType,
+                bType, outType, outType, entry->second[0], &algo));
+            set_algo_attr(algo, entry->second);
+            TLLM_LOG_DEBUG("Found SM120 range cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
+            return true;
+        }
+    }
     if ((aType == CUDA_R_16BF || aType == CUDA_R_16F) && (outType == aType || outType == CUDA_R_32F)
         && compType == CUBLAS_COMPUTE_32F)
     {

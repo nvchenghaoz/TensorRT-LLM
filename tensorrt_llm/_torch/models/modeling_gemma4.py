@@ -14,6 +14,7 @@
 # limitations under the License.
 """TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
 
+import bisect
 import copy
 import dataclasses
 import math
@@ -31,7 +32,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import SimpleActivation
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -100,6 +101,62 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import Gemma4TextConfig  # noqa: E402
+
+
+class _CublasMmTokenGate:
+    """Token counts (rows of the 2D input) a projection sends to trtllm::cublas_mm: the union of sorted,
+    disjoint inclusive ranges. Other token counts keep F.linear."""
+
+    __slots__ = ("_starts", "_ends")
+
+    def __init__(self, ranges):
+        ranges = sorted(ranges)
+        self._starts = tuple(lo for lo, _ in ranges)
+        self._ends = tuple(hi for _, hi in ranges)
+
+    def __contains__(self, num_tokens: int) -> bool:
+        i = bisect.bisect_right(self._starts, num_tokens) - 1
+        return i >= 0 and num_tokens <= self._ends[i]
+
+
+# SM120 routes for the Gemma-4-31B BF16 attention projections, keyed (in_features, out_features), i.e. the
+# {k, n} keys of sm120_bf16_range_algo_list in cpp/tensorrt_llm/thop/cublasScaledMMLut.h: sliding qkv, global
+# qkv (with and without the duplicated k_eq_v V block), sliding and global o_proj. Each value lists the
+# inclusive token-count ranges where that table pins a measured cuBLASLt algo; generated together with the
+# table by experiments/ascent/sm120_bf16_lut/sweep3.py.
+_SM120_BF16_CUBLAS_MM_ROUTES = {
+    # sliding qkv
+    (5376, 16384): (
+        (300, 300), (900, 900), (1000, 1000), (1200, 1200), (1345, 1600), (1729, 1920), (1985, 2000),
+        (2241, 2400), (2433, 2496), (2625, 2700), (2753, 2880), (3000, 3072), (3201, 3264), (3393, 3456),
+        (3777, 3840), (4161, 4224), (4481, 4608), (4929, 4992), (5313, 5376), (5697, 5760), (6081, 6144),
+        (6300, 6528), (6721, 6900), (6913, 7000), (7041, 7808), (7873, 8000), (8065, 8192),
+    ),
+    # global qkv, V duplicated from K
+    (5376, 20480): (
+        (900, 900), (1000, 1000), (1200, 1200), (1280, 1536), (1800, 1920), (2100, 2304), (2369, 2496),
+        (2625, 2688), (3000, 3136), (3265, 3328), (3600, 3648), (3900, 4032), (4161, 4224), (4501, 4608),
+        (4801, 4992), (5000, 5376), (5401, 5568), (5697, 5952), (6145, 6208), (6273, 6400), (6465, 6528),
+        (6593, 6720), (6849, 6912), (7001, 7168), (7201, 7424), (7489, 7808), (7873, 8064), (8101, 8192),
+    ),
+    # global qkv, k_eq_v V-dedup ([q | k])
+    (5376, 18432): (
+        (600, 600), (900, 900), (1200, 1200), (1280, 1408), (1473, 1600), (1793, 1856), (1985, 2112),
+        (2369, 2496), (2625, 2700), (3000, 3072), (3600, 3712), (4000, 4032), (4289, 4416), (4673, 4800),
+        (5001, 5184), (5313, 5568), (5697, 5952), (6081, 6400), (6465, 6912), (6977, 7104), (7201, 7296),
+        (7361, 7500), (7617, 7680), (7745, 7936), (8001, 8192),
+    ),
+    # sliding o_proj
+    (8192, 5376): (
+        (900, 900), (1793, 1856), (2100, 2496), (2625, 3968), (4001, 4032), (4225, 4992), (5001, 5056),
+        (5121, 5184), (5313, 5376), (5441, 5568), (5697, 6336), (6849, 7500), (7553, 7680), (8000, 8192),
+    ),
+    # global o_proj
+    (16384, 5376): (
+        (900, 900), (1000, 1000), (1280, 1280), (1793, 1856), (2100, 2496), (2625, 3840), (3900, 3904),
+        (4200, 5120), (5441, 5568), (5697, 6400), (6657, 6784), (6849, 7680), (8000, 8192),
+    ),
+}
 
 
 def _get_gemma4_per_layer_config(
@@ -546,6 +603,17 @@ class Gemma4Attention(QKNormRoPEAttention):
                 use_cute_dsl_blockscaling_mm=qkv_proj.use_cute_dsl_blockscaling_mm,
             )
             del qkv_proj
+
+        # SM120: trtllm::cublas_mm pins measured cuBLASLt algos per M range for these BF16 projection
+        # shapes (sm120_bf16_range_algo_list in cpp/tensorrt_llm/thop/cublasScaledMMLut.h), each bitwise
+        # equal to F.linear's output. Route only the shapes and token counts that table pins; everything
+        # else stays on F.linear. Runs after the Q-only / [q | k] replacements above.
+        if get_sm_version() == 120:
+            for proj in (self.qkv_proj, self.o_proj):
+                route = _SM120_BF16_CUBLAS_MM_ROUTES.get((proj.in_features, proj.out_features))
+                if route is not None:
+                    proj.use_custom_cublas_mm = True
+                    proj.custom_cublas_mm_tokens = _CublasMmTokenGate(route)
 
         # v_norm: always present in Gemma4 (no learnable scale).
         # For K=V layers, weight mapper duplicates k_proj→v_proj, so v equals
