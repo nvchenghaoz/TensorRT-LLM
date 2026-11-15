@@ -357,12 +357,13 @@ def mode_check(ckpt):
     guards["trtllm_gen_backend"] = untouched_false(c, c.metadata(), pp,
                                                    me_=types.SimpleNamespace(flashinfer_backend="trtllm-gen"))
     guards["sliding_window"] = untouched_false(c, c.metadata(), c.plan_params(window_left=1023))
-    # split main plan
-    c.plan_main(fixed_split_size=1024 // PAGE)
-    split_info = (int(c.main_wrapper._plan_info[3]), int(c.main_wrapper._plan_info[14]))
+    # split main plan (1x1000, forced 256-token KV chunks; the workspace holds it)
+    c1 = get_case("isl1k@1", 1, 1000)
+    c1.plan_main(fixed_split_size=256 // PAGE)
+    split_info = (int(c1.main_wrapper._plan_info[3]), int(c1.main_wrapper._plan_info[14]))
     log("forced-split main plan (cta_tile_q, split_kv):", split_info)
-    guards["split_main_plan"] = split_info[1] == 1 and untouched_false(c, c.metadata(), pp)
-    c.plan_main()
+    guards["split_main_plan"] = split_info[1] == 1 and untouched_false(c1, c1.metadata(), c1.plan_params())
+    c1.plan_main()
     # main plan with cta_tile_q 16: short requests (packed len <= 32)
     cs = Case(fi_mod, heads, kv_heads, head_dim, 3, 4, seed=5, workspace=ws)
     cs_info = (int(cs.main_wrapper._plan_info[3]), int(cs.main_wrapper._plan_info[14]))
