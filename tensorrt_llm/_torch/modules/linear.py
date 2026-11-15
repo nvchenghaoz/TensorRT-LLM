@@ -57,6 +57,7 @@ from ..locality_domain_utils import _copy_to_new_cuda_allocation
 from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
                      get_model_extra_attrs, is_torch_compiling,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .gemma4 import down_wave_split as _gemma4_dws
 from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                          low_m_gemm_dispatcher, lowm_fp8_supported)
 from .multi_stream_utils import no_eager_forks
@@ -2058,17 +2059,34 @@ class NVFP4LinearMethod(LinearMethodBase):
         fuse_bias_in_gemm = (bias is not None and not use_marlin
                              and output_buffer_kind == int(BufferKind.DEFAULT)
                              and module.weight.shape[0] == module.out_features)
-        output = torch.ops.trtllm.nvfp4_gemm(
-            act_fp4,
-            module.weight,
-            act_sf,
-            module.weight_scale,
-            alpha,
-            module.dtype,
-            output_buffer_kind=output_buffer_kind,
-            allowed_backends=allowed_backends_str,
-            group=group,
-            bias=bias if fuse_bias_in_gemm else None)
+        if (getattr(module, "_gemma4_down_wave_split", False)
+                and bias is None and not use_marlin
+                and output_buffer_kind == int(BufferKind.DEFAULT)
+                and module.weight.shape[0] == module.out_features
+                and getattr(module, "lora", None) is None
+                and not is_torch_compiling() and _gemma4_dws.prepare()
+                and not AutoTuner.get().is_tuning_mode
+                and _gemma4_dws.applies(act_fp4, module.weight, act_sf,
+                                        alpha, module.dtype)):
+            # Gemma4 down_proj at prefill M 4096-8192: wave-aligned M split
+            # over FlashInfer SM120 DP tactics, bitwise equal to the
+            # nvfp4_gemm below (TRTLLM_GEMMA4_DOWN_WAVE_SPLIT=0 disables).
+            output = _gemma4_dws.down_wave_split_gemm(act_fp4, module.weight,
+                                                      act_sf,
+                                                      module.weight_scale,
+                                                      alpha)
+        else:
+            output = torch.ops.trtllm.nvfp4_gemm(
+                act_fp4,
+                module.weight,
+                act_sf,
+                module.weight_scale,
+                alpha,
+                module.dtype,
+                output_buffer_kind=output_buffer_kind,
+                allowed_backends=allowed_backends_str,
+                group=group,
+                bias=bias if fuse_bias_in_gemm else None)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()

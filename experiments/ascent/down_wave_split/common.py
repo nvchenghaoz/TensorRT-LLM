@@ -39,7 +39,10 @@ def receipts(tag=""):
     try:
         import pynvml
         pynvml.nvmlInit()
-        h = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+        uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
+        if not uuid.startswith("GPU-"):
+            uuid = "GPU-" + uuid
+        h = pynvml.nvmlDeviceGetHandleByUUID(uuid)
         out = dict(
             sm_clock=pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM),
             mem_clock=pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_MEM),
