@@ -565,12 +565,17 @@ class Gemma4Attention(QKNormRoPEAttention):
         # unfused path below stays as the reference / fallback.
         self._fused_qkv_prep: Optional[bool] = None
         self._fused_qkv_prep_out_fp8 = False
+        self._fused_qkv_prep_kv_out_fp8 = False
         self._fused_prep_blocked = False
 
     def _fused_qkv_prep_enabled(self) -> bool:
         if self._fused_qkv_prep is None:
             rot = self.rotary_emb
-            use_flashinfer_fp8 = getattr(self.attn, "flashinfer_backend", None) == "trtllm-gen"
+            flashinfer_backend = getattr(self.attn, "flashinfer_backend", None)
+            use_flashinfer_fp8 = flashinfer_backend == "trtllm-gen"
+            # FlashInfer FA2 (SM120 and other non-SM100 GPUs) runs BF16 Q
+            # against the FP8 paged KV cache: emit BF16 Q and FP8 K/V.
+            use_flashinfer_fa2_fp8_kv = flashinfer_backend == "fa2"
             use_trtllm_bf16 = self._use_trtllm_fused_qkv_prep
             self._fused_qkv_prep = (
                 not self.is_kv_shared
@@ -578,9 +583,10 @@ class Gemma4Attention(QKNormRoPEAttention):
                 and not self._qk_only_proj
                 and not self.fuse_qk_norm_rope
                 and not self.skip_rope
-                # FlashInfer trtllm-gen consumes separate FP8 tensors. Native
-                # TRTLLM instead consumes the kernel's packed BF16 output.
-                and (use_flashinfer_fp8 or use_trtllm_bf16)
+                # FlashInfer trtllm-gen consumes separate FP8 tensors, FA2
+                # BF16 Q with FP8 K/V. Native TRTLLM instead consumes the
+                # kernel's packed BF16 output.
+                and (use_flashinfer_fp8 or use_flashinfer_fa2_fp8_kv or use_trtllm_bf16)
                 and getattr(self.attn, "has_fp8_kv_cache", False)
                 and rot is not None
                 and getattr(rot, "is_neox", False)
@@ -600,6 +606,7 @@ class Gemma4Attention(QKNormRoPEAttention):
                 and self.q_norm.variance_epsilon == self.v_norm.variance_epsilon
             )
             self._fused_qkv_prep_out_fp8 = use_flashinfer_fp8
+            self._fused_qkv_prep_kv_out_fp8 = use_flashinfer_fp8 or use_flashinfer_fa2_fp8_kv
         return self._fused_qkv_prep
 
     def apply_rope(
@@ -652,6 +659,7 @@ class Gemma4Attention(QKNormRoPEAttention):
                     self.head_dim,
                     out_fp8=self._fused_qkv_prep_out_fp8,
                     packed_output=self._use_trtllm_fused_qkv_prep,
+                    kv_out_fp8=self._fused_qkv_prep_kv_out_fp8,
                 )
 
             if self._qk_only_proj and k is None and v is None:

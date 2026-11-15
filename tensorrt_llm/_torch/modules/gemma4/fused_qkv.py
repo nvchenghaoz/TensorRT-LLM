@@ -74,7 +74,8 @@ def _gemma4_qkv_norm_rope_quant_kernel(
     N,  # num tokens (rows)
     HD: tl.constexpr,  # head dim
     HALF: tl.constexpr,  # HD // 2 (power of two)
-    OUT_FP8: tl.constexpr,
+    Q_OUT_FP8: tl.constexpr,
+    KV_OUT_FP8: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tokens per program (power of two)
 ):
     h = tl.program_id(0)
@@ -104,15 +105,21 @@ def _gemma4_qkv_norm_rope_quant_kernel(
         o1 = (y1 * cos - y2 * sin).to(tl.bfloat16)
         o2 = (y2 * cos + y1 * sin).to(tl.bfloat16)
         if h < NQ:
-            out = q_out_ptr + rows[:, None] * Q_OUT_SW + h * HD + offs[None, :]
+            q_out = q_out_ptr + rows[:, None] * Q_OUT_SW + h * HD + offs[None, :]
+            if Q_OUT_FP8:
+                tl.store(q_out, o1.to(tl.float8e4nv), mask=rmask[:, None])
+                tl.store(q_out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
+            else:
+                tl.store(q_out, o1, mask=rmask[:, None])
+                tl.store(q_out + HALF, o2, mask=rmask[:, None])
         else:
-            out = k_out_ptr + rows[:, None] * K_OUT_SW + (h - NQ) * HD + offs[None, :]
-        if OUT_FP8:
-            tl.store(out, o1.to(tl.float8e4nv), mask=rmask[:, None])
-            tl.store(out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
-        else:
-            tl.store(out, o1, mask=rmask[:, None])
-            tl.store(out + HALF, o2, mask=rmask[:, None])
+            k_out = k_out_ptr + rows[:, None] * K_OUT_SW + (h - NQ) * HD + offs[None, :]
+            if KV_OUT_FP8:
+                tl.store(k_out, o1.to(tl.float8e4nv), mask=rmask[:, None])
+                tl.store(k_out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
+            else:
+                tl.store(k_out, o1, mask=rmask[:, None])
+                tl.store(k_out + HALF, o2, mask=rmask[:, None])
     else:
         # V head: weightless norm, no rope (v_norm is applied to the raw v
         # slice; reads happen before any write, matching HF's
@@ -120,7 +127,7 @@ def _gemma4_qkv_norm_rope_quant_kernel(
         o1 = (x1 * rms[:, None]).to(tl.bfloat16)
         o2 = (x2 * rms[:, None]).to(tl.bfloat16)
         out = v_out_ptr + rows[:, None] * V_OUT_SW + (h - NQ - NK) * HD + offs[None, :]
-        if OUT_FP8:
+        if KV_OUT_FP8:
             tl.store(out, o1.to(tl.float8e4nv), mask=rmask[:, None])
             tl.store(out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
         else:
@@ -140,6 +147,7 @@ def gemma4_fused_qkv_norm_rope_quant(
     head_dim: int,
     out_fp8: bool,
     packed_output: bool = False,
+    kv_out_fp8: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Run the fused per-head norm + rope + quant over a packed QKV tensor.
 
@@ -156,6 +164,9 @@ def gemma4_fused_qkv_norm_rope_quant(
         packed_output: emit one contiguous BF16 packed-QKV tensor instead of
             separate Q/K/V tensors. Packed FP8 is not supported because the
             native TRTLLM preprocessing contract consumes BF16 packed QKV.
+        kv_out_fp8: K/V output dtype override. None (default) follows
+            ``out_fp8``; ``out_fp8=False, kv_out_fp8=True`` emits BF16 Q with
+            FP8 K/V (FlashInfer FA2 with an FP8 paged KV cache).
 
     Returns:
         Separate mode returns contiguous ``(q, k, v)`` tensors in the
@@ -163,7 +174,9 @@ def gemma4_fused_qkv_norm_rope_quant(
         with contiguous BF16 QKV. In both modes q/k are roped and v is
         norm-only.
     """
-    if packed_output and out_fp8:
+    if kv_out_fp8 is None:
+        kv_out_fp8 = out_fp8
+    if packed_output and (out_fp8 or kv_out_fp8):
         raise ValueError("packed_output requires BF16 output")
 
     assert qkv.dim() == 2 and qkv.stride(-1) == 1
@@ -177,6 +190,7 @@ def gemma4_fused_qkv_norm_rope_quant(
 
     n = qkv.shape[0]
     out_dtype = torch.float8_e4m3fn if out_fp8 else torch.bfloat16
+    kv_out_dtype = torch.float8_e4m3fn if kv_out_fp8 else torch.bfloat16
     packed_qkv = None
     if packed_output:
         packed_qkv = torch.empty(
@@ -190,8 +204,8 @@ def gemma4_fused_qkv_norm_rope_quant(
         )
     else:
         q_out = torch.empty((n, q_size), dtype=out_dtype, device=qkv.device)
-        k_out = torch.empty((n, kv_size), dtype=out_dtype, device=qkv.device)
-        v_out = torch.empty((n, kv_size), dtype=out_dtype, device=qkv.device)
+        k_out = torch.empty((n, kv_size), dtype=kv_out_dtype, device=qkv.device)
+        v_out = torch.empty((n, kv_size), dtype=kv_out_dtype, device=qkv.device)
     if n == 0:
         if packed_output:
             assert packed_qkv is not None
@@ -223,7 +237,8 @@ def gemma4_fused_qkv_norm_rope_quant(
         n,
         HD=head_dim,
         HALF=half,
-        OUT_FP8=out_fp8,
+        Q_OUT_FP8=out_fp8,
+        KV_OUT_FP8=kv_out_fp8,
         BLOCK_N=block_n,
         num_warps=8,
     )
