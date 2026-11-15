@@ -63,11 +63,16 @@ def main():
     k = run("kernel_test", [ck]) if want("kernel_test") else skip
     c = run("correctness", [ck]) if want("correctness") else skip
     b = run("bcg_check", [ck]) if want("bcg_check") else skip
+    sm = run("small_m_gate", [ck]) if want("small_m_gate") else skip
     out = {
         "passed": bool(s.get("passed") and s0.get("passed") and k.get("passed") and c.get("passed")
-                       and b.get("passed") and s["_rc"] == 0 and s0["_rc"] == 0 and k["_rc"] == 0
-                       and c["_rc"] == 0 and b["_rc"] == 0),
-        "ran": only or ["synced_test", "kernel_test", "correctness", "bcg_check"],
+                       and b.get("passed") and sm.get("passed") and s["_rc"] == 0 and s0["_rc"] == 0
+                       and k["_rc"] == 0 and c["_rc"] == 0 and b["_rc"] == 0 and sm["_rc"] == 0),
+        "ran": only or ["synced_test", "kernel_test", "correctness", "bcg_check", "small_m_gate"],
+        "small_m_gate": {key: sm.get(key) for key in ("passed", "summary", "repeat", "repeat_paths",
+                                                       "inputs_unchanged")},
+        "small_m_gate_smi": {a: (sm.get("arms") or {}).get(a, {}).get("smi_at_start")
+                             for a in ("main", "cand", "main2")},
         "synced_test_dense0": {key: s0.get(key) for key in ("passed", "dense_tuning", "picks", "dense_picks",
                                                             "item6_forced", "item7_kill_switch",
                                                             "inputs_unchanged", "tuner_cache_unchanged",
