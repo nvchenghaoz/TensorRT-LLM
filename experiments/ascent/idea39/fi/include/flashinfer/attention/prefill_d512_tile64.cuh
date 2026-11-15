@@ -72,6 +72,10 @@ constexpr uint32_t kMDOff = kPOff + kPBytes;
 constexpr uint32_t kSmemBytes = kMDOff + kMDBytes;  // 100352
 static_assert(kSmemBytes <= 101376, "d512 tile64 smem must fit the 99 KB opt-in limit");
 
+#ifndef D512T64_D_UPDATE
+#define D512T64_D_UPDATE 1
+#endif
+
 __device__ __forceinline__ void ldsm_x4(uint32_t addr, uint32_t* r) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
@@ -537,7 +541,6 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
               const float m_new_scaled =
                   max(m_new * sm_scale, -cuda::std::numeric_limits<float>::max());
               o_scale[mq][j] = math::ptx_exp2(m_prev * sm_scale - m_new_scaled);
-              d[mq][j] *= o_scale[mq][j];
               m[mq][j] = m_new;
             }
           }
@@ -592,7 +595,12 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
               for (uint32_t w2 = 0; w2 < 4; ++w2) {
                 dt += md_sum[w2 * 32 + mq * 16 + j * 8 + g];
               }
-              d[mq][j] += dt;
+              // d = d * o_scale + dt, rounded as the 32-row kernel's compiled code does.
+#if D512T64_D_UPDATE == 1
+              d[mq][j] = __fmaf_rn(d[mq][j], o_scale[mq][j], dt);
+#else
+              d[mq][j] = __fadd_rn(__fmul_rn(d[mq][j], o_scale[mq][j]), dt);
+#endif
             }
           }
         }

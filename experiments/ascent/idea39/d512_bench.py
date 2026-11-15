@@ -287,15 +287,25 @@ def driver(a):
     if a.lse:
         common.append("--lse")
     finals = {}
-    for arm in (["tree", "overlay"] if not a.only_overlay else ["overlay"]):
+    # --variants "name:-DFLAG=1 -DOTHER=2;name2:..." : one overlay arm per variant
+    variants = []
+    for spec in [v for v in a.variants.split(";") if v.strip()]:
+        name, _, flags = spec.partition(":")
+        variants.append((name.strip(), flags.strip()))
+    if not variants:
+        variants = [("overlay", "")]
+    arms = ([] if a.only_overlay else [("tree", "tree", "")]) + \
+        [(name, "overlay", flags) for name, flags in variants]
+    for arm_name, arm, flags in arms:
         env = dict(os.environ)
         if arm == "overlay":
             env["FLASHINFER_WORKSPACE_BASE"] = tempfile.mkdtemp(prefix="idea39_ws_")
             # VERBOSE=1 alone also turns on --device-debug -O0 (jit/core.py); DEBUG=0 keeps -O3
             env["FLASHINFER_JIT_VERBOSE"] = "1"
             env["FLASHINFER_JIT_DEBUG"] = "0"
-            env["FLASHINFER_EXTRA_CUDAFLAGS"] = "-Xptxas=-v"
+            env["FLASHINFER_EXTRA_CUDAFLAGS"] = ("-Xptxas=-v " + flags).strip()
         cmd = [sys.executable, __file__, "--arm", arm] + common
+        arm = arm_name
         log("DRIVER run", arm, "ws", env.get("FLASHINFER_WORKSPACE_BASE", "<default>"))
         t0 = time.time()
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -327,11 +337,14 @@ def driver(a):
         if last is not None:
             finals[arm] = json.loads(last)
     table = []
-    if "tree" in finals and "overlay" in finals:
-        base = {r["case"]: r for r in finals["tree"]["results"]}
-        for r in finals["overlay"]["results"]:
+    base = {r["case"]: r for r in finals["tree"]["results"]} if "tree" in finals else {}
+    for vname, _ in variants:
+        if vname not in finals:
+            continue
+        for r in finals[vname]["results"]:
             b = base.get(r["case"], {})
-            row = dict(case=r["case"], base_tile=b.get("cta_tile_q"), cand_tile=r["cta_tile_q"],
+            row = dict(variant=vname, case=r["case"], base_tile=b.get("cta_tile_q"),
+                       cand_tile=r["cta_tile_q"],
                        base_split=b.get("split_kv"), cand_split=r["split_kv"],
                        base_ms=b.get("median_ms"), base_p10=b.get("p10_ms"),
                        base_p90=b.get("p90_ms"), cand_ms=r.get("median_ms"),
@@ -362,6 +375,7 @@ def main():
     ap.add_argument("--arm", default="tree", choices=["tree", "overlay"])
     ap.add_argument("--driver", action="store_true")
     ap.add_argument("--only-overlay", action="store_true")
+    ap.add_argument("--variants", default="")
     ap.add_argument("--cases", default=CASES)
     ap.add_argument("--extra", default="")
     ap.add_argument("--warmup", type=int, default=5)
