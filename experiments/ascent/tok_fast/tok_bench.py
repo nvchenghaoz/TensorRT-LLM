@@ -32,9 +32,6 @@ def _hb():
         log("heartbeat")
 
 
-threading.Thread(target=_hb, daemon=True).start()
-
-ckpt, mode = sys.argv[1], sys.argv[2]
 ISLS = [300, 1000, 2000, 4000, 8000]
 N_PER_ISL = int(os.environ.get("N_PER_ISL", "40"))
 
@@ -308,9 +305,12 @@ def sweep():
     print(json.dumps({"passed": True, "sweep_median_ms": out}))
 
 
-if mode == "check":
-    check()
-elif mode == "sweep":
-    sweep()
-else:
-    timing()
+if __name__ == "__main__":
+    threading.Thread(target=_hb, daemon=True).start()
+    ckpt, mode = sys.argv[1], sys.argv[2]
+    if mode == "check":
+        check()
+    elif mode == "sweep":
+        sweep()
+    else:
+        timing()
