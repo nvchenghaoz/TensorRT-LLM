@@ -12,6 +12,7 @@ time:  cold-weight chain timing (flush before every chain) per arm:
        order {fwd, rev} x L2 window {none, persist}. Reports chain, gemm sum,
        act sum, act t_in (in chain), act t_cold (after flush) and H.
 """
+import inspect
 import json
 import os
 import sys
@@ -129,7 +130,7 @@ def act_into(x, gs, out, sf, cfgname, rev):
     """Act on x [m, 2I] writing into out [m, I/2] and sf (pad128(m) rows)."""
     bm, bk, nw = ACT_CFGS[cfgname]
     m = x.shape[0]
-    if not rev and "m_pad" in gm._gelu_tanh_mul_fp4_kernel.arg_names:
+    if not rev and "out" in inspect.signature(gm.gelu_tanh_mul_fp4_quant).parameters:
         # post-landing-7 tree: the production wrapper (its own SM120 config)
         gm.gelu_tanh_mul_fp4_quant(x, gs, out=out, sf_out=sf)
     elif cfgname == "main" and not rev:
