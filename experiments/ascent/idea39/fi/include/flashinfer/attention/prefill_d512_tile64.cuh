@@ -72,13 +72,6 @@ constexpr uint32_t kMDOff = kPOff + kPBytes;
 constexpr uint32_t kSmemBytes = kMDOff + kMDBytes;  // 100352
 static_assert(kSmemBytes <= 101376, "d512 tile64 smem must fit the 99 KB opt-in limit");
 
-#ifndef D512T64_D_UPDATE
-#define D512T64_D_UPDATE 1
-#endif
-#ifndef D512T64_K_LDS128
-#define D512T64_K_LDS128 0
-#endif
-
 __device__ __forceinline__ void ldsm_x4(uint32_t addr, uint32_t* r) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
@@ -89,12 +82,6 @@ __device__ __forceinline__ void ldsm_x4_trans(uint32_t addr, uint32_t* r) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                : "r"(addr));
-}
-
-__device__ __forceinline__ uint32_t lds_u32(uint32_t addr) {
-  uint32_t v;
-  asm volatile("ld.shared.u32 %0, [%1];\n" : "=r"(v) : "r"(addr));
-  return v;
 }
 
 __device__ __forceinline__ uint4 lds_u128(uint32_t addr) {
@@ -377,9 +364,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
   const uint32_t p_lane[2] = {
       p_s + ((lane >> 4) * kTileQ + 32 * gq + 0 + frag_row) * 16,
       p_s + ((lane >> 4) * kTileQ + 32 * gq + 16 + frag_row) * 16};
-  // K B-fragment words: key 16 w + 8 nt + g, bytes 2t, 2t+1 (word t/2) and 2t+8, 2t+9.
-  const uint32_t k_lane = ((16 * w + g) * 16) + 4 * (t >> 1);
-  [[maybe_unused]] const uint32_t k_lane128 = (16 * w + g) * 16;
+  // K B fragment: key 16 w + 8 nt + g.
+  const uint32_t k_lane = (16 * w + g) * 16;
   const uint32_t k_sel = (t & 1u) ? 0x7632u : 0x5410u;
   // V ldmatrix.trans: keys frag_row, piece 8 w + (lane >> 4) (+ 2 pp).
   const uint32_t v_lane = ((8 * w + (lane >> 4)) * 16 + frag_row) * 16;
@@ -458,17 +444,12 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
           uint32_t b[2][2];
 #pragma unroll
           for (uint32_t nt = 0; nt < 2; ++nt) {
-#if D512T64_K_LDS128
-            // One 16-byte load of the key's piece; lanes keep words t/2 and t/2 + 2.
-            const uint4 kw = lds_u128(sb + k_lane128 + (sl * kTileKV + 8 * nt) * 16);
+            // One 16-byte load of the key's d-step; lane t keeps bytes 2t, 2t+1 (word t/2)
+            // and 2t+8, 2t+9 (word t/2 + 2): the B fragment's k positions.
+            const uint4 kw = lds_u128(sb + k_lane + (sl * kTileKV + 8 * nt) * 16);
             const uint32_t lo = (t & 2u) ? kw.y : kw.x;
             const uint32_t hi = (t & 2u) ? kw.w : kw.z;
-            const uint32_t x = __byte_perm(lo, hi, k_sel);
-#else
-            const uint32_t addr = sb + k_lane + (sl * kTileKV + 8 * nt) * 16;
-            const uint32_t x = __byte_perm(lds_u32(addr), lds_u32(addr + 8), k_sel);
-#endif
-            fp8x4_to_16b<DTypeQ, DTypeKV>(x, b[nt]);
+            fp8x4_to_16b<DTypeQ, DTypeKV>(__byte_perm(lo, hi, k_sel), b[nt]);
           }
           if (mma_d == 0) {
 #pragma unroll
@@ -615,12 +596,9 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
               for (uint32_t w2 = 0; w2 < 4; ++w2) {
                 dt += md_sum[w2 * 32 + mq * 16 + j * 8 + g];
               }
-              // d = d * o_scale + dt, rounded as the 32-row kernel's compiled code does.
-#if D512T64_D_UPDATE == 1
+              // d = d * o_scale + dt in one rounding: the 32-row kernel's compiled code fuses
+              // its `d *= o_scale` and `d += dt` into one FFMA (two roundings mismatch).
               d[mq][j] = __fmaf_rn(d[mq][j], o_scale[mq][j], dt);
-#else
-              d[mq][j] = __fadd_rn(__fmul_rn(d[mq][j], o_scale[mq][j]), dt);
-#endif
             }
           }
         }
