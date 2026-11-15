@@ -36,11 +36,51 @@ ISLS = [300, 1000, 2000, 4000, 8000]
 N_PER_ISL = int(os.environ.get("N_PER_ISL", "40"))
 
 
+SHARED = Path("/home/scratch.chengzhang/trtllm-dev-gemma4-31b-pf-20261114-163048/shared/"
+              "host_runtime_benchfiles/a929b157")
+_BENCH_FILES = ("common.py", "corpus.txt")
+
+
+def _publish_shared(src_dir):
+    """Copy the frozen common.py + corpus.txt to SHARED (tmp dir, manifest last, rename)."""
+    import hashlib
+    import shutil
+    if (SHARED / "manifest.json").exists():
+        return
+    tmp = SHARED.parent / f".tmp-{os.environ.get('AUTO_DEV_JOB_ID', os.getpid())}"
+    try:
+        tmp.mkdir(parents=True, exist_ok=True)
+        man = {"source": str(src_dir), "job": os.environ.get("AUTO_DEV_JOB_ID"), "files": {}}
+        for f in _BENCH_FILES:
+            shutil.copyfile(src_dir / f, tmp / f)
+            man["files"][f] = hashlib.sha256((tmp / f).read_bytes()).hexdigest()
+        (tmp / "manifest.json").write_text(json.dumps(man))
+        os.rename(tmp, SHARED)
+        log("published frozen benchmark files to", SHARED, man["files"])
+    except OSError as e:
+        log("publish to shared dir skipped:", repr(e))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _shared_ok():
+    import hashlib
+    try:
+        man = json.loads((SHARED / "manifest.json").read_text())
+        return all(hashlib.sha256((SHARED / f).read_bytes()).hexdigest() == man["files"][f] for f in _BENCH_FILES)
+    except (OSError, ValueError, KeyError):
+        return False
+
+
 def load_common():
     import glob
     import hashlib
-    cands = [Path("experiments/ascent-benchmark/common.py"),
-             Path(__file__).resolve().parents[2] / "ascent-benchmark" / "common.py"]
+    local = Path(__file__).resolve().parents[2] / "ascent-benchmark"
+    if (local / "common.py").exists() and (local / "corpus.txt").exists():
+        _publish_shared(local)
+    cands = [Path("experiments/ascent-benchmark/common.py"), local / "common.py"]
+    # The base tree of a pair does not carry the frozen benchmark: read the verified shared copy.
+    if _shared_ok():
+        cands.append(SHARED / "common.py")
     # The base tree of a pair does not carry the frozen benchmark; any copy on the node is the
     # same frozen file (sha256 logged so both arms can be compared).
     root = "/home/scratch.chengzhang/trtllm-dev-gemma4-31b-pf-20261114-163048/runner/slots"
@@ -332,7 +372,10 @@ def sweep():
 if __name__ == "__main__":
     threading.Thread(target=_hb, daemon=True).start()
     ckpt, mode = sys.argv[1], sys.argv[2]
-    if mode == "check":
+    if mode == "publish":
+        load_common()
+        print(json.dumps({"passed": _shared_ok(), "shared": str(SHARED)}))
+    elif mode == "check":
         print(json.dumps(check()))
     elif mode == "sweep":
         sweep()
