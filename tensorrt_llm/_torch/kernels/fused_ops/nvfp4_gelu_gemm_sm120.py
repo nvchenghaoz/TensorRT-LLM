@@ -301,6 +301,7 @@ def gelu_tanh_mul_fp4_quant_permuted(
 EPI_TACTIC = ("cutlass", 2)
 _GEMM_OP = "trtllm::nvfp4_gemm::gemm"
 _GEMM_DENSE_OP = "trtllm::nvfp4_gemm::gemm_dense"
+_GEMM_DENSE_DP_OP = "trtllm::nvfp4_gemm::gemm_dense_dp"
 _epi_decisions: Dict[Tuple, bool] = {}
 _epi_cache_len = -1
 # Calls per path, for A/B and test accounting.
@@ -345,11 +346,12 @@ def main_gate_up_tactic(act_fp4, act_sf, weight, weight_scale, alpha, output_dty
     inference mode, or None when it would run the cache-miss fallback.
 
     Mirrors main's order: the M-chunked chain (chunk_rows given and the standard full-M pick is
-    a CUTLASS tactic) runs the standard pick per chunk; otherwise trtllm::nvfp4_gemm runs the
-    dense-bucket pick (TRTLLM_NVFP4_DENSE_TUNING, M in the shape's dense range, dense cache hit)
-    or else the standard pick.
+    a CUTLASS tactic) runs the standard pick per chunk; otherwise trtllm::nvfp4_gemm runs, in
+    its own order, the CUTLASS-only dense-dp pick (gemm_dense_dp, M in the shape's dp band,
+    'cutlass' allowed, cache hit), then the dense-bucket pick (TRTLLM_NVFP4_DENSE_TUNING, M in
+    the shape's dense range, dense cache hit), else the standard pick.
     """
-    from ...custom_ops.torch_custom_ops import _nvfp4_dense_range, _nvfp4_dense_tuning_config
+    from ...custom_ops import torch_custom_ops as tco
 
     tuner = AutoTuner.get()
     backends = list(allowed_backends)
@@ -359,6 +361,16 @@ def main_gate_up_tactic(act_fp4, act_sf, weight, weight_scale, alpha, output_dty
     if (chunk_rows is not None and hit and isinstance(std, tuple) and len(std) == 2
             and std[0] == "cutlass" and _main_chunk_runs(act_fp4, act_sf, chunk_rows)):
         return std
+    dp_range_fn = getattr(tco, "_nvfp4_dense_dp_range", None)
+    dp_range = dp_range_fn(weight.shape[0], act_fp4.shape[1] * 2) if dp_range_fn is not None else None
+    if dp_range is not None and "cutlass" in backends and dp_range[0] <= act_fp4.shape[0] <= dp_range[1]:
+        dp_runner = NVFP4GemmUnifiedRunner(0, output_dtype, backends, dense_min_m=dp_range[0],
+                                           dense_cutlass_only=True)
+        dphit, dpt = _cached_tactic(tuner, _GEMM_DENSE_DP_OP, dp_runner, inputs,
+                                    tco._nvfp4_dense_tuning_config(dp_range[0], dp_range[1]))
+        if dphit and dpt != -1:
+            return dpt
+    _nvfp4_dense_range, _nvfp4_dense_tuning_config = tco._nvfp4_dense_range, tco._nvfp4_dense_tuning_config
     dense_range = _nvfp4_dense_range(weight.shape[0], act_fp4.shape[1] * 2)
     if dense_range is not None:
         lo, hi = dense_range
