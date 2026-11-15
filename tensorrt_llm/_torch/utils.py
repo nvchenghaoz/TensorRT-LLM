@@ -9,7 +9,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.nn import functional as F
@@ -460,6 +460,41 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
     return tuple(num_token_buckets[::-1])
+
+
+# Dense NVFP4 GEMM tuning grid: (upper M, step). M in (previous upper, upper]
+# maps UP to the next multiple of step. Above the last upper, main's
+# power-of-2 rule applies.
+NVFP4_DENSE_TUNING_GRID = ((1024, 64), (2048, 128), (4096, 256), (8192, 512))
+NVFP4_DENSE_TUNING_MAX_M = NVFP4_DENSE_TUNING_GRID[-1][0]
+
+
+def nvfp4_dense_bucket(m: int, min_m: int) -> int:
+    """The dense tuning bucket of ``m``: the smallest grid point >= m.
+
+    M below ``min_m`` or above the grid keeps main's rule (last power of 2).
+    """
+    if m < min_m or m > NVFP4_DENSE_TUNING_MAX_M:
+        return last_positive_power_of_2(m)
+    for upper, step in NVFP4_DENSE_TUNING_GRID:
+        if m <= upper:
+            return max(min_m, -(-m // step) * step)
+    return last_positive_power_of_2(m)
+
+
+def nvfp4_dense_buckets(x: int, min_m: int) -> Tuple[int, ...]:
+    """Every dense grid point from ``min_m`` up to the bucket of ``x``."""
+    top = nvfp4_dense_bucket(min(x, NVFP4_DENSE_TUNING_MAX_M), min_m)
+    out = []
+    lower = 0
+    for upper, step in NVFP4_DENSE_TUNING_GRID:
+        b = -(-max(lower + 1, min_m) // step) * step
+        while b <= upper:
+            if min_m <= b <= top:
+                out.append(b)
+            b += step
+        lower = upper
+    return tuple(sorted(set(out)))
 
 
 def deep_gemm_gen_tuning_buckets(x: int):
