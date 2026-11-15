@@ -197,6 +197,14 @@ def main():
     summary["offline_id_check"] = tb
     if not tb or not tb.get("passed"):
         summary["errors"].append(f"offline id check failed rc={rc}")
+    if len(sys.argv) > 2 and sys.argv[2] == "offline":
+        # Offline only: cut proof, byte-fallback fuzz, workload + fuzz id equality (no server).
+        fz = pr["byte_fallback_fuzz"]
+        summary["passed"] = bool(not summary["errors"] and fz["guard_on"]["mismatches"] == 0
+                                 and fz["default_settings_mismatches"] == 0)
+        (out / "summary.json").write_text(json.dumps(summary))
+        print(json.dumps(summary, ensure_ascii=True))
+        return
 
     # (2) frozen check adapter with the id-digest hook in its server
     ref = json.loads(Path("experiments/ascent-benchmark/reference.json").read_text())
