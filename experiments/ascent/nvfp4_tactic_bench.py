@@ -231,20 +231,42 @@ def mode_check(args, cases):
             err = (first.float() - ref)
             maxabs = err.abs().max().item()
             rel = (err.norm() / ref.norm()).item()
-            # also the main-semantics cuBLASLt op output of the same tuned tactic for comparison
-            ok = bitwise and finite and first.shape == (m, n) and first.dtype == torch.bfloat16 and rel < 3e-2
+            # main's output for the same tuned tactic: main indexes the heuristic list of the actual M
+            hit, tactic, _ = tuned_tactic(xq, xsf, wq, wsf, alpha)
+            if isinstance(tactic, (tuple, list)) and tactic[0] == "cublaslt":
+                mo = runner_obj().run_gemm_bucketed(xq, wq, xsf, wsf, alpha, 0, tactic[1], -1, None, None)
+            else:
+                mo = first  # non-cuBLASLt tactics run identically on main
+            merr = mo.float() - ref
+            m_maxabs = merr.abs().max().item()
+            m_rel = (merr.norm() / ref.norm()).item()
+            ulp = 2.0 ** (torch.floor(torch.log2(ref.abs().max())).item() - 7)
+            cand_vs_main = (first.float() - mo.float()).abs().max().item()
+            tol_ok = (maxabs <= 1.10 * m_maxabs + ulp) and (rel <= 1.10 * m_rel + 1e-3)
+            ok = bitwise and finite and first.shape == (m, n) and first.dtype == torch.bfloat16 and tol_ok
             passed &= ok
-            results[f"{name}@{m}"] = {"bitwise_repeat": bitwise, "finite": finite,
-                                      "maxabs_vs_fp32": maxabs, "relfro_vs_fp32": rel}
-            log(f"[check] {name} M={m} repeat_bitwise={bitwise} finite={finite} maxabs={maxabs:.4g} rel={rel:.4g}")
+            results[f"{name}@{m}"] = {"tactic": str(tactic), "bitwise_repeat": bitwise, "finite": finite,
+                                      "maxabs_vs_fp32": maxabs, "relfro_vs_fp32": rel,
+                                      "main_maxabs_vs_fp32": m_maxabs, "main_relfro_vs_fp32": m_rel,
+                                      "cand_vs_main_maxabs": cand_vs_main, "ok": ok}
+            log(f"[check] {name} M={m} tactic={tactic} repeat_bitwise={bitwise} finite={finite} "
+                f"maxabs={maxabs:.4g} rel={rel:.4g} main_maxabs={m_maxabs:.4g} main_rel={m_rel:.4g} "
+                f"cand_vs_main={cand_vs_main:.4g} ok={ok}")
             del ref, xref, outs
         del wref
     cache_after = dict(AutoTuner.get().profiling_cache.cache)
     mutated = cache_before != cache_after
     log(f"[check] autotuner cache entries={len(cache_after)} mutated_during_sequence={mutated}")
     passed &= not mutated
-    print(json.dumps({"passed": bool(passed), "compared": "every call vs first (bitwise) and vs FP32 dequant reference",
-                      "results": results, "autotuner_cache_mutated": mutated}))
+    out = {"passed": bool(passed),
+           "compared": "every call vs first (bitwise), vs FP32 dequant reference, and vs main's algo for the tuned tactic",
+           "results": results, "autotuner_cache_mutated": mutated}
+    if args.with_cache:
+        args.phase = "driver"
+        cres = mode_cache(args, cases, emit=False)
+        out["cache_reload"] = cres
+        out["passed"] = bool(passed and cres["passed"])
+    print(json.dumps(out))
 
 
 def resolved_table(cases):
@@ -266,7 +288,7 @@ def resolved_table(cases):
     return tab
 
 
-def mode_cache(args, cases):
+def mode_cache(args, cases, emit=True):
     path = args.cache_path
     if args.phase == "save":
         if os.path.exists(path):
@@ -289,10 +311,16 @@ def mode_cache(args, cases):
         sys.stderr.write(p.stderr[-4000:])
         outs[phase] = json.loads(p.stdout.strip().splitlines()[-1])
     same = outs["save"] == outs["load"]
+    n_cub = 0
     for key in outs["save"]:
+        n_cub += "algo" in outs["save"][key]
         log(f"[cache] {key} save={outs['save'][key]} load={outs['load'].get(key)}")
-    print(json.dumps({"passed": same, "compared": "resolved cuBLASLt algo per (shape,M) after save vs after reload",
-                      "cache_file_exists": os.path.exists(path)}))
+    res = {"passed": same, "compared": "resolved cuBLASLt algo per (shape,M) after save vs after reload (new process)",
+           "cache_file_exists": os.path.exists(path), "cublaslt_tuned_cases": n_cub,
+           "backends": BACKENDS}
+    if emit:
+        print(json.dumps(res))
+    return res
 
 
 def main():
@@ -304,6 +332,7 @@ def main():
     ap.add_argument("--cache-path", default="/tmp/nvfp4_tactic_cache.json")
     ap.add_argument("--shapes", default="gate_up,down")
     ap.add_argument("--backends", default=BACKENDS)
+    ap.add_argument("--with-cache", action="store_true")
     args = ap.parse_args()
     BACKENDS = args.backends
     import tensorrt_llm  # noqa: F401  (loads torch ops)
