@@ -54,6 +54,8 @@ from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
 from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
 from ..kernels.fused_ops.rmsnorm_residual_add import (
     rmsnorm_residual_add,
+    rmsnorm_residual_add_fp4_quant,
+    rmsnorm_residual_add_fp4_quant_supported,
     rmsnorm_residual_add_scale,
 )
 from ..model_config import KVCacheLayerSpec, ModelConfig
@@ -82,6 +84,10 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
     from .modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+# One kernel for the post-attention junction (norm + residual add + pre-ffn
+# norm + gate_up NVFP4 quant); bitwise equal to the two-kernel chain.
+_FUSE_POST_ATTN_FP4 = True
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
 if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
@@ -1107,14 +1113,41 @@ class Gemma4DecoderLayer(DecoderLayer):
         # Fused post_attention RMSNorm + residual add (one kernel instead of
         # a norm round-trip plus a separate add). The unfused sequence remains
         # for configurations the kernel does not support.
-        if (
+        fuse_post_attn = (
             isinstance(hidden_states, torch.Tensor)
             and hidden_states.dim() == 2
             and hidden_states.dtype == torch.bfloat16
             and residual.shape == hidden_states.shape
             and not is_torch_compiling()
             and self._fused_norm_add_enabled()
+        )
+        mlp_fp4_input = None
+        if (
+            fuse_post_attn
+            and not lora_params
+            and rmsnorm_residual_add_fp4_quant_supported(hidden_states.shape[-1])
+            and _FUSE_POST_ATTN_FP4
+            and self._fused_norm_quant_enabled()
         ):
+            # One kernel for the whole post-attention junction: the
+            # norm+residual add (h, kept as the residual) and the pre-ffn
+            # norm + gate_up NVFP4 quantize of h, replicating
+            # rmsnorm_fp4_quant's math without re-reading h from HBM.
+            hidden_states, fp4, sf = rmsnorm_residual_add_fp4_quant(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                self.pre_feedforward_layernorm.weight,
+                self.pre_feedforward_layernorm.variance_epsilon,
+                self.mlp.gate_up_proj.input_scale,
+            )
+            mlp_fp4_input = Fp4QuantizedTensor(fp4, sf)
+            logger.info_once(
+                "Gemma4 fused post-attention norm+add+pre-ffn NVFP4-quant path: enabled",
+                key="gemma4_fused_post_attn_fp4",
+            )
+        elif fuse_post_attn:
             hidden_states = rmsnorm_residual_add(
                 hidden_states,
                 residual,
@@ -1133,7 +1166,9 @@ class Gemma4DecoderLayer(DecoderLayer):
         # input_scale / alpha the unfused quantize would use; the fused
         # kernel skips the intermediate bf16 round, so the GEMM inputs are
         # near- rather than byte-identical).
-        if (
+        if mlp_fp4_input is not None:
+            hidden_states = self.mlp(mlp_fp4_input, lora_params=lora_params)
+        elif (
             not lora_params
             and isinstance(hidden_states, torch.Tensor)
             and hidden_states.dim() == 2
