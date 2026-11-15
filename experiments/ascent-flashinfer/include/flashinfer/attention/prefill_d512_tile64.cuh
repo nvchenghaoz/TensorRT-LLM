@@ -92,6 +92,12 @@ __device__ __forceinline__ uint4 lds_u128(uint32_t addr) {
   return v;
 }
 
+__device__ __forceinline__ uint32_t lds_u32(uint32_t addr) {
+  uint32_t v;
+  asm volatile("ld.shared.u32 %0, [%1];\n" : "=r"(v) : "r"(addr));
+  return v;
+}
+
 __device__ __forceinline__ void sts_u32(uint32_t addr, uint32_t v) {
   asm volatile("st.shared.u32 [%0], %1;\n" ::"r"(addr), "r"(v));
 }
@@ -119,8 +125,15 @@ __device__ __forceinline__ void mma_m16n8k16(float* c, const uint32_t* a, const 
 
 __device__ __forceinline__ void cp_async_16_zfill(uint32_t smem_addr, const void* gptr,
                                                   bool pred) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr), "l"(gptr),
-               "r"(pred ? 16 : 0));
+  // In-range rows: the fixed 16-byte cp.async. Rows past the chunk: 16 zero bytes stored
+  // directly (what the zero-fill form writes). On SM120 the runtime src-size (zero-fill) form
+  // and the ignore-src form are not coalesced across lanes: each 16-byte lane fetches its own
+  // 32-byte sector, so a warp's 512 bytes moved ~34 sectors and ~30 smem wavefronts.
+  if (pred) {
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::"r"(smem_addr), "l"(gptr));
+  } else {
+    asm volatile("st.shared.v4.u32 [%0], {%1, %1, %1, %1};\n" ::"r"(smem_addr), "r"(0u));
+  }
 }
 
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
@@ -164,9 +177,12 @@ __device__ __forceinline__ void store_4(DTypeO* ptr, float a, float b, float c, 
   v.store(ptr);
 }
 
-// K/V ring loader: thread -> key `key` of each 64-key tile, 16-byte part `part` (an 8-lane
-// phase = 8 keys of one part: 128 contiguous smem bytes; a warp instruction covers 8 keys x
-// 64 contiguous global bytes).
+// K/V ring loader: thread -> key `key` = 8 warp + lane / 4 of each 64-key tile and 16-byte
+// pieces 4 j + `part` (part = lane % 4). A quarter-warp loads 2 keys x 64 contiguous global
+// bytes (4 whole 32-byte sectors). Smem rows are XOR-swizzled: piece p of key r sits at row
+// r ^ ((2 p) & 7) (low 3 bits only), so the quarter-warp's 8 stores hit 8 distinct 16-byte bank
+// groups, and a consumer's 8 lanes reading 8 aligned keys of one piece still cover 128
+// contiguous bytes.
 template <bool SAME_KV_STRIDES, typename DTypeKV, typename IdType>
 struct RingLoader {
   const DTypeKV* k_data;
@@ -200,12 +216,13 @@ struct RingLoader {
   // Sub-tile st (0..3: K dims 128 st.. of all 64 keys; 4..7: V keys 16 (st-4).. , all dims).
   __device__ __forceinline__ void issue(uint32_t st, uint32_t slot) const {
     const uint32_t dst_base = ring_s + slot * kSlotBytes;
+    const uint32_t swz = 2u * part;  // (2 piece) & 7 for piece = 4 j + part
     if (st < 4) {
       // smem [8 pieces][64 keys] x 16 B
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        const uint32_t piece = part + 4 * j;
-        cp_async_16_zfill(dst_base + (piece * kTileKV + key) * 16,
+        const uint32_t piece = 4 * j + part;
+        cp_async_16_zfill(dst_base + (piece * kTileKV + (key ^ swz)) * 16,
                           k_data + koff + st * 128 + piece * 16, valid);
       }
     } else if ((warp >> 1) == st - 4) {
@@ -213,8 +230,9 @@ struct RingLoader {
       const uint32_t kk = key & 15u;
 #pragma unroll
       for (uint32_t j = 0; j < 8; ++j) {
-        const uint32_t piece = part + 4 * j;
-        cp_async_16_zfill(dst_base + (piece * 16 + kk) * 16, v_data + voff + piece * 16, valid);
+        const uint32_t piece = 4 * j + part;
+        cp_async_16_zfill(dst_base + (piece * 16 + (kk ^ swz)) * 16, v_data + voff + piece * 16,
+                          valid);
       }
     }
   }
@@ -324,8 +342,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
   loader.v_data = paged_kv.v_data;
   loader.koff = 0;
   loader.voff = 0;
-  loader.key = 8 * warp + (lane & 7u);
-  loader.part = lane >> 3;
+  loader.key = 8 * warp + (lane >> 2);
+  loader.part = lane & 3u;
   loader.warp = warp;
   loader.ring_s = ring_s;
   loader.valid = false;
@@ -335,14 +353,17 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
     const size_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     const DTypeQ* q_base = params.q + size_t(params.q_indptr[request_idx]) * q_stride_n +
                            size_t(kv_head_idx * group_size) * q_stride_h;
-    const uint32_t row = loader.key;  // 8 warps x 8 rows
+    // 8 warps x 8 rows; a quarter-warp loads 4 rows x 2 adjacent chunks (one whole 32-byte
+    // sector of each row).
+    const uint32_t row = 8 * warp + 4 * ((lane >> 3) & 1u) + ((lane >> 1) & 3u);
+    const uint32_t chunk0 = 2 * (lane >> 4) + (lane & 1u);
     uint32_t qi, hi;
     group_size.divmod(qo_tile_idx * kTileQ + row, qi, hi);
     const bool valid = qi < qo_upper_bound64;
     const DTypeQ* src = q_base + (valid ? (qi * q_stride_n + hi * q_stride_h) : 0);
 #pragma unroll
     for (uint32_t i = 0; i < 16; ++i) {
-      const uint32_t chunk = 4 * i + loader.part;
+      const uint32_t chunk = 4 * i + chunk0;
       cp_async_16_zfill(q_s + (chunk * kTileQ + row) * 16, src + chunk * 8, valid);
     }
   }
@@ -367,10 +388,15 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
       p_s + ((lane >> 4) * kTileQ + 32 * gq + 0 + frag_row) * 16,
       p_s + ((lane >> 4) * kTileQ + 32 * gq + 16 + frag_row) * 16};
   // K B fragment: key 16 w + 8 nt + g.
-  const uint32_t k_lane = (16 * w + g) * 16;
+  // K B fragment: key 16 w + 8 nt + g, at swizzled row g ^ ((2 sl) & 7) of piece sl,
+  // + word t/2 of its 16-byte d-step (the second word, t/2 + 2, is 8 bytes on).
+  const uint32_t k_lane = 16 * w * 16 + (t >> 1) * 4;
   const uint32_t k_sel = (t & 1u) ? 0x7632u : 0x5410u;
   // V ldmatrix.trans: keys frag_row, piece 8 w + (lane >> 4) (+ 2 pp).
-  const uint32_t v_lane = ((8 * w + (lane >> 4)) * 16 + frag_row) * 16;
+  // The ring rows are swizzled (RingLoader): key row r of piece p sits at r ^ ((2 p) & 7);
+  // for piece 8 w + (lane >> 4) + 2 pp that is r ^ (2 (lane >> 4)) ^ (4 (pp & 1)).
+  const uint32_t v_lane = ((8 * w + (lane >> 4)) * 16 + (frag_row & 8u)) * 16;
+  const uint32_t v_x = (lane & 7u) ^ (2u * (lane >> 4));
 
   uint32_t row_q[2][2], row_h[2][2];
 #pragma unroll
@@ -446,11 +472,12 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
           uint32_t b[2][2];
 #pragma unroll
           for (uint32_t nt = 0; nt < 2; ++nt) {
-            // One 16-byte load of the key's d-step; lane t keeps bytes 2t, 2t+1 (word t/2)
-            // and 2t+8, 2t+9 (word t/2 + 2): the B fragment's k positions.
-            const uint4 kw = lds_u128(sb + k_lane + (sl * kTileKV + 8 * nt) * 16);
-            const uint32_t lo = (t & 2u) ? kw.y : kw.x;
-            const uint32_t hi = (t & 2u) ? kw.w : kw.z;
+            // Lane t needs bytes 2t, 2t+1 (word t/2) and 2t+8, 2t+9 (word t/2 + 2) of the
+            // key's d-step: two 4-byte loads, one wavefront each (8 rows x 2 words).
+            const uint32_t k_addr =
+                sb + k_lane + (sl * kTileKV + 8 * nt + (g ^ ((2u * sl) & 7u))) * 16;
+            const uint32_t lo = lds_u32(k_addr);
+            const uint32_t hi = lds_u32(k_addr + 8);
             fp8x4_to_16b<DTypeQ, DTypeKV>(__byte_perm(lo, hi, k_sel), b[nt]);
           }
           if (mma_d == 0) {
@@ -615,7 +642,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
 #pragma unroll
         for (uint32_t pp = 0; pp < 4; ++pp) {
           uint32_t vr[4];
-          ldsm_x4_trans(sb + v_lane + pp * 2 * 16 * 16, vr);
+          ldsm_x4_trans(sb + v_lane + pp * 2 * 16 * 16 + (v_x ^ (4u * (pp & 1u))) * 16, vr);
 #pragma unroll
           for (uint32_t h = 0; h < 2; ++h) {
             uint32_t be[2], bo[2];
