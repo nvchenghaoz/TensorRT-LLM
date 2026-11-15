@@ -42,10 +42,20 @@ def print_dims():
     log("config: " + json.dumps({k: tc.get(k) for k in keys}))
 
 
+MIRROR_JSON = os.path.join(HERE, "engine_overlay.json")
+USE_OVERLAY = os.environ.get("BCG_OVERLAY", "1") == "1"
+
+
 def overlay():
-    if os.path.exists(ENGINE_JSON):
-        with open(ENGINE_JSON) as f:
-            return json.load(f)
+    """engine.json of this tree if the job checkout has it, else the mirrored copy beside this
+    script (identical to the branch's experiments/ascent-config/engine.json). BCG_OVERLAY=0
+    (baseline arm) runs without it, i.e. main's eager settings."""
+    if not USE_OVERLAY:
+        return {}
+    for path in (ENGINE_JSON, MIRROR_JSON):
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
     return {}
 
 
