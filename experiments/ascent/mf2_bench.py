@@ -35,8 +35,9 @@ print("fused available:", FUSED is not None, "cute available:", rmsnorm_fp4_quan
 CASES = [
     ("300", 300), ("1000", 1000), ("1200", 1200), ("2000", 2000), ("4000", 4000),
     ("4800", 4800), ("8000", 8000), ("8100", 8100), ("8192", 8192),
-    ("4x2000", 8000), ("16x512", 8192),
-]  # 16x300 packs to 4800 rows: the "4800" case
+]
+# The kernel is one program per row with no sequence boundaries, so packed
+# mixes are their row totals: 16x300 = 4800, 4x2000 = 8000, 16x512 = 8192.
 WARMUP, ITERS = 5, 30
 dev = "cuda"
 
