@@ -1532,6 +1532,148 @@ def _nvfp4_dense_dp_range(n: int, k: int) -> Optional[Tuple[int, int]]:
     return rng
 
 
+# NVFP4 tactic pins (SM120). The AutoTuner's pick for some (N, K, bucket) is a
+# per-process lottery: the top tactics sit within ~1-2% of each other, and a
+# cuBLASLt pick is a heuristic-list index that runtime re-resolves in the list
+# of the actual M, whose order differs from the bucket's (Gemma-4-31B down_proj:
+# index 0 is nvjet 256x128 DP at m=1024 but cutlass3x stream-K at m=2000). A pin
+# fixes the tactic of a served M range by identity: ("cutlass", config index), or
+# ("cublaslt", algorithm config) matched in the heuristic list the runner uses at
+# that M (the bucket's list for gemm_dense, the actual M's list for gemm). Pins
+# apply after the tuner lookup in inference mode only, so tuning and the tuner
+# cache are unchanged. A cuBLASLt identity missing from the list keeps the tuned
+# pick. Gemma-4-31B-IT-NVFP4 MLP shapes only; TRTLLM_NVFP4_GATEUP_PIN=0 /
+# TRTLLM_NVFP4_DOWN_PIN=0 turn off the gate_up / down pins. The down band of
+# gemm_dense_dp (M 513-1023) returns before any pin code runs.
+NVFP4_GATEUP_PIN = os.environ.get("TRTLLM_NVFP4_GATEUP_PIN", "1") != "0"
+NVFP4_DOWN_PIN = os.environ.get("TRTLLM_NVFP4_DOWN_PIN", "1") != "0"
+_NVFP4_GATEUP_NK = (43008, 5376)
+_NVFP4_DOWN_NK = (5376, 21504)
+# cuBLASLt algorithm configs, as get_algo_config()[2:] returns them:
+# (algo_id, tile, stages, splitK, reduction, swizzle, custom, inner, cluster).
+_LT_NVJET_256x128 = (67, 24, 36, 1, 0, 0, 31, 0, 0)  # nvjet ootst 256x128x128, DP
+_LT_CUTLASS3X_SK = (70, 20, 37, -2, 2, 0, 0, 0, 0)  # cutlass3x 128x128x256 stream-K
+# (N, K) -> [(op key, min M, max M, identity)]
+_NVFP4_PINS = {
+    _NVFP4_GATEUP_NK: [
+        # dense bucket 320 (served M=300): nvjet 256x128x128, also on a dense
+        # cache miss and on the main-bucket (256) fallback.
+        ("gemm_dense", 257, 320, ("cublaslt", _LT_NVJET_256x128)),
+        ("gemm", 257, 320, ("cublaslt", _LT_NVJET_256x128)),
+        # main buckets 1024/2048/4096 (the chunked chain's lookup at M>=1664,
+        # and M>2048): TRT CUTLASS config 2 (256x128x128), keeps the chunker on.
+        ("gemm", 1024, 8191, ("cutlass", 2)),
+    ],
+    _NVFP4_DOWN_NK: [
+        # main bucket 1024: stream-K where it is fastest (served M 1200/1500),
+        # nvjet 256x128x128 DP above (served M 1800/2000).
+        ("gemm", 1024, 1663, ("cublaslt", _LT_CUTLASS3X_SK)),
+        ("gemm", 1664, 2047, ("cublaslt", _LT_NVJET_256x128)),
+    ],
+}
+# (n, k, m, heuristic_m, config, dtype) -> heuristic-list index or None
+_NVFP4_PIN_LT_INDEX: dict = {}
+
+
+def _nvfp4_pin_entry(op: str, n: int, k: int, m: int) -> Optional[Tuple]:
+    if (n, k) == _NVFP4_GATEUP_NK:
+        if not NVFP4_GATEUP_PIN:
+            return None
+    elif (n, k) == _NVFP4_DOWN_NK:
+        if not NVFP4_DOWN_PIN:
+            return None
+    else:
+        return None
+    if not _nvfp4_dense_sm_ok():
+        return None
+    for p_op, lo, hi, ident in _NVFP4_PINS[(n, k)]:
+        if p_op == op and lo <= m <= hi:
+            return ident
+    return None
+
+
+def _nvfp4_pin_lt_index(inputs: List[torch.Tensor], output_dtype: torch.dtype,
+                        heuristic_m: int, cfg: Tuple) -> Optional[int]:
+    """Index of cuBLASLt config ``cfg`` in the heuristic list runtime uses at
+    this M (heuristic_m > 0: that M's list, checked at the actual M)."""
+    act_fp4, weight, act_sf, weight_scale, _ = inputs
+    m, n, k = act_fp4.shape[0], weight.shape[0], act_fp4.shape[1] * 2
+    key = (n, k, m, heuristic_m, cfg, output_dtype)
+    if key in _NVFP4_PIN_LT_INDEX:
+        return _NVFP4_PIN_LT_INDEX[key]
+    runner = CublasLtFP4GemmRunner(0, output_dtype).cublaslt_runner
+    found = None
+    if heuristic_m <= 0 or heuristic_m == m:
+        count = runner.get_num_heuristic_algos(act_fp4, weight, act_sf,
+                                               weight_scale)
+        hm = -1
+    else:
+        # The list size of heuristic_m (only the shape of the first operand
+        # is read; no GEMM runs).
+        shape_only = act_fp4.new_empty((heuristic_m, act_fp4.shape[1]))
+        count = runner.get_num_heuristic_algos(shape_only, weight, act_sf,
+                                               weight_scale)
+        del shape_only
+        hm = heuristic_m
+    for i in range(count):
+        c = runner.get_algo_config(act_fp4, weight, act_sf, weight_scale, i,
+                                   hm)
+        if not c[0]:
+            break
+        if not c[1] and tuple(c[2:]) == cfg:
+            found = i
+            break
+    if found is None:
+        logger.warning(
+            f"NVFP4 tactic pin: cuBLASLt config {cfg} not in the heuristic "
+            f"list at m={m} (list m={heuristic_m}, n={n}, k={k}); the tuned "
+            f"tactic runs instead")
+    else:
+        logger.info(f"NVFP4 tactic pin: n={n} k={k} m={m} -> cuBLASLt index "
+                    f"{found} of the m={heuristic_m if hm > 0 else m} list, "
+                    f"config {cfg}")
+    _NVFP4_PIN_LT_INDEX[key] = found
+    return found
+
+
+def nvfp4_pinned_tactic(op: str,
+                        inputs: List[torch.Tensor],
+                        output_dtype: torch.dtype,
+                        tactic,
+                        allowed_backends: List[str],
+                        dense_min_m: Optional[int] = None):
+    """The tactic trtllm::nvfp4_gemm runs for op key ``op`` ('gemm' or
+    'gemm_dense'): the pinned one for a pinned (N, K, M), else ``tactic``."""
+    act_fp4, weight = inputs[0], inputs[1]
+    m, n, k = act_fp4.shape[0], weight.shape[0], act_fp4.shape[1] * 2
+    ident = _nvfp4_pin_entry(op, n, k, m)
+    if ident is None:
+        return tactic
+    backend, val = ident
+    if backend not in allowed_backends or (backend == "cublaslt"
+                                           and not IS_CUBLASLT_AVAILABLE):
+        return tactic
+    if backend == "cutlass":
+        return ("cutlass", val)
+    heuristic_m = (nvfp4_dense_bucket(m, dense_min_m)
+                   if op == "gemm_dense" and dense_min_m is not None else -1)
+    idx = _nvfp4_pin_lt_index(inputs, output_dtype, heuristic_m, val)
+    if idx is None:
+        logger.warning_once(
+            f"NVFP4 tactic pin: n={n} k={k} m={m} op={op} runs the tuned "
+            f"tactic {tactic} (pinned cuBLASLt config {val} unavailable)",
+            key=("nvfp4_pin_unavailable", op, n, k, m))
+        return tactic
+    return ("cublaslt", idx)
+
+
+def nvfp4_pin_info(n: int, k: int, m: int) -> dict:
+    """Pins that apply at (N, K, M), per op key (diagnostics)."""
+    return {op: (None if (e := _nvfp4_pin_entry(op, n, k, m)) is None else
+                 str(e))
+            for op in ("gemm", "gemm_dense")}
+
+
 class NVFP4GemmUnifiedRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(
@@ -1952,6 +2094,21 @@ def nvfp4_gemm(
                 inputs,
                 bias=bias,
             )
+            if in_range and not tuning:
+                missed = dense_tactic == -1
+                dense_tactic = nvfp4_pinned_tactic("gemm_dense", inputs,
+                                                   output_dtype, dense_tactic,
+                                                   backends_list, dense_min_m)
+                if missed:
+                    logger.warning_once(
+                        f"NVFP4 gemm_dense cache miss at M={m} "
+                        f"(N={weight.shape[0]}, K={act_fp4.shape[1] * 2}); "
+                        + (f"running the pinned tactic {dense_tactic}"
+                           if dense_tactic != -1 else
+                           "running the main-bucket ('gemm') pick"),
+                        key=("nvfp4_dense_miss", weight.shape[0],
+                             act_fp4.shape[1] * 2,
+                             nvfp4_dense_bucket(m, dense_min_m)))
             if in_range and dense_tactic != -1:
                 if (dp_range is not None and tuning
                         and m >= dp_range[0]):
@@ -1984,6 +2141,10 @@ def nvfp4_gemm(
             f"AutoTuner failed to find a valid (runner, tactic) pair. "
             f"Input shape: M={act_fp4.shape[0]}, K={act_fp4.shape[1]*2}, N={weight.shape[0]}"
         ) from e
+
+    if not tuner.is_tuning_mode:
+        best_tactic = nvfp4_pinned_tactic("gemm", inputs, output_dtype,
+                                          best_tactic, backends_list)
 
     return runner(
         inputs=[act_fp4, weight, act_sf, weight_scale, alpha],

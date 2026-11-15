@@ -36,7 +36,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 
 from ...autotuner import AutoTuner
-from ...custom_ops.torch_custom_ops import NVFP4GemmUnifiedRunner
+from ...custom_ops.torch_custom_ops import NVFP4GemmUnifiedRunner, nvfp4_pinned_tactic
 from .gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
 
 _GEMM_OP = "trtllm::nvfp4_gemm::gemm"
@@ -76,7 +76,15 @@ def full_m_gemm_tactic(
     hit, _, tactic, _ = tuner.profiling_cache.search_cache(
         _GEMM_OP, [runner], shapes, NVFP4GemmUnifiedRunner.tuning_config
     )
-    if not hit:
+    # The tactic trtllm::nvfp4_gemm itself would run at this M (its pins).
+    tactic = nvfp4_pinned_tactic(
+        "gemm",
+        [act_fp4, weight, act_sf, weight_scale, alpha],
+        output_dtype,
+        tactic if hit else -1,
+        list(allowed_backends),
+    )
+    if tactic == -1:
         return None
     return runner, tactic
 
