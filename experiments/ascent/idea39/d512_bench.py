@@ -170,6 +170,9 @@ def build_cases(a, dims):
 
 def run_arm(a):
     if a.arm == "overlay":
+        if not os.environ.get("FLASHINFER_WORKSPACE_BASE", "").count("idea39_ws_"):
+            # every overlay arm needs its own JIT cache: all arms share one module URI
+            os.environ["FLASHINFER_WORKSPACE_BASE"] = tempfile.mkdtemp(prefix="idea39_ws_")
         sys.path.insert(0, str(HERE))
         import fi_overlay
         ov = pathlib.Path(a.overlay_dir or tempfile.mkdtemp(prefix="idea39_ov_"))
@@ -185,7 +188,7 @@ def run_arm(a):
     log("DIMS", json.dumps(dims))
     p = torch.cuda.get_device_properties(0)
     log("GPU", p.name, "SMs", p.multi_processor_count)
-    ws = torch.zeros(512 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    ws = torch.zeros(1024 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     save_dir = pathlib.Path(a.save_dir) if a.save_dir else None
     results = []
     all_ok = True

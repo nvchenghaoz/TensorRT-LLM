@@ -162,6 +162,45 @@ __device__ __forceinline__ void store_4(DTypeO* ptr, float a, float b, float c, 
   v.store(ptr);
 }
 
+// Global offsets of this thread's 4 rows (tokens ld_tok + 8 i) of K/V tile `tile`.
+template <bool SAME_KV_STRIDES, typename DTypeKV, typename IdType>
+__device__ __forceinline__ uint32_t kv_tile_offsets(const paged_kv_t<DTypeKV, IdType>& paged_kv,
+                                                   uint32_t packed_page_iter_base, uint32_t tile,
+                                                   uint32_t ld_tok, uint32_t ld_chunk,
+                                                   uint32_t kv_head_idx, uint32_t chunk_size,
+                                                   IdType last_indptr, size_t* k_off,
+                                                   size_t* v_off) {
+  uint32_t valid = 0;
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t rel = tile * kTileKV + ld_tok + 8 * i;
+    uint32_t page_iter, entry_idx;
+    paged_kv.page_size.divmod(packed_page_iter_base + rel, page_iter, entry_idx);
+    const bool in_range = static_cast<IdType>(page_iter) < last_indptr;
+    const size_t page = in_range ? static_cast<size_t>(__ldg(paged_kv.indices + page_iter)) : 0;
+    k_off[i] = in_range ? page * paged_kv.stride_page + size_t(kv_head_idx) * paged_kv.stride_h +
+                              size_t(entry_idx) * paged_kv.stride_n + ld_chunk * 16
+                        : 0;
+    if constexpr (!SAME_KV_STRIDES) {
+      v_off[i] = in_range ? page * paged_kv.v_stride_page +
+                                size_t(kv_head_idx) * paged_kv.v_stride_h +
+                                size_t(entry_idx) * paged_kv.v_stride_n + ld_chunk * 16
+                          : 0;
+    }
+    valid |= (rel < chunk_size ? 1u : 0u) << i;
+  }
+  return valid;
+}
+
+template <typename DTypeKV>
+__device__ __forceinline__ void kv_tile_issue(uint32_t smem_dst, const DTypeKV* data,
+                                              const size_t* off, uint32_t valid) {
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i) {
+    cp_async_16_zfill(smem_dst + i * 8 * 16, data + off[i], (valid >> i) & 1u);
+  }
+}
+
 template <typename Params, typename AttentionVariant, MaskMode MASK_MODE>
 struct Supported {
   using DTypeQ = typename Params::DTypeQ;
@@ -255,51 +294,19 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
   const DTypeKV* k_data = paged_kv.k_data;
   const DTypeKV* v_data = paged_kv.v_data;
   size_t k_off[4];
-  [[maybe_unused]] size_t v_off[SAME_KV_STRIDES ? 1 : 4];
+  size_t v_off_store[SAME_KV_STRIDES ? 1 : 4];
+  size_t* v_off = SAME_KV_STRIDES ? k_off : v_off_store;
   uint32_t ld_valid = 0;
 
-  auto compute_offsets = [&](uint32_t tile) {
-    ld_valid = 0;
-#pragma unroll
-    for (uint32_t i = 0; i < 4; ++i) {
-      const uint32_t rel = tile * kTileKV + ld_tok + 8 * i;
-      uint32_t page_iter, entry_idx;
-      paged_kv.page_size.divmod(packed_page_iter_base + rel, page_iter, entry_idx);
-      const bool in_range = static_cast<IdType>(page_iter) < last_indptr;
-      const size_t page = in_range ? static_cast<size_t>(__ldg(paged_kv.indices + page_iter)) : 0;
-      k_off[i] = in_range ? page * paged_kv.stride_page + size_t(kv_head_idx) * paged_kv.stride_h +
-                                size_t(entry_idx) * paged_kv.stride_n + ld_chunk * 16
-                          : 0;
-      if constexpr (!SAME_KV_STRIDES) {
-        v_off[i] = in_range ? page * paged_kv.v_stride_page +
-                                  size_t(kv_head_idx) * paged_kv.v_stride_h +
-                                  size_t(entry_idx) * paged_kv.v_stride_n + ld_chunk * 16
-                            : 0;
-      }
-      ld_valid |= (rel < chunk_size ? 1u : 0u) << i;
-    }
-  };
-  auto issue_k = [&]() {
-#pragma unroll
-    for (uint32_t i = 0; i < 4; ++i) {
-      cp_async_16_zfill(k_s + ld_smem + i * 8 * 16, k_data + k_off[i], (ld_valid >> i) & 1u);
-    }
-  };
-  auto issue_v = [&]() {
-#pragma unroll
-    for (uint32_t i = 0; i < 4; ++i) {
-      const size_t off = SAME_KV_STRIDES ? k_off[i] : v_off[SAME_KV_STRIDES ? 0 : i];
-      cp_async_16_zfill(v_s + ld_smem + i * 8 * 16, v_data + off, (ld_valid >> i) & 1u);
-    }
-  };
-
   if (num_iterations > 0) {
-    compute_offsets(0);
-    issue_k();
+    ld_valid = kv_tile_offsets<SAME_KV_STRIDES>(paged_kv, packed_page_iter_base, 0, ld_tok,
+                                                ld_chunk, kv_head_idx, chunk_size, last_indptr,
+                                                k_off, v_off_store);
+    kv_tile_issue(k_s + ld_smem, k_data, k_off, ld_valid);
   }
   cp_async_commit();
   if (num_iterations > 0) {
-    issue_v();
+    kv_tile_issue(v_s + ld_smem, v_data, v_off, ld_valid);
   }
   cp_async_commit();
 
@@ -370,7 +377,9 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
   for (uint32_t iter = 0; iter < num_iterations; ++iter) {
     const bool has_next = iter + 1 < num_iterations;
     if (has_next) {
-      compute_offsets(iter + 1);
+      ld_valid = kv_tile_offsets<SAME_KV_STRIDES>(paged_kv, packed_page_iter_base, iter + 1,
+                                                  ld_tok, ld_chunk, kv_head_idx, chunk_size,
+                                                  last_indptr, k_off, v_off_store);
     }
 
     // S = Q . K^T for this warp's 16 rows x 16 tokens.
@@ -490,7 +499,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
     cp_async_wait<0>();
     __syncthreads();
     if (has_next) {
-      issue_k();
+      kv_tile_issue(k_s + ld_smem, k_data, k_off, ld_valid);
     }
     cp_async_commit();
 
@@ -524,7 +533,7 @@ __global__ __launch_bounds__(kNumThreads, 1) void BatchPrefillPagedD512Tile64Ker
     cp_async_wait<0>();
     __syncthreads();
     if (has_next) {
-      issue_v();
+      kv_tile_issue(v_s + ld_smem, v_data, v_off, ld_valid);
     }
     cp_async_commit();
   }
