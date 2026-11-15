@@ -38,7 +38,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 PAGE = 32
 CASES = "1x300,16x300,27x300,1x1000,8x1000,1x2000,4x2000,16x512,1x4000,2x4000,1x8000"
 # global-only read-rows cases (layer 59 sub-call): q rows 16 per request against kv_len
-EXTRA_GLOBAL = {"rr1x8000": ([16], [8000]), "rr4x2000": ([16] * 4, [2000] * 4)}
+# 'rr<B>x<S>' cases (global layer only): layer 59's read-rows sub-call, B requests x the trailing
+# read_rows_n(S) rows against kv_len S, planned with disable_split_kv=True (16 rows at S=8000).
 
 # ------------------------------------------------------------------ text transforms
 V2M_NEW = """  for (uint32_t idx = thread_id; idx < NUM_B128; idx += NUM_THREADS) {
@@ -161,18 +162,75 @@ def load_dims(ckpt):
     return d
 
 
-def case_list(layers, cases):
+READ_ROWS_TILE = 64   # main's d512 CTA tile (Tile64) that the read-rows subset is aligned to
+READ_ROWS_MIN = 512   # TRTLLM_GEMMA4_LAST_LAYER_ATTN_ROWS_MIN_TOKENS default
+
+
+def read_rows_n(L, dims):
+    """Trailing rows per request that layer 59's read-rows sub-call runs (pitfall 775)."""
+    group = dims["num_heads"] // dims["global_kv_heads"]
+    tile = READ_ROWS_TILE
+    head = tile // group + 1
+    return head + (L - head) % (tile // math.gcd(tile, group))
+
+
+def case_list(layers, cases, dims):
     out = []
     for layer in layers.split(","):
         for cs in [c for c in cases.split(",") if c]:
-            if cs in EXTRA_GLOBAL:
+            if cs.startswith("rr"):
                 if layer != "global":
                     continue
-                ql, kl = EXTRA_GLOBAL[cs]
-                out.append((layer, cs, ql, kl, {"disable_split_kv": True}))
+                b, s = (int(x) for x in cs[2:].split("x"))
+                n = read_rows_n(s, dims)
+                out.append((layer, cs, [n] * b, [s] * b, {"disable_split_kv": True}))
             else:
                 b, s = (int(x) for x in cs.split("x"))
                 out.append((layer, cs, [s] * b, None, {}))
+    return out
+
+
+# Workload case -> the packed attention call one prefill forward makes for it (max_num_tokens
+# 8192, fresh prompts, kv_len == qo_len), as in experiments/ascent/idea38/bench.py.
+WORKLOAD = {"isl300@1": "1x300", "isl300@4": "4x300", "isl300@16": "16x300",
+            "isl300@64": "27x300", "isl1k@1": "1x1000", "isl1k@4": "4x1000",
+            "isl1k@16": "8x1000", "isl1k@64": "8x1000", "isl2k@1": "1x2000",
+            "isl2k@4": "4x2000", "isl2k@16": "4x2000", "isl2k@64": "4x2000",
+            "isl4k@1": "1x4000", "isl4k@4": "2x4000", "isl4k@16": "2x4000",
+            "isl4k@64": "2x4000", "isl8k@1": "1x8000", "isl8k@4": "1x8000",
+            "isl8k@16": "1x8000", "isl8k@64": "1x8000"}
+PAIR_CASES = ("1x300,4x300,16x300,27x300,1x1000,4x1000,8x1000,1x2000,4x2000,16x512,1x4000,"
+              "2x4000,1x8000,rr4x300,rr16x300,rr27x300,rr1x1000,rr4x1000,rr8x1000,rr1x2000,"
+              "rr4x2000,rr1x4000,rr2x4000,rr1x8000")
+
+
+def layer_counts(ckpt):
+    cfg = json.load(open(os.path.join(ckpt, "config.json")))
+    tc = cfg.get("text_config", cfg)
+    lt = tc.get("layer_types") or []
+    ns = sum(1 for t in lt if "sliding" in t)
+    ng = sum(1 for t in lt if "full" in t or "global" in t)
+    return ns, ng
+
+
+def composite(batch, dims, ckpt):
+    """Per-forward FA2 attention kernel time of each workload case on the measured per-kernel
+    medians: n_sliding x d256 + (n_global - 1) x d512 + layer 59's call (read-rows sub-call
+    at >= 512 rows, else the full-row d512 call). Spread = the same weighted sum of p90 - p10."""
+    ns, ng = layer_counts(ckpt)
+    out = {}
+    for label, spec in WORKLOAD.items():
+        b, s = (int(x) for x in spec.split("x"))
+        k256, k512 = batch.get(f"{spec}_d256"), batch.get(f"{spec}_d512")
+        last = batch.get(f"rr{spec}_d512") if b * s >= READ_ROWS_MIN else k512
+        if not (k256 and k512 and last):
+            continue
+        parts = [(ns, k256), (ng - 1, k512), (1, last)]
+        med = sum(w * k["kernel_ms"] for w, k in parts)
+        spread = sum(w * (k["p90_ms"] - k["p10_ms"]) for w, k in parts)
+        out[label] = dict(kernel_ms=round(med, 4), noise_floor=round(spread / med, 4),
+                          d256_ms=k256["kernel_ms"], d512_ms=k512["kernel_ms"],
+                          last_layer_ms=last["kernel_ms"], n_sliding=ns, n_global=ng)
     return out
 
 
@@ -332,7 +390,7 @@ def worker(a):
     del xa
     torch.cuda.empty_cache()
     log("WARM gpu spin done")
-    for layer, label, ql, kl, kw in case_list(a.layers, a.cases):
+    for layer, label, ql, kl, kw in case_list(a.layers, a.cases, dims):
         key = f"{label}_{'d256' if layer == 'sliding' else 'd512'}"
         t0 = time.time()
         c = Case(layer, label, ql, kl, dims, kw)
@@ -401,7 +459,13 @@ def worker(a):
         except Exception as ex:  # noqa: BLE001
             log("SASS census failed", ex)
     stop.set()
-    print(json.dumps({"batch": batch, "output": {"class": "exact"}, "passed": bool(ok),
+    kernels = batch
+    if a.workload_batch:
+        batch = composite(kernels, dims, a.ckpt)
+        for label, v in batch.items():
+            log("WORKLOAD", label, json.dumps(v))
+    print(json.dumps({"batch": batch, "kernels": kernels, "output": {"class": "exact"},
+                      "passed": bool(ok),
                       "arm": a.arm, "hashes": hashes, "results": recs}), flush=True)
 
 
@@ -693,7 +757,7 @@ def driver(a):
     dims = load_dims(a.ckpt)
     numer = {}
     ref_arm = arms[0]
-    for layer, label, ql, kl, kw in case_list(a.layers, a.cases):
+    for layer, label, ql, kl, kw in case_list(a.layers, a.cases, dims):
         key = f"{label}_{'d256' if layer == 'sliding' else 'd512'}"
         outs = {}
         for arm in arms:
@@ -727,9 +791,9 @@ def driver(a):
         torch.cuda.empty_cache()
     # timing table
     table = {}
-    for layer, label, ql, kl, kw in case_list(a.layers, a.cases):
+    for layer, label, ql, kl, kw in case_list(a.layers, a.cases, dims):
         key = f"{label}_{'d256' if layer == 'sliding' else 'd512'}"
-        table[key] = {arm: [None if j is None else j["batch"].get(key) for j in res[arm]]
+        table[key] = {arm: [None if j is None else j["kernels"].get(key) for j in res[arm]]
                       for arm in arms}
     log("TABLE case | " + " | ".join(f"{arm} r{r} med(p10,p90)" for arm in arms
                                      for r in range(a.rounds)))
@@ -776,7 +840,12 @@ def main():
     ap.add_argument("--stage0-only", action="store_true")
     ap.add_argument("--sass", action="store_true")
     ap.add_argument("--fresh-base", action="store_true")
+    ap.add_argument("--workload-batch", action="store_true",
+                    help="report batch keyed by workload case (per-forward FA2 composite)")
+    ap.add_argument("--pair-cases", action="store_true", help=f"--cases {PAIR_CASES}")
     a = ap.parse_args()
+    if a.pair_cases:
+        a.cases = PAIR_CASES
     if a.worker:
         worker(a)
     elif a.stage0_only:
