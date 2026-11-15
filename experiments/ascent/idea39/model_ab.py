@@ -134,18 +134,40 @@ def ref_delta(ref, cand):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--n300", type=int, default=10)
-    ap.add_argument("--n1k", type=int, default=12)
-    ap.add_argument("--n8k1", type=int, default=10)
-    ap.add_argument("--n8k4", type=int, default=8)
+    ap.add_argument("--n300", type=int, default=20)
+    ap.add_argument("--n1k1", type=int, default=20)
+    ap.add_argument("--n1k", type=int, default=24)
+    ap.add_argument("--n8k1", type=int, default=20)
+    ap.add_argument("--n8k4", type=int, default=16)
     a = ap.parse_args()
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.ckpt)
-    classes = [("isl300@1", 300, 1, a.n300), ("isl1k@4", 1000, 4, a.n1k),
-               ("isl8k@1", 8000, 1, a.n8k1), ("isl8k@4", 8000, 4, a.n8k4)]
+    classes = [("isl8k@4", 8000, 4, a.n8k4), ("isl1k@4", 1000, 4, a.n1k),
+               ("isl8k@1", 8000, 1, a.n8k1), ("isl1k@1", 1000, 1, a.n1k1),
+               ("isl300@1", 300, 1, a.n300)]
     prompts = build_prompts(tok, classes)
     for k, (isl, conc, lst) in prompts.items():
         log("class", k, "isl", isl, "c", conc, "n", len(lst), "lens", sorted({len(p) for p in lst}))
+
+    # Count this path's dispatches: every head_dim-512 paged prefill plan and how many of them
+    # chose the 64-row tile (plan_info[3]).
+    import flashinfer
+    counts = {"d512_plans": 0, "d512_tile64": 0}
+    _orig_plan = flashinfer.BatchPrefillWithPagedKVCacheWrapper.plan
+
+    def _counting_plan(self, *args, **kwargs):
+        r = _orig_plan(self, *args, **kwargs)
+        try:
+            head_dim = kwargs.get("head_dim_qk", args[6] if len(args) > 6 else None)
+            pi = getattr(self, "_plan_info", None)
+            if head_dim == 512 and pi is not None:
+                counts["d512_plans"] += 1
+                counts["d512_tile64"] += int(int(pi[3]) == 64)
+        except Exception:
+            pass
+        return r
+
+    flashinfer.BatchPrefillWithPagedKVCacheWrapper.plan = _counting_plan
 
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.llmapi import KvCacheConfig
@@ -159,8 +181,11 @@ def main():
     log("LLM ready in", round(time.time() - t0, 1), "s")
     sp = SamplingParams(max_tokens=1, logprobs=20)  # default sampling is greedy
 
+    dispatch = {}
+
     def run_pass(name, flag):
         os.environ[FLAG] = flag
+        counts["d512_plans"] = counts["d512_tile64"] = 0
         res = {}
         t = time.time()
         for cls, (isl, conc, lst) in prompts.items():
@@ -170,7 +195,9 @@ def main():
                 got = llm.generate(group, sp, use_tqdm=False)
                 outs.extend(summarize(g) for g in got)
             res[cls] = outs
-        log("pass", name, f"{FLAG}={flag}", "secs", round(time.time() - t, 1))
+        dispatch[name] = dict(counts)
+        log("pass", name, f"{FLAG}={flag}", "secs", round(time.time() - t, 1),
+            "dispatch", json.dumps(counts))
         return res
 
     # warm both paths once (JIT + autotune) outside the compared passes
@@ -202,7 +229,7 @@ def main():
     summary = {"passed": bool(ok), "prompts": total,
                "B_vs_A_bitwise_total": sum(r["B_vs_A_bitwise"] for r in report.values()),
                "A_vs_A2_bitwise_total": sum(r["A_vs_A2_bitwise"] for r in report.values()),
-               "classes": report, "flag": FLAG,
+               "classes": report, "flag": FLAG, "dispatch_per_pass": dispatch,
                "host_prefill_plan": os.environ.get("TRTLLM_FI_HOST_PREFILL_PLAN", "default")}
     print(json.dumps(summary), flush=True)
 
