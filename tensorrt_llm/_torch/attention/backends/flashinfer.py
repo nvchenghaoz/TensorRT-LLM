@@ -78,27 +78,29 @@ rows only (see ``FlashInferAttention._prefill_forward_read_rows``).
 
 TRTLLM_GEMMA4_LAST_LAYER_ATTN_ROWS=0 restores the full-row prefill call."""
 
-_READ_ROWS_CTA_TILE_Q = 32
-"""FA2 query tile (packed rows) of a long-q head_dim-512 plan."""
+_READ_ROWS_CTA_TILES_Q = (32, 64)
+"""Query tiles (packed rows) of main's long-q head_dim-512 FA2 plans: 32 (the
+FA2 template) and 64 (the d512 64-row kernel the planner promotes unsplit,
+full-attention FP8-KV plans to when the average packed length exceeds 64)."""
 
 READ_ROWS_STATS = {"ran": 0, "fallback": 0}
 """Read-rows dispatch counters (tests and A/B harnesses read them)."""
 
 
-def read_rows_subset_lengths(seq_lens: np.ndarray,
-                             group_size: int) -> Optional[np.ndarray]:
+def read_rows_subset_lengths(seq_lens: np.ndarray, group_size: int,
+                             tile: int) -> Optional[np.ndarray]:
     """Trailing query rows per request for a bitwise last-row attention pass.
 
-    n is the smallest count with n * group_size > CTA_TILE_Q (so FA2 picks the
-    long-q CTA_TILE_Q=32 template, as for the full rows) and with
-    (seq_len - n) * group_size a multiple of CTA_TILE_Q. The second condition
+    tile is main's plan's CTA_TILE_Q. n is the smallest count with
+    n * group_size > tile (so the planner's FA2DetermineCtaTileQ and its
+    64-row promotion pick main's tile again; the caller checks the sub-plan's
+    tile) and with (seq_len - n) * group_size a multiple of the tile. The
+    second condition
     puts every kept row at the same packed offset inside its query tile as in
     the full-row plan, so each CTA's KV range, iteration count and mask
-    iteration (prefill.cuh, BatchPrefillWithPagedKVCacheKernel) are those of
-    the full-row CTA that holds the row. Returns None when a request is too
-    short for that.
+    iteration are those of the full-row CTA that holds the row. Returns None
+    when a request is too short for that.
     """
-    tile = _READ_ROWS_CTA_TILE_Q
     n_min = tile // group_size + 1
     period = tile // math.gcd(tile, group_size)
     seq_lens = seq_lens.astype(np.int64, copy=False)
@@ -2772,8 +2774,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         the final-norm gather of rows qo_indptr[1:] - 1. K/V of every row is
         already appended. Each request's trailing n rows (see
         ``read_rows_subset_lengths``) run through FA2 with main's plan template
-        (CTA_TILE_Q=32, unsplit, same variant), so the kept row is bitwise
-        main's; every other output row is zero. Returns False, before any
+        (main's CTA_TILE_Q, 32 or the 64-row d512 kernel, unsplit, same
+        variant, same in-tile row offsets), so the kept row is bitwise main's;
+        every other output row is zero. Returns False, before any
         work, when a guard fails, and the caller runs main's full-row call.
         """
         if not (_LAST_LAYER_ATTN_ROWS
@@ -2797,7 +2800,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         main_wrapper = metadata.get_prefill_wrapper(plan_params)
         main_info = getattr(main_wrapper, "_plan_info", None)
         if (main_info is None or getattr(main_wrapper, "_backend", None) != "fa2"
-                or int(main_info[3]) != _READ_ROWS_CTA_TILE_Q
+                or int(main_info[3]) not in _READ_ROWS_CTA_TILES_Q
                 or int(main_info[14]) != 0):
             READ_ROWS_STATS["fallback"] += 1
             return False
@@ -2822,16 +2825,18 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # The sub-plan depends only on these host inputs (the page ids are read
         # at run time from the same device buffer), so a step with the same
         # ones reuses the wrapper's plan and index tensor as they stand.
+        main_tile = int(main_info[3])
         key = (host_qo_indptr.numpy().tobytes(),
                paged_kv_indptr.numpy().tobytes(),
                paged_kv_last_page_len.numpy().tobytes(),
                page_indices.data_ptr(), page_indices.shape[0],
-               metadata.page_size, plan_params)
+               metadata.page_size, plan_params, main_tile)
         if state["key"] != key:
             state["key"] = None
             qo_np = host_qo_indptr.numpy()
             group_size = plan_params.num_heads // plan_params.num_kv_heads
-            n = read_rows_subset_lengths(qo_np[1:] - qo_np[:-1], group_size)
+            n = read_rows_subset_lengths(qo_np[1:] - qo_np[:-1], group_size,
+                                         main_tile)
             if n is None:
                 READ_ROWS_STATS["fallback"] += 1
                 return False

@@ -292,11 +292,16 @@ def mode_check(ckpt):
                                 workspace=ws)
         return built[label]
 
-    order = list(CASES)
+    order = [(lab, b, L, "1") for lab, b, L in CASES]
     # A, B, A permutation of the reused workspace / sub-plan wrapper.
-    order += [CASES[-1], CASES[2], CASES[-1]]
-    for label, b, L in order:
+    order += [CASES[-1] + ("1",), CASES[2] + ("1",), CASES[-1] + ("1",)]
+    # main on the 32-row FA2 template (64-row d512 kernel off for main and sub-plan alike)
+    order += [CASES[i] + ("0",) for i in (0, 1, 2, 3, 11)]
+    for label, b, L, t64 in order:
+        os.environ["FLASHINFER_FA2_D512_TILE64"] = t64
         c = get_case(label, b, L)
+        c.plan_main()  # main re-plans every forward under the current setting
+        label = f"{label}|tile64={t64}"
         H = heads * head_dim
         q_before = c.q.clone()
         kv_before = c.kv.view(torch.uint8).clone()
@@ -335,8 +340,8 @@ def mode_check(ckpt):
         infos = meta._read_rows_plan_infos
         finite = bool(torch.isfinite(out[rows].float()).all().item())
         case_ok = (read_bitwise and nonread_zero and rep_equal and q_same and kv_same and sentinel_ok
-                   and finite and infos["main"][0] == 32 and infos["main"][1] == 0
-                   and infos["sub"][0] == 32 and infos["sub"][1] == 0)
+                   and finite and infos["main"][0] == (64 if t64 == "1" else 32) and infos["main"][1] == 0
+                   and infos["sub"][0] == infos["main"][0] and infos["sub"][1] == 0)
         ok_all &= case_ok
         r = {"tokens": c.M, "read_rows_bitwise_vs_main": read_bitwise, "nonread_rows_zero": nonread_zero,
              "repeated_calls_equal": rep_equal, "calls": n_calls, "q_unchanged": q_same,
@@ -353,8 +358,10 @@ def mode_check(ckpt):
         del ref_main, out, kv_before, q_before
 
     # Guard-off cases: the method must return False before touching the output.
+    os.environ["FLASHINFER_FA2_D512_TILE64"] = "1"
     guards = {}
     c = get_case("isl8k@1", 1, 8000)
+    c.plan_main()
     me = types.SimpleNamespace(flashinfer_backend="fa2")
     pp = c.plan_params()
     H = heads * head_dim
