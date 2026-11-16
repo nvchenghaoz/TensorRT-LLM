@@ -496,6 +496,11 @@
 # DeepSeek and GPT-OSS examples retain the Modeling V2 team ownership above.
 # Other model implementations and their tests belong to their submitting authors.
 
+# Gemma4 (Gemma-4-31B), including its native code in csrc/
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/gemma4 @nvchenghaoz
+/tests/unittest/_torch/modeling_v2/models/gemma4 @nvchenghaoz
+/tests/integration/defs/accuracy/modeling_v2/gemma4 @nvchenghaoz
+
 # Qwen4
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/qwen4_exp @Wanli-Jiang
 /tests/unittest/_torch/modeling_v2/models/qwen4_exp @Wanli-Jiang

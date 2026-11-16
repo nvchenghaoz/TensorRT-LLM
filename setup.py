@@ -211,6 +211,8 @@ package_data += [
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
+    # Kernel sources modeling_v2 targets compile at runtime (FlashInfer JIT).
+    '_torch/_experimental/modeling_v2/models/*/*/kernels/**/*',
 ]
 
 
