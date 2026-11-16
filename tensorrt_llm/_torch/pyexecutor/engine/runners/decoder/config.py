@@ -58,4 +58,11 @@ class DecoderRunnerConfig(RunnerConfig):
     # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths); False for a config
     # built without it. Keyword-only, so subclasses may still add required fields.
     spec_decode_fast_paths: bool = field(default=False, kw_only=True)
+    # Prefill CUDA graphs replay only steps whose token count equals a captured
+    # size; every other context step runs eagerly at its real token count instead
+    # of padded to the next captured size. A model asks for this
+    # (``prefill_cuda_graph_exact_sizes``) when its replay must run the same
+    # kernels at the same M as its eager step, e.g. because GEMM tactics are
+    # chosen per M. Keyword-only, like spec_decode_fast_paths.
+    prefill_cuda_graph_exact_sizes: bool = field(default=False, kw_only=True)
     watermark_config: "WatermarkConfig | None" = field(default=None, kw_only=True)

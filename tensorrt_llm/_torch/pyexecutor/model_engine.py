@@ -88,6 +88,18 @@ def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
     return bool(getattr(model, "spec_decode_fast_paths", False))
 
 
+def _prefill_cuda_graph_exact_sizes(model: torch.nn.Module) -> bool:
+    """``prefill_cuda_graph_exact_sizes`` of the language model: True when its
+    prefill CUDA graphs may replay only steps at a captured token count (no
+    padding to the next size); False for a model that does not set it."""
+    if isinstance(model, MultimodalModelMixin):
+        try:
+            model = model.language_model
+        except NotImplementedError:
+            return False
+    return bool(getattr(model, "prefill_cuda_graph_exact_sizes", False))
+
+
 # Refit only needs the compile wrapper removed before weights are loaded: the
 # wrapper inserts "_orig_mod" into every parameter path, and load_weights()
 # matches checkpoint tensors by dotted path (modeling_utils.py:1141-1160). With
@@ -591,6 +603,7 @@ class ModelEngine:
                 and self.model.samples_from_vocab_shards
             ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
+            prefill_cuda_graph_exact_sizes=_prefill_cuda_graph_exact_sizes(self.model),
             watermark_config=self.llm_args.watermark_config,
             **extra_fields,
         )

@@ -692,6 +692,7 @@ class DecoderInputPreparer:
                 else PrefillCudaGraphBackend.DISABLED
             ),
             prefill_cuda_graph_num_tokens=prefill_cuda_graph_num_tokens,
+            prefill_cuda_graph_exact_sizes=self._config.prefill_cuda_graph_exact_sizes,
         )
 
     def model_inputs(

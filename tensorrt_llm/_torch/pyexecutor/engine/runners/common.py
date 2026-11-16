@@ -70,9 +70,14 @@ def get_padding_params(
     enable_attention_dp: bool,
     prefill_cuda_graph_backend: PrefillCudaGraphBackend,
     prefill_cuda_graph_num_tokens: list[int],
+    prefill_cuda_graph_exact_sizes: bool = False,
 ) -> tuple[int, bool, list[int] | None]:
     """
     Get the padding parameters for tensor padding.
+
+    With ``prefill_cuda_graph_exact_sizes`` a prefill graph runs only when the
+    step's token count is a captured size; any other step runs eagerly and
+    unpadded, so a replay runs the same kernels at the same M as eager.
     Return:
         padded_num_tokens: the padded number of tokens
         can_run_prefill_cuda_graph: whether a prefill CUDA graph can run
@@ -102,6 +107,11 @@ def get_padding_params(
             can_run_prefill_cuda_graph = (
                 has_ctx_requests and max(attn_all_rank_num_tokens) <= max_captured_num_tokens
             )
+            if can_run_prefill_cuda_graph and prefill_cuda_graph_exact_sizes:
+                can_run_prefill_cuda_graph = all(
+                    get_padded_prefill_tokens(max(attn_all_rank_num_tokens)) == n
+                    for n in attn_all_rank_num_tokens
+                )
             if can_run_prefill_cuda_graph:
                 padded_num_tokens = get_padded_prefill_tokens(max(attn_all_rank_num_tokens))
                 logger.debug(
@@ -113,6 +123,8 @@ def get_padding_params(
                 return total_num_tokens, False, attn_all_rank_num_tokens
         elif num_ctx_requests != 0 and total_num_tokens <= max_captured_num_tokens:
             padded_num_tokens = get_padded_prefill_tokens(total_num_tokens)
+            if prefill_cuda_graph_exact_sizes and padded_num_tokens != total_num_tokens:
+                return total_num_tokens, False, None
             logger.debug(f"Pad tensor with {total_num_tokens} tokens to {padded_num_tokens} tokens")
             return padded_num_tokens, True, None
         else:
@@ -137,6 +149,7 @@ def pad_input_tokens(
     enable_attention_dp: bool,
     prefill_cuda_graph_backend: PrefillCudaGraphBackend,
     prefill_cuda_graph_num_tokens: list[int],
+    prefill_cuda_graph_exact_sizes: bool = False,
 ) -> int:
     """Pad the batch to the token count its prefill graph or attention-DP peers need.
 
@@ -151,6 +164,7 @@ def pad_input_tokens(
         enable_attention_dp=enable_attention_dp,
         prefill_cuda_graph_backend=prefill_cuda_graph_backend,
         prefill_cuda_graph_num_tokens=prefill_cuda_graph_num_tokens,
+        prefill_cuda_graph_exact_sizes=prefill_cuda_graph_exact_sizes,
     )
     set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
     attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
